@@ -424,12 +424,30 @@ contract UniswapV3GraduatorTest is BaseTest {
 
         vm.recordLogs();
         launchpad.graduate(e.token);
-        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(_countSkewEvents(vm.getRecordedLogs()), 1);
 
         assertEq(_price(pool), e.expectedSqrtPrice);
-        assertEq(_countSkewEvents(logs), 1);
         uint256 ethReturned = launchpad.mindBalance(e.token) - e.mindBefore;
         assertGt(ethReturned, 0.5 ether, "WETH received from the attacker is returned");
+        _assertGraduatorEmpty(e.token);
+        _assertSolvent(e.token);
+
+        _attackerExit(positionId);
+        assertLt(_attackerValue(e), valueBefore, "attacker cannot profit beyond fair value");
+    }
+
+    /// @dev The leftover WETH of a correction (here: WETH bought from attacker liquidity above the fair price) is
+    ///      credited with exactly one `MindFunded(token, graduator, ethReturned)`.
+    function test_graduate_skewedPool_emitsMindFundedForLeftoverEth() public {
+        _wire(WETH_HIGH); // coin is token0
+        Expectation memory e = _completeAndExpect(0.5 ether);
+        _preSkew(e, 20_000);
+        _attackerRange(e, 10_500, 20_000, 50_000_000e18, 1 ether);
+        vm.recordLogs();
+        launchpad.graduate(e.token);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 ethReturned = launchpad.mindBalance(e.token) - e.mindBefore;
+        assertGt(ethReturned, 0);
         uint256 found;
         for (uint256 i; i < logs.length; ++i) {
             if (logs[i].emitter == address(launchpad) && logs[i].topics[0] == IMindLaunchpad.MindFunded.selector) {
@@ -440,11 +458,6 @@ contract UniswapV3GraduatorTest is BaseTest {
             }
         }
         assertEq(found, 1, "one MindFunded for the leftover ETH");
-        _assertGraduatorEmpty(e.token);
-        _assertSolvent(e.token);
-
-        _attackerExit(positionId);
-        assertLt(_attackerValue(e), valueBefore, "attacker cannot profit beyond fair value");
     }
 
     function test_correction_attackerDeeperThanCap_revertsPoolPriceSkewed_wethIsToken0() public {
@@ -603,7 +616,8 @@ contract UniswapV3GraduatorTest is BaseTest {
         Expectation memory e = _completeAndExpect();
         // Fresh pool at `expected`: token1 is the binding side of the floor-rounded price.
         uint256 desired0 = e.amount0;
-        uint256 desired1 = Math.mulDiv(Math.mulDiv(e.amount0, e.expectedSqrtPrice, 1 << 96), e.expectedSqrtPrice, 1 << 96);
+        uint256 desired1 =
+            Math.mulDiv(Math.mulDiv(e.amount0, e.expectedSqrtPrice, 1 << 96), e.expectedSqrtPrice, 1 << 96);
         assertLe(desired1, e.amount1);
         INonfungiblePositionManager.MintParams memory params = INonfungiblePositionManager.MintParams({
             token0: e.token0,

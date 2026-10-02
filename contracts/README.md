@@ -6,18 +6,20 @@ chain addresses: `docs/ROBINHOOD_CHAIN.md`.
 
 | Contract | Role |
 |---|---|
-| `src/MindLaunchpad.sol` | Token factory, constant-product bonding curve with virtual reserves, fee router, mind vault, registry. `Ownable2Step`, `Pausable` (createMind/buy only), `ReentrancyGuard`. |
+| `src/MindLaunchpad.sol` | Token factory, constant-product bonding curve with virtual reserves, fee router, mind vault, registry. `Ownable2Step` (renounce disabled), `Pausable` (createMind/buy only), `ReentrancyGuard`. A `Complete` curve not graduated within `graduationGrace` (default 1 day) accepts sells again (they reopen it). |
 | `src/MindToken.sol` | Plain ERC20 + ERC20Permit; the full supply (1e9) is minted to the launchpad. |
-| `src/UniswapV3Graduator.sol` | Moves `LP_SUPPLY` + the curve ETH into a full-range Uniswap v3 position owned forever by the graduator; harvests fees (ETH → mind vault, tokens → `0x…dEaD`). A pre-created pool at a skewed price never blocks graduation (`GraduatedAtSkewedPrice`). |
+| `src/UniswapV3Graduator.sol` | Moves `LP_SUPPLY` + the curve ETH into a full-range Uniswap v3 position owned forever by the graduator; harvests fees (ETH → mind vault, tokens → `0x…dEaD`). A pre-created pool at another price is first swapped back towards the price implied by the amounts (at most half of the sold side, `GraduatedAtSkewedPrice`); if it is still outside `priceToleranceBps` (default 1 %) graduation reverts `PoolPriceSkewed` and can be retried. |
 | `src/MockGraduator.sol` | Graduator for testnets without Uniswap v3 and local runs: keeps ETH and tokens, returns `(address(this), 0, 0)`. |
 | `src/libraries/CurveMath.sol` | Pure curve math (quotes, price, fee split, `minEthToComplete`), shared by the launchpad, the views and the fixture generator; mirrored bit-for-bit by `@www-rh/shared` `curve.ts`. |
 | `src/interfaces/` | `IMindLaunchpad` (types, events, errors, full external interface), `IGraduator`, minimal hand-written Uniswap v3 interfaces (`uniswap/`). |
 
 Money flows in short: every trade fee is split `mindShareBps` (70 %) to the coin's mind vault and the rest to
 `protocolBalance`; graduation takes `graduationFeeBps` (2.5 %) of the reserve with the same split. ETH comes back
-from a graduator only through the launchpad's `receive()`, which accepts ETH from addresses ever set as graduator
-and does no accounting; `graduate`/`harvest` check the exact balance change (`EthReturnMismatch()` otherwise) and
-credit the vault. Vault ETH leaves only through `drawCompute` (operator, epoch-capped) to `computeTreasury`.
+from a graduator only through the launchpad's `receive()`, which accepts ETH only from the graduator that
+`graduate`/`harvest` is calling at that moment and counts it; the call must report exactly the counted amount
+(`EthReturnMismatch()` otherwise), which is credited to the vault (`fundMind` is `nonReentrant`, so nothing can be
+credited twice). Vault ETH leaves only through `drawCompute` (operator, epoch-capped, cap ≤ 2 ETH per epoch) to
+`computeTreasury`.
 
 ## Setup
 
@@ -34,7 +36,7 @@ Dependencies are vendored in `lib/` (forge-std, OpenZeppelin 5.6.1); no npm pack
 ```bash
 forge fmt                      # format (CI: forge fmt --check)
 forge build                    # compile (lint runs on build; src/ is warning-free)
-forge build --sizes            # MindLaunchpad runtime ~20 KB (< 24 KB limit)
+forge build --sizes            # MindLaunchpad runtime ~21 KB (< 24 KB limit)
 forge test -vv                 # unit + fuzz (512 runs) + invariant (64 x 32) tests
 FOUNDRY_PROFILE=ci forge test  # 2048 fuzz runs, 256 x 64 invariant runs
 forge test --match-contract UniswapV3GraduatorTest -vvv
@@ -48,17 +50,21 @@ Test suites (`test/`):
 |---|---|
 | `CurveMath.t.sol` | round trips never profit (buy→sell, sell→buy), `x·y` never decreases, price monotone, completion exactness (`minEthToComplete`), 1-wei rounding guard, fee split |
 | `MindLaunchpad.Trading.t.sol` | createMind validation/creation fee/initial buy, buy/sell vs quotes, completion with refund, minimal completing amount and −1/−2 wei, rounding guard on-chain, fee split + `FeeAccrued`, events |
-| `MindLaunchpad.Graduation.t.sol` | graduation via `MockGraduator`, returned ETH credit + `MindFunded`, `EthReturnMismatch` (graduate and harvest), `GraduatorNotSet`, `graduatorOf` vs `setGraduator`, `receive()` gating (`DirectEthNotAccepted`) |
+| `MindLaunchpad.Graduation.t.sol` | graduation via `MockGraduator`, returned ETH credit + `MindFunded`, `EthReturnMismatch` (graduate and harvest), the ETH return counter (no double credit through `fundMind`, forced ETH not counted, 2300-gas returns fail, returns from other addresses rejected, split returns summed), `GraduatorNotSet`, `graduatorOf` vs `setGraduator`, `setGraduator` sanity checks, `receive()` gating (`DirectEthNotAccepted`) |
+| `MindLaunchpad.EscapeHatch.t.sol` | `completedAt`, `graduationGrace` and its setter, sells/quotes blocked during the grace, post-grace sells reopening the curve (`CurveReopened`), buys staying Bonding-only, re-completion and graduation afterwards, holders exiting when graduation is impossible |
 | `MindLaunchpad.Vault.t.sol` | `fundMind`, `drawCompute` epoch caps/reset/`computeTreasury` payee/any status, creator pause vs operator status rules, `setMindConfig`, `anchorMemory` |
-| `MindLaunchpad.Admin.t.sol` | constructor, owner setters and bounds, access control for every restricted function, pause scope, protocol fee withdrawal, Ownable2Step |
+| `MindLaunchpad.Admin.t.sol` | constructor, owner setters and bounds (`MAX_DRAW_PER_EPOCH`, 2x burst bound), access control for every restricted function, pause scope, protocol fee withdrawal, Ownable2Step, `renounceOwnership` disabled |
 | `Reentrancy.t.sol` | `ReentrantReceiver` re-entering on sell, completing-buy refund, draw and withdrawal |
-| `UniswapV3Graduator.t.sol` | Uniswap v3 mocks, both token orderings, fresh / uninitialized / exact / skewed / extremely skewed pools, leftovers credited and burned, harvest crediting and burning, access control |
-| `invariant/LaunchpadInvariants.t.sol` | `balance >= Σ realEthReserve + Σ mindBalance + protocolBalance` (and exact equality), launchpad token balance `== TOTAL_SUPPLY - tokensSold` while Bonding, `k` never decreases, draw cap |
+| `UniswapV3Graduator.t.sol` | realistic Uniswap v3 models, both token orderings, fresh / uninitialized / exact / skewed / extremely skewed / fuzzed pre-set prices (free correction), corrections trading against attacker liquidity (attacker loses at the fair price), `PoolPriceSkewed` when the attacker is deeper than the cap (retry after arbitrage), swap callback authorization, tolerance and mint minimums, leftovers credited and burned, harvest (seeded and real swap fees), access control |
+| `invariant/LaunchpadInvariants.t.sol` | `balance >= Σ realEthReserve + Σ mindBalance + protocolBalance` (and exact equality), launchpad token balance `== TOTAL_SUPPLY - tokensSold` while Bonding, `k` never decreases, draw cap, `completedAt` vs phase; the handler also sells on Complete curves after the grace |
 | `Fixture.t.sol` | the checked-in `curve.json` is up to date, matches `CurveMath`, and every case replays on a real launchpad (quotes and executed trades) |
-| `Deploy.t.sol` | the deploy script for both graduator kinds, defaults, ownership hand-over, JSON output |
+| `Deploy.t.sol` | the deploy script for both graduator kinds, defaults, ownership hand-over, JSON output, `mock` refused on 4663 |
+| `audit/*.t.sol` | the audit PoCs (`test_POC_*` assert the safe behaviour) and a TickMath sanity check of the Uniswap math port |
 
-Mocks live in `test/mocks/` (`MockWETH9`, `MockUniswapV3Factory`, `MockUniswapV3Pool`,
-`MockNonfungiblePositionManager`, `ReentrantReceiver`, `ConfigurableGraduator`).
+Mocks live in `test/mocks/` (`MockWETH9`, `ReentrantReceiver`, `ConfigurableGraduator`, `MaliciousGraduator`) and
+`test/mocks/uniswapv3/` (`UniV3Factory`, `UniV3Pool`, `UniV3PositionManager`, `UniV3Math`: Uniswap v3 models with
+the real TickMath / LiquidityAmounts / SqrtPriceMath / SwapMath, multi-position liquidity, `swap` with callback and
+per-position swap fees).
 
 ## Curve fixture
 
@@ -92,7 +98,7 @@ COMPUTE_TREASURY, OPERATOR)` → graduator(launchpad) → `setGraduator` → (if
 |---|---|
 | `DEPLOYER_PRIVATE_KEY` | required; broadcaster |
 | `OWNER`, `TREASURY`, `COMPUTE_TREASURY`, `OPERATOR` | role addresses, each defaults to the deployer |
-| `GRADUATOR_KIND` | `uniswapv3` \| `mock` (default `uniswapv3` on 4663, `mock` elsewhere) |
+| `GRADUATOR_KIND` | `uniswapv3` \| `mock` (default `uniswapv3` on 4663, `mock` elsewhere; `mock` is refused on 4663) |
 | `WETH9`, `UNIV3_FACTORY`, `UNIV3_POSITION_MANAGER` | required for `uniswapv3`; default to the 4663 addresses from `docs/ROBINHOOD_CHAIN.md` on mainnet |
 | `UNIV3_FEE_TIER` | default `10000` (1 %, tick spacing 200, full range ±887200) |
 | `DEPLOYMENTS_FILE` | optional output path override |
@@ -167,6 +173,8 @@ Compiler settings come from `foundry.toml` (solc 0.8.37, optimizer 200 runs, can
 
 - Arbitrum Orbit: `block.number` is the parent-chain block number, so no contract reads it; deadlines and draw
   epochs use `block.timestamp`.
-- ETH is sent with `call` only; every function that sends ETH or calls a graduator is `nonReentrant`.
+- ETH is sent with `call` only; every function that sends ETH or calls a graduator, and `fundMind`, is
+  `nonReentrant`. The launchpad's `receive()` writes storage, so graduators must return ETH with a full-gas `call`
+  (a 2300-gas `transfer`/`send` fails).
 - If the chain's WETH9 unwraps with a 2300-gas `transfer` (canonical WETH9 does), `UniswapV3Graduator.receive()`
   still works: it only compares `msg.sender` with an immutable.

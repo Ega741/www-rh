@@ -38,7 +38,9 @@ contract UniV3PositionManager is INonfungiblePositionManager {
     uint256 public nextId = 1;
     mapping(uint256 tokenId => Position) internal _positions;
 
-    event Minted(uint256 indexed tokenId, address indexed recipient, uint128 liquidity, uint256 amount0, uint256 amount1);
+    event Minted(
+        uint256 indexed tokenId, address indexed recipient, uint128 liquidity, uint256 amount0, uint256 amount1
+    );
 
     error UnorderedTokens();
     error PoolMissing();

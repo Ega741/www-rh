@@ -83,7 +83,8 @@ FOUNDRY_SOLC=/usr/local/bin/solc FOUNDRY_DISABLE_NIGHTLY_WARNING=1`; Chromium is
 | `mindShareBps` | `7000` (70 %) | share of every trade and graduation fee credited to the coin's **mind vault**; the rest → protocol; max 10000 |
 | `graduationFeeBps` | `250` (2.5 %) | taken from the real ETH reserve at graduation, split by `mindShareBps`; max 1000 |
 | `creationFee` | `0` | flat fee to create a mind; owner-settable; credited 100 % to `protocolBalance` |
-| `maxDrawPerEpoch` / `drawEpoch` | `0.25 ether` / `1 day` (86400 s) | absolute per-mind cap on operator compute draws per epoch; owner-settable, `drawEpoch >= 1 hour` |
+| `maxDrawPerEpoch` / `drawEpoch` | `0.25 ether` / `1 day` (86400 s) | absolute per-mind cap on operator compute draws per epoch; owner-settable, `drawEpoch >= 1 hour`, `maxDrawPerEpoch <= MAX_DRAW_PER_EPOCH = 2 ether` (fixed epochs allow a 2× burst at an epoch boundary) |
+| `graduationGrace` | `1 day` | after `completedAt + graduationGrace` a curve stuck in `Complete` accepts sells again (first sell reopens it to `Bonding`, `CurveReopened`); owner-settable within [1 hour, 30 days] |
 
 Fee parameters are global: `setFeeParams` applies immediately to every mind, including curves in
 progress (there is no per-mind snapshot). Constants other than the fee parameters, `creationFee` and
@@ -113,8 +114,9 @@ decreases across trades and a sell can never take out more than `realEthReserve`
   `protocolAmount = fee - mindAmount`.
 - **currentPrice** (wei per 1e18 tokens) `= x·1e18 / y`. Market cap (display, wei) `= price·TOTAL_SUPPLY / 1e18`.
   Progress (bps) `= tokensSold·10000 / CURVE_SUPPLY`.
-- Trades are allowed only while phase == `Bonding`. Completion needs exactly `4.0 ETH` of net
-  reserve (`1.365·800/273`), ≈ 4.04 ETH gross including fees.
+- Buys are allowed only while phase == `Bonding`; sells while `Bonding`, or while `Complete` once
+  `block.timestamp >= completedAt + graduationGrace` (the sell flips the phase back to `Bonding`, see §2.3).
+  Completion needs exactly `4.0 ETH` of net reserve (`1.365·800/273`), ≈ 4.04 ETH gross including fees.
 - **Graduation** (phase `Complete` → `Graduated`): `gradFee = realEthReserve·graduationFeeBps / 10000`
   (split mind/protocol), `ethLiquidity = realEthReserve - gradFee`, `tokenLiquidity = LP_SUPPLY`.
   Final curve price `≈ 1.965e-8 ETH` (mcap ≈ 19.65 ETH), LP opening price `≈ 1.95e-8 ETH`
@@ -164,7 +166,9 @@ interface IGraduator {
     /// @notice Deploys liquidity for `token`. The launchpad has already transferred `tokenAmount`
     ///         of `token` to this contract and sends the ETH liquidity as msg.value.
     ///         Before returning, the graduator MUST send exactly `ethReturned` wei back to the
-    ///         launchpad with a plain call (unused ETH), and burn unused tokens to 0x…dEaD.
+    ///         launchpad (unused ETH) with one or more full-gas plain calls (`call{value: …}("")`,
+    ///         never `transfer`/`send`: the launchpad's receive() writes storage), and burn unused
+    ///         tokens to 0x…dEaD.
     /// @return pool        DEX pool that received the liquidity (address(this) for the mock)
     /// @return positionId  LP position id (0 when not applicable)
     /// @return ethReturned wei sent back to the launchpad during this call
@@ -172,12 +176,17 @@ interface IGraduator {
         external payable returns (address pool, uint256 positionId, uint256 ethReturned);
 
     /// @notice Collects DEX fees for `token`. Before returning, sends exactly `ethOut` wei to the
-    ///         launchpad with a plain call and burns collected tokens (`tokensBurned`) to 0x…dEaD.
+    ///         launchpad with full-gas plain calls (as above) and burns collected tokens
+    ///         (`tokensBurned`) to 0x…dEaD.
     function harvest(address token) external returns (uint256 ethOut, uint256 tokensBurned);
 }
 ```
 
-Both functions are callable only by `launchpad()` (implementations revert `NotLaunchpad()`).
+Both functions are callable only by `launchpad()` (implementations revert `NotLaunchpad()`). During
+each call the launchpad's `receive()` accepts ETH only from that graduator and counts it; the
+launchpad then requires the count to equal `ethReturned` / `ethOut` (§2.3 rules 4–6). ETH that
+reaches the launchpad any other way (e.g. through `fundMind`, which is `nonReentrant`, a forced
+transfer, or from another address) is not counted.
 
 ### 2.3 `MindLaunchpad` — `src/MindLaunchpad.sol`
 
@@ -186,14 +195,15 @@ Single core contract: factory + bonding curve + fee router + mind vault + mind r
 
 ```solidity
 constructor(address initialOwner, address treasury, address computeTreasury, address operator);
-receive() external payable;   // accepts ETH only from isGraduator[msg.sender]; no accounting
+receive() external payable;   // accepts ETH only from the graduator graduate/harvest is calling; counts it
 ```
 
 Constructor: `Ownable(initialOwner)` (reverts `OwnableInvalidOwner(address(0))` for zero);
 `treasury`, `computeTreasury`, `operator` MUST be non-zero (`ZeroAddress()`); emits
-`TreasuryUpdated`, `ComputeTreasuryUpdated`, `OperatorUpdated`. The graduator starts unset
+`TreasuryUpdated`, `ComputeTreasuryUpdated`, `OperatorUpdated`, `FeeParamsUpdated`,
+`DrawLimitUpdated`, `GraduationGraceUpdated(1 days)`. The graduator starts unset
 (`address(0)`) and is wired afterwards with `setGraduator` (§2.6). Initial fee params, creation fee
-and draw limit are the §1 defaults.
+and draw limit are the §1 defaults; `graduationGrace` starts at `1 days`.
 
 Full interface — `src/interfaces/IMindLaunchpad.sol` (normative; `MindLaunchpad` implements it):
 
@@ -226,6 +236,7 @@ interface IMindLaunchpad {
     event Trade(address indexed token, address indexed trader, bool isBuy, uint256 ethAmount,
         uint256 tokenAmount, uint256 fee, uint256 realEthReserve, uint256 tokensSold);
     event CurveCompleted(address indexed token, uint256 realEthReserve);
+    event CurveReopened(address indexed token);
     event Graduated(address indexed token, address pool, uint256 positionId, uint256 ethLiquidity,
         uint256 tokenLiquidity, uint256 graduationFee);
     event FeeAccrued(address indexed token, uint256 mindAmount, uint256 protocolAmount);
@@ -243,6 +254,7 @@ interface IMindLaunchpad {
     event FeeParamsUpdated(uint16 tradeFeeBps, uint16 mindShareBps, uint16 graduationFeeBps);
     event CreationFeeUpdated(uint256 newCreationFee);
     event DrawLimitUpdated(uint256 maxPerEpoch, uint32 epochSeconds);
+    event GraduationGraceUpdated(uint32 graceSeconds);
 
     // ---------------------------------------------------------------- errors
     error NotAMind();
@@ -268,6 +280,10 @@ interface IMindLaunchpad {
     error GraduatorNotSet();
     error EthReturnMismatch();
     error DirectEthNotAccepted();
+    error InvalidGraduationGrace();
+    error InvalidGraduator();
+    error RenounceDisabled();
+    error PoolPriceSkewed(uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96); // bubbled up from UniswapV3Graduator
 
     // ---------------------------------------------------------------- user
     function createMind(string calldata name, string calldata symbol, string calldata metadataURI,
@@ -295,6 +311,7 @@ interface IMindLaunchpad {
     function setFeeParams(FeeParams calldata params) external;
     function setCreationFee(uint256 newCreationFee) external;
     function setDrawLimit(uint256 maxPerEpoch, uint32 epochSeconds) external;
+    function setGraduationGrace(uint32 graceSeconds) external;
     function pause() external;
     function unpause() external;
 
@@ -321,7 +338,8 @@ interface IMindLaunchpad {
     function computeTreasury() external view returns (address);
     function graduator() external view returns (address);
     function graduatorOf(address token) external view returns (address);
-    function isGraduator(address account) external view returns (bool);
+    function completedAt(address token) external view returns (uint64);
+    function graduationGrace() external view returns (uint32);
     function TOTAL_SUPPLY() external view returns (uint256);
     function CURVE_SUPPLY() external view returns (uint256);
     function LP_SUPPLY() external view returns (uint256);
@@ -331,7 +349,8 @@ interface IMindLaunchpad {
 ```
 
 Inherited public surface (part of the ABI, §3.3): `owner()`, `pendingOwner()`,
-`transferOwnership(address newOwner)`, `acceptOwnership()`, `renounceOwnership()`, `paused()`;
+`transferOwnership(address newOwner)`, `acceptOwnership()`, `renounceOwnership()` (overridden as
+`pure`: always reverts `RenounceDisabled()`, for every caller), `paused()`;
 events `OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner)`,
 `OwnershipTransferred(address indexed previousOwner, address indexed newOwner)`,
 `Paused(address account)`, `Unpaused(address account)`; errors
@@ -343,7 +362,9 @@ events `OwnershipTransferStarted(address indexed previousOwner, address indexed 
 (reserves stored as `uint128` via `SafeCast.toUint128`; all arithmetic in `uint256` through
 `CurveMath`); `mapping(address => uint256) mindBalance`; `uint256 protocolBalance`;
 per-mind draw epoch `{ uint256 drawn; uint64 epochStart; }`; `mapping(address => address) graduatorOf`;
-`mapping(address => bool) isGraduator`.
+`mapping(address => uint64) completedAt`; `uint32 graduationGrace`; the ETH return window of the
+graduator call in progress, `address private _returnFrom; uint256 private _returned;` (both zero
+outside `graduate`/`harvest`).
 
 **`src/libraries/CurveMath.sol`** — `library CurveMath` with the §1 constants (`TOTAL_SUPPLY`,
 `CURVE_SUPPLY`, `LP_SUPPLY`, `VIRTUAL_ETH`, `VIRTUAL_TOKENS`, `BPS = 10_000`) and internal pure
@@ -375,10 +396,17 @@ functions, used by the launchpad and by the fixture generator:
    (`mindBalance += mindAmount`, `protocolBalance += protocolAmount`), emit
    `FeeAccrued(token, mindAmount, protocolAmount)`, emit `Trade(token, buyer, true, ethUsed,
    tokensOut, fee, realEthReserve, tokensSold)` (post-trade reserves); if `tokensSold == CURVE_SUPPLY`:
-   phase = `Complete`, emit `CurveCompleted(token, realEthReserve)`. Interactions: transfer
+   phase = `Complete`, `completedAt[token] = block.timestamp`, emit `CurveCompleted(token, realEthReserve)`.
+   Buys require `Bonding` (a `Complete` curve is never reopened by a buy). Interactions: transfer
    `tokensOut` to the buyer, then refund `ethIn - ethUsed` (non-zero only on the completing buy).
 3. `sell` — `nonReentrant`, `onlyMind` (not pausable). `Expired()`; `tokensIn == 0` → `ZeroAmount()`;
-   `WrongPhase()`; `tokensIn > tokensSold` → `ExceedsTokensSold()`. Quote (§1); `ethOut == 0` →
+   `WrongPhase()` unless phase == `Bonding`, or phase == `Complete` and
+   `block.timestamp >= completedAt[token] + graduationGrace` (escape hatch for a coin that could not be
+   graduated; the grace is read at sell time, so `setGraduationGrace` applies to curves already waiting).
+   In the latter case the sell first reopens the curve: phase = `Bonding`, `completedAt[token] = 0`, emit
+   `CurveReopened(token)` (before the sell's `FeeAccrued`/`Trade`; reverted with the sell if any later check
+   fails); the curve can then be bought out again, which records a new `completedAt` and starts a new grace.
+   `tokensIn > tokensSold` → `ExceedsTokensSold()`. Quote (§1); `ethOut == 0` →
    `ZeroAmount()`; `ethOut < minEthOut` → `Slippage()`. Pull `tokensIn` with `safeTransferFrom`
    (seller approves the launchpad, or uses `permit` on the token beforehand); update reserves
    (`realEthReserve -= ethOut + fee`, `tokensSold -= tokensIn`); split fee + `FeeAccrued`;
@@ -387,26 +415,32 @@ functions, used by the launchpad and by the fixture generator:
    excluded) for sells; `Trade.fee` is the total fee.** Gross ETH of a sell = `ethAmount + fee`.
 4. `graduate(token)` — permissionless, `nonReentrant`, `onlyMind`, not pausable. Phase != `Complete`
    → `WrongPhase()`; `grad = graduator`, `grad == address(0)` → `GraduatorNotSet()`.
+   Graduation stays possible for as long as the phase is `Complete` (also after the grace period).
    Effects: `gradFee`, split + `FeeAccrued(token, mindFee, protocolFee)`; `ethLiquidity =
    realEthReserve - gradFee`; `realEthReserve = 0`; phase = `Graduated`; `graduatorOf[token] = grad`.
-   Interactions: `safeTransfer(grad, LP_SUPPLY)`; `balBefore = address(this).balance`;
-   `(pool, positionId, ethReturned) = IGraduator(grad).graduate{value: ethLiquidity}(token, LP_SUPPLY)`;
-   require `address(this).balance == balBefore - ethLiquidity + ethReturned` else
-   `EthReturnMismatch()`. Then store `pool`/`positionId`; if `ethReturned > 0`:
+   Interactions: `safeTransfer(grad, LP_SUPPLY)`; open the return window (`_returnFrom = grad`,
+   `_returned = 0`); `(pool, positionId, ethReturned) = IGraduator(grad).graduate{value: ethLiquidity}(token, LP_SUPPLY)`;
+   read the count, close the window (`_returnFrom = address(0)`, `_returned = 0`) and require
+   `count == ethReturned` else `EthReturnMismatch()` (no balance-delta check). Then store `pool`/`positionId`; if `ethReturned > 0`:
    `mindBalance[token] += ethReturned`, emit `MindFunded(token, grad, ethReturned)`; finally emit
    `Graduated(token, pool, positionId, ethLiquidity, LP_SUPPLY, gradFee)` (`ethLiquidity` = ETH
-   sent to the graduator, before the return). If the graduator call reverts, the whole tx reverts,
-   the coin stays `Complete` and anyone may retry; recovery is the owner wiring a corrected
-   graduator with `setGraduator`.
+   sent to the graduator, before the return). If the graduator call reverts (e.g. `PoolPriceSkewed`,
+   §2.4), the whole tx reverts, the coin stays `Complete` and anyone may retry; recovery is the pool
+   being arbitraged, the owner wiring a corrected graduator with `setGraduator`, or holders selling
+   after the grace period (rule 3).
 5. `harvest(token)` — permissionless, `nonReentrant`, `onlyMind`. Phase != `Graduated` →
    `WrongPhase()`. `grad = graduatorOf[token]` (the graduator that performed the graduation, never
-   the current one); `balBefore`; `(ethOut, tokensBurned) = IGraduator(grad).harvest(token)`;
-   require `balance == balBefore + ethOut` else `EthReturnMismatch()`; if `ethOut > 0`:
-   `mindBalance[token] += ethOut`, emit `MindFunded(token, grad, ethOut)`; emit
-   `Harvested(token, ethOut, tokensBurned)`.
-6. `receive()` — reverts `DirectEthNotAccepted()` unless `isGraduator[msg.sender]`; performs no
-   accounting (graduate/harvest account via the balance check). Not `nonReentrant`.
-7. `fundMind(token)` — anyone, any phase/status, not pausable, `onlyMind`; `msg.value == 0` →
+   the current one); open the return window for `grad`; `(ethOut, tokensBurned) =
+   IGraduator(grad).harvest(token)`; read the count, close the window and require `count == ethOut`
+   else `EthReturnMismatch()`; if `ethOut > 0`: `mindBalance[token] += ethOut`, emit
+   `MindFunded(token, grad, ethOut)`; emit `Harvested(token, ethOut, tokensBurned)`.
+6. `receive()` — reverts `DirectEthNotAccepted()` unless `msg.sender == _returnFrom` (the graduator
+   whose `graduate`/`harvest` the launchpad is calling right now; zero, i.e. nobody, at any other
+   time — including current and former graduators); then `_returned += msg.value`. Not
+   `nonReentrant`. It writes storage, so graduators MUST return ETH with full-gas calls (a 2300-gas
+   `transfer`/`send` fails, §2.2).
+7. `fundMind(token)` — anyone, any phase/status, not pausable, `nonReentrant` (so a graduator cannot
+   route its return through it during `graduate`/`harvest` and have it credited twice), `onlyMind`; `msg.value == 0` →
    `ZeroAmount()`; `mindBalance[token] += msg.value`; emit `MindFunded(token, msg.sender, msg.value)`.
    `MindFunded` is emitted only by `fundMind` (from = sender) and by `graduate`/`harvest`
    (from = graduator); fee shares emit `FeeAccrued` only.
@@ -425,7 +459,10 @@ functions, used by the launchpad and by the fixture generator:
     status/phase (settles compute already incurred). `amount == 0` → `ZeroAmount()`;
     `amount > mindBalance[token]` → `InsufficientMindBalance()`. Epoch: if
     `block.timestamp >= epochStart + epochSeconds` then `epochStart = block.timestamp`, `drawn = 0`;
-    then `drawn + amount > maxPerEpoch` → `DrawLimitExceeded()`. Effects: `drawn += amount`,
+    then `drawn + amount > maxPerEpoch` → `DrawLimitExceeded()`. Epochs are fixed windows, so draws at
+    the end of one epoch and the start of the next can take up to `2 · maxPerEpoch` within one
+    `epochSeconds` interval (at most `2 · MAX_DRAW_PER_EPOCH` = 4 ether); this bound is accepted and
+    documented in the NatSpec. Effects: `drawn += amount`,
     `mindBalance[token] -= amount`, emit `ComputeDrawn(token, amount, receiptHash)`; send `amount`
     to `computeTreasury`. `drawnInEpoch` returns the stored `(drawn, epochStart)` without applying
     an elapsed-epoch reset (callers compute the remaining allowance, §4.1 economics). Vault ETH
@@ -434,46 +471,63 @@ functions, used by the launchpad and by the fixture generator:
 11. `anchorMemory` — operator only, `onlyMind`; emits `MemoryAnchored` only (no storage).
 12. Owner setters (all `onlyOwner` → `OwnableUnauthorizedAccount(msg.sender)`): `setOperator`,
     `setTreasury`, `setComputeTreasury` revert `ZeroAddress()` on zero
-    and emit their `…Updated` event. `setGraduator(newGraduator)` accepts any address including
-    zero (zero disables graduation; `graduate` then reverts `GraduatorNotSet()`), affects future
-    graduations only, sets `isGraduator[newGraduator] = true` for non-zero values (never unset) and
-    emits `GraduatorUpdated`. `setFeeParams` bounds: `tradeFeeBps <= 500`, `mindShareBps <= 10000`,
+    and emit their `…Updated` event. `setGraduator(newGraduator)` accepts zero (zero disables
+    graduation; `graduate` then reverts `GraduatorNotSet()`) or a contract whose
+    `IGraduator(newGraduator).launchpad() == address(this)` (checked with a `staticcall`: no code, a
+    failing call, short return data or another launchpad → `InvalidGraduator()`), affects future
+    graduations only and emits `GraduatorUpdated`. `setFeeParams` bounds: `tradeFeeBps <= 500`, `mindShareBps <= 10000`,
     `graduationFeeBps <= 1000` else `FeeTooHigh()`. `setDrawLimit` requires
-    `epochSeconds >= 3600` else `InvalidDrawLimit()` (`maxPerEpoch` may be 0, which blocks draws).
+    `epochSeconds >= 3600` and `maxPerEpoch <= MAX_DRAW_PER_EPOCH` (internal constant `2 ether`) else
+    `InvalidDrawLimit()` (`maxPerEpoch` may be 0, which blocks draws). `setGraduationGrace(graceSeconds)`
+    requires `3600 <= graceSeconds <= 30 days` else `InvalidGraduationGrace()` and emits
+    `GraduationGraceUpdated(graceSeconds)`. `renounceOwnership()` always reverts `RenounceDisabled()`.
 13. `pause()`/`unpause()` (owner) pause `createMind` and `buy` only; `sell`, `graduate`, `harvest`,
     `fundMind`, `drawCompute`, `anchorMemory`, status and config functions stay enabled.
 14. `withdrawProtocolFees(to)` — `nonReentrant`; caller must be `owner()` or `treasury`, else
     `OwnableUnauthorizedAccount(msg.sender)`; `to == 0` → `ZeroAddress()`; `protocolBalance == 0` →
     `ZeroAmount()`; sets `protocolBalance = 0`, emits `ProtocolFeesWithdrawn(to, amount)`, sends.
-15. Views: `quoteBuy`/`quoteSell` revert `NotAMind()`, `WrongPhase()` (not `Bonding`),
+15. Views: `quoteBuy`/`quoteSell` revert `NotAMind()`, `WrongPhase()` (`quoteBuy`: not `Bonding`;
+    `quoteSell`: the rule-3 sell rule, i.e. not `Bonding` and not `Complete` past the grace),
     `ZeroAmount()` (zero input), `ExceedsTokensSold()` (sell) and otherwise return the §1 quote.
+    `completedAt(token)` is the `block.timestamp` of the curve's last completion (0 before it and after
+    a reopening sell; kept after graduation); `graduationGrace()` the current grace in seconds.
     `currentPrice` reverts `NotAMind()`, and `WrongPhase()` once `Graduated`; in `Bonding`/`Complete`
     it returns `CurveMath.price(realEthReserve, tokensSold)`. `getMind`/`getCurve` return zeroed
     structs for unknown tokens.
 
 Invariants: `address(this).balance >= Σ realEthReserve + Σ mindBalance + protocolBalance`;
-`token.balanceOf(launchpad) >= TOTAL_SUPPLY - tokensSold` while `Bonding`/`Complete`.
+`token.balanceOf(launchpad) >= TOTAL_SUPPLY - tokensSold` while `Bonding`/`Complete`;
+`completedAt[token] == 0` exactly while `Bonding`.
 
 ### 2.4 `UniswapV3Graduator` — `src/UniswapV3Graduator.sol`
 
-`contract UniswapV3Graduator is IGraduator, Ownable2Step, ReentrancyGuard`.
+`contract UniswapV3Graduator is IGraduator, IUniswapV3SwapCallback, Ownable2Step, ReentrancyGuard`.
 `constructor(address initialOwner, address launchpad, address positionManager, address factory,
 address weth9, uint24 feeTier)` — all addresses non-zero (`ZeroAddress()`); reads
 `tickSpacing = factory.feeAmountTickSpacing(feeTier)` (zero → `UnsupportedFeeTier()`) and fixes
 `tickLower = (-887272 / tickSpacing) * tickSpacing`, `tickUpper = -tickLower` (±887200 for the 1 %
-tier). The owner has no privileged function in this version (no rescue path; the LP NFT can never
-leave the contract).
+tier); sets `priceToleranceBps = 100` and emits `PriceToleranceUpdated(100)`. The owner's only
+privileged function is `setPriceToleranceBps(uint16)` (`onlyOwner`, at most 1000 else
+`InvalidPriceTolerance()`, 0 allowed = exact price required; emits `PriceToleranceUpdated`); there is
+no rescue path and the LP NFT can never leave the contract.
 
 Public views: `launchpad()`, `positionManager()`, `factory()`, `weth9()`, `feeTier()` (`uint24`),
-`tickLower()`/`tickUpper()` (`int24`), `positionOf(address token) returns (uint256)`,
-`poolOf(address token) returns (address)`.
-Event: `event GraduatedAtSkewedPrice(address indexed token, uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96);`
+`tickLower()`/`tickUpper()` (`int24`), `priceToleranceBps()` (`uint16`),
+`positionOf(address token) returns (uint256)`, `poolOf(address token) returns (address)`.
+Events: `event GraduatedAtSkewedPrice(address indexed token, uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96);`
+(a correction swap was made; `actual` = pool price before it), `event PriceToleranceUpdated(uint16 toleranceBps);`.
 Errors: `NotLaunchpad()`, `AlreadyGraduated()`, `NoPosition()`, `UnexpectedEthSender()`,
-`UnsupportedFeeTier()`, `ZeroAddress()`, `EthTransferFailed()`.
+`UnsupportedFeeTier()`, `ZeroAddress()`, `EthTransferFailed()`,
+`PoolPriceSkewed(uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96)` (`actual` = price after the
+correction; same selector as the `IMindLaunchpad` declaration), `UnauthorizedCallback()`,
+`InvalidPriceTolerance()`.
 `receive() external payable` accepts ETH only from `weth9` (unwraps), else `UnexpectedEthSender()`.
 Local minimal interfaces in `src/interfaces/uniswap/` (do not import Uniswap packages):
 `IWETH9` (`deposit() payable`, `withdraw(uint256)`, ERC20), `IUniswapV3Factory`
-(`getPool`, `feeAmountTickSpacing`), `IUniswapV3Pool` (`slot0()`),
+(`getPool`, `feeAmountTickSpacing`), `IUniswapV3Pool` (`slot0()`, `swap(address recipient, bool
+zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes data) returns (int256 amount0,
+int256 amount1)`) and, in the same file, `IUniswapV3SwapCallback`
+(`uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes data)`),
 `INonfungiblePositionManager` (`createAndInitializePoolIfNecessary`, `mint(MintParams)`,
 `collect(CollectParams)` with the canonical v3-periphery structs).
 
@@ -485,15 +539,37 @@ Local minimal interfaces in `src/interfaces/uniswap/` (do not import Uniswap pac
    solely from the received amounts.
 3. `pool = positionManager.createAndInitializePoolIfNecessary(token0, token1, feeTier, expected)`
    (creates and/or initializes the pool if needed; leaves an already-initialized pool untouched).
-   Read `actual = IUniswapV3Pool(pool).slot0().sqrtPriceX96`; if `actual != expected` emit
-   `GraduatedAtSkewedPrice(token, expected, actual)`. A pre-created or skewed pool never blocks
-   graduation: liquidity is minted at the pool's current price.
-4. `forceApprove` both tokens to the position manager; `mint` full range (`tickLower`, `tickUpper`,
-   `amount0Desired/amount1Desired` = the amounts, `amount0Min = amount1Min = 0`,
-   `recipient = address(this)`, `deadline = block.timestamp`); reset approvals to 0; store
-   `positionOf[token] = tokenId`, `poolOf[token] = pool`.
-5. Leftovers: unused WETH → `withdraw` → send to the launchpad (`ethReturned`); unused tokens →
-   `safeTransfer` to 0x…dEaD. Return `(pool, tokenId, ethReturned)`.
+   Read `actual = IUniswapV3Pool(pool).slot0().sqrtPriceX96`.
+4. Price correction, only if `actual != expected` (anyone can create and initialize the pool at any
+   price beforehand): `zeroForOne = actual > expected` (the price must fall: sell token0; otherwise
+   sell token1 — i.e. WETH when the coin is too cheap, coins when it is too expensive);
+   `cap = amountIn-side * 5000 / 10000` (at most 50 % of the side being sold); record the pool for the
+   callback (`_swapPool = pool`), then `pool.swap(address(this), zeroForOne, int256(cap), expected,
+   abi.encode(token0, token1))` (exact input, price limit = `expected`), clear `_swapPool`, and apply
+   the returned deltas to `amount0`/`amount1` (positive = paid, negative = received). Where no
+   liquidity lies between `actual` and `expected` the price moves there for free (zero deltas).
+   Emit `GraduatedAtSkewedPrice(token, expected, actual)`. Liquidity the correction trades against is
+   mispriced relative to `expected`: its owner sells to the graduator below, or buys from it above,
+   the price implied by the amounts.
+5. Re-read `price = slot0().sqrtPriceX96`; require `|price - expected| * 10000 <= expected *
+   priceToleranceBps` (sqrt-price terms) else revert `PoolPriceSkewed(expected, price)` — nothing
+   changes (the launchpad call reverts, the coin stays `Complete`) and anyone may retry once the pool
+   has been arbitraged.
+6. Desired amounts: the largest `(desired0, desired1) <= (amount0, amount1)` in the proportion
+   `desired1 / desired0 = price² / 2^192` (the full range makes the exact proportion differ by
+   < 1e-12); `forceApprove` them to the position manager; `mint` full range (`tickLower`, `tickUpper`,
+   `amount{0,1}Desired = desired{0,1}`, `amount{0,1}Min = max(1, desired{0,1} * (10000 - 2 *
+   priceToleranceBps - 100) / 10000)`, `recipient = address(this)`, `deadline = block.timestamp`);
+   reset approvals to 0; store `positionOf[token] = tokenId`, `poolOf[token] = pool`.
+7. Leftovers (`amount{0,1} - used{0,1}`): unused WETH → `withdraw` → send to the launchpad with a
+   full-gas call (`ethReturned`, counted by its `receive()`); unused tokens → `safeTransfer` to
+   0x…dEaD. Return `(pool, tokenId, ethReturned)`.
+
+`uniswapV3SwapCallback(amount0Delta, amount1Delta, data)` — `msg.sender != _swapPool` →
+`UnauthorizedCallback()` (so only the pool of the correction swap in progress can call it, and nobody
+outside `graduate`); decodes `(token0, token1)` from `data` and `safeTransfer`s each positive delta of
+that token to the pool. Zero deltas (a price move through a range without liquidity) owe nothing and
+MUST NOT revert.
 
 `harvest(token)` — only launchpad, `nonReentrant`; `positionOf[token] == 0` → `NoPosition()`.
 `collect(tokenId, address(this), type(uint128).max, type(uint128).max)`; the WETH side is unwrapped
@@ -510,7 +586,8 @@ returns `(address(this), 0, 0)`; `harvest` returns `(0, 0)`. Exposes `launchpad(
 
 - `script/Deploy.s.sol` — env: `DEPLOYER_PRIVATE_KEY` (required), `OWNER`, `TREASURY`,
   `COMPUTE_TREASURY`, `OPERATOR` (each defaults to the deployer address when empty),
-  `GRADUATOR_KIND` (`uniswapv3` | `mock`), and for `uniswapv3`: `WETH9`, `UNIV3_FACTORY`,
+  `GRADUATOR_KIND` (`uniswapv3` | `mock`; `mock` is refused on chain id 4663 with
+  `MockGraduatorNotAllowedOnMainnet(chainId)`, the mock keeping every graduation's liquidity forever), and for `uniswapv3`: `WETH9`, `UNIV3_FACTORY`,
   `UNIV3_POSITION_MANAGER` (required), `UNIV3_FEE_TIER` (default 10000). Steps in one broadcast:
   (1) `launchpad = new MindLaunchpad(deployer, TREASURY, COMPUTE_TREASURY, OPERATOR)`;
   (2) `graduator = new MockGraduator(launchpad)` or `new UniswapV3Graduator(deployer, launchpad,
@@ -532,17 +609,34 @@ returns `(address(this), 0, 0)`; `harvest` returns `(0, 0)`. Exposes `launchpad(
   §1 guard).
 - `test/` — unit + fuzz + invariant tests. Must cover: curve monotonicity and rounding (buy then
   sell never profits; `x·y` non-decreasing); completing buy, refund and the guard; fee split and
-  creation fee; graduation with `MockGraduator`; `UniswapV3Graduator` against
-  `MockWETH`/`MockFactory`/`MockPool`/`MockPositionManager` with (a) a fresh pool, (b) a pool
-  pre-initialized at a skewed price — graduation succeeds, emits `GraduatedAtSkewedPrice`, and
-  (c) non-zero WETH and token leftovers — `mindBalance` grows by `ethReturned` and tokens reach
-  0x…dEaD; a graduator returning a wrong amount → `EthReturnMismatch()`; harvest credit and
+  creation fee; graduation with `MockGraduator`; `UniswapV3Graduator` against `MockWETH9` and the
+  Uniswap v3 models of `test/mocks/uniswapv3/` (factory, pool, position manager built on a port of
+  TickMath / LiquidityAmounts / SqrtPriceMath / SwapMath: real liquidity amounts, multi-position
+  liquidity, exact-input `swap` with callback and `'IIA'` check, per-position swap fees; the audit
+  PoCs in `test/audit/` use the same models) with, in both token orders, (a) a fresh pool,
+  (b) pools pre-initialized at skewed and extreme prices (`MIN_SQRT_RATIO`, `MAX_SQRT_RATIO - 1`,
+  fuzzed) without liquidity — the correction moves the price to exactly `expected`, graduation
+  succeeds and emits `GraduatedAtSkewedPrice`, (c) corrections trading against third-party liquidity
+  in both directions — the price ends at `expected`, WETH leftovers credit `mindBalance` and token
+  leftovers reach 0x…dEaD, and the liquidity owner ends poorer at the fair price (fees included),
+  (d) third-party liquidity deeper than the cap → `PoolPriceSkewed` with nothing changed, then success
+  after an arbitrage, (e) `uniswapV3SwapCallback` rejecting any caller but the pool of the correction
+  in progress, tolerance and mint minimums; a graduator returning a wrong amount →
+  `EthReturnMismatch()`; the ETH return counter (a graduator pushing its return through `fundMind`
+  during `graduate`/`harvest` reverts — no double credit; forced ETH is not counted; 2300-gas returns
+  fail; returns from another address are rejected; split returns are summed); harvest credit and
   `Harvested`/`MindFunded`; after `setGraduator(new)`, harvesting a coin graduated by the old
-  graduator still uses `graduatorOf`; `receive()` rejects non-graduators; `GraduatorNotSet()`;
-  draw limits and epoch reset (`vm.warp`), draws in every status, ETH reaching `computeTreasury`;
-  `setCreatorPaused`/`setMindStatus` transitions and `InvalidStatus()`; pause scope; access control;
-  input validation (name/symbol/metadata/model); reentrancy (malicious receiver on refund, sell,
-  draw, withdraw); every event. Invariants: the two invariants of §2.3.
+  graduator still uses `graduatorOf`; `setGraduator` sanity checks (EOA, no `launchpad()`, another
+  launchpad → `InvalidGraduator()`; zero allowed); `receive()` rejects everyone outside graduator
+  calls; `GraduatorNotSet()`; the escape hatch (sells and `quoteSell` blocked during the grace, a
+  post-grace sell reopening the curve with `CurveReopened`, buys staying Bonding-only, re-completion
+  and graduation afterwards, `setGraduationGrace` bounds); `renounceOwnership` → `RenounceDisabled()`;
+  draw limits and epoch reset (`vm.warp`), `MAX_DRAW_PER_EPOCH` and the documented 2x burst, draws in
+  every status, ETH reaching `computeTreasury`; `setCreatorPaused`/`setMindStatus` transitions and
+  `InvalidStatus()`; pause scope; access control; input validation (name/symbol/metadata/model);
+  reentrancy (malicious receiver on refund, sell, draw, withdraw); the deploy script refusing `mock`
+  on 4663; every event. Invariants: the invariants of §2.3, with a handler that also sells on
+  `Complete` curves after the grace period.
 - `foundry.toml`: `solc_version = "0.8.37"`, cancun, optimizer 200, `fs_permissions` for
   `../packages/shared/fixtures` and `./deployments`, `[rpc_endpoints]` and `[etherscan]` Blockscout
   entries from `docs/ROBINHOOD_CHAIN.md`, profile `ci` with more fuzz/invariant runs.
@@ -704,7 +798,9 @@ Hashes and URIs:
   `ECDSAInvalidSignatureLength`, `ECDSAInvalidSignatureS`.
 - `graduatorAbi` = `IGraduator` (§2.2) + `event GraduatedAtSkewedPrice(address indexed token, uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96)`
   + errors `NotLaunchpad()`, `AlreadyGraduated()`, `NoPosition()`, `UnexpectedEthSender()`,
-  `UnsupportedFeeTier()`, `ZeroAddress()`, `EthTransferFailed()`.
+  `UnsupportedFeeTier()`, `ZeroAddress()`, `EthTransferFailed()`, `PoolPriceSkewed(uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96)`,
+  `UnauthorizedCallback()`, `InvalidPriceTolerance()` (the admin event `PriceToleranceUpdated(uint16)` and OpenZeppelin
+  SafeCast errors are optional).
 - Equivalence test (vitest): when `packages/shared/abi/MindLaunchpad.json` exists (copied by
   `pnpm abi:sync` from `contracts/out/MindLaunchpad.sol/MindLaunchpad.json`), function selectors
   and event topics MUST be set-equal in both directions; every error of the compiled ABI MUST be in
@@ -1264,9 +1360,12 @@ Routes:
   from `contracts/broadcast/Deploy.s.sol/<chainId>/run-latest.json`; fund OPERATOR (≥ 0.05 ETH);
   `CHAIN_ID`/`VITE_CHAIN_ID` and `LAUNCHPAD_ADDRESS`/`VITE_LAUNCHPAD_ADDRESS` must match; consider a
   non-zero `creationFee` on mainnet against spam; running the runner (docker compose), graduate and
-  harvest ops, risks (operator key is a hot wallet capped by `maxDrawPerEpoch` and paying only
-  `computeTreasury`; a skewed pre-created pool lowers liquidity efficiency at graduation; Complete
-  coins wait for anyone to call `graduate`).
+  harvest ops, risks (operator key is a hot wallet capped by `maxDrawPerEpoch` (≤ 2 ETH per epoch,
+  up to 2x around an epoch boundary) and paying only `computeTreasury`; a pool pre-created at a
+  skewed price is swapped back to the curve price at graduation, but if third-party liquidity
+  absorbs more than half of a side graduation reverts `PoolPriceSkewed` until someone arbitrages the
+  pool and retries; Complete coins wait for anyone to call `graduate`, and after `graduationGrace`
+  (default 1 day) holders may sell on the curve again, which reopens it).
 - `docker-compose.yml`: `runner` — `runner/Dockerfile` `FROM mcr.microsoft.com/playwright:v1.56.1-noble` (ships
   the matching Chromium; tag pinned to the Playwright version), `pnpm deploy --filter
   @www-rh/runner --prod`, `CMD ["node", "dist/main.js"]`, `env_file: .env`, volume `./data:/app/data`;

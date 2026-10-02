@@ -100,7 +100,8 @@ contract DeployScriptTest is Test {
         script.deployWith(_cfg("mock", address(0), "cache/x.json"), DEPLOYER_KEY);
         // Testnet and local chains still accept the mock.
         vm.chainId(46_630);
-        Deploy.Deployment memory d = script.deployWith(_cfg("mock", address(0), "cache/deploy-test-mock.json"), DEPLOYER_KEY);
+        Deploy.Deployment memory d =
+            script.deployWith(_cfg("mock", address(0), "cache/deploy-test-mock.json"), DEPLOYER_KEY);
         assertEq(MindLaunchpad(payable(d.launchpad)).graduator(), d.graduator);
     }
 

@@ -163,7 +163,8 @@ contract AuditGraduatorSkewTest is BaseTest {
     function _wethOnlyPrice(address token, bool inRange) internal view returns (uint160) {
         bool wethIs0 = address(weth) < token;
         if (inRange) return wethIs0 ? uint160(1e10) : uint160(1e48);
-        return wethIs0 ? uint160(4_295_128_739 + 1)
+        return wethIs0
+            ? uint160(4_295_128_739 + 1)
             : uint160(1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342 - 1);
     }
 
@@ -224,7 +225,9 @@ contract AuditGraduatorSkewTest is BaseTest {
         launchpad.graduate(token);
         emit log_named_decimal_uint("ETH liquidity sent to the graduator", ethLiquidity, 18);
         emit log_named_decimal_uint("pool WETH", weth.balanceOf(pool), 18);
-        emit log_named_decimal_uint("ETH returned and credited to the mind vault", ethLiquidity - weth.balanceOf(pool), 18);
+        emit log_named_decimal_uint(
+            "ETH returned and credited to the mind vault", ethLiquidity - weth.balanceOf(pool), 18
+        );
 
         // SAFE behaviour: (almost) all ETH liquidity ends up in the DEX pool, not in the operator-drawable vault.
         assertGe(weth.balanceOf(pool), ethLiquidity * 90 / 100, "graduation ETH diverted away from the LP");

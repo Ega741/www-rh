@@ -128,6 +128,7 @@ contract LaunchpadHandler is Test {
     }
 
     function _graceElapsed(address token) internal view returns (bool) {
+        // forge-lint: disable-next-line(block-timestamp)
         return block.timestamp >= uint256(launchpad.completedAt(token)) + launchpad.graduationGrace();
     }
 

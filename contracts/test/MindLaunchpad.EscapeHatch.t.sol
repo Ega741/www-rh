@@ -25,8 +25,7 @@ contract MindLaunchpadEscapeHatchTest is BaseTest {
     function _trySell(address who, address token, uint256 amount) internal returns (bool ok, bytes memory err) {
         vm.startPrank(who);
         MindToken(token).approve(address(launchpad), amount);
-        (ok, err) =
-            address(launchpad).call(abi.encodeCall(IMindLaunchpad.sell, (token, amount, 0, block.timestamp)));
+        (ok, err) = address(launchpad).call(abi.encodeCall(IMindLaunchpad.sell, (token, amount, 0, block.timestamp)));
         vm.stopPrank();
     }
 

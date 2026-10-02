@@ -321,8 +321,8 @@ contract MindLaunchpadGraduationTest is BaseTest {
         assertEq(address(launchpad).balance, _liabilities());
     }
 
-    /// @dev ETH force-sent with selfdestruct is invisible to the counter: reporting it as returned reverts, and
-    ///      the forced wei is never credited.
+    /// @dev ETH that reaches the launchpad without a `receive()` call (a forced transfer such as selfdestruct,
+    ///      simulated here by raising its balance) is invisible to the counter: reporting it as returned reverts.
     function test_graduate_forcedEthIsNotCounted() public {
         address token = _createMind();
         _complete(alice, token);

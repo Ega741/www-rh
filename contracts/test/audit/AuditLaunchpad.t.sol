@@ -82,8 +82,7 @@ contract AuditLaunchpadTest is BaseTest {
         // ...after which bob can no longer sell on the live curve: the launchpad is insolvent.
         vm.startPrank(bob);
         MindToken(live).approve(address(launchpad), bobTokens);
-        (bool ok,) =
-            address(launchpad).call(abi.encodeCall(IMindLaunchpad.sell, (live, bobTokens, 0, block.timestamp)));
+        (bool ok,) = address(launchpad).call(abi.encodeCall(IMindLaunchpad.sell, (live, bobTokens, 0, block.timestamp)));
         vm.stopPrank();
         emit log_named_string("bob's sell on the live curve succeeded", ok ? "yes" : "no");
 

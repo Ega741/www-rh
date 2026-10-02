@@ -70,6 +70,7 @@ contract LaunchpadInvariantsTest is StdInvariant, Test {
             IMindLaunchpad.CurvePhase phase = launchpad.getCurve(token).phase;
             uint64 completedAt = launchpad.completedAt(token);
             if (phase == IMindLaunchpad.CurvePhase.Bonding) assertEq(completedAt, 0);
+            // forge-lint: disable-next-line(block-timestamp)
             else assertTrue(completedAt != 0 && completedAt <= block.timestamp);
         }
     }
@@ -87,6 +88,22 @@ contract LaunchpadInvariantsTest is StdInvariant, Test {
             (uint256 drawn,) = launchpad.drawnInEpoch(handler.tokens(i));
             assertLe(drawn, maxPerEpoch);
         }
+    }
+
+    /// @dev Deterministic check that the handler's post-grace sell path works (the fuzzer reaches it randomly).
+    function test_handler_postGraceSellReopens() public {
+        handler.buy(1, 0, 5 ether); // completes tokens[0]
+        address token = handler.tokens(0);
+        assertEq(uint8(launchpad.getCurve(token).phase), uint8(IMindLaunchpad.CurvePhase.Complete));
+        handler.sell(1, 0, 5000); // still inside the grace: skipped
+        assertEq(handler.calls("sellAfterGrace"), 0);
+        handler.warpPastGrace(0, 0);
+        handler.sell(1, 0, 5000);
+        assertEq(handler.calls("sellAfterGrace"), 1);
+        assertEq(uint8(launchpad.getCurve(token).phase), uint8(IMindLaunchpad.CurvePhase.Bonding));
+        invariant_ethAccountingExact();
+        invariant_tokenBalanceWhileBonding();
+        invariant_completedAtMatchesPhase();
     }
 
     function _liabilities() internal view returns (uint256 total) {

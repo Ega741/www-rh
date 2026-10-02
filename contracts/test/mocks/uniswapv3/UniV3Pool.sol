@@ -211,9 +211,7 @@ contract UniV3Pool is IUniswapV3Pool {
     // ---------------------------------------------------------------------------------------------
 
     /// @dev Pays the output, calls back the swapper and checks the input arrived (UniswapV3Pool.swap's tail).
-    function _settle(address recipient, bool zeroForOne, int256 amount0, int256 amount1, bytes calldata data)
-        internal
-    {
+    function _settle(address recipient, bool zeroForOne, int256 amount0, int256 amount1, bytes calldata data) internal {
         (address tokenIn, address tokenOut) = zeroForOne ? (token0, token1) : (token1, token0);
         (int256 owed, int256 paid) = zeroForOne ? (amount0, amount1) : (amount1, amount0);
         if (paid < 0) IERC20(tokenOut).safeTransfer(recipient, SafeCast.toUint256(-paid));
@@ -247,7 +245,11 @@ contract UniV3Pool is IUniswapV3Pool {
 
     /// @dev Next boundary in the swap direction (capped by `limit`) and the liquidity active up to it: moving down
     ///      from `p` the segment is (target, p], moving up it is [p, target).
-    function _segment(bool zeroForOne, uint160 p, uint160 limit) internal view returns (uint160 target, uint128 active) {
+    function _segment(bool zeroForOne, uint160 p, uint160 limit)
+        internal
+        view
+        returns (uint160 target, uint128 active)
+    {
         target = limit;
         for (uint256 i; i < _ranges.length; ++i) {
             Range storage r = _ranges[i];
