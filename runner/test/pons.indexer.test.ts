@@ -215,6 +215,18 @@ describe('Pons indexer (SPEC §9.4)', () => {
     // the registry records launchConfigId 0 for adoptions as a placeholder: reported as unknown
     expect(repos.pons.get(ATOKEN)).toMatchObject({ curve: ACURVE, account: AACCOUNT, launched_here: 0, adopted: 0, deployer: BUYER, fee_recipient: CREATOR.toLowerCase(), launch_config_id: null });
     expect(seen.map((e) => e.type)).toEqual(['mind:created', 'mind:status']);
+    // the pending adoption is re-prepared by the current recipient: new creator and config (no MindConfigUpdated on chain)
+    const reModel = `0x${'ee'.repeat(32)}` as const;
+    reader.mindInfo.set(ATOKEN, { creator: BUYER, modelId: reModel, personaHash: `0x${'ef'.repeat(32)}`, metadataURI: 'ipfs://bafy-again', createdAt: 1n, status: 1 });
+    source.logs.push(reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT, creator: BUYER }, 40n, 1, `0x${'40'.repeat(32)}`));
+    source.head = 40n;
+    repos.state.setLastBlock(39n); // the second preparation lands in a later pass over block 40
+    repos.chain.deleteBlockHashesAbove(39);
+    await indexer.syncOnce();
+    m = repos.minds.get(ATOKEN)!;
+    expect([m.creator, m.model_id, m.metadata_uri, m.meta_status, m.status]).toEqual([BUYER, reModel, 'ipfs://bafy-again', 'pending', 1]);
+    expect(seen.map((e) => e.type)).toEqual(['mind:created', 'mind:status', 'mind:config']);
+    seen.length = 2;
     source.logs.push(
       factory('CreatorFeeRecipientUpdated', { token: ATOKEN, previousRecipient: CREATOR, newRecipient: AACCOUNT }, 41n, 0),
       reg('MindAdopted', { token: ATOKEN, account: AACCOUNT }, 41n, 1),

@@ -432,6 +432,11 @@ export class MindsRepo {
     this.db.run('UPDATE minds SET status = ? WHERE token = ?', status, token);
   }
 
+  /** Pons: a re-prepared adoption changes the mind's creator (the launch's current fee recipient). */
+  setCreator(token: string, creator: string): void {
+    this.db.run('UPDATE minds SET creator = ? WHERE token = ?', creator.toLowerCase(), token);
+  }
+
   /**
    * `MindConfigUpdated`: new model / persona hash / metadata URI. The previously verified persona
    * belongs to the old `personaHash`, so it is cleared until the new metadata is resolved.

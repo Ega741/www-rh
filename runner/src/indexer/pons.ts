@@ -213,6 +213,15 @@ export class PonsIndexerVenue implements IndexerVenue {
     for (const r of pending.values()) {
       registrations.set(r.token, await this.#registration(repos, r, !created.has(r.token) && repos.minds.get(r.token) === undefined));
     }
+    // a pending adoption re-prepared by the launch's current recipient: creator and config are overwritten on chain
+    // without MindConfigUpdated, so the config is re-read
+    const reprepared = new Map<string, OnchainMind>();
+    for (const d of registryLogs) {
+      const token = lower(d.args['token']);
+      if (d.eventName !== 'AdoptionPrepared' || pending.has(token) || reprepared.has(token) || repos.pons.get(token) === undefined) continue;
+      if (this.reader === null) throw new Error('Pons reads unavailable: cannot re-read a re-prepared adoption');
+      reprepared.set(token, await this.reader.getMind(token as Address));
+    }
 
     // ------------------------------------------------------------ address sets
     const rows = repos.pons.all();
@@ -302,7 +311,7 @@ export class PonsIndexerVenue implements IndexerVenue {
       rawCount,
       logCount: decoded.length,
       blocksNeedingTimestamps: [...blocks],
-      apply: (r, timestampOf, onAnomaly) => applyPonsLogs(r, decoded, { registrations, anchors, phantoms, postStates }, timestampOf, onAnomaly),
+      apply: (r, timestampOf, onAnomaly) => applyPonsLogs(r, decoded, { registrations, reprepared, anchors, phantoms, postStates }, timestampOf, onAnomaly),
     };
   }
 }
@@ -310,6 +319,8 @@ export class PonsIndexerVenue implements IndexerVenue {
 /** Pre-read state {@link applyPonsLogs} uses. */
 export interface PonsPrefetch {
   registrations: ReadonlyMap<string, PonsRegistration>;
+  /** `getMind` of adoptions re-prepared in the batch (tokens already registered). */
+  reprepared?: ReadonlyMap<string, OnchainMind>;
   /** End-of-block reserves, keyed `${curve}@${block}`. */
   anchors: ReadonlyMap<string, ReserveState>;
   /** Phantom quote reserve per curve (`quoteReserve − realQuoteReserve`). */
@@ -443,6 +454,22 @@ export function applyPonsLogs(
         case 'MindLaunched':
         case 'AdoptionPrepared': {
           const reg = pre.registrations.get(token);
+          const again = d.eventName === 'AdoptionPrepared' ? pre.reprepared?.get(token) : undefined;
+          if (reg === undefined && again !== undefined) {
+            // re-preparation of a pending adoption: new creator (the current recipient) and config, Dormant again
+            const mind = repos.minds.get(token);
+            if (mind !== undefined) {
+              repos.minds.setCreator(token, lower(a['creator']));
+              const [modelId, ph] = [again.modelId.toLowerCase(), again.personaHash.toLowerCase()];
+              if (mind.model_id !== modelId || mind.persona_hash !== ph || mind.metadata_uri !== again.metadataURI) {
+                repos.minds.setConfig(token, modelId, ph, again.metadataURI);
+                out.push({ type: 'mind:config', token, ...base });
+              }
+              const ev = setStatus(token, 1, base);
+              if (ev !== null) out.push(ev);
+            }
+            break;
+          }
           if (reg === undefined) {
             if (repos.pons.get(token) === undefined) onAnomaly('Pons registration without pre-read state (skipped)', { token, event: d.eventName, txHash });
             break;
