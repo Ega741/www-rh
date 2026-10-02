@@ -9,6 +9,7 @@ evm_version = "cancun"
 optimizer = true
 optimizer_runs = 200
 via_ir = false
+ignored_warnings_from = ["lib/"]
 bytecode_hash = "none"
 cbor_metadata = false
 fs_permissions = [{ access = "read-write", path = "./" }, { access = "read-write", path = "../packages/shared/fixtures" }]
