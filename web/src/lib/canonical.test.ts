@@ -2,6 +2,7 @@ import { keccak256, toBytes } from 'viem';
 import { describe, expect, it } from 'vitest';
 import { canonicalJson, keccakCanonical, utf8ByteLength } from './canonical';
 import { METADATA_LIMITS, buildMetadata, dataUriFits, metadataJson, modelHashOf, personaHashOf, validateDraft, type MetadataDraft } from './metadata';
+import { decodeJsonDataUri } from './dataUri';
 import { verifyReceipt } from './receipts';
 import type { ComputeReceipt } from './types';
 
@@ -49,6 +50,13 @@ describe('metadata (SPEC §5 / §7 create flow)', () => {
     expect(fits).toBe(true);
     expect(decodeDataUri(uri)).toBe(metadataJson(meta));
     expect(metadataJson(meta).startsWith('{"links":{"website":"https://example.org"},"model":"claude-opus-5-5","name":"Night Sky"')).toBe(true);
+  });
+
+  it('decodes the data: URI back to the metadata in the browser', () => {
+    const meta = buildMetadata({ ...draft, persona: 'Ünïcödé persona — long enough to pass.' });
+    expect(decodeJsonDataUri(dataUriFits(meta).uri)).toEqual(meta);
+    expect(decodeJsonDataUri('runner://metadata/abc')).toBeNull();
+    expect(decodeJsonDataUri('data:application/json;base64,!!!')).toBeNull();
   });
 
   it('reports when the data: URI would exceed the 2048-byte metadataURI limit', () => {

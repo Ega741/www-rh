@@ -6,7 +6,7 @@
  *
  * @module routes/Create
  */
-import { DEFAULT_MODEL, DEFAULT_TRADE_FEE_BPS, TOTAL_SUPPLY } from '@www-rh/shared';
+import { DEFAULT_MODEL, DEFAULT_TRADE_FEE_BPS, mindLaunchpadAbi as launchpadAbi, TOTAL_SUPPLY } from '@www-rh/shared';
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router';
@@ -18,13 +18,12 @@ import { MindAvatar, TxLink } from '../components/common';
 import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
 import { formatBps, formatEth, formatTokens, parseAmount } from '../format';
 import { useTxFlow } from '../hooks/useTxFlow';
-import { mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
 import { describeError } from '../lib/errors';
 import { mindCreatedToken } from '../lib/events';
-import { METADATA_LIMITS, buildMetadata, metadataJson, modelHashOf, validateDraft, type DraftErrors, type MetadataDraft } from '../lib/metadata';
+import { METADATA_LIMITS, buildMetadata, dataUriFits, metadataJson, modelHashOf, validateDraft, type DraftErrors, type MetadataDraft } from '../lib/metadata';
 import { publishMetadata, type PublishedMetadata } from '../lib/publish';
 import { DEFAULT_SLIPPAGE_BPS, planInitialBuy, slippagePercentToBps } from '../lib/quote';
-import { useModels } from '../queries';
+import { useHealth, useModels } from '../queries';
 
 type Step = 'form' | 'publishing' | 'creating' | 'seeding' | 'done';
 
@@ -87,6 +86,8 @@ export function Create() {
     [initialBuyWei, slippageBps, fee, tradeFeeBps],
   );
   const selectedModel = models.data?.models.find((m) => m.id === draft.model);
+  const health = useHealth();
+  const fallback = useMemo(() => (Object.keys(errors).length === 0 ? dataUriFits(buildMetadata(draft)) : null), [errors, draft]);
 
   const write = useWriteContract();
   const seedWrite = useWriteContract();
@@ -121,6 +122,11 @@ export function Create() {
     setStep('done');
     void navigate(`/mind/${token}`);
   }
+
+  // A createMind that reverts on-chain (or whose receipt cannot be fetched) returns to the form.
+  useEffect(() => {
+    if (step === 'creating' && (createTx.phase === 'reverted' || createTx.phase === 'error')) setStep('form');
+  }, [step, createTx.phase]);
 
   // The vault seed is optional: a rejected or failed fundMind still lands on the new mind (SPEC §7 step 5).
   useEffect(() => {
@@ -281,6 +287,12 @@ export function Create() {
             <p className="rounded border border-amber/40 bg-amber/5 p-2 text-[12px] text-amber">The launchpad is paused by its owner: new coins cannot be created right now.</p>
           )}
           {touched && errors.schema !== undefined && <p className="text-[12px] text-danger">{errors.schema}</p>}
+          {health.isError && fallback !== null && (
+            <p className={`rounded border p-2 text-[12px] ${fallback.fits ? 'border-amber/40 bg-amber/5 text-amber' : 'border-danger/40 bg-danger/5 text-danger'}`}>
+              The runner is not answering, so the metadata would be embedded on-chain as a data: URI ({fallback.bytes} / {METADATA_LIMITS.metadataUriBytes} bytes).
+              {fallback.fits ? ' That fits.' : ' That is too large: shorten the persona or description, or try again when the runner is back.'}
+            </p>
+          )}
           {flowError !== null && <p className="rounded border border-danger/40 bg-danger/5 p-2 text-[12px] text-danger">{flowError}</p>}
           {createTx.error !== null && step === 'form' && <p className="text-[12px] text-danger">{createTx.error}</p>}
 
@@ -317,7 +329,7 @@ export function Create() {
             <dl className="text-[12px]">
               <div className="kv">
                 <dt>creation fee</dt>
-                <dd>{creationFee.data !== undefined ? formatEth(creationFee.data) : LAUNCHPAD_ADDRESS === null ? 'n/a' : '…'}</dd>
+                <dd>{creationFee.data !== undefined ? formatEth(creationFee.data) : LAUNCHPAD_ADDRESS === null ? 'n/a' : creationFee.isError ? 'unavailable (RPC)' : '…'}</dd>
               </div>
               <div className="kv">
                 <dt>initial buy</dt>

@@ -5,9 +5,10 @@
  */
 import { MODELS, toPublicModelSpec } from '@www-rh/shared';
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
+import { useEffect, useState } from 'react';
 import type { Address } from 'viem';
 import { ApiError, getCompute, getHealth, getMemories, getMind, getMinds, getModels, getStats, getThoughts, getTrades } from './api';
-import type { MindsSort, ModelInfo } from './lib/types';
+import type { ComputeInfo, MindsSort, ModelInfo } from './lib/types';
 
 /** Query keys. */
 export const queryKeys = {
@@ -38,6 +39,30 @@ export function isNotFound(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }
 
+/** Runs `load`, mapping a 404 (mind not indexed yet) to `empty`. */
+async function orEmptyOn404<T>(load: () => Promise<T>, empty: T): Promise<T> {
+  try {
+    return await load();
+  } catch (error) {
+    if (isNotFound(error)) return empty;
+    throw error;
+  }
+}
+
+/**
+ * The query's error, kept until the next success. TanStack Query resets a query that never
+ * succeeded back to `pending` (error `null`) on every refetch; without this, error copy would
+ * flicker away during each retry against an unreachable runner.
+ */
+export function useSettledError(query: { isSuccess: boolean; error: unknown }): unknown {
+  const [last, setLast] = useState<unknown>(null);
+  useEffect(() => {
+    if (query.isSuccess) setLast(null);
+    else if (query.error !== null && query.error !== undefined) setLast(query.error);
+  }, [query.isSuccess, query.error]);
+  return query.isSuccess ? null : (query.error ?? last);
+}
+
 /** Mind detail from the runner; polls every 2 s while the runner answers 404 ("indexing…", SPEC §7). */
 export function useMindDetail(token: Address | undefined) {
   return useQuery({
@@ -53,7 +78,7 @@ export function useMindDetail(token: Address | undefined) {
 export function useTrades(token: Address | undefined) {
   return useQuery({
     queryKey: queryKeys.trades(token ?? ''),
-    queryFn: () => getTrades(token as Address, 100),
+    queryFn: () => orEmptyOn404(() => getTrades(token as Address, 100), []),
     enabled: token !== undefined,
     refetchInterval: 20_000,
     retry: 1,
@@ -64,7 +89,7 @@ export function useTrades(token: Address | undefined) {
 export function useMemories(token: Address | undefined) {
   return useInfiniteQuery({
     queryKey: queryKeys.memories(token ?? ''),
-    queryFn: ({ pageParam }) => getMemories(token as Address, { limit: 30, before: pageParam }),
+    queryFn: ({ pageParam }) => orEmptyOn404(() => getMemories(token as Address, { limit: 30, before: pageParam }), []),
     initialPageParam: null as number | null,
     getNextPageParam: (last) => {
       if (last.length < 30) return null;
@@ -81,18 +106,18 @@ export function useMemories(token: Address | undefined) {
 export function useThoughts(token: Address | undefined) {
   return useQuery({
     queryKey: queryKeys.thoughts(token ?? ''),
-    queryFn: () => getThoughts(token as Address, 50),
+    queryFn: () => orEmptyOn404(() => getThoughts(token as Address, 50), []),
     enabled: token !== undefined,
     refetchInterval: 20_000,
     retry: 1,
   });
 }
 
-/** Compute meter data: balance, burn, runway, ledger, receipts. */
+/** Compute meter data: balance, burn, runway, ledger, receipts (`null` while the mind is not indexed). */
 export function useCompute(token: Address | undefined) {
   return useQuery({
     queryKey: queryKeys.compute(token ?? ''),
-    queryFn: () => getCompute(token as Address),
+    queryFn: () => orEmptyOn404<ComputeInfo | null>(() => getCompute(token as Address), null),
     enabled: token !== undefined,
     refetchInterval: 20_000,
     retry: 1,

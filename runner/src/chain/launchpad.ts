@@ -1,7 +1,7 @@
 /**
- * Typed read/write helpers for `MindLaunchpad` (SPEC §4.1 `chain/launchpad.ts`). Writes are
- * simulated first (so reverts such as `DrawLimitExceeded` surface without spending gas) and never
- * sent in `DRY_RUN`.
+ * Typed `MindLaunchpad` reads and operator writes (`docs/SPEC.md` §4.1 `chain/launchpad.ts`).
+ * Writes are not sent from here directly: they go through the FIFO {@link TxQueue} (`txQueue.ts`),
+ * which uses {@link LaunchpadSender} to simulate, send and await each transaction.
  *
  * @module chain/launchpad
  */
@@ -36,29 +36,29 @@ export interface LaunchpadReader {
   mindBalance(token: Address): Promise<bigint>;
   drawLimit(): Promise<{ maxPerEpoch: bigint; epochSeconds: number }>;
   drawnInEpoch(token: Address): Promise<{ drawn: bigint; epochStart: bigint }>;
-  graduatorOf(token: Address): Promise<Address>;
+  feeParams(): Promise<{ tradeFeeBps: number; mindShareBps: number; graduationFeeBps: number }>;
   operator(): Promise<Address>;
-  /** Timestamp of the latest block (seconds). */
+  /** Timestamp (unix seconds) of the latest block. */
   latestTimestamp(): Promise<bigint>;
 }
 
-/** Result of a write: skipped in dry-run mode, or submitted with its hash. */
-export type TxOutcome = { kind: 'dry_run' } | { kind: 'submitted'; hash: Hex };
+/** Operator / permissionless write calls, as `(functionName, args)` pairs. */
+export type LaunchpadWrite =
+  | { functionName: 'drawCompute'; args: readonly [Address, bigint, Hex] }
+  | { functionName: 'anchorMemory'; args: readonly [Address, bigint, Hex, string] }
+  | { functionName: 'setMindStatus'; args: readonly [Address, 0 | 1] }
+  | { functionName: 'graduate'; args: readonly [Address] }
+  | { functionName: 'harvest'; args: readonly [Address] };
 
-/** Operator / permissionless writes. */
-export interface LaunchpadWriter {
-  readonly dryRun: boolean;
-  drawCompute(token: Address, amount: bigint, receiptHash: Hex): Promise<TxOutcome>;
-  anchorMemory(token: Address, seq: bigint, contentHash: Hex, uri: string): Promise<TxOutcome>;
-  setMindStatus(token: Address, status: 0 | 1): Promise<TxOutcome>;
-  graduate(token: Address): Promise<TxOutcome>;
-  harvest(token: Address): Promise<TxOutcome>;
-  /** Waits for the receipt of a submitted transaction. */
-  waitForReceipt(hash: Hex): Promise<'success' | 'reverted'>;
+/** Simulates + sends transactions and waits for receipts (used by the tx queue). */
+export interface LaunchpadSender {
+  /** The operator account. */
+  readonly account: Address;
+  /** Simulates (`eth_call`) then sends the transaction; resolves to its hash. */
+  send(write: LaunchpadWrite): Promise<Hex>;
+  /** Waits for the receipt (rejects on timeout). */
+  waitForReceipt(hash: Hex, timeoutMs: number): Promise<'success' | 'reverted'>;
 }
-
-/** Launchpad gateway = reader + writer. */
-export type LaunchpadGateway = LaunchpadReader & LaunchpadWriter;
 
 /** Custom error name of a contract revert (e.g. `DrawLimitExceeded`), if `err` is one. */
 export function revertName(err: unknown): string | undefined {
@@ -68,91 +68,90 @@ export function revertName(err: unknown): string | undefined {
   return undefined;
 }
 
-type WriteName = 'drawCompute' | 'anchorMemory' | 'setMindStatus' | 'graduate' | 'harvest';
-
-/** viem implementation of {@link LaunchpadGateway}. */
-export class ViemLaunchpad implements LaunchpadGateway {
+/** viem implementation of {@link LaunchpadReader}. */
+export class ViemLaunchpadReader implements LaunchpadReader {
   constructor(
     readonly address: Address,
-    private readonly publicClient: RunnerPublicClient,
-    private readonly walletClient: RunnerWalletClient | null,
-    readonly dryRun: boolean,
+    private readonly client: RunnerPublicClient,
   ) {}
 
   async getMind(token: Address): Promise<OnchainMind> {
-    const m = await this.publicClient.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'getMind', args: [token] });
+    const m = await this.client.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'getMind', args: [token] });
     return { creator: m.creator, modelId: m.modelId, personaHash: m.personaHash, metadataURI: m.metadataURI, createdAt: m.createdAt, status: m.status };
   }
 
   async getCurve(token: Address): Promise<OnchainCurve> {
-    const c = await this.publicClient.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'getCurve', args: [token] });
+    const c = await this.client.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'getCurve', args: [token] });
     return { realEthReserve: c.realEthReserve, tokensSold: c.tokensSold, phase: c.phase, pool: c.pool, positionId: c.positionId };
   }
 
   mindBalance(token: Address): Promise<bigint> {
-    return this.publicClient.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'mindBalance', args: [token] });
+    return this.client.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'mindBalance', args: [token] });
   }
 
   async drawLimit(): Promise<{ maxPerEpoch: bigint; epochSeconds: number }> {
-    const [maxPerEpoch, epochSeconds] = await this.publicClient.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'drawLimit' });
+    const [maxPerEpoch, epochSeconds] = await this.client.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'drawLimit' });
     return { maxPerEpoch, epochSeconds };
   }
 
   async drawnInEpoch(token: Address): Promise<{ drawn: bigint; epochStart: bigint }> {
-    const [drawn, epochStart] = await this.publicClient.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'drawnInEpoch', args: [token] });
+    const [drawn, epochStart] = await this.client.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'drawnInEpoch', args: [token] });
     return { drawn, epochStart };
   }
 
-  graduatorOf(token: Address): Promise<Address> {
-    return this.publicClient.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'graduatorOf', args: [token] });
+  async feeParams(): Promise<{ tradeFeeBps: number; mindShareBps: number; graduationFeeBps: number }> {
+    const p = await this.client.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'feeParams' });
+    return { tradeFeeBps: p.tradeFeeBps, mindShareBps: p.mindShareBps, graduationFeeBps: p.graduationFeeBps };
   }
 
   operator(): Promise<Address> {
-    return this.publicClient.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'operator' });
+    return this.client.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'operator' });
   }
 
   async latestTimestamp(): Promise<bigint> {
-    const block = await this.publicClient.getBlock({ blockTag: 'latest' });
-    return block.timestamp;
+    return (await this.client.getBlock({ blockTag: 'latest' })).timestamp;
+  }
+}
+
+/** viem implementation of {@link LaunchpadSender}. */
+export class ViemLaunchpadSender implements LaunchpadSender {
+  constructor(
+    private readonly launchpad: Address,
+    private readonly publicClient: RunnerPublicClient,
+    private readonly walletClient: RunnerWalletClient,
+  ) {}
+
+  get account(): Address {
+    return this.walletClient.account.address;
   }
 
-  drawCompute(token: Address, amount: bigint, receiptHash: Hex): Promise<TxOutcome> {
-    return this.#write('drawCompute', [token, amount, receiptHash]);
+  async send(write: LaunchpadWrite): Promise<Hex> {
+    const base = { account: this.walletClient.account, address: this.launchpad, abi: mindLaunchpadAbi } as const;
+    switch (write.functionName) {
+      case 'drawCompute': {
+        const { request } = await this.publicClient.simulateContract({ ...base, functionName: 'drawCompute', args: [...write.args] });
+        return this.walletClient.writeContract(request);
+      }
+      case 'anchorMemory': {
+        const { request } = await this.publicClient.simulateContract({ ...base, functionName: 'anchorMemory', args: [...write.args] });
+        return this.walletClient.writeContract(request);
+      }
+      case 'setMindStatus': {
+        const { request } = await this.publicClient.simulateContract({ ...base, functionName: 'setMindStatus', args: [...write.args] });
+        return this.walletClient.writeContract(request);
+      }
+      case 'graduate': {
+        const { request } = await this.publicClient.simulateContract({ ...base, functionName: 'graduate', args: [...write.args] });
+        return this.walletClient.writeContract(request);
+      }
+      case 'harvest': {
+        const { request } = await this.publicClient.simulateContract({ ...base, functionName: 'harvest', args: [...write.args] });
+        return this.walletClient.writeContract(request);
+      }
+    }
   }
 
-  anchorMemory(token: Address, seq: bigint, contentHash: Hex, uri: string): Promise<TxOutcome> {
-    return this.#write('anchorMemory', [token, seq, contentHash, uri]);
-  }
-
-  setMindStatus(token: Address, status: 0 | 1): Promise<TxOutcome> {
-    return this.#write('setMindStatus', [token, status]);
-  }
-
-  graduate(token: Address): Promise<TxOutcome> {
-    return this.#write('graduate', [token]);
-  }
-
-  harvest(token: Address): Promise<TxOutcome> {
-    return this.#write('harvest', [token]);
-  }
-
-  async waitForReceipt(hash: Hex): Promise<'success' | 'reverted'> {
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash, timeout: 120_000 });
-    return receipt.status;
-  }
-
-  async #write(functionName: WriteName, args: readonly unknown[]): Promise<TxOutcome> {
-    if (this.dryRun || this.walletClient === null) return { kind: 'dry_run' };
-    const wallet = this.walletClient;
-    // The ABI is a const tuple; viem infers per-function arg types from `functionName`.
-    const { request } = await this.publicClient.simulateContract({
-      account: wallet.account,
-      address: this.address,
-      abi: mindLaunchpadAbi,
-      functionName,
-      args,
-    } as Parameters<RunnerPublicClient['simulateContract']>[0]);
-    const hash = await wallet.writeContract(request as Parameters<RunnerWalletClient['writeContract']>[0]);
-    return { kind: 'submitted', hash };
+  async waitForReceipt(hash: Hex, timeoutMs: number): Promise<'success' | 'reverted'> {
+    return (await this.publicClient.waitForTransactionReceipt({ hash, timeout: timeoutMs })).status;
   }
 }

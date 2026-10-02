@@ -12,7 +12,7 @@ import { memoryBatchUrl, parseMemoryBatchUri } from '../api';
 import { displayUrl, timeAgo } from '../format';
 import { useNow } from '../hooks/useTick';
 import type { Memory } from '../lib/types';
-import { useMemories } from '../queries';
+import { useMemories, useSettledError } from '../queries';
 import { Panel, TxLink } from './common';
 
 /** Merges live and fetched memories, de-duplicated by `seq`, newest first. */
@@ -43,6 +43,7 @@ export function memoryHashMatches(m: Memory): boolean {
 /** See module docs. */
 export function MemoryList({ token, live }: { token: Address; live: readonly Memory[] }) {
   const query = useMemories(token);
+  const error = useSettledError(query);
   const now = useNow(30_000);
   const memories = useMemo(() => mergeMemories(live, query.data?.pages.flat() ?? []), [live, query.data]);
   const findings = memories.filter((m) => m.kind === 'finding').length;
@@ -52,10 +53,10 @@ export function MemoryList({ token, live }: { token: Address; live: readonly Mem
       <ul className="scroll-thin max-h-[28rem] divide-y divide-line overflow-y-auto">
         {memories.length === 0 && (
           <li className="px-3 py-4 text-dim">
-            {query.isPending
-              ? 'Loading memories…'
-              : query.isError
-                ? 'Memories are served by the runner, which is not reachable right now.'
+            {error !== null
+              ? 'Memories are served by the runner, which is not reachable right now.'
+              : query.isPending
+                ? 'Loading memories…'
                 : 'No memories yet. When the mind finds something worth keeping, it writes it down here, and batches get anchored on-chain.'}
           </li>
         )}

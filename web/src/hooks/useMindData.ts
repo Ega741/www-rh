@@ -5,21 +5,28 @@
  *
  * @module hooks/useMindData
  */
-import { marketCap, priceOf, progressBps } from '@www-rh/shared';
+import { marketCap, mindLaunchpadAbi as launchpadAbi, priceOf, progressBps } from '@www-rh/shared';
+import { useEffect, useState } from 'react';
 import { erc20Abi, zeroAddress, type Address } from 'viem';
 import { useReadContract } from 'wagmi';
 import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
-import { mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
+import { decodeJsonDataUri } from '../lib/dataUri';
+import { readText } from '../lib/json';
+import { personaHashOf } from '../lib/metadata';
 import { toPhaseName, toStatusName } from '../lib/normalize';
 import type { MindDetail } from '../lib/types';
 import { useMindDetail } from '../queries';
 
+/** What the chain says about the token. */
+export type ChainLookup = 'disabled' | 'pending' | 'mind' | 'not-a-mind' | 'error';
+
 /** Merged mind data. */
 export interface MindData {
   mind: MindDetail | null;
-  /** Neither the runner nor the chain know this token. */
-  notFound: boolean;
+  /** The runner request is still in flight and nothing is known yet. */
   loading: boolean;
+  /** On-chain lookup state (`getMind`). */
+  chain: ChainLookup;
   apiError: unknown;
   chainError: unknown;
   /** Re-reads on-chain state (after a transaction). */
@@ -36,7 +43,16 @@ export function useMindData(token: Address | undefined): MindData {
   const info = useReadContract({ ...base, functionName: 'getMind', args, query: { enabled, refetchInterval: 15_000 } });
   const curve = useReadContract({ ...base, functionName: 'getCurve', args, query: { enabled, refetchInterval: 5_000 } });
   const vault = useReadContract({ ...base, functionName: 'mindBalance', args, query: { enabled, refetchInterval: 5_000 } });
-  const needNames = token !== undefined && api.data === undefined && api.isError;
+  // TanStack Query resets a never-successful query to `pending` on every refetch (the 2 s polling
+  // while the runner answers 404), so remember the last error until a success arrives.
+  const [lastError, setLastError] = useState<unknown>(null);
+  useEffect(() => {
+    if (api.isSuccess) setLastError(null);
+    else if (api.error !== null) setLastError(api.error);
+  }, [api.isSuccess, api.error]);
+  const apiError: unknown = api.isSuccess ? null : (api.error ?? lastError);
+
+  const needNames = token !== undefined && api.data === undefined;
   const name = useReadContract({ address: token, abi: erc20Abi, functionName: 'name', chainId: TARGET_CHAIN.id, query: { enabled: needNames, staleTime: Infinity } });
   const symbol = useReadContract({ address: token, abi: erc20Abi, functionName: 'symbol', chainId: TARGET_CHAIN.id, query: { enabled: needNames, staleTime: Infinity } });
 
@@ -45,7 +61,8 @@ export function useMindData(token: Address | undefined): MindData {
   const isOnchainMind = chainInfo !== undefined && chainInfo.creator !== zeroAddress;
 
   let mind: MindDetail | null = api.data ?? null;
-  if (mind === null && api.isError && token !== undefined && isOnchainMind && chainCurve !== undefined) {
+  const namesSettled = (name.isSuccess || name.isError) && (symbol.isSuccess || symbol.isError);
+  if (mind === null && token !== undefined && isOnchainMind && chainCurve !== undefined && namesSettled) {
     mind = {
       token: token.toLowerCase() as Address,
       name: name.data ?? 'Unnamed mind',
@@ -79,6 +96,21 @@ export function useMindData(token: Address | undefined): MindData {
     };
   }
 
+  // Metadata embedded as a data: URI can be read (and its persona verified) without the runner.
+  if (mind !== null && mind.persona === null && api.data === undefined) {
+    const meta = decodeJsonDataUri(mind.metadataURI);
+    if (meta !== null) {
+      const persona = readText(meta, 'persona');
+      const verified = persona !== null && personaHashOf(persona).toLowerCase() === mind.personaHash.toLowerCase();
+      mind = {
+        ...mind,
+        persona: verified ? persona : null,
+        personaVerified: persona === null ? null : verified,
+        description: mind.description ?? readText(meta, 'description'),
+      };
+    }
+  }
+
   if (mind !== null && isOnchainMind) {
     mind = { ...mind, status: toStatusName(chainInfo.status), modelId: chainInfo.modelId, personaHash: chainInfo.personaHash, metadataURI: chainInfo.metadataURI };
     if (mind.creator === zeroAddress) mind = { ...mind, creator: chainInfo.creator.toLowerCase() as Address };
@@ -100,14 +132,13 @@ export function useMindData(token: Address | undefined): MindData {
   }
   if (mind !== null && vault.data !== undefined) mind = { ...mind, mindBalanceWei: vault.data };
 
-  const loading = mind === null && (api.isPending || (enabled && (info.isPending || curve.isPending)));
-  const notFound = mind === null && !loading && (api.isError || !enabled) && (!enabled || info.isSuccess);
+  const chain: ChainLookup = !enabled ? 'disabled' : info.isSuccess ? (isOnchainMind ? 'mind' : 'not-a-mind') : info.isError ? 'error' : 'pending';
 
   return {
     mind,
-    notFound,
-    loading,
-    apiError: api.error,
+    loading: mind === null && api.isPending && apiError === null && chain !== 'error' && chain !== 'not-a-mind',
+    chain,
+    apiError,
     chainError: info.error ?? curve.error,
     refetchChain: () => {
       void info.refetch();

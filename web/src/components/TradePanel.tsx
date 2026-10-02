@@ -6,16 +6,15 @@
  *
  * @module components/TradePanel
  */
-import { completionReserves } from '@www-rh/shared';
+import { completionReserves, mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
 import { useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import { erc20Abi, formatUnits, zeroAddress, type Address } from 'viem';
 import { useBalance, useConnection, useReadContract, useWriteContract } from 'wagmi';
 import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
-import { formatBps, formatEth, formatPrice, formatTokens, parseAmount, progressPercent } from '../format';
+import { formatBps, formatEth, formatPrice, formatTokens, parseAmount, progressPercent, shortAddress } from '../format';
 import { useDebounced } from '../hooks/useDebounced';
 import { useTxFlow } from '../hooks/useTxFlow';
-import { mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
 import { addressUrl, tokenUrl } from '../lib/chain';
 import { DEFAULT_DEADLINE_MINUTES, deadlineFromNow, estimateBuy, estimateSell, minOutWithSlippage, priceImpactBps, slippagePercentToBps } from '../lib/quote';
 import type { MindDetail } from '../lib/types';
@@ -135,13 +134,14 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
     void queryClient.invalidateQueries({ queryKey: queryKeys.mind(mind.token) });
     void queryClient.invalidateQueries({ queryKey: queryKeys.trades(mind.token) });
   };
+  const approveTx = useTxFlow({ onConfirmed: () => void allowance.refetch() });
   const tradeTx = useTxFlow({
     onConfirmed: () => {
       setAmount('');
+      approveTx.reset();
       afterTx();
     },
   });
-  const approveTx = useTxFlow({ onConfirmed: () => void allowance.refetch() });
   // A WrongPhase revert on graduate means someone else graduated first: refetch, no error (SPEC §7).
   const phaseTx = useTxFlow({
     onConfirmed: afterTx,
@@ -245,15 +245,23 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
                 ? `The curve is closed. This launchpad uses the MockGraduator, so ${symbol} has no DEX pool: the liquidity is held by the graduator contract.`
                 : `The curve is closed. ${symbol} now trades against WETH in its full-range DEX pool.`}
             </p>
-            <div className="flex flex-wrap gap-2">
-              <ExternalLink href={tokenUrl(mind.token)} className="btn btn-sm">
-                token on explorer
-              </ExternalLink>
-              {mind.pool !== null && (
-                <ExternalLink href={addressUrl(mind.pool)} className="btn btn-sm">
-                  {mockGraduator ? 'MockGraduator (no DEX)' : 'pool on explorer'}
+            <div className="flex flex-wrap items-center gap-2">
+              {tokenUrl(mind.token) !== null && (
+                <ExternalLink href={tokenUrl(mind.token)} className="btn btn-sm hover:no-underline">
+                  token on explorer
                 </ExternalLink>
               )}
+              {mind.pool !== null &&
+                (addressUrl(mind.pool) !== null ? (
+                  <ExternalLink href={addressUrl(mind.pool)} className="btn btn-sm hover:no-underline">
+                    {mockGraduator ? 'MockGraduator (no DEX)' : 'pool on explorer'}
+                  </ExternalLink>
+                ) : (
+                  <span className="chip" title={mind.pool}>
+                    {mockGraduator ? 'MockGraduator (no DEX)' : `pool ${shortAddress(mind.pool)}`}
+                  </span>
+                ))}
+              {tokenUrl(mind.token) === null && <span className="text-[11px] text-mute">no block explorer for {TARGET_CHAIN.name}</span>}
             </div>
             <p className="text-dim">LP fees belong to the mind: harvesting sends the ETH side to its vault and burns the token side. Anyone can trigger it.</p>
             <ChainGuard action="harvest" compact>
@@ -292,6 +300,7 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
                     setSide(s);
                     setAmount('');
                     tradeTx.reset();
+                    approveTx.reset();
                   }}
                   className={`rounded py-1.5 ${side === s ? (s === 'buy' ? 'bg-acid/15 text-acid' : 'bg-danger/15 text-danger') : 'text-dim'}`}
                 >
@@ -402,7 +411,6 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
                     {approveTx.busy ? 'Approving…' : `Approve ${formatTokens(parsed ?? 0n)} ${symbol}`}
                   </button>
                   <p className="text-[11px] text-mute">Step 1 of 2: allow the launchpad to take exactly this amount. Then sell.</p>
-                  <TxStatus tx={approveTx} labels={{ confirmed: 'Approved. Now sell.' }} />
                 </div>
               ) : (
                 <button
@@ -421,6 +429,7 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
                 </button>
               )}
             </ChainGuard>
+            {side === 'sell' && <TxStatus tx={approveTx} labels={{ confirmed: 'Approved. Now sell.' }} />}
             <TxStatus tx={tradeTx} labels={{ confirmed: side === 'buy' ? 'Bought.' : 'Sold.' }} />
           </div>
         </Panel>

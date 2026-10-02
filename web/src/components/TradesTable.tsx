@@ -21,16 +21,24 @@ export interface TradesTableProps {
   symbol: string;
   loading: boolean;
   error: boolean;
+  /** The runner has not indexed this coin yet (its history is not available). */
+  indexing?: boolean;
 }
 
 /** See module docs. */
-export function TradesTable({ trades, symbol, loading, error }: TradesTableProps) {
+export function TradesTable({ trades, symbol, loading, error, indexing = false }: TradesTableProps) {
   const now = useNow(10_000);
   return (
     <Panel title="recent trades" right={<span className="normal-case tracking-normal text-mute">{trades.length > 0 ? `${trades.length}` : ''}</span>}>
       {trades.length === 0 ? (
         <p className="px-3 py-4 text-dim">
-          {loading ? 'Loading trades…' : error ? 'Trade history is served by the runner, which is not reachable right now.' : `No trades yet. The first buy of $${symbol} will show up here.`}
+          {loading
+            ? 'Loading trades…'
+            : error
+              ? 'Trade history is served by the runner, which is not reachable right now.'
+              : indexing
+                ? 'Trade history appears once the runner has indexed this coin.'
+                : `No trades yet. The first buy of $${symbol} will show up here.`}
         </p>
       ) : (
         <div className="scroll-thin max-h-96 overflow-auto">

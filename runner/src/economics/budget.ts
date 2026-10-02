@@ -1,84 +1,84 @@
 /**
- * Mind budget (SPEC §4.1 economics, R5): `available = onchainMindBalance · ethUsd − unsettledSpend`,
- * all in integer micro-USD. A mind is runnable only when
- * `available ≥ max(MIN_TICK_BUDGET_USD, MAX_TICK_COST_USD)`.
+ * Budget arithmetic (`docs/SPEC.md` §4.1 economics), all in integer micro-USD:
+ *
+ * ```
+ * usdMicroOfWei(wei)   = wei · ethUsdMicro / 1e18            (floor)
+ * weiOfUsdMicro(usd)   = ceilDiv(usd · 1e18, ethUsdMicro)
+ * epochRemainingWei    = now ≥ epochStart + epochSeconds ? maxPerEpoch : max(0, maxPerEpoch − drawn)
+ * availableUsdMicro    = usdMicroOfWei(min(balanceWei, epochRemainingWei)) − unsettledUsdMicro
+ * vaultUsdMicro        = max(0, usdMicroOfWei(balanceWei) − unsettledUsdMicro)
+ * runnable threshold   = max(MIN_TICK_BUDGET_USD, MAX_TICK_COST_USD)
+ * ```
  *
  * @module economics/budget
  */
-import { usdToMicro } from './cost.js';
 
 const WAD = 10n ** 18n;
 
-/** Inputs of {@link computeBudget}. */
-export interface BudgetInputs {
-  /** Vault balance (`mindBalance(token)`), wei. */
+/** `wei · ethUsdMicro / 1e18` (floor). */
+export function usdMicroOfWei(wei: bigint, ethUsdMicro: number): number {
+  return Number((wei * BigInt(ethUsdMicro)) / WAD);
+}
+
+/** `ceilDiv(usdMicro · 1e18, ethUsdMicro)`. */
+export function weiOfUsdMicro(usdMicro: number | bigint, ethUsdMicro: number): bigint {
+  const num = BigInt(usdMicro) * WAD;
+  const den = BigInt(ethUsdMicro);
+  return num === 0n ? 0n : (num - 1n) / den + 1n;
+}
+
+/** On-chain draw allowance inputs (`drawLimit()`, `drawnInEpoch()`, latest block timestamp). */
+export interface EpochState {
+  maxPerEpoch: bigint;
+  epochSeconds: number;
+  drawn: bigint;
+  epochStart: bigint;
+  /** Latest block timestamp, unix seconds. */
+  now: bigint;
+}
+
+/** Remaining draw allowance of the current epoch (the contract resets lazily on the next draw). */
+export function epochRemainingWei(e: EpochState): bigint {
+  if (e.now >= e.epochStart + BigInt(e.epochSeconds)) return e.maxPerEpoch;
+  return e.maxPerEpoch > e.drawn ? e.maxPerEpoch - e.drawn : 0n;
+}
+
+/** Budget snapshot of one mind. */
+export interface Budget {
   balanceWei: bigint;
-  /** Spend not yet settled on-chain, µUSD. */
+  /** `null` when the epoch state is unknown (treated as unlimited). */
+  epochRemainingWei: bigint | null;
   unsettledUsdMicro: number;
-  /** ETH/USD × 1e6. */
-  ethUsdPriceMicro: number;
-}
-
-/** A mind's budget snapshot. */
-export interface Budget extends BudgetInputs {
+  ethUsdMicro: number;
   balanceUsdMicro: number;
-  /** `max(0, balanceUsdMicro − unsettledUsdMicro)` */
+  /** May be negative when unsettled spend exceeds the drawable amount. */
   availableUsdMicro: number;
+  vaultUsdMicro: number;
 }
 
-/** wei → µUSD (floor). */
-export function weiToUsdMicro(wei: bigint, ethUsdPriceMicro: number): number {
-  return Number((wei * BigInt(ethUsdPriceMicro)) / WAD);
+/** Computes the {@link Budget}. */
+export function computeBudget(i: { balanceWei: bigint; epochRemainingWei: bigint | null; unsettledUsdMicro: number; ethUsdMicro: number }): Budget {
+  const balanceUsdMicro = usdMicroOfWei(i.balanceWei, i.ethUsdMicro);
+  const drawable = i.epochRemainingWei !== null && i.epochRemainingWei < i.balanceWei ? i.epochRemainingWei : i.balanceWei;
+  return {
+    ...i,
+    balanceUsdMicro,
+    availableUsdMicro: usdMicroOfWei(drawable, i.ethUsdMicro) - i.unsettledUsdMicro,
+    vaultUsdMicro: Math.max(0, balanceUsdMicro - i.unsettledUsdMicro),
+  };
 }
 
-/** µUSD → wei (floor): never converts to more ETH than the USD amount is worth. */
-export function usdMicroToWei(usdMicro: number | bigint, ethUsdPriceMicro: number): bigint {
-  return (BigInt(usdMicro) * WAD) / BigInt(ethUsdPriceMicro);
+/** USD → integer micro-USD. */
+export function usdToMicro(usd: number): number {
+  return Math.round(usd * 1_000_000);
 }
 
-/** Computes the budget snapshot. */
-export function computeBudget(inputs: BudgetInputs): Budget {
-  const balanceUsdMicro = weiToUsdMicro(inputs.balanceWei, inputs.ethUsdPriceMicro);
-  return { ...inputs, balanceUsdMicro, availableUsdMicro: Math.max(0, balanceUsdMicro - inputs.unsettledUsdMicro) };
+/** micro-USD → USD rounded to 6 decimals. */
+export function microToUsd(micro: number): number {
+  return Math.round(micro) / 1_000_000;
 }
 
-/** Budget policy knobs. */
-export interface BudgetPolicy {
-  minTickBudgetUsd: number;
-  maxTickCostUsd: number;
-}
-
-/** Minimum available budget (µUSD) for a mind to be runnable (R5). */
-export function runnableThresholdMicro(policy: BudgetPolicy): number {
-  return usdToMicro(Math.max(policy.minTickBudgetUsd, policy.maxTickCostUsd));
-}
-
-/** Whether the budget allows a tick. */
-export function hasTickBudget(budget: Budget, policy: BudgetPolicy): boolean {
-  return budget.availableUsdMicro >= runnableThresholdMicro(policy);
-}
-
-/** Why a mind cannot tick right now. */
-export type NotRunnableReason = 'not-alive' | 'cooling' | 'budget' | 'no-api-key';
-
-/** Runnability decision. */
-export type Runnability = { runnable: true } | { runnable: false; reason: NotRunnableReason };
-
-/**
- * Full runnability check: on-chain status must be Alive (0), the mind must not be cooling, an API
- * key must be configured and the budget must cover a maximal tick.
- */
-export function mindRunnability(args: {
-  status: number;
-  coolingUntil: string | null;
-  budget: Budget;
-  policy: BudgetPolicy;
-  hasApiKey: boolean;
-  now: number;
-}): Runnability {
-  if (args.status !== 0) return { runnable: false, reason: 'not-alive' };
-  if (args.coolingUntil !== null && Date.parse(args.coolingUntil) > args.now) return { runnable: false, reason: 'cooling' };
-  if (!args.hasApiKey) return { runnable: false, reason: 'no-api-key' };
-  if (!hasTickBudget(args.budget, args.policy)) return { runnable: false, reason: 'budget' };
-  return { runnable: true };
+/** `max(MIN_TICK_BUDGET_USD, MAX_TICK_COST_USD)` in micro-USD. */
+export function runnableThresholdMicro(p: { minTickBudgetUsd: number; maxTickCostUsd: number }): number {
+  return usdToMicro(Math.max(p.minTickBudgetUsd, p.maxTickCostUsd));
 }

@@ -18,15 +18,18 @@ export interface ChainGuardProps {
   action?: string;
   /** Render the prompts as compact single buttons. */
   compact?: boolean;
+  /** Sit inside a row next to an input: short labels, no full width. */
+  inline?: boolean;
 }
 
 /** See module docs. */
-export function ChainGuard({ children, action = 'continue', compact = false }: ChainGuardProps) {
+export function ChainGuard({ children, action = 'continue', compact = false, inline = false }: ChainGuardProps) {
   const connection = useConnection();
   const chainSwitch = useChainSwitch();
   const [picking, setPicking] = useState(false);
 
   if (LAUNCHPAD_ADDRESS === null) {
+    if (inline) return <span className="self-center text-[11px] text-amber">launchpad not configured</span>;
     return (
       <p className="rounded border border-amber/40 bg-amber/5 p-2 text-[12px] text-amber">
         No launchpad is configured for {TARGET_CHAIN.name}. Set VITE_LAUNCHPAD_ADDRESS (or sync contracts/deployments) to enable on-chain actions.
@@ -36,6 +39,13 @@ export function ChainGuard({ children, action = 'continue', compact = false }: C
 
   if (!connection.isConnected) {
     if (picking) return <ConnectMenu onDone={() => setPicking(false)} />;
+    if (inline) {
+      return (
+        <button type="button" className="btn btn-primary btn-sm shrink-0" onClick={() => setPicking(true)}>
+          Connect
+        </button>
+      );
+    }
     return (
       <button type="button" className={`btn btn-primary w-full ${compact ? 'btn-sm' : ''}`} onClick={() => setPicking(true)}>
         Connect wallet to {action}
@@ -44,6 +54,13 @@ export function ChainGuard({ children, action = 'continue', compact = false }: C
   }
 
   if (chainSwitch.wrongChain) {
+    if (inline) {
+      return (
+        <button type="button" className="btn btn-danger btn-sm shrink-0" disabled={chainSwitch.pending} onClick={() => void chainSwitch.switchToTarget()} title={chainSwitch.error ?? undefined}>
+          {chainSwitch.pending ? 'Switching…' : 'Switch network'}
+        </button>
+      );
+    }
     return (
       <div>
         <button type="button" className={`btn btn-danger w-full ${compact ? 'btn-sm' : ''}`} disabled={chainSwitch.pending} onClick={() => void chainSwitch.switchToTarget()}>

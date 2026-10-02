@@ -1,216 +1,175 @@
 /**
- * Compute settlement (SPEC §4.1 economics, R2): unsettled ledger lines are bundled into a draw
- * receipt whose canonical-JSON keccak is passed to `drawCompute(token, amountWei, receiptHash)`.
- * Never draws more than was spent (`amountWei` is floored), more than the vault holds, or more
- * than the remaining epoch cap (the largest whole-tick prefix that fits is settled).
+ * Compute settlement (`docs/SPEC.md` §4.1 economics, §3.2 draw receipts).
+ *
+ * Eligible ticks (no receipt, or a failed one) are included greedily in `tickId` order while
+ * `weiOfUsdMicro(Σ cost) <= cap`, `cap = min(mindBalanceWei, epochRemainingWei)`. If not even the
+ * first tick fits and the cap is limited by the balance, that tick alone is settled for the whole
+ * balance (the shortfall is absorbed by the operator); if the epoch limits, settlement waits for
+ * the next epoch. The receipt row is inserted (`pending`, or `dry_run`) before `drawCompute` is
+ * queued; it becomes `confirmed` when the indexer commits the matching `ComputeDrawn` log.
  *
  * @module economics/settle
  */
 import type { Address, Hex } from 'viem';
-import type { DrawReceiptTick } from '@www-rh/shared';
-import { buildDrawReceipt, receiptPayload } from '../canonical.js';
-import { revertName, type LaunchpadReader, type LaunchpadWriter } from '../chain/launchpad.js';
-import type { LedgerRow, Repos } from '../db/repos.js';
-import { errorMessage, type Logger } from '../log.js';
-import { nowIso } from '../util.js';
-import { usdToMicro } from './cost.js';
-import type { EthUsdSource } from './ethUsd.js';
+import { canonicalJson, drawReceiptHash, type DrawReceiptObject } from '@www-rh/shared';
+import type { TxQueue } from '../chain/txQueue.js';
+import type { Repos, TickRow } from '../db/repos.js';
+import type { Logger } from '../log.js';
+import { epochRemainingWei, usdToMicro, weiOfUsdMicro } from './budget.js';
+import type { EconomicsService } from './service.js';
 
 /** Outcome of {@link Settler.settle}. */
 export type SettleResult =
-  | { kind: 'skipped'; reason: 'nothing' | 'below-threshold' | 'cap' | 'busy' | 'zero-amount' }
-  | { kind: 'settled'; receiptHash: Hex; amountWei: bigint; status: 'dry_run' | 'confirmed' | 'failed' | 'submitted'; txHash: Hex | null; error: string | null };
+  | { kind: 'skipped'; reason: 'busy' | 'nothing' | 'below-threshold' | 'cap-zero' | 'epoch-limit' }
+  | { kind: 'settled'; receiptHash: Hex; amountWei: bigint; status: 'dry_run' | 'pending' | 'failed'; txHash: Hex | null; error: string | null };
 
-/** Settlement knobs. */
-export interface SettlePolicy {
-  drawThresholdUsd: number;
-}
-
-/** Callback fired after a receipt changes state (for the stream bus). */
-export type ReceiptListener = (token: string) => void;
-
-const MAX_LINES = 1_000;
-
-/** Ledger lines grouped by tick, in tick order. */
-function groupByTick(lines: readonly LedgerRow[]): LedgerRow[][] {
-  const groups: LedgerRow[][] = [];
-  for (const line of lines) {
-    const last = groups[groups.length - 1];
-    if (last !== undefined && (last[0] as LedgerRow).tick_id === line.tick_id) last.push(line);
-    else groups.push([line]);
-  }
-  return groups;
-}
-
-function toReceiptTick(l: LedgerRow): DrawReceiptTick {
-  return {
-    tickId: l.tick_id,
-    model: l.model,
-    inputTokens: l.input_tokens,
-    outputTokens: l.output_tokens,
-    cacheReadTokens: l.cache_read_tokens,
-    cacheWriteTokens: l.cache_write_tokens,
-    costUsdMicro: l.cost_usd_micro,
-  };
+/** Result of {@link selectTicks}. */
+export interface Selection {
+  ticks: TickRow[];
+  amountWei: bigint;
 }
 
 /**
- * Chooses the largest prefix of whole ticks whose draw amount fits `maxAmountWei`.
- * Exported for tests.
+ * Greedy tick selection (pure; exported for tests).
+ *
+ * @returns the ticks and amount to draw, or the reason nothing is drawn.
  */
-export function selectSettlement(lines: readonly LedgerRow[], ethUsdPriceMicro: number, maxAmountWei: bigint | null): LedgerRow[] {
-  const chosen: LedgerRow[] = [];
+export function selectTicks(
+  eligible: readonly TickRow[],
+  balanceWei: bigint,
+  epochRemainingWei: bigint | null,
+  ethUsdMicro: number,
+): Selection | { reason: 'nothing' | 'cap-zero' | 'epoch-limit' } {
+  if (eligible.length === 0) return { reason: 'nothing' };
+  const epochLimits = epochRemainingWei !== null && epochRemainingWei < balanceWei;
+  const cap = epochLimits ? (epochRemainingWei as bigint) : balanceWei;
+  if (cap === 0n) return { reason: 'cap-zero' };
+  const chosen: TickRow[] = [];
   let micro = 0n;
-  for (const group of groupByTick(lines)) {
-    const groupMicro = group.reduce((s, l) => s + BigInt(l.cost_usd_micro), 0n);
-    const amount = ((micro + groupMicro) * 10n ** 18n) / BigInt(ethUsdPriceMicro);
-    if (maxAmountWei !== null && amount > maxAmountWei) break;
-    chosen.push(...group);
-    micro += groupMicro;
+  for (const t of eligible) {
+    const next = micro + BigInt(t.cost_usd_micro);
+    if (weiOfUsdMicro(next, ethUsdMicro) > cap) break;
+    chosen.push(t);
+    micro = next;
   }
-  return chosen;
+  if (chosen.length === 0) {
+    if (epochLimits) return { reason: 'epoch-limit' };
+    return { ticks: [eligible[0] as TickRow], amountWei: balanceWei };
+  }
+  const want = weiOfUsdMicro(micro, ethUsdMicro);
+  return { ticks: chosen, amountWei: want < cap ? want : cap };
 }
 
-/** Settles compute spend on-chain. */
+/** Builds the §3.2 receipt object for `ticks`. */
+export function buildReceipt(token: string, ticks: readonly TickRow[], ethUsdMicro: number, amountWei: bigint): DrawReceiptObject {
+  const sorted = [...ticks].sort((a, b) => a.id - b.id);
+  return {
+    token: token.toLowerCase() as `0x${string}`,
+    fromTickId: (sorted[0] as TickRow).id,
+    toTickId: (sorted[sorted.length - 1] as TickRow).id,
+    ticks: sorted.map((t) => ({
+      tickId: t.id,
+      model: t.served_model ?? t.requested_model,
+      inputTokens: t.input_tokens,
+      outputTokens: t.output_tokens,
+      cacheReadTokens: t.cache_read_tokens,
+      cacheWriteTokens: t.cache_write_tokens,
+      costUsdMicro: t.cost_usd_micro,
+    })),
+    ethUsdPriceMicro: ethUsdMicro,
+    amountWei: amountWei.toString(10),
+  };
+}
+
+/** Pending receipts older than this without a matching indexed `ComputeDrawn` become `failed`. */
+export const RECEIPT_RECONCILE_MS = 10 * 60_000;
+
+/** Settles compute spend on-chain through the operator tx queue. */
 export class Settler {
   readonly #busy = new Set<string>();
 
   constructor(
     private readonly repos: Repos,
-    private readonly writer: LaunchpadWriter,
-    private readonly reader: LaunchpadReader | null,
-    private readonly ethUsd: EthUsdSource,
-    private readonly policy: SettlePolicy,
+    private readonly economics: EconomicsService,
+    private readonly queue: TxQueue,
+    private readonly policy: { drawThresholdUsd: number },
     private readonly log: Logger,
-    private readonly onReceipt: ReceiptListener = () => undefined,
+    private readonly onChange: (token: string) => void = () => undefined,
+    private readonly now: () => number = Date.now,
   ) {}
 
-  /** Remaining drawable amount (vault balance and epoch cap), or `null` when unknown (dry run / no RPC). */
-  async #maxDrawable(token: Address): Promise<bigint | null> {
-    if (this.writer.dryRun || this.reader === null) {
-      const row = this.repos.minds.get(token);
-      return row === undefined ? null : BigInt(row.mind_balance);
-    }
-    const [balance, limit, used, now] = await Promise.all([
-      this.reader.mindBalance(token),
-      this.reader.drawLimit(),
-      this.reader.drawnInEpoch(token),
-      this.reader.latestTimestamp(),
-    ]);
-    const epochOver = now >= used.epochStart + BigInt(limit.epochSeconds);
-    const capLeft = epochOver ? limit.maxPerEpoch : limit.maxPerEpoch > used.drawn ? limit.maxPerEpoch - used.drawn : 0n;
-    return balance < capLeft ? balance : capLeft;
-  }
-
   /**
-   * Settles `token`'s unreceipted spend when it reaches `DRAW_THRESHOLD_USD` (or always with
-   * `force`, e.g. when the mind goes dormant).
+   * Settles `token` when its unreceipted spend reaches `DRAW_THRESHOLD_USD`, or whenever there is
+   * any with `force` (before going Dormant, after a creator pause).
    */
   async settle(token: string, opts: { force?: boolean } = {}): Promise<SettleResult> {
-    const t = token.toLowerCase();
-    if (this.#busy.has(t)) return { kind: 'skipped', reason: 'busy' };
-    this.#busy.add(t);
+    const key = token.toLowerCase();
+    if (this.#busy.has(key)) return { kind: 'skipped', reason: 'busy' };
+    this.#busy.add(key);
     try {
-      return await this.#settle(t, opts.force === true);
+      return await this.#settle(key, opts.force === true);
     } finally {
-      this.#busy.delete(t);
+      this.#busy.delete(key);
     }
   }
 
   async #settle(token: string, force: boolean): Promise<SettleResult> {
-    const lines = this.repos.compute.unreceipted(token, MAX_LINES);
-    if (lines.length === 0) return { kind: 'skipped', reason: 'nothing' };
-    const totalMicro = lines.reduce((s, l) => s + l.cost_usd_micro, 0);
-    if (!force && totalMicro < usdToMicro(this.policy.drawThresholdUsd)) return { kind: 'skipped', reason: 'below-threshold' };
+    const eligible = this.repos.ticks.eligibleForSettlement(token, 1_000);
+    if (eligible.length === 0) return { kind: 'skipped', reason: 'nothing' };
+    const eligibleMicro = eligible.reduce((s, t) => s + t.cost_usd_micro, 0);
+    if (!force && eligibleMicro < usdToMicro(this.policy.drawThresholdUsd)) return { kind: 'skipped', reason: 'below-threshold' };
+    const ethUsdMicro = await this.economics.ethUsdMicro();
+    const epoch = await this.economics.epochState(token);
+    const balanceWei = BigInt(this.repos.minds.get(token)?.mind_balance ?? '0');
+    const selection = selectTicks(eligible, balanceWei, epoch === null ? null : epochRemainingWei(epoch), ethUsdMicro);
+    if ('reason' in selection) return { kind: 'skipped', reason: selection.reason };
 
-    const ethUsdPriceMicro = await this.ethUsd.priceMicro();
-    const maxAmount = await this.#maxDrawable(token as Address);
-    const chosen = selectSettlement(lines, ethUsdPriceMicro, maxAmount);
-    if (chosen.length === 0) return { kind: 'skipped', reason: 'cap' };
-    const receipt = buildDrawReceipt(token, chosen.map(toReceiptTick), ethUsdPriceMicro);
-    const amountWei = BigInt(receipt.amountWei);
-    if (amountWei === 0n) return { kind: 'skipped', reason: 'zero-amount' };
-    const { json, receiptHash } = receiptPayload(receipt);
-    const at = nowIso();
-    const receiptId = this.repos.tx(() =>
-      this.repos.compute.insertReceipt(
-        {
-          token,
-          receipt_hash: receiptHash.toLowerCase(),
-          receipt_json: json,
-          amount_wei: receipt.amountWei,
-          cost_usd_micro: chosen.reduce((s, l) => s + l.cost_usd_micro, 0),
-          status: 'pending',
-          tx_hash: null,
-          error: null,
-          created_at: at,
-          updated_at: at,
-        },
-        chosen.map((l) => l.id),
+    const receipt = buildReceipt(token, selection.ticks, ethUsdMicro, selection.amountWei);
+    const receiptHash = drawReceiptHash(receipt);
+    const at = this.now();
+    const status = this.queue.dryRun ? 'dry_run' : 'pending';
+    const id = this.repos.tx(() =>
+      this.repos.ticks.insertReceipt(
+        { token, receipt_hash: receiptHash.toLowerCase(), receipt_json: canonicalJson(receipt), amount_wei: receipt.amountWei, status, tx_hash: null, error: null, created_at: at, updated_at: at },
+        selection.ticks.map((t) => t.id),
       ),
     );
-
-    let result: SettleResult;
-    try {
-      const outcome = await this.writer.drawCompute(token as Address, amountWei, receiptHash);
-      if (outcome.kind === 'dry_run') {
-        this.repos.compute.updateReceipt(receiptId, 'dry_run', null, null, nowIso());
-        result = { kind: 'settled', receiptHash, amountWei, status: 'dry_run', txHash: null, error: null };
-        this.log.info('draw receipt recorded (dry run, no transaction)', { token, receiptHash, amountWei });
-      } else {
-        this.repos.compute.updateReceipt(receiptId, 'submitted', outcome.hash, null, nowIso());
-        this.onReceipt(token);
-        const status = await this.writer.waitForReceipt(outcome.hash);
-        if (status === 'success') {
-          this.repos.compute.updateReceipt(receiptId, 'confirmed', outcome.hash, null, nowIso());
-          result = { kind: 'settled', receiptHash, amountWei, status: 'confirmed', txHash: outcome.hash, error: null };
-          this.log.info('compute drawn', { token, receiptHash, amountWei, tx: outcome.hash });
-        } else {
-          this.repos.tx(() => {
-            this.repos.compute.updateReceipt(receiptId, 'failed', outcome.hash, 'transaction reverted', nowIso());
-            this.repos.compute.releaseReceipt(receiptId);
-          });
-          result = { kind: 'settled', receiptHash, amountWei, status: 'failed', txHash: outcome.hash, error: 'transaction reverted' };
-        }
-      }
-    } catch (err) {
-      const error = revertName(err) ?? errorMessage(err);
-      this.repos.tx(() => {
-        this.repos.compute.updateReceipt(receiptId, 'failed', null, error, nowIso());
-        this.repos.compute.releaseReceipt(receiptId);
-      });
-      this.log.warn('drawCompute failed; lines released for a later draw', { token, error });
-      result = { kind: 'settled', receiptHash, amountWei, status: 'failed', txHash: null, error };
+    this.onChange(token);
+    if (status === 'dry_run') {
+      this.log.info('draw receipt recorded (dry run)', { token, receiptHash, amountWei: selection.amountWei });
+      return { kind: 'settled', receiptHash, amountWei: selection.amountWei, status: 'dry_run', txHash: null, error: null };
     }
-    this.onReceipt(token);
-    return result;
+    const outcome = await this.queue.enqueue({ functionName: 'drawCompute', args: [token as Address, selection.amountWei, receiptHash] }, `draw ${token}`);
+    this.economics.invalidateEpoch(token);
+    switch (outcome.kind) {
+      case 'confirmed':
+        // stays `pending` until the indexer commits the ComputeDrawn log (balance and unsettled move together)
+        if (this.repos.ticks.receipt(id)?.status === 'pending') this.repos.ticks.updateReceipt(id, 'pending', outcome.hash, null, this.now());
+        this.onChange(token);
+        return { kind: 'settled', receiptHash, amountWei: selection.amountWei, status: 'pending', txHash: outcome.hash, error: null };
+      case 'dry_run':
+        this.repos.ticks.updateReceipt(id, 'dry_run', null, null, this.now());
+        this.onChange(token);
+        return { kind: 'settled', receiptHash, amountWei: selection.amountWei, status: 'dry_run', txHash: null, error: null };
+      case 'reverted':
+      case 'failed': {
+        const error = outcome.kind === 'reverted' ? 'transaction reverted' : outcome.error;
+        this.repos.ticks.updateReceipt(id, 'failed', outcome.hash, error, this.now());
+        this.onChange(token);
+        return { kind: 'settled', receiptHash, amountWei: selection.amountWei, status: 'failed', txHash: outcome.hash, error };
+      }
+    }
   }
 
   /**
-   * Startup / periodic reconciliation: resolves `submitted` receipts by their transaction receipt
-   * and fails + releases `pending` receipts older than `staleMs` that never reached the chain.
+   * Startup reconciliation: `pending` receipts are matched against indexed `ComputeDrawn` logs by
+   * `receiptHash` (match → `confirmed`; none after 10 min → `failed`, ticks eligible again).
    */
-  async reconcile(staleMs = 10 * 60_000, now = Date.now()): Promise<void> {
-    for (const r of this.repos.compute.receiptsWithStatus('submitted')) {
-      if (r.tx_hash === null) continue;
-      try {
-        const status = await this.writer.waitForReceipt(r.tx_hash as Hex);
-        if (status === 'success') this.repos.compute.updateReceipt(r.id, 'confirmed', r.tx_hash, null, nowIso());
-        else
-          this.repos.tx(() => {
-            this.repos.compute.updateReceipt(r.id, 'failed', r.tx_hash, 'transaction reverted', nowIso());
-            this.repos.compute.releaseReceipt(r.id);
-          });
-      } catch (err) {
-        this.log.debug('receipt reconciliation pending', { receipt: r.receipt_hash, error: errorMessage(err) });
-      }
-    }
-    for (const r of this.repos.compute.receiptsWithStatus('pending')) {
-      if (now - Date.parse(r.created_at) < staleMs) continue;
-      this.repos.tx(() => {
-        this.repos.compute.updateReceipt(r.id, 'failed', null, 'never submitted (runner restarted)', nowIso());
-        this.repos.compute.releaseReceipt(r.id);
-      });
+  reconcile(): void {
+    for (const r of this.repos.ticks.receiptsWithStatus('pending')) {
+      const draw = this.repos.facts.drawByReceiptHash(r.receipt_hash);
+      if (draw !== undefined) this.repos.ticks.updateReceipt(r.id, 'confirmed', draw.tx_hash, null, this.now());
+      else if (this.now() - r.created_at >= RECEIPT_RECONCILE_MS) this.repos.ticks.updateReceipt(r.id, 'failed', null, 'no ComputeDrawn log after 10 min', this.now());
     }
   }
 }

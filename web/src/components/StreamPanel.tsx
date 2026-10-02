@@ -20,9 +20,9 @@ function decodeBase64Jpeg(data: string): Blob {
   return new Blob([bytes], { type: 'image/jpeg' });
 }
 
-function ConnectionPill({ state }: { state: StreamState['connection'] }) {
+function ConnectionPill({ state, alive }: { state: StreamState['connection']; alive: boolean }) {
   const map = {
-    open: ['live', 'text-danger', 'bg-danger animate-pulse'],
+    open: alive ? (['live', 'text-danger', 'bg-danger animate-pulse'] as const) : (['connected', 'text-dim', 'bg-acid-dim'] as const),
     connecting: ['connecting', 'text-dim', 'bg-mute'],
     reconnecting: ['reconnecting', 'text-amber', 'bg-amber'],
     closed: ['offline', 'text-mute', 'bg-mute'],
@@ -47,9 +47,9 @@ export interface StreamPanelProps {
 export function StreamPanel({ mind, stream }: StreamPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const now = useNow(1_000);
-  const fallback = useLiveFrame(mind.token, { enabled: stream.frame === null, refresh: stream.frame === null && (stream.status ?? mind.status) === 'alive' });
+  const fallback = useLiveFrame(mind.token, { enabled: stream.frame === null, refresh: stream.frame === null && mind.status === 'alive' });
   const url = stream.currentUrl ?? mind.currentUrl;
-  const status = stream.status ?? mind.status;
+  const status = mind.status;
   const frameAt = stream.frame?.at ?? fallback.loadedAt;
 
   useEffect(() => {
@@ -99,7 +99,7 @@ export function StreamPanel({ mind, stream }: StreamPanelProps) {
             <span className="text-mute">about:blank</span>
           )}
         </div>
-        <ConnectionPill state={stream.connection} />
+        <ConnectionPill state={stream.connection} alive={status === 'alive'} />
       </div>
       <div className="relative aspect-[16/10] bg-bg">
         {stream.frame !== null ? (

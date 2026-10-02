@@ -1,32 +1,24 @@
 /**
- * Decodes launchpad logs and applies them to the database. Called inside one transaction per
- * batch; every log is first recorded in `chain_events`, so re-applying a batch is a no-op (R9).
+ * Decodes launchpad logs (viem `parseEventLogs`) and applies them to the database inside the
+ * caller's transaction. Each log is first recorded in `chain_events`, so re-applying a range is a
+ * no-op (idempotent on `(tx_hash, log_index)`).
  *
  * @module indexer/apply
  */
-import { decodeEventLog, type Hex } from 'viem';
-import { marketCap, mindLaunchpadAbi, priceOf } from '@www-rh/shared';
+import { parseEventLogs, type Log } from 'viem';
+import { CURVE_SUPPLY, marketCap, mindLaunchpadAbi, priceOf } from '@www-rh/shared';
 import type { Repos } from '../db/repos.js';
-import { unixToIso } from '../util.js';
 import type { IndexedEvent } from './events.js';
 import type { RawLog } from './source.js';
 
+/** Global counter keys in `indexer_state`. */
+export const STATE_TOTAL_VOLUME = 'total_volume_wei';
+export const STATE_TOTAL_FEES_TO_MINDS = 'total_fees_to_minds_wei';
+
 /** Events whose rows carry a block timestamp. */
-export const TIMESTAMPED_EVENTS: ReadonlySet<string> = new Set(['MindCreated', 'Trade', 'MindFunded', 'ComputeDrawn']);
+const TIMESTAMPED = new Set(['MindCreated', 'Trade', 'MindFunded', 'ComputeDrawn']);
 
-type Decoded = ReturnType<typeof decodeEventLog<typeof mindLaunchpadAbi>>;
-
-/** Decodes a launchpad log, or `undefined` for logs outside the ABI. */
-export function decodeLaunchpadLog(log: RawLog): Decoded | undefined {
-  if (log.topics.length === 0) return undefined;
-  try {
-    return decodeEventLog({ abi: mindLaunchpadAbi, data: log.data, topics: log.topics as [Hex, ...Hex[]], strict: true });
-  } catch {
-    return undefined;
-  }
-}
-
-/** Curve price + display market cap (as a float ETH sort key) for a reserve state. */
+/** Curve price and a float ETH market-cap sort key for a reserve state. */
 export function curveMetrics(realEthReserve: bigint, tokensSold: bigint): { priceWei: string; mcapSort: number } {
   try {
     const state = { realEthReserve, tokensSold };
@@ -36,168 +28,149 @@ export function curveMetrics(realEthReserve: bigint, tokensSold: bigint): { pric
   }
 }
 
-const STATE_CURRENT_GRADUATOR = 'current_graduator';
-/** Global counter keys in `indexer_state`. */
-export const STATE_VOLUME_TOTAL = 'volume_total_wei';
-export const STATE_FEES_TO_MINDS = 'fees_to_minds_wei';
+type Parsed = ReturnType<typeof parseEventLogs<typeof mindLaunchpadAbi>>[number];
+
+/** Decodes raw logs, dropping logs outside the ABI; result is in `(blockNumber, logIndex)` order. */
+export function decodeLaunchpadLogs(logs: readonly RawLog[]): { log: RawLog; parsed: Parsed }[] {
+  const sorted = [...logs].sort((a, b) => (a.blockNumber === b.blockNumber ? a.logIndex - b.logIndex : a.blockNumber < b.blockNumber ? -1 : 1));
+  const out: { log: RawLog; parsed: Parsed }[] = [];
+  for (const log of sorted) {
+    const [parsed] = parseEventLogs({ abi: mindLaunchpadAbi, logs: [log as unknown as Log], strict: true });
+    if (parsed !== undefined) out.push({ log, parsed });
+  }
+  return out;
+}
+
+/** Block numbers whose timestamps {@link applyLogs} needs and the logs do not carry. */
+export function blocksNeedingTimestamps(decoded: readonly { log: RawLog; parsed: Parsed }[]): bigint[] {
+  const blocks = new Set<bigint>();
+  for (const { log, parsed } of decoded) if (log.blockTimestamp === undefined && TIMESTAMPED.has(parsed.eventName)) blocks.add(log.blockNumber);
+  return [...blocks];
+}
 
 /**
- * Applies `logs` (chain order) and returns the domain events to emit after commit.
+ * Applies decoded logs (chain order) and returns the domain events of the newly applied ones.
  *
- * @param timestampOf resolves a block number to unix seconds (pre-fetched by the caller).
- * @param liveFrom first block whose events are "live" (`null` = treat everything as history).
+ * @param timestampOf block number → unix seconds (pre-fetched by the caller).
  */
-export function applyLogs(repos: Repos, logs: readonly RawLog[], timestampOf: (block: bigint) => bigint, liveFrom: bigint | null): IndexedEvent[] {
+export function applyLogs(repos: Repos, decoded: readonly { log: RawLog; parsed: Parsed }[], timestampOf: (block: bigint) => bigint): IndexedEvent[] {
   const out: IndexedEvent[] = [];
-  for (const log of logs) {
-    const decoded = decodeLaunchpadLog(log);
-    if (decoded === undefined) continue;
-    const args = decoded.args as Record<string, unknown>;
-    const token = typeof args['token'] === 'string' ? (args['token'] as string).toLowerCase() : null;
+  for (const { log, parsed } of decoded) {
+    const args = parsed.args as { token?: string };
+    const token = typeof args.token === 'string' ? args.token.toLowerCase() : null;
     const txHash = log.transactionHash.toLowerCase();
     const blockNumber = Number(log.blockNumber);
-    if (!repos.events.insertIfNew(txHash, log.logIndex, blockNumber, decoded.eventName, token)) continue;
-    const live = liveFrom !== null && log.blockNumber >= liveFrom;
-    const base = { blockNumber, txHash, live };
-    const at = (): string => unixToIso(log.blockTimestamp ?? timestampOf(log.blockNumber));
+    if (!repos.chain.insertEvent(txHash, log.logIndex, blockNumber, parsed.eventName, token)) continue;
+    const ms = (): number => Number(log.blockTimestamp ?? timestampOf(log.blockNumber)) * 1000;
+    const base = { blockNumber, txHash };
 
-    switch (decoded.eventName) {
+    switch (parsed.eventName) {
       case 'MindCreated': {
-        const a = decoded.args;
+        const a = parsed.args;
         const t = a.token.toLowerCase();
-        const metrics = curveMetrics(0n, 0n);
+        const m = curveMetrics(0n, 0n);
         repos.minds.insertCreated({
-          token: t,
-          creator: a.creator.toLowerCase(),
-          name: a.name,
-          symbol: a.symbol,
-          metadataUri: a.metadataURI,
-          modelId: a.modelId.toLowerCase(),
-          personaHash: a.personaHash.toLowerCase(),
-          blockNumber,
-          logIndex: log.logIndex,
-          createdAt: at(),
-          priceWei: metrics.priceWei,
-          mcapSort: metrics.mcapSort,
+          token: t, creator: a.creator.toLowerCase(), name: a.name, symbol: a.symbol, metadataUri: a.metadataURI,
+          modelId: a.modelId.toLowerCase(), personaHash: a.personaHash.toLowerCase(), blockNumber, logIndex: log.logIndex,
+          createdAt: ms(), priceWei: m.priceWei, mcapSort: m.mcapSort,
         });
         out.push({ type: 'mind:created', token: t, ...base });
         break;
       }
       case 'Trade': {
-        const a = decoded.args;
+        const a = parsed.args;
         const t = a.token.toLowerCase();
-        const metrics = curveMetrics(a.realEthReserve, a.tokensSold);
-        const timestamp = at();
+        const m = curveMetrics(a.realEthReserve, a.tokensSold);
         const trade = {
-          tx_hash: txHash,
-          log_index: log.logIndex,
-          block_number: blockNumber,
-          timestamp,
-          token: t,
-          trader: a.trader.toLowerCase(),
-          is_buy: a.isBuy ? 1 : 0,
-          eth_amount: a.ethAmount.toString(10),
-          token_amount: a.tokenAmount.toString(10),
-          fee: a.fee.toString(10),
-          real_eth_reserve: a.realEthReserve.toString(10),
-          tokens_sold: a.tokensSold.toString(10),
-          price_wei: metrics.priceWei,
+          tx_hash: txHash, log_index: log.logIndex, block_number: blockNumber, timestamp: ms(), token: t, trader: a.trader.toLowerCase(),
+          is_buy: a.isBuy ? 1 : 0, eth_amount: a.ethAmount.toString(10), token_amount: a.tokenAmount.toString(10), fee: a.fee.toString(10),
+          real_eth_reserve: a.realEthReserve.toString(10), tokens_sold: a.tokensSold.toString(10), price_wei: m.priceWei,
         };
         repos.trades.insert(trade);
-        repos.minds.applyTrade(t, { realEthReserve: trade.real_eth_reserve, tokensSold: trade.tokens_sold, priceWei: metrics.priceWei, mcapSort: metrics.mcapSort, at: timestamp });
-        repos.state.addBigint(STATE_VOLUME_TOTAL, a.ethAmount);
+        repos.minds.applyTrade(t, { realEthReserve: trade.real_eth_reserve, tokensSold: trade.tokens_sold, priceWei: m.priceWei, mcapSort: m.mcapSort });
+        // gross ETH: ethAmount for buys, ethAmount + fee for sells (SPEC §5)
+        repos.state.addBigint(STATE_TOTAL_VOLUME, a.isBuy ? a.ethAmount : a.ethAmount + a.fee);
         out.push({ type: 'trade', token: t, trade, ...base });
         break;
       }
       case 'CurveCompleted': {
-        const t = decoded.args.token.toLowerCase();
-        repos.minds.setPhase(t, 1);
+        const t = parsed.args.token.toLowerCase();
+        const m = curveMetrics(parsed.args.realEthReserve, CURVE_SUPPLY);
+        repos.minds.setComplete(t, parsed.args.realEthReserve.toString(10), m.priceWei, m.mcapSort);
         out.push({ type: 'curve:complete', token: t, ...base });
         break;
       }
       case 'Graduated': {
-        const a = decoded.args;
+        const a = parsed.args;
         const t = a.token.toLowerCase();
-        repos.minds.setGraduated(t, a.pool.toLowerCase(), a.positionId.toString(10), repos.state.get(STATE_CURRENT_GRADUATOR) ?? null);
+        repos.minds.setGraduated(t, a.pool.toLowerCase(), a.positionId.toString(10));
         out.push({ type: 'graduated', token: t, ...base });
         break;
       }
-      case 'MindFunded': {
-        const a = decoded.args;
+      case 'FeeAccrued': {
+        const a = parsed.args;
         const t = a.token.toLowerCase();
-        repos.facts.insertFunding({ txHash, logIndex: log.logIndex, blockNumber, timestamp: at(), token: t, from: a.from.toLowerCase(), amount: a.amount.toString(10) });
+        repos.facts.insertFeeAccrual({ txHash, logIndex: log.logIndex, blockNumber, token: t, mindAmount: a.mindAmount.toString(10), protocolAmount: a.protocolAmount.toString(10) });
+        repos.minds.addBalance(t, a.mindAmount);
+        repos.state.addBigint(STATE_TOTAL_FEES_TO_MINDS, a.mindAmount);
+        out.push({ type: 'fee:accrued', token: t, mindAmount: a.mindAmount, ...base });
+        break;
+      }
+      case 'MindFunded': {
+        const a = parsed.args;
+        const t = a.token.toLowerCase();
+        repos.facts.insertFunding({ txHash, logIndex: log.logIndex, blockNumber, timestamp: ms(), token: t, from: a.from.toLowerCase(), amount: a.amount.toString(10) });
         repos.minds.addBalance(t, a.amount);
         out.push({ type: 'mind:funded', token: t, amount: a.amount, ...base });
         break;
       }
-      case 'FeeAccrued': {
-        const a = decoded.args;
-        const t = a.token.toLowerCase();
-        repos.facts.insertFeeAccrual({ txHash, logIndex: log.logIndex, blockNumber, token: t, mindAmount: a.mindAmount.toString(10), protocolAmount: a.protocolAmount.toString(10) });
-        repos.minds.addBalance(t, a.mindAmount);
-        repos.state.addBigint(STATE_FEES_TO_MINDS, a.mindAmount);
-        break;
-      }
       case 'ComputeDrawn': {
-        const a = decoded.args;
+        const a = parsed.args;
         const t = a.token.toLowerCase();
-        const timestamp = at();
         const receiptHash = a.receiptHash.toLowerCase();
-        repos.facts.insertDraw({ tx_hash: txHash, log_index: log.logIndex, block_number: blockNumber, timestamp, token: t, amount: a.amount.toString(10), receipt_hash: receiptHash });
+        const at = ms();
+        repos.facts.insertDraw({ tx_hash: txHash, log_index: log.logIndex, block_number: blockNumber, timestamp: at, token: t, amount: a.amount.toString(10), receipt_hash: receiptHash });
         repos.minds.addBalance(t, -a.amount);
-        repos.compute.confirmByHash(receiptHash, txHash, timestamp);
-        out.push({ type: 'draw', token: t, amount: a.amount, receiptHash, ...base });
+        // the receipt becomes confirmed together with the vault balance change (SPEC §4.1 settlement)
+        const receipt = repos.ticks.receiptByHash(receiptHash);
+        if (receipt !== undefined) repos.ticks.updateReceipt(receipt.id, 'confirmed', txHash, null, at);
+        out.push({ type: 'compute:drawn', token: t, amount: a.amount, receiptHash, ...base });
         break;
       }
       case 'MemoryAnchored': {
-        const a = decoded.args;
+        const a = parsed.args;
         const t = a.token.toLowerCase();
         const contentHash = a.contentHash.toLowerCase();
-        repos.facts.insertAnchor({ txHash, logIndex: log.logIndex, blockNumber, token: t, seq: Number(a.seq), contentHash, uri: a.uri });
-        repos.memories.confirmBatchByUri(t, a.uri, contentHash, txHash);
-        out.push({ type: 'anchor', token: t, seq: Number(a.seq), contentHash, uri: a.uri, ...base });
+        repos.facts.insertAnchorLog({ txHash, logIndex: log.logIndex, blockNumber, token: t, seq: Number(a.seq), contentHash, uri: a.uri });
+        const anchor = repos.memories.anchorByUri(t, a.uri);
+        if (anchor !== undefined && anchor.content_hash === contentHash) repos.memories.updateAnchor(anchor.id, 'confirmed', txHash, null, Date.now());
+        out.push({ type: 'memory:anchored', token: t, seq: Number(a.seq), contentHash, uri: a.uri, ...base });
         break;
       }
       case 'MindConfigUpdated': {
-        const a = decoded.args;
+        const a = parsed.args;
         const t = a.token.toLowerCase();
         repos.minds.setConfig(t, a.modelId.toLowerCase(), a.personaHash.toLowerCase(), a.metadataURI);
         out.push({ type: 'mind:config', token: t, ...base });
         break;
       }
       case 'MindStatusChanged': {
-        const a = decoded.args;
-        const t = a.token.toLowerCase();
-        repos.minds.setStatus(t, a.status);
-        out.push({ type: 'mind:status', token: t, status: a.status, ...base });
+        const t = parsed.args.token.toLowerCase();
+        repos.minds.setStatus(t, parsed.args.status);
+        out.push({ type: 'mind:status', token: t, status: parsed.args.status, ...base });
         break;
       }
       case 'Harvested': {
-        const a = decoded.args;
+        const a = parsed.args;
         const t = a.token.toLowerCase();
         repos.facts.insertHarvest({ txHash, logIndex: log.logIndex, blockNumber, token: t, ethOut: a.ethOut.toString(10), tokensBurned: a.tokensBurned.toString(10) });
         out.push({ type: 'harvested', token: t, ethOut: a.ethOut, ...base });
         break;
       }
-      case 'GraduatorUpdated': {
-        repos.state.set(STATE_CURRENT_GRADUATOR, decoded.args.graduator.toLowerCase());
-        break;
-      }
       default:
-        // Admin / OpenZeppelin events are recorded in chain_events only.
+        // admin / OpenZeppelin events are recorded in chain_events only
         break;
     }
   }
   return out;
-}
-
-/** Block numbers whose timestamps `applyLogs` will need and the logs do not carry. */
-export function blocksNeedingTimestamps(logs: readonly RawLog[]): bigint[] {
-  const blocks = new Set<bigint>();
-  for (const log of logs) {
-    if (log.blockTimestamp !== undefined) continue;
-    const decoded = decodeLaunchpadLog(log);
-    if (decoded !== undefined && TIMESTAMPED_EVENTS.has(decoded.eventName)) blocks.add(log.blockNumber);
-  }
-  return [...blocks];
 }

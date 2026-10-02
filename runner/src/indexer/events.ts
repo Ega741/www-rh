@@ -1,35 +1,39 @@
 /**
- * In-process events emitted by the indexer **after** each batch commits (R9). `live` is true only
- * for logs at or above the chain head observed at startup; consumers must not trigger on-chain
- * side effects (graduate / harvest / status transactions) for replayed history (`live: false`).
+ * In-process events emitted by the indexer after each range commits (`docs/SPEC.md` §4.1
+ * `indexer/`). They are emitted **only for live logs** (blocks ≥ the head observed at startup);
+ * replayed history never reaches listeners, so it can never trigger graduate / harvest / status /
+ * settlement transactions.
  *
  * @module indexer/events
  */
 import { EventEmitter } from 'node:events';
 import type { TradeRow } from '../db/repos.js';
 
-/** Common fields of every indexed event. */
 interface Base {
+  /** Lowercase token address. */
   token: string;
   blockNumber: number;
   txHash: string;
-  live: boolean;
 }
 
-/** Domain events derived from launchpad logs. */
+/** Domain events derived from live launchpad logs. */
 export type IndexedEvent =
   | (Base & { type: 'mind:created' })
   | (Base & { type: 'mind:config' })
   | (Base & { type: 'mind:status'; status: number })
-  | (Base & { type: 'mind:funded'; amount: bigint })
   | (Base & { type: 'trade'; trade: TradeRow })
+  | (Base & { type: 'fee:accrued'; mindAmount: bigint })
+  | (Base & { type: 'mind:funded'; amount: bigint })
   | (Base & { type: 'curve:complete' })
   | (Base & { type: 'graduated' })
-  | (Base & { type: 'harvested'; ethOut: bigint })
-  | (Base & { type: 'draw'; amount: bigint; receiptHash: string })
-  | (Base & { type: 'anchor'; seq: number; contentHash: string; uri: string });
+  | (Base & { type: 'compute:drawn'; amount: bigint; receiptHash: string })
+  | (Base & { type: 'memory:anchored'; seq: number; contentHash: string; uri: string })
+  | (Base & { type: 'harvested'; ethOut: bigint });
 
-/** Typed wrapper over `EventEmitter` for {@link IndexedEvent}. */
+/** Event type names. */
+export type IndexedEventType = IndexedEvent['type'];
+
+/** Typed wrapper over `EventEmitter`; a throwing listener never affects the others. */
 export class IndexerEvents {
   readonly #emitter = new EventEmitter();
 
@@ -43,7 +47,7 @@ export class IndexerEvents {
     return () => this.#emitter.off('event', listener);
   }
 
-  /** Emits `event` to all listeners; a throwing listener does not affect the others. */
+  /** Emits `event` to all listeners. */
   emit(event: IndexedEvent): void {
     for (const listener of this.#emitter.listeners('event') as ((e: IndexedEvent) => void)[]) {
       try {

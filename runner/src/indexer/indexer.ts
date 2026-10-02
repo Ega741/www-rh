@@ -1,51 +1,67 @@
 /**
- * Polling launchpad indexer (R9): `eth_getLogs` over ranges of at most `batchBlocks` (≤ 2000) up
- * to `head - confirmations`; each range is applied in one transaction together with the new
- * `last_block`, so a crash resumes exactly where it stopped; events are emitted after commit; the
- * first observed head separates replayed history (`live: false`) from live events.
+ * Polling launchpad indexer (`docs/SPEC.md` §4.1 `indexer/`): every 1000 ms, `eth_getLogs` over
+ * ranges of ≤ 2000 blocks from `last_processed_block + 1` up to `head − CONFIRMATIONS`; each range
+ * is applied in ONE transaction together with `last_processed_block` (restart resumes exactly);
+ * events are emitted after commit and only for live logs (blocks ≥ the head seen at startup).
+ * RPC failures are retried with exponential backoff; the head keeps being polled even when no
+ * launchpad address is configured.
  *
  * @module indexer/indexer
  */
 import type { Address } from 'viem';
-import type { IndexerStatus } from '@www-rh/shared';
 import type { Repos } from '../db/repos.js';
 import { errorMessage, type Logger } from '../log.js';
 import { backoffMs, sleep } from '../util.js';
-import { applyLogs, blocksNeedingTimestamps } from './apply.js';
+import { applyLogs, blocksNeedingTimestamps, decodeLaunchpadLogs } from './apply.js';
 import type { IndexerEvents } from './events.js';
 import type { LogSource } from './source.js';
 
+/** Poll interval (SPEC §4.1). */
+export const INDEXER_POLL_MS = 1_000;
+/** Maximum `eth_getLogs` range (SPEC §4.1). */
+export const INDEXER_MAX_RANGE = 2_000n;
+
 /** Options of {@link Indexer}. */
 export interface IndexerOptions {
-  /** Launchpad address, or `null` to keep the indexer disabled. */
+  /** Launchpad address; `null` = only track the head. */
   address: Address | null;
   startBlock: bigint;
   confirmations: number;
-  batchBlocks: number;
-  pollMs: number;
-  /** Max backoff after errors. */
+  pollMs?: number;
   maxBackoffMs?: number;
+}
+
+/** Health snapshot. */
+export interface IndexerStatus {
+  /** True once everything up to the startup head is processed. */
+  live: boolean;
+  lastError: string | null;
+  headBlock: bigint | null;
+  lastIndexedBlock: bigint | null;
+  /** Head observed at startup: logs at or above it are "live". */
+  liveFrom: bigint | null;
 }
 
 /** Result of one {@link Indexer.syncOnce} pass. */
 export interface SyncResult {
   head: bigint;
-  target: bigint;
-  fromBlock: bigint | null;
   toBlock: bigint | null;
   logs: number;
   events: number;
+  /** True when everything up to `head − CONFIRMATIONS` has been processed. */
+  caughtUp: boolean;
 }
 
 /** The launchpad log indexer. */
 export class Indexer {
-  #status: IndexerStatus;
+  #live = false;
   #lastError: string | null = null;
   #head: bigint | null = null;
   #liveFrom: bigint | null = null;
   #stopped = false;
-  #abort = new AbortController();
+  readonly #abort = new AbortController();
   #loop: Promise<void> | null = null;
+  readonly #liveWaiters: (() => void)[] = [];
 
   constructor(
     private readonly repos: Repos,
@@ -53,66 +69,76 @@ export class Indexer {
     private readonly events: IndexerEvents,
     private readonly opts: IndexerOptions,
     private readonly log: Logger,
-  ) {
-    this.#status = opts.address === null ? 'disabled' : 'starting';
+  ) {}
+
+  /** Health snapshot for `/api/health`. */
+  get status(): IndexerStatus {
+    return { live: this.#live, lastError: this.#lastError, headBlock: this.#head, lastIndexedBlock: this.repos.state.lastBlock() ?? null, liveFrom: this.#liveFrom };
   }
 
-  /** Current status for `/api/health`. */
-  get status(): { status: IndexerStatus; lastError: string | null; headBlock: bigint | null; lastIndexedBlock: bigint | null; liveFrom: bigint | null } {
-    return { status: this.#status, lastError: this.#lastError, headBlock: this.#head, lastIndexedBlock: this.repos.state.lastBlock() ?? null, liveFrom: this.#liveFrom };
+  /** Resolves once the indexer has processed up to the startup head. */
+  whenLive(): Promise<void> {
+    if (this.#live) return Promise.resolve();
+    return new Promise((resolve) => this.#liveWaiters.push(resolve));
   }
 
-  /** Whether the indexer has caught up with `head - confirmations` at least once. */
-  get isLive(): boolean {
-    return this.#status === 'live';
+  async #timestamps(blocks: readonly bigint[]): Promise<Map<bigint, bigint>> {
+    const out = new Map<bigint, bigint>();
+    for (const block of blocks) {
+      const cached = this.repos.chain.blockTimestamp(Number(block));
+      if (cached !== undefined) {
+        out.set(block, BigInt(cached));
+        continue;
+      }
+      const ts = await this.source.getBlockTimestamp(block);
+      this.repos.chain.putBlockTimestamp(Number(block), Number(ts));
+      out.set(block, ts);
+    }
+    return out;
   }
 
-  /**
-   * Fetches the head and processes every pending range once.
-   * The first successful call fixes `liveFrom` (= head at startup).
-   */
+  /** Fetches the head and processes every pending range once. */
   async syncOnce(): Promise<SyncResult> {
-    const address = this.opts.address;
-    if (address === null) return { head: 0n, target: 0n, fromBlock: null, toBlock: null, logs: 0, events: 0 };
     const head = await this.source.getBlockNumber();
     this.#head = head;
     this.#liveFrom ??= head;
+    const result: SyncResult = { head, toBlock: null, logs: 0, events: 0, caughtUp: true };
+    const address = this.opts.address;
+    if (address === null) return result;
     const target = head - BigInt(this.opts.confirmations);
     const last = this.repos.state.lastBlock();
     let from = last === undefined ? this.opts.startBlock : last + 1n;
-    const result: SyncResult = { head, target, fromBlock: null, toBlock: null, logs: 0, events: 0 };
-    if (from > target) return result;
-    this.#status = 'syncing';
-    result.fromBlock = from;
-    const step = BigInt(Math.min(2000, Math.max(1, this.opts.batchBlocks)));
     while (from <= target && !this.#stopped) {
-      const to = from + step - 1n < target ? from + step - 1n : target;
-      const logs = await this.source.getLogs(address, from, to);
-      const timestamps = new Map<bigint, bigint>();
-      for (const block of blocksNeedingTimestamps(logs)) timestamps.set(block, await this.source.getBlockTimestamp(block));
-      const liveFrom = this.#liveFrom;
-      const emitted = this.repos.tx(() => {
-        const evs = applyLogs(this.repos, logs, (b) => timestamps.get(b) ?? 0n, liveFrom);
+      const to = from + INDEXER_MAX_RANGE - 1n < target ? from + INDEXER_MAX_RANGE - 1n : target;
+      const decoded = decodeLaunchpadLogs(await this.source.getLogs(address, from, to));
+      const timestamps = await this.#timestamps(blocksNeedingTimestamps(decoded));
+      const applied = this.repos.tx(() => {
+        const evs = applyLogs(this.repos, decoded, (b) => timestamps.get(b) ?? 0n);
         this.repos.state.setLastBlock(to);
         return evs;
       });
-      for (const ev of emitted) this.events.emit(ev);
-      result.logs += logs.length;
-      result.events += emitted.length;
+      const liveFrom = this.#liveFrom;
+      for (const ev of applied) if (BigInt(ev.blockNumber) >= liveFrom) this.events.emit(ev);
+      result.logs += decoded.length;
+      result.events += applied.length;
       result.toBlock = to;
-      if (logs.length > 0) this.log.debug('indexed range', { from, to, logs: logs.length });
       from = to + 1n;
     }
+    result.caughtUp = from > target;
     return result;
   }
 
-  /** Starts the polling loop (retries with exponential backoff on RPC errors). */
+  #markLive(): void {
+    if (this.#live) return;
+    this.#live = true;
+    this.log.info('indexer live', { head: this.#head, lastIndexedBlock: this.repos.state.lastBlock() });
+    for (const resolve of this.#liveWaiters.splice(0)) resolve();
+  }
+
+  /** Starts the polling loop. */
   start(): void {
     if (this.#loop !== null) return;
-    if (this.opts.address === null) {
-      this.log.warn('no launchpad address configured (LAUNCHPAD_ADDRESS / deployments) — indexer disabled');
-      return;
-    }
+    if (this.opts.address === null) this.log.warn('no launchpad address: tracking the chain head only');
     this.#loop = this.#run();
   }
 
@@ -120,18 +146,16 @@ export class Indexer {
     let failures = 0;
     while (!this.#stopped) {
       try {
-        await this.syncOnce();
-        if (this.#status !== 'live') this.log.info('indexer live', { head: this.#head, lastBlock: this.repos.state.lastBlock() });
-        this.#status = 'live';
+        const r = await this.syncOnce();
         this.#lastError = null;
         failures = 0;
-        await sleep(this.opts.pollMs, this.#abort.signal);
+        if (r.caughtUp) this.#markLive();
+        await sleep(this.opts.pollMs ?? INDEXER_POLL_MS, this.#abort.signal);
       } catch (err) {
         if (this.#stopped) break;
-        this.#status = 'error';
         this.#lastError = errorMessage(err);
-        const delay = backoffMs(failures++, 1_000, this.opts.maxBackoffMs ?? 60_000);
-        this.log.warn('indexer error, retrying', { error: this.#lastError, retryInMs: delay });
+        const delay = backoffMs(failures++, 1_000, this.opts.maxBackoffMs ?? 30_000);
+        this.log.warn('indexer RPC error, retrying', { error: this.#lastError, retryInMs: delay });
         await sleep(delay, this.#abort.signal).catch(() => undefined);
       }
     }

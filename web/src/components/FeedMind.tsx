@@ -71,7 +71,7 @@ export function FeedMind({ token, symbol, ethUsd = null, burnUsdPerHour = null, 
         ))}
       </div>
       <div className="flex gap-2">
-        <label className="relative flex-1">
+        <label className="relative min-w-0 flex-1">
           <span className="sr-only">Amount in ETH</span>
           <input
             className={`field pr-11 ${!valid && amount !== '' ? 'field-error' : ''} ${compact ? 'py-1' : ''}`}
@@ -82,8 +82,8 @@ export function FeedMind({ token, symbol, ethUsd = null, burnUsdPerHour = null, 
           />
           <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-[11px] text-mute">ETH</span>
         </label>
-        <ChainGuard action="feed" compact>
-          <button type="button" className={`btn btn-primary ${compact ? 'btn-sm' : ''}`} disabled={!valid || tx.busy} onClick={submit}>
+        <ChainGuard action="feed" inline>
+          <button type="button" className={`btn btn-primary shrink-0 ${compact ? 'btn-sm' : ''}`} disabled={!valid || tx.busy} onClick={submit}>
             {tx.busy ? 'Feeding…' : 'Feed'}
           </button>
         </ChainGuard>

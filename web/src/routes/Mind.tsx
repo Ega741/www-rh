@@ -23,15 +23,15 @@ import { TradePanel } from '../components/TradePanel';
 import { TradesTable, mergeTrades } from '../components/TradesTable';
 import { AddressLink, CopyButton, ExternalLink, MindAvatar, PhaseBadge, StatusBadge } from '../components/common';
 import { modelLabel } from '../components/MindCard';
-import { RUNNER_LABEL } from '../config';
+import { RUNNER_LABEL, TARGET_CHAIN } from '../config';
 import { formatEth, shortAddress, timeAgo } from '../format';
-import { useMindData } from '../hooks/useMindData';
+import { useMindData, type ChainLookup } from '../hooks/useMindData';
 import { useMindStream } from '../hooks/useMindStream';
 import { useNow } from '../hooks/useTick';
 import { tokenUrl } from '../lib/chain';
 import { describeError } from '../lib/errors';
 import type { MindDetail } from '../lib/types';
-import { isNotFound, useCompute, useThoughts, useTrades } from '../queries';
+import { isNotFound, useCompute, useSettledError, useThoughts, useTrades } from '../queries';
 
 /** Mind route. */
 export function Mind() {
@@ -58,6 +58,10 @@ function MindPage({ token }: { token: Address }) {
   const trades = useTrades(token);
   const thoughts = useThoughts(token);
   const compute = useCompute(token);
+  const tradesError = useSettledError(trades);
+  const thoughtsError = useSettledError(thoughts);
+  const computeError = useSettledError(compute);
+  const computeData = compute.data ?? undefined;
   const { address } = useConnection();
   const location = useLocation();
   const seedError = isObjectState(location.state) && typeof location.state['seedError'] === 'string' ? location.state['seedError'] : null;
@@ -67,27 +71,7 @@ function MindPage({ token }: { token: Address }) {
     if (data.loading) {
       return <div className="panel h-96 animate-pulse" aria-busy="true" />;
     }
-    const unavailable = data.apiError instanceof ApiError && data.apiError.unavailable;
-    return (
-      <div className="panel mx-auto max-w-lg p-8 text-center">
-        {unavailable ? (
-          <>
-            <p className="text-fg">Can't load this mind right now.</p>
-            <p className="mt-1 text-dim">
-              {RUNNER_LABEL} is unreachable ({describeError(data.apiError)}) and the coin could not be read from the chain either.
-            </p>
-          </>
-        ) : (
-          <>
-            <p className="text-fg">No mind lives at {shortAddress(token)}.</p>
-            <p className="mt-1 text-dim">This address is not a coin of this launchpad. Check the link, or browse the minds that exist.</p>
-          </>
-        )}
-        <Link to="/" className="btn btn-sm mt-4 hover:no-underline">
-          back to all minds
-        </Link>
-      </div>
-    );
+    return <MindUnavailable token={token} apiError={data.apiError} chain={data.chain} />;
   }
 
   const live: MindDetail = {
@@ -114,15 +98,15 @@ function MindPage({ token }: { token: Address }) {
         data.apiError !== null &&
         data.apiError !== undefined && (
           <p className="rounded border border-amber/40 bg-amber/5 px-3 py-2 text-[12px] text-amber">
-            The runner is not answering ({describeError(data.apiError)}). Curve, balances and trading come straight from the chain; the stream,
-            memories and history return when it does.
+            The runner is not answering ({data.apiError instanceof ApiError ? data.apiError.message : describeError(data.apiError)}). Curve, balances
+            and trading come straight from the chain; the stream, memories and history return when it does.
           </p>
         )
       )}
       <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-[minmax(0,1.6fr)_minmax(300px,1fr)_minmax(300px,1fr)]">
         <div className="min-w-0 space-y-4 lg:col-span-2 xl:col-span-1">
           <StreamPanel mind={live} stream={stream} />
-          <ThoughtsTicker blocks={stream.blocks} history={thoughts.data} saved={stream.savedThoughts} historyError={thoughts.isError} />
+          <ThoughtsTicker blocks={stream.blocks} history={thoughts.data} saved={stream.savedThoughts} historyError={thoughtsError !== null} />
           <ActionLog actions={stream.actions} />
         </div>
         <div className="min-w-0 space-y-4">
@@ -130,13 +114,44 @@ function MindPage({ token }: { token: Address }) {
         </div>
         <div className="min-w-0 space-y-4">
           <MindInfoPanel mind={live} />
-          <ComputeMeter mind={live} compute={compute.data} computeError={compute.isError} budget={stream.budget} onFunded={data.refetchChain} />
+          <ComputeMeter mind={live} compute={computeData} computeError={computeError !== null} budget={stream.budget} onFunded={data.refetchChain} />
           {isCreator && <CreatorTools mind={live} currentModel={currentModel} onChanged={data.refetchChain} />}
           <MemoryList token={token} live={stream.memories} />
-          <ReceiptsList compute={compute.data} error={compute.isError} />
+          <ReceiptsList compute={computeData} error={computeError !== null} />
         </div>
       </div>
-      <TradesTable trades={mergedTrades} symbol={live.symbol} loading={trades.isPending} error={trades.isError} />
+      <TradesTable trades={mergedTrades} symbol={live.symbol} loading={trades.isPending && tradesError === null} error={tradesError !== null} indexing={isNotFound(data.apiError)} />
+    </div>
+  );
+}
+
+function MindUnavailable({ token, apiError, chain }: { token: Address; apiError: unknown; chain: ChainLookup }) {
+  const unavailable = apiError instanceof ApiError && apiError.unavailable;
+  let title: string;
+  let body: string;
+  if (chain === 'not-a-mind') {
+    title = `No mind lives at ${shortAddress(token)}.`;
+    body = 'This address is not a coin of this launchpad. Check the link, or browse the minds that exist.';
+  } else if (chain === 'pending') {
+    title = 'Looking for this coin…';
+    body = unavailable ? `${RUNNER_LABEL} is unreachable; checking ${TARGET_CHAIN.name} directly.` : `The runner has not indexed ${shortAddress(token)}; checking ${TARGET_CHAIN.name} directly.`;
+  } else if (unavailable) {
+    title = "Can't load this mind right now.";
+    body = `${RUNNER_LABEL} is unreachable (${describeError(apiError)}) and the coin could not be read from ${TARGET_CHAIN.name} either.`;
+  } else {
+    title = `indexing… ${shortAddress(token)} is not known to the runner yet.`;
+    body =
+      chain === 'disabled'
+        ? 'No launchpad is configured, so the chain cannot be checked. If the coin was just created it appears within a few blocks.'
+        : `${TARGET_CHAIN.name} could not be reached to check it. If the coin was just created it appears within a few blocks; this page keeps checking.`;
+  }
+  return (
+    <div className="panel mx-auto max-w-lg p-8 text-center">
+      <p className="text-fg">{title}</p>
+      <p className="mt-1 text-dim">{body}</p>
+      <Link to="/" className="btn btn-sm mt-4 hover:no-underline">
+        back to all minds
+      </Link>
     </div>
   );
 }
