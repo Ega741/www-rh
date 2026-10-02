@@ -35,7 +35,7 @@ API-база — `VITE_RUNNER_URL` (пусто = тот же origin), WebSocket 
 pnpm --filter @www-rh/web build      # tsc --noEmit + vite build → web/dist
 pnpm --filter @www-rh/web preview    # отдать dist на :4173
 pnpm --filter @www-rh/web typecheck
-pnpm --filter @www-rh/web test       # vitest: форматирование, котировки, WS-парсер, нормализация, хэши
+pnpm --filter @www-rh/web test       # vitest: форматирование, котировки, WS-парсер, нормализация, хэши, окно выпуска, ошибки
 ```
 
 ## Переменные окружения
@@ -79,6 +79,18 @@ pnpm --filter @www-rh/web test       # vitest: форматирование, к�
 
   Пока раннер отвечает 404 по новой монете, страница показывает «indexing…», опрашивает его раз в
   2 с и уже работает по данным из сети (`getMind`, `getCurve`, `mindBalance`).
+
+  **Окно выпуска (SPEC §2.3, правило 3).** В фазе `complete` страница читает `completedAt(token)` и
+  `graduationGrace()` (по умолчанию 86400 с) и показывает «graduation window: ends in HH:MM:SS», а
+  когда `now >= completedAt + grace` — «sells reopened since …»: включаются форма продажи и чтения
+  `quoteSell` (кнопка активна, когда котировка из сети подтвердит, что и блок перешёл границу) с
+  пометкой, что первая продажа возвращает кривую в `bonding` (`CurveReopened`); покупка в `complete`
+  остаётся выключенной, Graduate — доступной. Откат `graduate` с `PoolPriceSkewed` (декодируется по
+  ABI из shared) — не ошибка, а уведомление «pool price is skewed, graduation will be retried; you
+  can try again later». Смена фазы по WS сразу перечитывает кривую; при переходе `complete` →
+  `bonding` buy/sell работают как обычно, и, если `completedAt` был ненулевым, показывается строка
+  «curve reopened after the graduation window expired». Математика окна — чистые функции
+  `lib/grace.ts` (с тестами).
 
 ## Устройство
 

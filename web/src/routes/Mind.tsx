@@ -6,7 +6,7 @@
  * @module routes/Mind
  */
 import { modelById } from '@www-rh/shared';
-import { useMemo } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { Link, useLocation, useParams } from 'react-router';
 import { isAddress, type Address } from 'viem';
 import { useConnection } from 'wagmi';
@@ -66,6 +66,13 @@ function MindPage({ token }: { token: Address }) {
   const location = useLocation();
   const seedError = isObjectState(location.state) && typeof location.state['seedError'] === 'string' ? location.state['seedError'] : null;
   const mergedTrades = useMemo(() => mergeTrades(stream.trades, trades.data ?? []), [stream.trades, trades.data]);
+  // A WS phase change (CurveCompleted, CurveReopened, Graduated) re-reads the curve right away
+  // instead of waiting for the 5 s poll; on-chain state stays the source of truth for the phase.
+  const refetchChain = useRef(data.refetchChain);
+  refetchChain.current = data.refetchChain;
+  useEffect(() => {
+    if (stream.phase !== null) refetchChain.current();
+  }, [stream.phase]);
 
   if (data.mind === null) {
     if (data.loading) {

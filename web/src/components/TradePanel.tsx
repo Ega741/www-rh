@@ -4,18 +4,26 @@
  * approve-then-sell with an allowance check, the Graduate button once the curve is complete,
  * and Blockscout token / pool links after graduation (W4).
  *
+ * Graduation grace (SPEC §2.3 rule 3): while `Complete` the graduation panel counts down to
+ * `completedAt + graduationGrace`; once it passes, the sell form (and `quoteSell`) is enabled
+ * with a note that the first sell reopens the curve, while buys stay disabled until `Bonding`.
+ * A `PoolPriceSkewed` revert of `graduate` is a non-fatal "retry later" notice.
+ *
  * @module components/TradePanel
  */
 import { completionReserves, mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
 import { useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { erc20Abi, formatUnits, zeroAddress, type Address } from 'viem';
 import { useBalance, useConnection, useReadContract, useWriteContract } from 'wagmi';
 import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
-import { formatBps, formatEth, formatPrice, formatTokens, parseAmount, progressPercent, shortAddress } from '../format';
+import { formatBps, formatDuration, formatEth, formatPrice, formatTokens, parseAmount, progressPercent, shortAddress, timeAgo } from '../format';
 import { useDebounced } from '../hooks/useDebounced';
+import { useGraduationWindow, type GraduationWindow } from '../hooks/useGraduationWindow';
 import { useTxFlow } from '../hooks/useTxFlow';
 import { addressUrl, tokenUrl } from '../lib/chain';
+import { isRetryLaterRevert, revertErrorName, revertMessage } from '../lib/errors';
+import { formatCountdown } from '../lib/grace';
 import { DEFAULT_DEADLINE_MINUTES, deadlineFromNow, estimateBuy, estimateSell, minOutWithSlippage, priceImpactBps, slippagePercentToBps } from '../lib/quote';
 import type { MindDetail } from '../lib/types';
 import { queryKeys } from '../queries';
@@ -34,7 +42,7 @@ export interface TradePanelProps {
 
 /** See module docs. */
 export function TradePanel({ mind, onTx }: TradePanelProps) {
-  const [side, setSide] = useState<'buy' | 'sell'>('buy');
+  const [sideChoice, setSide] = useState<'buy' | 'sell'>('buy');
   const [amount, setAmount] = useState('');
   const [slippage, setSlippage] = useState('1');
   const [deadline, setDeadline] = useState(String(DEFAULT_DEADLINE_MINUTES));
@@ -44,6 +52,16 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
   const launchpad = LAUNCHPAD_ADDRESS ?? zeroAddress;
   const hasLaunchpad = LAUNCHPAD_ADDRESS !== null;
   const bonding = mind.phase === 'bonding';
+  const grad = useGraduationWindow(mind.token, mind.phase);
+  // Complete past the grace: sells only (the first one reopens the curve); buys need Bonding.
+  const sellOnly = mind.phase === 'complete' && grad.sellsOpen;
+  const tradeOpen = bonding || sellOnly;
+  const side: 'buy' | 'sell' = sellOnly ? 'sell' : sideChoice;
+  useEffect(() => {
+    if (!sellOnly || sideChoice === 'sell') return;
+    setSide('sell');
+    setAmount('');
+  }, [sellOnly, sideChoice]);
 
   const debounced = useDebounced(amount, 250);
   const parsed = parseAmount(debounced);
@@ -72,8 +90,8 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
     chainId: TARGET_CHAIN.id,
     query: { enabled: address !== undefined && hasLaunchpad && side === 'sell' },
   });
-  const quoteEnabled = hasLaunchpad && bonding && parsed !== null && parsed > 0n;
-  const buyQuote = useReadContract({ ...lp, functionName: 'quoteBuy', args: [mind.token, parsed ?? 0n], query: { enabled: quoteEnabled && side === 'buy', refetchInterval: 2_000 } });
+  const quoteEnabled = hasLaunchpad && tradeOpen && parsed !== null && parsed > 0n;
+  const buyQuote = useReadContract({ ...lp, functionName: 'quoteBuy', args: [mind.token, parsed ?? 0n], query: { enabled: quoteEnabled && bonding && side === 'buy', refetchInterval: 2_000 } });
   const sellQuote = useReadContract({ ...lp, functionName: 'quoteSell', args: [mind.token, parsed ?? 0n], query: { enabled: quoteEnabled && side === 'sell', refetchInterval: 2_000 } });
 
   const tradeFeeBps = feeParams.data !== undefined ? BigInt(feeParams.data.tradeFeeBps) : 100n;
@@ -84,7 +102,7 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
   let feeAmount: bigint | null = null;
   let ethUsed: bigint | null = null;
   let source: 'chain' | 'estimate' | null = null;
-  if (parsed !== null && parsed > 0n && bonding) {
+  if (parsed !== null && parsed > 0n && tradeOpen) {
     if (side === 'buy') {
       if (buyQuote.data !== undefined) {
         [outAmount, ethUsed, feeAmount] = buyQuote.data;
@@ -124,6 +142,8 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
       : tokenBalance.data !== undefined && parsed > tokenBalance.data);
   const needsApproval = side === 'sell' && parsed !== null && parsed > 0n && allowance.data !== undefined && allowance.data < parsed;
   const sellExceedsCurve = side === 'sell' && parsed !== null && parsed > mind.tokensSold;
+  // The wall clock passed the window but the latest block has not: quoteSell still says WrongPhase.
+  const waitingForBlock = sellOnly && sellQuote.error !== null && revertErrorName(sellQuote.error) === 'WrongPhase';
 
   const write = useWriteContract();
   const afterTx = () => {
@@ -142,19 +162,25 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
       afterTx();
     },
   });
-  // A WrongPhase revert on graduate means someone else graduated first: refetch, no error (SPEC §7).
+  // A WrongPhase revert on graduate means someone else graduated first (or a post-grace sell
+  // reopened the curve): refetch, no error (SPEC §7). PoolPriceSkewed means "retry later" (§2.3).
   const phaseTx = useTxFlow({
     onConfirmed: afterTx,
     onRevert: (name) => {
-      if (name !== 'WrongPhase' || mind.phase !== 'complete') return false;
-      afterTx();
-      return true;
+      if (mind.phase !== 'complete') return false;
+      if (name === 'WrongPhase') {
+        afterTx();
+        return true;
+      }
+      return isRetryLaterRevert(name) ? revertMessage(name) : false;
     },
   });
   const mockGraduator = mind.phase === 'graduated' && (mind.positionId === null || mind.positionId === 0n);
 
+  // While Complete, a sell also waits for the chain's quoteSell to agree that the window passed.
+  const phaseAllows = side === 'buy' ? bonding : bonding || (sellOnly && source === 'chain');
   const canTrade =
-    hasLaunchpad && bonding && !stale && parsed !== null && parsed > 0n && minOut !== null && deadlineValid && !insufficient && !sellExceedsCurve && !tradeTx.busy;
+    hasLaunchpad && phaseAllows && !stale && parsed !== null && parsed > 0n && minOut !== null && deadlineValid && !insufficient && !sellExceedsCurve && !tradeTx.busy;
 
   function trade() {
     if (!canTrade || parsed === null || minOut === null) return;
@@ -182,6 +208,9 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
 
   return (
     <div className="space-y-4">
+      {grad.reopened && (
+        <p className="rounded border border-info/40 bg-info/5 px-3 py-2 text-[12px] text-info">curve reopened after the graduation window expired</p>
+      )}
       <Panel title="curve">
         <dl className="px-3 py-2 text-[12px]">
           <div className="kv">
@@ -209,7 +238,9 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
             {mind.phase === 'bonding'
               ? `${progressPercent(mind.tokensSold).toFixed(2)}% to graduation`
               : mind.phase === 'complete'
-                ? 'Curve sold out: ready to graduate'
+                ? sellOnly
+                  ? 'Curve sold out: graduation window over, sells are open'
+                  : 'Curve sold out: ready to graduate'
                 : 'Graduated: liquidity lives on the DEX'}
           </p>
         </div>
@@ -222,6 +253,7 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
               All 800M curve tokens are sold. Anyone can graduate the coin: the reserve (minus the graduation fee, part of which goes to the mind's
               vault) and the 200M LP tokens seed a full-range pool that stays locked forever.
             </p>
+            <GraceWindowLine grad={grad} show={hasLaunchpad} />
             <ChainGuard action="graduate">
               <button
                 type="button"
@@ -279,7 +311,7 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
         </Panel>
       )}
 
-      {bonding && (
+      {tradeOpen && (
         <Panel
           title="trade"
           right={
@@ -296,13 +328,15 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
                   type="button"
                   role="tab"
                   aria-selected={side === s}
+                  disabled={s === 'buy' && sellOnly}
+                  title={s === 'buy' && sellOnly ? 'Buying stays disabled until the curve is back in bonding' : undefined}
                   onClick={() => {
                     setSide(s);
                     setAmount('');
                     tradeTx.reset();
                     approveTx.reset();
                   }}
-                  className={`rounded py-1.5 ${side === s ? (s === 'buy' ? 'bg-acid/15 text-acid' : 'bg-danger/15 text-danger') : 'text-dim'}`}
+                  className={`rounded py-1.5 disabled:cursor-not-allowed disabled:opacity-40 ${side === s ? (s === 'buy' ? 'bg-acid/15 text-acid' : 'bg-danger/15 text-danger') : 'text-dim'}`}
                 >
                   {s}
                 </button>
@@ -321,6 +355,14 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
                 </label>
               </div>
             )}
+
+            {sellOnly && (
+              <p className="text-[12px] text-amber">
+                The graduation window expired, so selling on the curve is open again. The first sell reopens the curve (back to bonding); buying
+                stays disabled until then.
+              </p>
+            )}
+            {waitingForBlock && <p className="text-[12px] text-mute">The chain has not reached the end of the window yet; waiting for the next block…</p>}
 
             {paused.data === true && side === 'buy' && (
               <p className="text-[12px] text-amber">The launchpad is paused: buying is disabled, selling still works.</p>
@@ -438,3 +480,29 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
   );
 }
 
+
+/** Countdown to the end of the graduation window, or since when sells are open again. */
+function GraceWindowLine({ grad, show }: { grad: GraduationWindow; show: boolean }) {
+  if (!show) return null;
+  const { window: w } = grad;
+  const grace = grad.graceSeconds !== null ? formatDuration(grad.graceSeconds * 1000) : 'the grace period';
+  return (
+    <div className="space-y-0.5 rounded border border-line px-2 py-1.5 text-[12px]">
+      {w.state === 'running' && (
+        <p className="text-fg">
+          graduation window: ends in <span className="tabular-nums">{formatCountdown(w.remainingSeconds)}</span>
+        </p>
+      )}
+      {w.state === 'expired' && (
+        <p className="text-amber">
+          sells reopened since {new Date(w.endsAt * 1000).toLocaleString()} ({timeAgo(w.endsAt * 1000, grad.now)})
+        </p>
+      )}
+      {w.state === 'unknown' && <p className="text-mute">graduation window: reading…</p>}
+      <p className="text-[11px] text-mute">
+        If nobody graduates within {grace} of the sell-out, holders can sell on the curve again and the first sell reopens it. Graduating stays
+        possible for as long as the curve is complete.
+      </p>
+    </div>
+  );
+}
