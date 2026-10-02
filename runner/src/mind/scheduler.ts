@@ -19,7 +19,6 @@ import { microToUsd } from '../economics/budget.js';
 import type { MindEconomics } from '../economics/service.js';
 import type { IndexedEvent } from '../indexer/events.js';
 import { errorMessage, type Logger } from '../log.js';
-import type { StreamBus } from '../stream/bus.js';
 import type { TickInput, TickResult } from './tick.js';
 
 /** Consecutive failures before cooling. */
@@ -30,6 +29,8 @@ export const COOLING_MS = 3_600_000;
 export const STATUS_TX_SPACING_MS = 60_000;
 /** Slot-filling period. */
 export const SCHEDULER_POLL_MS = 1_000;
+/** Retry period for graduations that failed (e.g. `PoolPriceSkewed`) — every `Complete` mind is retried. */
+export const GRADUATE_RETRY_MS = 10 * 60_000;
 
 /** Dependencies of {@link Scheduler}. */
 export interface SchedulerDeps {
@@ -39,7 +40,8 @@ export interface SchedulerDeps {
   queue: Pick<TxQueue, 'enqueue' | 'dryRun'>;
   reader: Pick<LaunchpadReader, 'getCurve'> | null;
   runTick(input: TickInput): Promise<TickResult>;
-  bus: StreamBus;
+  /** Publishes the WS `budget` message (after each tick). */
+  publishBudget(token: string, econ: MindEconomics): void;
   log: Logger;
   config: { maxConcurrentMinds: number; harvestIntervalMs: number };
   now?: () => number;
@@ -52,6 +54,7 @@ export class Scheduler {
   readonly #shutdown = new AbortController();
   #pollTimer: NodeJS.Timeout | null = null;
   #harvestTimer: NodeJS.Timeout | null = null;
+  #graduateTimer: NodeJS.Timeout | null = null;
   #polling = false;
   #stopped = false;
 
@@ -78,6 +81,8 @@ export class Scheduler {
     this.#pollTimer.unref();
     this.#harvestTimer = setInterval(() => void this.harvestSweep(), this.deps.config.harvestIntervalMs);
     this.#harvestTimer.unref();
+    this.#graduateTimer = setInterval(() => void this.graduateSweep(), GRADUATE_RETRY_MS);
+    this.#graduateTimer.unref();
     void this.graduateSweep();
     void this.poll();
   }
@@ -162,14 +167,7 @@ export class Scheduler {
     if (mind === undefined) return;
     try {
       const econ = await this.deps.economics.snapshot(token);
-      this.deps.bus.publish(token, {
-        type: 'budget',
-        balanceWei: econ.budget.balanceWei.toString(10),
-        balanceUsd: microToUsd(econ.budget.balanceUsdMicro),
-        burnUsdPerHour: Math.round(econ.burnUsdPerHour * 1e6) / 1e6,
-        runwayHours: econ.runwayHours,
-        at: new Date(this.#now()).toISOString(),
-      });
+      if (opts.afterTick === true) this.deps.publishBudget(token, econ);
       if (mind.status === 2) {
         await this.deps.settler.settle(token, { force: true });
         return;
@@ -225,13 +223,17 @@ export class Scheduler {
         const curve = await this.deps.reader.getCurve(token as Address);
         if (curve.phase !== 1) return;
       }
-      await this.deps.queue.enqueue({ functionName: 'graduate', args: [token as Address] }, `graduate ${token}`);
+      const outcome = await this.deps.queue.enqueue({ functionName: 'graduate', args: [token as Address] }, `graduate ${token}`);
+      if (outcome.kind === 'failed' || outcome.kind === 'reverted') {
+        // e.g. PoolPriceSkewed: expected to succeed on a later sweep
+        this.deps.log.info('graduation not done; will retry on the next sweep', { token, outcome: outcome.kind === 'failed' ? outcome.error : 'reverted' });
+      }
     } catch (err) {
       this.deps.log.warn('graduate failed', { token, error: errorMessage(err) });
     }
   }
 
-  /** Once when the indexer becomes live: graduate every mind already `Complete`. */
+  /** When the indexer becomes live and every 10 min: graduate every mind still `Complete`. */
   async graduateSweep(): Promise<void> {
     for (const m of this.deps.repos.minds.all()) if (m.phase === 1) await this.#graduate(m.token);
   }
@@ -254,8 +256,10 @@ export class Scheduler {
     this.#stopped = true;
     if (this.#pollTimer !== null) clearInterval(this.#pollTimer);
     if (this.#harvestTimer !== null) clearInterval(this.#harvestTimer);
+    if (this.#graduateTimer !== null) clearInterval(this.#graduateTimer);
     this.#pollTimer = null;
     this.#harvestTimer = null;
+    this.#graduateTimer = null;
     this.#shutdown.abort(new Error('shutdown'));
     await Promise.allSettled([...this.#inFlight.values()]);
   }
