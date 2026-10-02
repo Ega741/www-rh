@@ -1575,3 +1575,61 @@ with `{..., registry, venue: "pons"}`; `Deploy.s.sol` writes `venue: "curve"`.
 ### 9.6 Docs and ops
 
 README/DEPLOY describe Pons mode as the mainnet path: deploy `PonsMindRegistry` (`DeployPons.s.sol`), set the operator, run the runner with `VENUE=pons`; note that the registry must pass `factory.canLaunch` (public launches enabled, or Pons whitelists the registry), that creator fees reach the escrow only on sweeps (Pons operator, or our registry/account where permitted), and that Pons' own contracts are outside our audit.
+
+### 9.7 Adoption v2 and lifecycle hardening (normative; supersedes the adoption parts of §9.2)
+
+Audit findings on the first adoption design (a single deterministic account per token whose pending
+preparation could capture a later recipient's hand-off; no re-adoption after `leave`; `leave`
+diverting unswept fees; `leave` to the registry) are resolved by binding every preparation to its
+preparer and registering the mind only at activation:
+
+- `prepareAdoption(address token, bytes32 modelId, bytes32 personaHash, string metadataURI) returns (address account)`:
+  anyone may prepare for a native-quote Pons launch (`NotPonsLaunch` otherwise; launches with
+  `buybackEnabled == true` are rejected with `BuybackEnabledLaunch()`). The account is a clone with salt
+  `keccak256(abi.encode(token, msg.sender))` (deployed once per (token, preparer); a repeat call
+  updates the pending config and reuses the account). Nothing is registered in `_minds` yet.
+  Stored as `pendingAdoptions[token][preparer] = { account, modelId, personaHash, metadataURI }`.
+  Emits `AdoptionPrepared(token, account, preparer)`.
+- `predictAdoptionAccount(address token, address preparer) view returns (address)`;
+  `pendingAdoption(address token, address preparer) view returns (address account, bytes32 modelId, bytes32 personaHash, string metadataURI)`.
+- `activateAdoption(address token, address preparer)`: anyone; requires
+  `factory.getLaunchedToken(token).creatorFeeRecipient == pendingAdoptions[token][preparer].account`.
+  If the token is not a mind yet → register it (`MindInfo{creator: preparer, …, status: Alive}`,
+  `PonsMind{curve, account, launchConfigId: 0, launchedHere: false, adopted: true}`) and emit
+  `MindCreated(token, preparer, name, symbol, metadataURI, modelId, personaHash)` (name/symbol read
+  from the ERC-20) followed by `MindAdopted(token, account, preparer)`. If the token is already a mind
+  (launched here, or adopted earlier) whose current account is no longer the recipient (the previous
+  creator left, or the recipient was moved by Pons), this is a **takeover**: creator, modelId,
+  personaHash, metadataURI and account are replaced (old `tokenOf` mapping cleared), `adopted = true`,
+  `left = false`, status Alive, emit `MindConfigUpdated` + `MindAdopted`. If the current account is
+  still the recipient → `AlreadyAdopted()`. The pending record is deleted on activation.
+- `leave(address token, address newRecipient)`: creator only; `newRecipient` must not be zero, the
+  registry, or any mind account (`InvalidRecipient()`); first runs the same best-effort sweeps and the
+  claim as `harvest` (so fees earned so far reach the vault and `mindFeeBps` is not bypassed), then
+  `account.transferFeeRecipient(factory, token, newRecipient)`, sets `left[token] = true` and status
+  Dormant; emits `MindLeft`. While `left[token]` is true, `setCreatorPaused(false)` leaves the status
+  Dormant (not Alive) and the operator's `setMindStatus(Alive)` reverts `InvalidStatus()`; a later
+  takeover via `activateAdoption` clears the flag. `hasLeft(address token) view returns (bool)`.
+- `recoverAccountTokens(address token, address erc20)`: creator only; moves the full ERC-20 balance
+  of the mind's account (e.g. memecoin paid by Pons rescues) to the creator via
+  `MindAccount.sweepTokens(erc20, to) onlyRegistry`. ETH never leaves through this path.
+- Pool id: `derivedPoolId(address token) view returns (bytes32)` =
+  `keccak256(abi.encode(PoolKey{currency0: address(0), currency1: token, fee: lt.poolFee, tickSpacing: lt.tickSpacing, hooks: memeHook}))`
+  with `lt = factory.getLaunchedToken(token)` (native quote sorts first). `harvest` uses
+  `poolIdOf(token)` when set, else `derivedPoolId(token)`; `setPoolId` stays as an operator override.
+- `launchMind`: `msg.value >= launchFee + quoteIn + creationFee` (else `WrongValue()`); any surplus is
+  refunded to `msg.sender` in the same transaction (protects against a launch-fee change between
+  quote and inclusion).
+- `claimable(token)` returns `feeEscrow.balanceOf(account) + account.balance`.
+- Runner: a mind row is created on `MindCreated` (also emitted by activation) and updated on
+  `MindAdopted` (creator/account), `MindLeft` (status, `left`), `MindConfigUpdated`; `AdoptionPrepared`
+  is informational (served at `GET /api/minds/:token/adoptions` → `[{ preparer, account, modelId, personaHash, metadataURI }]`
+  for pending preparations). `MindDetail.pons` gains `left: boolean`.
+- Web adopt flow: paste token → `prepareAdoption` (own account) → `transferCreatorFeeRecipient(token, account)`
+  (shows the predicted account and the preparer) → `activateAdoption(token, preparer)`; the mind page shows
+  "left" state and the takeover path; `leave` warns that fees earned so far are harvested first.
+
+New/changed ABI vs §9.2: `activateAdoption(address,address)`, `predictAdoptionAccount(address,address)`,
+`pendingAdoption(address,address)`, `hasLeft(address)`, `derivedPoolId(address)`, `recoverAccountTokens(address,address)`,
+`MindAdopted(address indexed token, address indexed account, address indexed creator)`, errors `BuybackEnabledLaunch()`,
+`InvalidRecipient()`; `MindAccount.sweepTokens(address erc20, address to)`.
