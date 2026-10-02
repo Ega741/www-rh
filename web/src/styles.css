@@ -1,0 +1,135 @@
+@import "tailwindcss";
+
+/*
+ * www/rh — dark, terminal-ish theme. Tokens are exposed as Tailwind colors
+ * (bg-bg, bg-panel, border-line, text-fg, text-dim, text-acid, ...).
+ */
+@theme {
+  --color-bg: #07090b;
+  --color-panel: #0c1013;
+  --color-panel-2: #11171b;
+  --color-line: #1c252c;
+  --color-line-2: #26323a;
+  --color-fg: #d6e0e6;
+  --color-dim: #8494a0;
+  --color-mute: #56646e;
+  --color-acid: #34f58a;
+  --color-acid-dim: #1c7a49;
+  --color-amber: #f5b934;
+  --color-danger: #ff5c6c;
+  --color-info: #5cc8ff;
+  --color-violet: #b18cff;
+
+  --font-mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  --animate-pulse-dot: pulse-dot 1.6s ease-in-out infinite;
+  --animate-blink: blink 1s steps(1) infinite;
+
+  @keyframes pulse-dot {
+    0%, 100% { box-shadow: 0 0 0 0 rgb(52 245 138 / 0.55); opacity: 1; }
+    50% { box-shadow: 0 0 0 5px rgb(52 245 138 / 0); opacity: 0.75; }
+  }
+  @keyframes blink {
+    0%, 49% { opacity: 1; }
+    50%, 100% { opacity: 0; }
+  }
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    background: var(--color-bg);
+  }
+  body {
+    @apply bg-bg text-fg font-mono antialiased;
+    font-size: 13px;
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+  ::selection {
+    background: rgb(52 245 138 / 0.25);
+  }
+  a {
+    @apply text-info;
+  }
+  a:hover {
+    @apply underline;
+  }
+  input, textarea, select, button {
+    font: inherit;
+  }
+  input[type="number"]::-webkit-inner-spin-button,
+  input[type="number"]::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  :focus-visible {
+    outline: 1px solid var(--color-acid);
+    outline-offset: 1px;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-md border border-line bg-panel;
+  }
+  .panel-head {
+    @apply flex items-center justify-between gap-2 border-b border-line px-3 py-2 text-[11px] uppercase tracking-[0.14em] text-dim;
+  }
+  .field {
+    @apply w-full rounded border border-line-2 bg-bg px-2.5 py-2 text-fg placeholder:text-mute outline-none transition-colors;
+  }
+  .field:focus {
+    @apply border-acid-dim;
+  }
+  .field-error {
+    @apply border-danger/70;
+  }
+  .label {
+    @apply mb-1 block text-[11px] uppercase tracking-[0.12em] text-dim;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded border border-line-2 bg-panel-2 px-3 py-2 text-fg transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn:hover:not(:disabled) {
+    @apply border-mute;
+  }
+  .btn-primary {
+    @apply border-acid/60 bg-acid/10 text-acid;
+  }
+  .btn-primary:hover:not(:disabled) {
+    @apply border-acid bg-acid/20;
+  }
+  .btn-danger {
+    @apply border-danger/60 bg-danger/10 text-danger;
+  }
+  .btn-sm {
+    @apply px-2 py-1 text-[12px];
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded border border-line-2 px-1.5 py-0.5 text-[11px] text-dim;
+  }
+  .tab {
+    @apply rounded px-2.5 py-1 text-dim transition-colors;
+  }
+  .tab[aria-selected="true"] {
+    @apply bg-panel-2 text-acid;
+  }
+  .kv {
+    @apply flex items-baseline justify-between gap-3 py-1;
+  }
+  .kv > dt {
+    @apply text-dim;
+  }
+  .kv > dd {
+    @apply text-right tabular-nums;
+  }
+  .scanlines {
+    background-image: repeating-linear-gradient(to bottom, rgb(255 255 255 / 0.025) 0px, rgb(255 255 255 / 0.025) 1px, transparent 1px, transparent 3px);
+  }
+  .scroll-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-2) transparent;
+  }
+}

@@ -11,6 +11,9 @@ pragma solidity ^0.8.24;
 ///      for {graduate}, `balanceAfter == balanceBefore + ethOut` for {harvest}) and credits the returned
 ///      ETH to the coin's mind vault itself, so a graduator must send exactly the amount it reports.
 interface IGraduator {
+    /// @notice The launchpad allowed to call {graduate} / {harvest}; the only recipient of returned ETH.
+    function launchpad() external view returns (address);
+
     /// @notice Deploys liquidity for `token`. The caller (launchpad) has already transferred `tokenAmount`
     ///         of `token` to this contract and sends the ETH side as `msg.value`.
     /// @dev Any ETH not used for liquidity must be sent back to the launchpad (plain call) before returning

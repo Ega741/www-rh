@@ -9,6 +9,7 @@
  * @module lib/types
  */
 import type { Address, Hex } from 'viem';
+import type { JsonObject } from './json';
 
 /** Mind status names (R11 / D4). `paused` is set by the creator only. */
 export type MindStatusName = 'alive' | 'dormant' | 'paused';
@@ -90,6 +91,8 @@ export interface Memory {
   createdAt: number;
   contentHash: Hex | null;
   anchorTx: Hex | null;
+  /** `runner://memories/<token>/<fromSeq>-<toSeq>` of the anchored batch, when known. */
+  anchorUri: string | null;
 }
 
 /** Persisted thought (R7): `aloud` from `think_aloud`, `summary` from the tick's final text. */
@@ -114,31 +117,6 @@ export interface LedgerEntry {
   createdAt: number | null;
 }
 
-/** One tick inside a draw receipt (R2). */
-export interface ReceiptTick {
-  tickId: number;
-  model: string;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-  costUsdMicro: number;
-}
-
-/**
- * The canonical draw receipt object hashed into `receiptHash` (R2):
- * `{ token, fromTickId, toTickId, ticks, ethUsdPriceMicro, amountWei }`.
- * Kept as plain JSON values so it can be re-hashed byte-for-byte.
- */
-export interface DrawReceiptObject {
-  token: string;
-  fromTickId: number;
-  toTickId: number;
-  ticks: ReceiptTick[];
-  ethUsdPriceMicro: number | string;
-  amountWei: string;
-}
-
 /** A compute draw receipt as shown in the UI (W6). */
 export interface ComputeReceipt {
   receiptHash: Hex;
@@ -149,8 +127,11 @@ export interface ComputeReceipt {
   tickCount: number | null;
   costUsd: number | null;
   createdAt: number | null;
-  /** The canonical object when the API served all of its fields (enables local re-hash). */
-  object: DrawReceiptObject | null;
+  /**
+   * The canonical receipt object `{ token, fromTickId, toTickId, ticks, ethUsdPriceMicro, amountWei }`
+   * exactly as served (R2), when all fields are present; enables re-hashing in the browser.
+   */
+  object: JsonObject | null;
 }
 
 /** `GET /api/minds/:token/compute`. */

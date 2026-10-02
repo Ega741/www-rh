@@ -136,9 +136,8 @@ const launchpadEvents = [
 ] as const;
 
 /**
- * `MindLaunchpad` errors fixed by SPEC §2.3 / D1–D10 plus OpenZeppelin errors the contract can
- * revert with. The artifact may declare additional implementation-specific errors (input
- * validation, library errors such as SafeCast); those are tolerated by the equivalence test.
+ * `MindLaunchpad` errors: SPEC §2.3 / D1–D10, input validation (D10), the graduator balance check
+ * (D1), and the OpenZeppelin / library errors the contract can revert with.
  */
 const launchpadErrors = [
   'error NotAMind()',
@@ -157,12 +156,22 @@ const launchpadErrors = [
   'error EthTransferFailed()',
   'error DirectEthNotAccepted()',
   'error GraduatorNotSet()',
+  // balance after a graduator call != balBefore - ethSent + ethReturned (D1)
+  'error BalanceMismatch()',
+  // createMind / setMindConfig input validation (D10)
+  'error InvalidName()',
+  'error InvalidSymbol()',
+  'error InvalidMetadataURI()',
+  'error InvalidModelId()',
+  'error ExceedsTokensSold()',
   // --- OpenZeppelin ---
   'error OwnableUnauthorizedAccount(address account)',
   'error OwnableInvalidOwner(address owner)',
   'error EnforcedPause()',
   'error ExpectedPause()',
   'error ReentrancyGuardReentrantCall()',
+  'error SafeERC20FailedOperation(address token)',
+  'error SafeCastOverflowedUintDowncast(uint8 bits, uint256 value)',
 ] as const;
 
 /** Human-readable signatures of `MindLaunchpad` (structs, functions, events, errors). */

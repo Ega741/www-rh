@@ -40,8 +40,6 @@ export const DEFAULT_CREATION_FEE = 0n;
 export const DEFAULT_MAX_DRAW_PER_EPOCH = 250_000_000_000_000_000n;
 /** Default `drawEpoch` (1 day, seconds). */
 export const DEFAULT_DRAW_EPOCH_SECONDS = 86_400;
-/** Default `maxGraduationPriceDeviationBps` (20 %). */
-export const DEFAULT_MAX_GRADUATION_PRICE_DEVIATION_BPS = 2_000n;
 
 /** Upper bound for `tradeFeeBps` (5 %). */
 export const MAX_TRADE_FEE_BPS = 500n;
@@ -118,9 +116,12 @@ export interface GraduationSplit {
   ethLiquidity: bigint;
   /** Tokens sent to the DEX (= `LP_SUPPLY`). */
   tokenLiquidity: bigint;
-  /** Curve's final price, wei per 1e18 tokens (passed to the graduator as `targetPriceWei`). */
+  /** Curve's final price `x·1e18/y`, wei per 1e18 tokens (informational). */
   targetPriceWei: bigint;
-  /** Implied DEX price `ethLiquidity · 1e18 / tokenLiquidity`, wei per 1e18 tokens. */
+  /**
+   * Implied DEX price `ethLiquidity · 1e18 / tokenLiquidity`, wei per 1e18 tokens. The graduator
+   * initializes the pool from exactly these amounts (D3), see {@link sqrtPriceX96FromAmounts}.
+   */
   lpPriceWei: bigint;
 }
 
@@ -180,12 +181,11 @@ export function splitFee(fee: bigint, mindShareBps: bigint = DEFAULT_MIND_SHARE_
 // ---------------------------------------------------------------------------
 
 /**
- * Rounding note for the completing buy (SPEC §1): with `net' = ceilDiv(k, y - remaining) - x`
- * and `fee' = ceilDiv(net'·f, 10000 - f)`, a buyer whose `ethIn - floor(ethIn·f/10000)` already
- * equals `net'` would be charged `net' + fee' = ethIn + 1` wei. The mirror therefore clamps
- * `ethUsed` to `ethIn` (and sets `fee = ethIn - net'`) so `refund >= 0` always holds. The
- * contract must apply the same clamp (or skip the fee recomputation when `net' == net`);
- * both yield identical `(tokensOut, ethUsed, fee)`.
+ * Rounding note for the completing buy (SPEC §1, directive D6): with
+ * `net' = ceilDiv(k, y - remaining) - x` and `fee' = ceilDiv(net'·f, 10000 - f)`, a buyer whose
+ * `ethIn - floor(ethIn·f/10000)` already equals `net'` would be charged `net' + fee' = ethIn + 1`
+ * wei. D6 therefore clamps `ethUsed` to `msg.value` (and sets `fee' = ethUsed - net'`) so the refund
+ * is never negative; the mirror applies the same guard.
  */
 export const COMPLETION_ROUNDING_NOTE =
   'quoteBuy clamps ethUsed to ethIn on the completing buy (fee = ethIn - net when the ceil-rounded fee would exceed it)';
@@ -199,7 +199,8 @@ export const COMPLETION_ROUNDING_NOTE =
  * If the curve would overflow, `tokensOut` is capped at the remaining supply and the ETH
  * actually needed is recomputed (`net' = ceilDiv(k, y - tokensOut) - x`,
  * `fee' = ceilDiv(net'·tradeFeeBps, 10000 - tradeFeeBps)`, `ethUsed = min(net' + fee', ethIn)`,
- * see {@link COMPLETION_ROUNDING_NOTE}); the remainder is refunded.
+ * see {@link COMPLETION_ROUNDING_NOTE}); the state update uses `net'` / `fee'` (D6) and the
+ * remainder is refunded.
  *
  * @throws RangeError when `ethIn == 0`, the curve is not in `Bonding` (sold out) or inputs are out of range.
  */
@@ -364,4 +365,44 @@ export function graduationSplit(state: CurveReserves, fees: Readonly<FeeParams> 
 export function applySlippage(amount: bigint, slippageBps: bigint): bigint {
   if (slippageBps < 0n || slippageBps > BPS) throw new RangeError('slippageBps must be within [0, 10000]');
   return (amount * (BPS - slippageBps)) / BPS;
+}
+
+/** `2^96` */
+export const Q96 = 2n ** 96n;
+
+/** Integer square root (floor) of a non-negative bigint (Newton's method). */
+export function sqrtBigint(value: bigint): bigint {
+  if (value < 0n) throw new RangeError('sqrtBigint: negative input');
+  if (value < 2n) return value;
+  let x0 = value;
+  let x1 = (value + 1n) >> 1n;
+  while (x1 < x0) {
+    x0 = x1;
+    x1 = (x1 + value / x1) >> 1n;
+  }
+  return x0;
+}
+
+/**
+ * Uniswap v3 `sqrtPriceX96` the graduator derives from the amounts it receives (D3), after ordering
+ * `token0 < token1`: `sqrt(amount1 · 2^192 / amount0)` (floor, as `Math.sqrt(Math.mulDiv(...))`).
+ */
+export function sqrtPriceX96FromAmounts(amount0: bigint, amount1: bigint): bigint {
+  if (amount0 <= 0n || amount1 < 0n) throw new RangeError('sqrtPriceX96FromAmounts: amount0 must be positive');
+  return sqrtBigint((amount1 * Q96 * Q96) / amount0);
+}
+
+/**
+ * The `sqrtPriceX96` a graduation of `state` targets: WETH = `ethLiquidity`, token = `LP_SUPPLY`,
+ * ordered by address (`token0 < token1`, compared as integers).
+ */
+export function graduationSqrtPriceX96(
+  state: CurveReserves,
+  token: string,
+  weth: string,
+  fees: Readonly<FeeParams> = DEFAULT_FEE_PARAMS,
+): bigint {
+  const { ethLiquidity, tokenLiquidity } = graduationSplit(state, fees);
+  const tokenIsToken0 = BigInt(token) < BigInt(weth);
+  return tokenIsToken0 ? sqrtPriceX96FromAmounts(tokenLiquidity, ethLiquidity) : sqrtPriceX96FromAmounts(ethLiquidity, tokenLiquidity);
 }

@@ -106,17 +106,17 @@ interface IMindLaunchpad {
     /// @notice The protocol balance was withdrawn.
     event ProtocolFeesWithdrawn(address indexed to, uint256 amount);
     /// @notice The operator (runner hot wallet) changed.
-    event OperatorUpdated(address operator);
+    event OperatorUpdated(address newOperator);
     /// @notice The protocol treasury changed.
-    event TreasuryUpdated(address treasury);
+    event TreasuryUpdated(address newTreasury);
     /// @notice The compute treasury (recipient of {drawCompute}) changed.
-    event ComputeTreasuryUpdated(address computeTreasury);
+    event ComputeTreasuryUpdated(address newComputeTreasury);
     /// @notice The graduator used for future graduations changed.
-    event GraduatorUpdated(address graduator);
+    event GraduatorUpdated(address newGraduator);
     /// @notice Fee parameters changed.
     event FeeParamsUpdated(uint16 tradeFeeBps, uint16 mindShareBps, uint16 graduationFeeBps);
     /// @notice The creation fee changed.
-    event CreationFeeUpdated(uint256 creationFee);
+    event CreationFeeUpdated(uint256 newCreationFee);
     /// @notice The per-mind compute draw cap changed.
     event DrawLimitUpdated(uint256 maxPerEpoch, uint32 epochSeconds);
 
@@ -142,6 +142,8 @@ interface IMindLaunchpad {
     error InvalidStatus();
     /// @notice The draw would exceed the per-mind epoch cap.
     error DrawLimitExceeded();
+    /// @notice `setDrawLimit` with an epoch shorter than one hour.
+    error InvalidDrawLimit();
     /// @notice The draw exceeds the mind vault balance.
     error InsufficientMindBalance();
     /// @notice A fee parameter exceeds its bound.
@@ -157,15 +159,15 @@ interface IMindLaunchpad {
     /// @notice No graduator is configured.
     error GraduatorNotSet();
     /// @notice The graduator's reported ETH return does not match the launchpad's balance change.
-    error BalanceMismatch();
+    error EthReturnMismatch();
     /// @notice Token name must be 1..64 bytes.
     error InvalidName();
     /// @notice Token symbol must be 1..16 bytes.
     error InvalidSymbol();
     /// @notice Metadata URI must be at most 2048 bytes.
-    error InvalidMetadataURI();
+    error MetadataTooLong();
     /// @notice Model id must be non-zero.
-    error InvalidModelId();
+    error InvalidModel();
     /// @notice `sell`/`quoteSell` with more tokens than the curve has sold.
     error ExceedsTokensSold();
 
@@ -228,7 +230,8 @@ interface IMindLaunchpad {
     // Views
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice Quotes a buy of `ethIn` wei on `token`'s curve (SPEC §1). Reverts `WrongPhase()` unless Bonding.
+    /// @notice Quotes a buy of `ethIn` wei on `token`'s curve (SPEC §1). Reverts `WrongPhase()` unless Bonding and
+    ///         `ZeroAmount()` for `ethIn == 0`.
     /// @return tokensOut Tokens out (capped at the remaining curve supply).
     /// @return ethUsed   ETH consumed including the fee; `ethIn - ethUsed` would be refunded.
     /// @return fee       Total fee included in `ethUsed`.
@@ -237,12 +240,13 @@ interface IMindLaunchpad {
         view
         returns (uint256 tokensOut, uint256 ethUsed, uint256 fee);
 
-    /// @notice Quotes a sell of `tokensIn` on `token`'s curve (SPEC §1). Reverts `WrongPhase()` unless Bonding.
+    /// @notice Quotes a sell of `tokensIn` on `token`'s curve (SPEC §1). Reverts `WrongPhase()` unless Bonding,
+    ///         `ZeroAmount()` for `tokensIn == 0` and `ExceedsTokensSold()` above `tokensSold`.
     /// @return ethOut ETH out, net of fee.
     /// @return fee    Fee taken.
     function quoteSell(address token, uint256 tokensIn) external view returns (uint256 ethOut, uint256 fee);
 
-    /// @notice Current curve price in wei per 1e18 tokens (`x * 1e18 / y`).
+    /// @notice Current curve price in wei per 1e18 tokens (`x * 1e18 / y`). Reverts `WrongPhase()` once Graduated.
     function currentPrice(address token) external view returns (uint256 weiPer1e18Tokens);
 
     /// @notice Mind information of `token` (zero struct when not a mind).
@@ -275,8 +279,8 @@ interface IMindLaunchpad {
     /// @notice Per-mind compute draw cap: at most `maxPerEpoch` wei per `epochSeconds`.
     function drawLimit() external view returns (uint256 maxPerEpoch, uint32 epochSeconds);
 
-    /// @notice Draw accounting of `token`: `drawn` in the current epoch (0 once the stored epoch has ended)
-    ///         and the stored epoch start.
+    /// @notice Stored draw accounting of `token` (no elapsed-epoch reset is applied: the allowance is
+    ///         `maxPerEpoch` again once `block.timestamp >= epochStart + epochSeconds`).
     function drawnInEpoch(address token) external view returns (uint256 drawn, uint64 epochStart);
 
     /// @notice Runner hot wallet allowed to draw compute, anchor memories and toggle Alive/Dormant.
@@ -318,8 +322,7 @@ interface IMindLaunchpad {
     function setMindConfig(address token, bytes32 modelId, bytes32 personaHash, string calldata metadataURI) external;
 
     /// @notice Creator-only: `paused = true` sets the status to `Paused` (from Alive or Dormant);
-    ///         `paused = false` restores `Alive`. Reverts `InvalidStatus()` when the mind is already in the
-    ///         requested state.
+    ///         `paused = false` restores `Alive` from `Paused`. A no-op (no event) when nothing changes.
     function setCreatorPaused(address token, bool paused) external;
 
     // ---------------------------------------------------------------------------------------------
@@ -334,8 +337,8 @@ interface IMindLaunchpad {
     /// @notice Operator-only, event only: anchors a batch of memories on-chain.
     function anchorMemory(address token, uint64 seq, bytes32 contentHash, string calldata uri) external;
 
-    /// @notice Operator-only: sets `Alive` or `Dormant`. Reverts `InvalidStatus()` when `status == Paused` or
-    ///         the mind is currently `Paused` (only the creator can change that).
+    /// @notice Operator-only: sets `Alive` or `Dormant` (no event when unchanged). Reverts `InvalidStatus()` when
+    ///         `status == Paused` or the mind is currently `Paused` (only the creator can change that).
     function setMindStatus(address token, MindStatus status) external;
 
     // ---------------------------------------------------------------------------------------------
@@ -355,7 +358,7 @@ interface IMindLaunchpad {
     function setFeeParams(FeeParams calldata params) external;
     /// @notice Sets the flat creation fee.
     function setCreationFee(uint256 newCreationFee) external;
-    /// @notice Sets the per-mind compute draw cap (`epochSeconds > 0`).
+    /// @notice Sets the per-mind compute draw cap (`epochSeconds >= 3600`; `maxPerEpoch = 0` blocks draws).
     function setDrawLimit(uint256 maxPerEpoch, uint32 epochSeconds) external;
     /// @notice Pauses {createMind} and {buy} only; sell/graduate/harvest/fund/draw stay enabled.
     function pause() external;

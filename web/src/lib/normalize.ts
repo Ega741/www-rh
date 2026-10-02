@@ -1,0 +1,313 @@
+/**
+ * Normalisers from runner JSON (SPEC §5 as amended by R1/R2/R7/R11) to UI view models.
+ * Required identity fields throw {@link ShapeError}; optional fields degrade to `null`.
+ * Old field names are accepted alongside the R11 `…Wei` names.
+ *
+ * @module lib/normalize
+ */
+import type { Address, Hex } from 'viem';
+import {
+  ShapeError,
+  asJson,
+  isObject,
+  mapValid,
+  readAddress,
+  readBigint,
+  readBigintOr,
+  readBoolean,
+  readHash,
+  readList,
+  readNumber,
+  readString,
+  readText,
+  readTime,
+  requireAddress,
+  requireString,
+  type JsonObject,
+} from './json';
+import type {
+  ComputeInfo,
+  ComputeReceipt,
+  CurvePhaseName,
+  Health,
+  LedgerEntry,
+  Memory,
+  MetadataUploadResult,
+  MindDetail,
+  MindLinks,
+  MindStatusName,
+  MindSummary,
+  MindsPage,
+  ModelInfo,
+  Stats,
+  Thought,
+  Trade,
+} from './types';
+
+function obj(raw: unknown, what: string): Record<string, unknown> {
+  if (!isObject(raw)) throw new ShapeError(`${what}: expected an object`);
+  return raw;
+}
+
+/** Maps any status value (R11 name or on-chain enum number) to a status name. */
+export function toStatusName(value: unknown): MindStatusName {
+  if (value === 'alive' || value === 0) return 'alive';
+  if (value === 'paused' || value === 2) return 'paused';
+  return 'dormant';
+}
+
+/** Maps any phase value (R11 name or on-chain enum number) to a phase name. */
+export function toPhaseName(value: unknown): CurvePhaseName {
+  if (value === 'complete' || value === 1) return 'complete';
+  if (value === 'graduated' || value === 2) return 'graduated';
+  return 'bonding';
+}
+
+const ZERO_HASH = `0x${'0'.repeat(64)}` as Hex;
+
+/** `MindSummary`. */
+export function normalizeMindSummary(raw: unknown): MindSummary {
+  const o = obj(raw, 'mind');
+  return {
+    token: requireAddress(o, 'token', 'token', 'address'),
+    name: requireString(o, 'name', 'name'),
+    symbol: requireString(o, 'symbol', 'symbol'),
+    creator: readAddress(o, 'creator') ?? ('0x0000000000000000000000000000000000000000' as Address),
+    metadataURI: readString(o, 'metadataURI', 'metadataUri') ?? '',
+    image: readText(o, 'image', 'imageUrl'),
+    modelId: readHash(o, 'modelId') ?? ZERO_HASH,
+    model: readText(o, 'model'),
+    status: toStatusName(o['status']),
+    phase: toPhaseName(o['phase']),
+    priceWei: readBigintOr(o, 0n, 'priceWei'),
+    marketCapWei: readBigintOr(o, 0n, 'marketCapWei'),
+    progressBps: Math.min(10_000, Math.max(0, readNumber(o, 'progressBps') ?? 0)),
+    realEthReserveWei: readBigintOr(o, 0n, 'realEthReserveWei', 'realEthReserve'),
+    tokensSold: readBigintOr(o, 0n, 'tokensSold', 'tokensSoldWei'),
+    mindBalanceWei: readBigintOr(o, 0n, 'mindBalanceWei', 'mindBalance'),
+    lastTickAt: readTime(o, 'lastTickAt'),
+    currentUrl: readText(o, 'currentUrl'),
+    createdAt: readTime(o, 'createdAt') ?? 0,
+    trades24h: readNumber(o, 'trades24h') ?? 0,
+    volume24hWei: readBigintOr(o, 0n, 'volume24hWei', 'volume24h'),
+  };
+}
+
+function normalizeLinks(raw: unknown): MindLinks | null {
+  if (!isObject(raw)) return null;
+  const links: MindLinks = {};
+  const x = readText(raw, 'x', 'twitter');
+  const website = readText(raw, 'website', 'web');
+  const telegram = readText(raw, 'telegram');
+  if (x !== null) links.x = x;
+  if (website !== null) links.website = website;
+  if (telegram !== null) links.telegram = telegram;
+  return Object.keys(links).length > 0 ? links : null;
+}
+
+/** `MindDetail`. Accepts metadata fields at the top level or under `metadata`. */
+export function normalizeMindDetail(raw: unknown): MindDetail {
+  const o = obj(raw, 'mind');
+  const meta = isObject(o['metadata']) ? o['metadata'] : {};
+  const summary = normalizeMindSummary(o);
+  const pool = readAddress(o, 'pool');
+  return {
+    ...summary,
+    image: summary.image ?? readText(meta, 'image'),
+    personaHash: readHash(o, 'personaHash') ?? ZERO_HASH,
+    pool: pool === '0x0000000000000000000000000000000000000000' ? null : pool,
+    positionId: readBigint(o, 'positionId'),
+    description: readText(o, 'description') ?? readText(meta, 'description'),
+    persona: readText(o, 'persona') ?? readText(meta, 'persona'),
+    links: normalizeLinks(o['links'] ?? meta['links']),
+    lastFrameAt: readTime(o, 'lastFrameAt'),
+  };
+}
+
+/** `GET /api/minds` page (`{ items, nextCursor }` or a bare array). */
+export function normalizeMindsPage(raw: unknown): MindsPage {
+  const items = mapValid(readList(raw, 'items', 'minds'), normalizeMindSummary, 'mind');
+  const cursor = isObject(raw) ? raw['nextCursor'] : null;
+  return {
+    items,
+    nextCursor: typeof cursor === 'string' && cursor !== '' ? cursor : typeof cursor === 'number' ? String(cursor) : null,
+  };
+}
+
+/** `Trade`. */
+export function normalizeTrade(raw: unknown): Trade {
+  const o = obj(raw, 'trade');
+  const txHash = readHash(o, 'txHash', 'transactionHash');
+  if (txHash === null) throw new ShapeError('trade: missing txHash');
+  return {
+    txHash,
+    logIndex: readNumber(o, 'logIndex') ?? 0,
+    blockNumber: readNumber(o, 'blockNumber') ?? 0,
+    timestamp: readTime(o, 'timestamp', 'createdAt', 'at') ?? 0,
+    trader: requireAddress(o, 'trader', 'trader'),
+    isBuy: readBoolean(o, 'isBuy') ?? readString(o, 'side') === 'buy',
+    ethAmountWei: readBigintOr(o, 0n, 'ethAmountWei', 'ethAmount'),
+    tokenAmount: readBigintOr(o, 0n, 'tokenAmount', 'tokenAmountWei'),
+    feeWei: readBigintOr(o, 0n, 'feeWei', 'fee'),
+    priceWei: readBigintOr(o, 0n, 'priceWei'),
+  };
+}
+
+/** `Memory` (R7: kind ∈ note | finding). */
+export function normalizeMemory(raw: unknown): Memory {
+  const o = obj(raw, 'memory');
+  const seq = readNumber(o, 'seq');
+  if (seq === null) throw new ShapeError('memory: missing seq');
+  const anchor = isObject(o['anchor']) ? o['anchor'] : {};
+  return {
+    seq,
+    kind: readString(o, 'kind') === 'finding' ? 'finding' : 'note',
+    content: requireString(o, 'content', 'content'),
+    url: readText(o, 'url'),
+    createdAt: readTime(o, 'createdAt', 'at') ?? 0,
+    contentHash: readHash(o, 'contentHash'),
+    anchorTx: readHash(o, 'anchorTx', 'anchorTxHash') ?? readHash(anchor, 'txHash', 'tx'),
+    anchorUri: readText(o, 'anchorUri') ?? readText(anchor, 'uri'),
+  };
+}
+
+/** `Thought` (R7: kind ∈ aloud | summary). */
+export function normalizeThought(raw: unknown): Thought {
+  const o = obj(raw, 'thought');
+  return {
+    id: readNumber(o, 'id') ?? 0,
+    tickId: readNumber(o, 'tickId') ?? 0,
+    kind: readString(o, 'kind') === 'summary' ? 'summary' : 'aloud',
+    text: requireString(o, 'text', 'text'),
+    createdAt: readTime(o, 'createdAt', 'at') ?? 0,
+  };
+}
+
+function normalizeLedgerEntry(raw: unknown): LedgerEntry {
+  const o = obj(raw, 'ledger entry');
+  const micro = readNumber(o, 'costUsdMicro');
+  return {
+    tickId: readNumber(o, 'tickId', 'id') ?? 0,
+    model: readString(o, 'model') ?? 'unknown',
+    inputTokens: readNumber(o, 'inputTokens') ?? 0,
+    outputTokens: readNumber(o, 'outputTokens') ?? 0,
+    cacheReadTokens: readNumber(o, 'cacheReadTokens') ?? 0,
+    cacheWriteTokens: readNumber(o, 'cacheWriteTokens') ?? 0,
+    costUsd: readNumber(o, 'costUsd') ?? (micro !== null ? micro / 1e6 : 0),
+    settledTx: readHash(o, 'settledTx', 'drawTx'),
+    createdAt: readTime(o, 'createdAt', 'startedAt', 'at'),
+  };
+}
+
+/** Keys of the canonical draw receipt object (R2). */
+export const RECEIPT_OBJECT_KEYS = ['token', 'fromTickId', 'toTickId', 'ticks', 'ethUsdPriceMicro', 'amountWei'] as const;
+
+/**
+ * Extracts the canonical receipt object (exactly the R2 keys, values as served) from a receipt
+ * entry, looking at `entry.receipt` first and then at the entry itself.
+ */
+export function extractReceiptObject(entry: Record<string, unknown>): JsonObject | null {
+  const source = isObject(entry['receipt']) ? entry['receipt'] : entry;
+  const out: JsonObject = {};
+  for (const key of RECEIPT_OBJECT_KEYS) {
+    const value = asJson(source[key]);
+    if (value === undefined || value === null) return null;
+    out[key] = value;
+  }
+  return Array.isArray(out['ticks']) ? out : null;
+}
+
+/** One compute receipt (R2 / W6). */
+export function normalizeReceipt(raw: unknown): ComputeReceipt {
+  const o = obj(raw, 'receipt');
+  const object = extractReceiptObject(o);
+  const inner = isObject(o['receipt']) ? o['receipt'] : o;
+  const receiptHash = readHash(o, 'receiptHash', 'hash');
+  if (receiptHash === null) throw new ShapeError('receipt: missing receiptHash');
+  const ticks = Array.isArray(inner['ticks']) ? inner['ticks'] : null;
+  let costUsd: number | null = readNumber(o, 'costUsd');
+  if (costUsd === null && ticks !== null) {
+    costUsd = ticks.reduce<number>((sum, t) => sum + (isObject(t) ? (readNumber(t, 'costUsdMicro') ?? 0) : 0), 0) / 1e6;
+  }
+  return {
+    receiptHash,
+    txHash: readHash(o, 'txHash', 'drawTx', 'tx'),
+    amountWei: readBigint(o, 'amountWei') ?? readBigint(inner, 'amountWei') ?? 0n,
+    fromTickId: readNumber(o, 'fromTickId') ?? readNumber(inner, 'fromTickId'),
+    toTickId: readNumber(o, 'toTickId') ?? readNumber(inner, 'toTickId'),
+    tickCount: ticks !== null ? ticks.length : readNumber(o, 'tickCount', 'ticks'),
+    costUsd,
+    createdAt: readTime(o, 'createdAt', 'timestamp', 'settledAt'),
+    object,
+  };
+}
+
+/** `GET /api/minds/:token/compute` (receipts per R2; legacy `draws` accepted). */
+export function normalizeCompute(raw: unknown): ComputeInfo {
+  const o = obj(raw, 'compute');
+  const balanceUsd = readNumber(o, 'balanceUsd') ?? 0;
+  const burnUsdPerHour = readNumber(o, 'burnUsdPerHour') ?? 0;
+  const runway = o['runwayHours'];
+  return {
+    balanceWei: readBigintOr(o, 0n, 'balanceWei'),
+    balanceUsd,
+    burnUsdPerHour,
+    runwayHours: typeof runway === 'number' && Number.isFinite(runway) ? runway : null,
+    ledger: mapValid(readList(o['ledger']), normalizeLedgerEntry, 'ledger entry'),
+    receipts: mapValid(readList(o['receipts'] ?? o['draws']), normalizeReceipt, 'receipt'),
+  };
+}
+
+/** `GET /api/stats`. */
+export function normalizeStats(raw: unknown): Stats {
+  const o = obj(raw, 'stats');
+  return {
+    minds: readNumber(o, 'minds') ?? 0,
+    alive: readNumber(o, 'alive') ?? 0,
+    graduated: readNumber(o, 'graduated') ?? 0,
+    volumeWei: readBigintOr(o, 0n, 'volumeWei', 'volumeWeiTotal', 'volumeTotalWei', 'volumeEthTotal'),
+    feesToMindsWei: readBigintOr(o, 0n, 'feesToMindsWei', 'feesToMindsEth'),
+  };
+}
+
+/** `GET /api/health`. */
+export function normalizeHealth(raw: unknown): Health {
+  const o = obj(raw, 'health');
+  return {
+    ok: readBoolean(o, 'ok') ?? false,
+    chainId: readNumber(o, 'chainId'),
+    launchpad: readAddress(o, 'launchpad'),
+    lastIndexedBlock: readNumber(o, 'lastIndexedBlock'),
+    headBlock: readNumber(o, 'headBlock'),
+    activeMinds: readNumber(o, 'activeMinds'),
+    dryRun: readBoolean(o, 'dryRun'),
+  };
+}
+
+/** `GET /api/models` item. */
+export function normalizeModel(raw: unknown): ModelInfo {
+  const o = obj(raw, 'model');
+  const id = requireString(o, 'id', 'id');
+  const hash = readHash(o, 'modelIdHash', 'modelId');
+  if (hash === null) throw new ShapeError('model: missing modelIdHash');
+  return {
+    id,
+    label: readString(o, 'label') ?? id,
+    description: readString(o, 'description') ?? '',
+    modelIdHash: hash,
+    inputUsdPerMTok: readNumber(o, 'inputUsdPerMTok') ?? 0,
+    outputUsdPerMTok: readNumber(o, 'outputUsdPerMTok') ?? 0,
+    cacheReadUsdPerMTok: readNumber(o, 'cacheReadUsdPerMTok') ?? 0,
+    cacheWriteUsdPerMTok: readNumber(o, 'cacheWriteUsdPerMTok') ?? 0,
+    isDefault: readBoolean(o, 'isDefault') ?? false,
+  };
+}
+
+/** `POST /api/metadata` response (R1). */
+export function normalizeMetadataUpload(raw: unknown): MetadataUploadResult {
+  const o = obj(raw, 'metadata upload');
+  const uri = requireString(o, 'uri', 'uri');
+  const personaHash = readHash(o, 'personaHash');
+  if (personaHash === null) throw new ShapeError('metadata upload: missing personaHash');
+  return { uri, hash: readString(o, 'hash') ?? '', personaHash };
+}

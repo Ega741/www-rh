@@ -92,8 +92,6 @@ contract UniswapV3Graduator is IGraduator, Ownable2Step, IERC721Receiver {
     error UnexpectedEth();
     /// @notice Returning ETH to the launchpad failed.
     error EthTransferFailed();
-    /// @notice The amounts imply a price outside the uint160 `sqrtPriceX96` range.
-    error PriceOutOfRange();
 
     modifier onlyLaunchpad() {
         if (msg.sender != launchpad) revert NotLaunchpad();
@@ -225,13 +223,13 @@ contract UniswapV3Graduator is IGraduator, Ownable2Step, IERC721Receiver {
         tickUpper = (MAX_TICK / spacing) * spacing;
     }
 
-    /// @notice `sqrt(amount1 * 2^192 / amount0)` as a Q64.96 number (Uniswap v3 `sqrtPriceX96`), with
+    /// @notice `sqrt(mulDiv(amount1, 2^192, amount0))` as a Q64.96 number (Uniswap v3 `sqrtPriceX96`), with
     ///         `amount0`/`amount1` the amounts of the ordered `token0 < token1` pair.
+    /// @dev Reverts (Math.mulDiv overflow) when `amount1 / amount0 >= 2^64`; graduation amounts are ~5e7 apart at
+    ///      most. The square root of a uint256 is below 2^128, so the uint160 cast is lossless.
     function computeSqrtPriceX96(uint256 amount0, uint256 amount1) public pure returns (uint160) {
-        uint256 sqrtPrice = Math.sqrt(Math.mulDiv(amount1, 1 << 192, amount0));
-        if (sqrtPrice > type(uint160).max) revert PriceOutOfRange();
         // forge-lint: disable-next-line(unsafe-typecast)
-        return uint160(sqrtPrice);
+        return uint160(Math.sqrt(Math.mulDiv(amount1, 1 << 192, amount0)));
     }
 
     /// @inheritdoc IERC721Receiver

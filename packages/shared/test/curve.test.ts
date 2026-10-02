@@ -4,6 +4,10 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   BPS,
+  Q96,
+  graduationSqrtPriceX96,
+  sqrtBigint,
+  sqrtPriceX96FromAmounts,
   CURVE_SUPPLY,
   DEFAULT_FEE_PARAMS,
   DEFAULT_TRADE_FEE_BPS,
@@ -348,21 +352,32 @@ describe('completion and refund', () => {
 // Foundry fixture equivalence
 // ---------------------------------------------------------------------------
 
+/**
+ * Fixture shape written by the Foundry generator (contracts agent):
+ * `{ tradeFeeBps, cases: [{ op, realEthReserve, tokensSold, amountIn, tokensOut, ethOut, ethUsed, fee, completes }] }`
+ * with decimal strings. Older shapes (bare array, numbers, missing fields) are still accepted.
+ */
 interface FixtureCase {
+  op: string;
   realEthReserve: string | number;
   tokensSold: string | number;
-  op: string;
   amountIn: string | number;
-  tokensOut?: string | number;
-  ethOut?: string | number;
-  ethUsed?: string | number;
-  fee?: string | number;
-  tradeFeeBps?: string | number;
+  tokensOut?: string | number | null;
+  ethOut?: string | number | null;
+  ethUsed?: string | number | null;
+  fee?: string | number | null;
+  completes?: boolean | string | null;
+  tradeFeeBps?: string | number | null;
 }
 
-function big(v: string | number | undefined): bigint | undefined {
-  if (v === undefined || v === null) return undefined;
+function big(v: string | number | null | undefined): bigint | undefined {
+  if (v === undefined || v === null || v === '') return undefined;
   return BigInt(typeof v === 'number' ? Math.trunc(v) : v);
+}
+
+function bool(v: boolean | string | null | undefined): boolean | undefined {
+  if (v === undefined || v === null) return undefined;
+  return typeof v === 'boolean' ? v : v === 'true';
 }
 
 function loadFixture(): { cases: FixtureCase[]; tradeFeeBps: bigint } | undefined {
@@ -381,8 +396,13 @@ function loadFixture(): { cases: FixtureCase[]; tradeFeeBps: bigint } | undefine
 const fixture = loadFixture();
 
 describe.skipIf(fixture === undefined)('Foundry fixture equivalence (fixtures/curve.json)', () => {
-  it('has at least 40 cases', () => {
-    expect(fixture?.cases.length ?? 0).toBeGreaterThanOrEqual(40);
+  it('has at least 40 cases covering buy, sell and complete', () => {
+    const cases = fixture?.cases ?? [];
+    expect(cases.length).toBeGreaterThanOrEqual(40);
+    const ops = new Set(cases.map((c) => c.op));
+    expect(ops.has('buy')).toBe(true);
+    expect(ops.has('sell')).toBe(true);
+    expect(ops.has('complete')).toBe(true);
   });
 
   it('every case matches the TS mirror exactly', () => {
@@ -391,16 +411,19 @@ describe.skipIf(fixture === undefined)('Foundry fixture equivalence (fixtures/cu
       const state: CurveReserves = { realEthReserve: big(c.realEthReserve) ?? 0n, tokensSold: big(c.tokensSold) ?? 0n };
       const feeBps = big(c.tradeFeeBps) ?? defaultFee;
       const amountIn = big(c.amountIn) ?? 0n;
+      const completes = bool(c.completes);
       const label = `case #${i} (${c.op}, amountIn=${amountIn})`;
       if (c.op === 'sell') {
         const q = quoteSell(state, amountIn, feeBps);
         expect(q.ethOut, `${label} ethOut`).toBe(big(c.ethOut));
         expect(q.fee, `${label} fee`).toBe(big(c.fee));
+        if (completes !== undefined) expect(completes, `${label} completes`).toBe(false);
       } else if (c.op === 'buy' || c.op === 'complete') {
         const q = quoteBuy(state, amountIn, feeBps);
         expect(q.tokensOut, `${label} tokensOut`).toBe(big(c.tokensOut));
         expect(q.ethUsed, `${label} ethUsed`).toBe(big(c.ethUsed));
         expect(q.fee, `${label} fee`).toBe(big(c.fee));
+        if (completes !== undefined) expect(q.completes, `${label} completes`).toBe(completes);
         if (c.op === 'complete') expect(q.completes, `${label} completes`).toBe(true);
       } else {
         throw new Error(`${label}: unknown op`);
@@ -416,3 +439,27 @@ if (fixture === undefined) {
       'Generate it with `cd contracts && forge script script/GenerateFixtures.s.sol` (see fixtures/README.md).',
   );
 }
+
+describe('graduation sqrtPriceX96 (D3)', () => {
+  it('sqrtBigint is the integer floor square root', () => {
+    for (const n of [0n, 1n, 2n, 3n, 4n, 15n, 16n, 17n, 10n ** 40n, 10n ** 40n - 1n, 2n ** 192n]) {
+      const r = sqrtBigint(n);
+      expect(r * r <= n).toBe(true);
+      expect((r + 1n) * (r + 1n) > n).toBe(true);
+    }
+  });
+
+  it('equal amounts give sqrtPriceX96 = 2^96 and the order of tokens inverts the price', () => {
+    expect(sqrtPriceX96FromAmounts(10n ** 18n, 10n ** 18n)).toBe(Q96);
+    const done = completionReserves();
+    const lowToken = '0x0000000000000000000000000000000000000001';
+    const highToken = '0xffffffffffffffffffffffffffffffffffffffff';
+    const weth = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
+    const a = graduationSqrtPriceX96(done, lowToken, weth); // token0 = token: price = eth/token (small)
+    const b = graduationSqrtPriceX96(done, highToken, weth); // token0 = weth: price = token/eth (large)
+    expect(a < Q96).toBe(true);
+    expect(b > Q96).toBe(true);
+    // price1/0 = (sqrt/2^96)^2 ≈ ethLiquidity / LP_SUPPLY ≈ 1.95e-8
+    expect((Number(a) / 2 ** 96) ** 2).toBeCloseTo(1.95e-8, 10);
+  });
+});

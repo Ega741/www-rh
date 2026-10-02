@@ -1,13 +1,17 @@
 /**
  * Known per-chain addresses (SPEC §3 `addresses.ts`, from `docs/ROBINHOOD_CHAIN.md`) and the
- * `launchpadAddress(chainId)` lookup that reads `contracts/deployments/<chainId>.json` when run
- * under Node. The file lookup uses `process.getBuiltinModule` so this module stays
- * browser-safe (no static `node:fs` import).
+ * deployed launchpad lookup (directive R13).
+ *
+ * This module never reads files at runtime: deployments come from `deployments.generated.ts`,
+ * which `scripts/sync-deployments.mjs` generates from `contracts/deployments/*.json`. Environment
+ * overrides (`LAUNCHPAD_ADDRESS`, `VITE_LAUNCHPAD_ADDRESS`) are handled by the consumer, optionally
+ * via the `override` option of {@link launchpadAddress}.
  *
  * @module addresses
  */
 import { getAddress, isAddress, type Address } from 'viem';
 import { ANVIL_CHAIN_ID, ROBINHOOD_CHAIN_ID, ROBINHOOD_TESTNET_CHAIN_ID } from './chains.js';
+import { DEPLOYMENTS } from './deployments.generated.js';
 
 /** Protocol addresses known for a chain. */
 export interface ChainAddresses {
@@ -73,21 +77,26 @@ export function addressesFor(chainId: number): Readonly<ChainAddresses> | undefi
 }
 
 /**
- * Shape of `contracts/deployments/<chainId>.json` written by `script/Deploy.s.sol`.
- * Only `launchpad` is required; other fields are informative.
+ * One entry of {@link DEPLOYMENTS}, generated from `contracts/deployments/<chainId>.json`
+ * (written by `script/Deploy.s.sol`; keys per D11).
  */
 export interface DeploymentRecord {
-  chainId?: number;
+  chainId: number;
   launchpad: Address;
   graduator?: Address;
-  graduatorKind?: 'uniswapv3' | 'mock' | string;
-  owner?: Address;
-  treasury?: Address;
-  operator?: Address;
-  weth9?: Address;
+  /** `uniswapv3` | `mock` (free-form for forward compatibility). */
+  graduatorKind?: string;
+  /** As written by the deploy script (timestamp or ISO string). */
   deployedAt?: string | number;
+  /** Deployment block, when the deploy script records it (used as the indexer's default start block). */
   blockNumber?: number;
-  [extra: string]: unknown;
+}
+
+export { DEPLOYMENTS };
+
+/** The generated deployment record for `chainId`, or `undefined`. */
+export function deploymentFor(chainId: number): DeploymentRecord | undefined {
+  return DEPLOYMENTS[chainId];
 }
 
 /**
@@ -98,73 +107,31 @@ export function launchpadAddressFromDeployment(deployment: unknown): Address | u
   if (deployment === null || typeof deployment !== 'object') return undefined;
   const rec = deployment as Record<string, unknown>;
   const candidate = rec['launchpad'] ?? rec['MindLaunchpad'] ?? rec['launchpadAddress'];
-  return typeof candidate === 'string' && isAddress(candidate) ? getAddress(candidate) : undefined;
+  return typeof candidate === 'string' && isAddress(candidate, { strict: false }) ? getAddress(candidate) : undefined;
 }
 
 /** Options for {@link launchpadAddress}. */
 export interface LaunchpadAddressOptions {
   /**
-   * Directory containing `<chainId>.json`. Defaults to `<repo>/contracts/deployments`, resolved
-   * relative to this module (`packages/shared/{src,dist}/addresses.js`).
+   * Explicit override supplied by the consumer (e.g. from `LAUNCHPAD_ADDRESS` /
+   * `VITE_LAUNCHPAD_ADDRESS`); returned when it is a non-zero address.
    */
-  deploymentsDir?: string;
-  /** Explicit override (e.g. from `LAUNCHPAD_ADDRESS` env); returned when it is a non-zero address. */
   override?: string | undefined;
 }
 
-const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
-
-interface MinimalFs {
-  existsSync(path: string): boolean;
-  readFileSync(path: string, encoding: 'utf8'): string;
-}
-interface MinimalPath {
-  resolve(...segments: string[]): string;
-  dirname(path: string): string;
-}
-
-/** Lazily loads node builtins without a static import so bundlers keep this module browser-safe. */
-function nodeBuiltins(): { fs: MinimalFs; path: MinimalPath } | undefined {
-  const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
-  const get = proc?.getBuiltinModule;
-  if (typeof get !== 'function') return undefined;
-  const fs = get('node:fs') as MinimalFs | undefined;
-  const path = get('node:path') as MinimalPath | undefined;
-  return fs && path ? { fs, path } : undefined;
-}
-
-/** Default `contracts/deployments` directory, resolved relative to this module. */
-export function defaultDeploymentsDir(): string | undefined {
-  const node = nodeBuiltins();
-  if (!node) return undefined;
-  const here = new URL('.', import.meta.url);
-  if (here.protocol !== 'file:') return undefined;
-  const dir = decodeURIComponent(here.pathname);
-  // <repo>/packages/shared/{src|dist}/ -> <repo>/contracts/deployments
-  return node.path.resolve(dir, '..', '..', '..', 'contracts', 'deployments');
-}
+const ZERO = '0x0000000000000000000000000000000000000000';
 
 /**
  * Returns the deployed `MindLaunchpad` address for `chainId`.
  *
- * Resolution order: `options.override` (if a non-zero address) → `<deploymentsDir>/<chainId>.json`
- * (if readable under Node) → `undefined`. Never throws on a missing or malformed file.
+ * Resolution order: `options.override` (if a non-zero address) → {@link DEPLOYMENTS}`[chainId]`
+ * → `undefined`. Pure: never touches the filesystem or the environment.
  */
 export function launchpadAddress(chainId: number, options: LaunchpadAddressOptions = {}): Address | undefined {
   const override = options.override;
-  if (typeof override === 'string' && isAddress(override) && override.toLowerCase() !== ZERO_ADDRESS) {
+  if (typeof override === 'string' && isAddress(override, { strict: false }) && override.toLowerCase() !== ZERO) {
     return getAddress(override);
   }
-  const node = nodeBuiltins();
-  if (!node) return undefined;
-  const dir = options.deploymentsDir ?? defaultDeploymentsDir();
-  if (dir === undefined) return undefined;
-  const file = node.path.resolve(dir, `${chainId}.json`);
-  try {
-    if (!node.fs.existsSync(file)) return undefined;
-    const parsed: unknown = JSON.parse(node.fs.readFileSync(file, 'utf8'));
-    return launchpadAddressFromDeployment(parsed);
-  } catch {
-    return undefined;
-  }
+  const record = DEPLOYMENTS[chainId];
+  return record === undefined ? undefined : launchpadAddressFromDeployment(record);
 }

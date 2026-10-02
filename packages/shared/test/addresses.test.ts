@@ -1,20 +1,15 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { getAddress } from 'viem';
 import {
   ADDRESSES,
+  DEPLOYMENTS,
   ROBINHOOD_ADDRESSES,
   ROBINHOOD_TESTNET_ADDRESSES,
   addressesFor,
-  defaultDeploymentsDir,
+  deploymentFor,
   launchpadAddress,
   launchpadAddressFromDeployment,
 } from '../src/addresses.js';
-
-const dir = mkdtempSync(join(tmpdir(), 'www-rh-deployments-'));
-afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 describe('known addresses', () => {
   it('mainnet addresses from docs/ROBINHOOD_CHAIN.md are checksummed', () => {
@@ -32,36 +27,33 @@ describe('known addresses', () => {
   });
 });
 
-describe('launchpadAddress', () => {
+describe('launchpadAddress (R13: static, generated, no file reads)', () => {
   const addr = '0x5fbdb2315678afecb367f032d93f642f64180aa3';
 
-  it('reads deployments/<chainId>.json when present', () => {
-    writeFileSync(join(dir, '31337.json'), JSON.stringify({ chainId: 31337, launchpad: addr, graduatorKind: 'mock' }));
-    expect(launchpadAddress(31337, { deploymentsDir: dir })).toBe(getAddress(addr));
-    expect(launchpadAddress(4663, { deploymentsDir: dir })).toBeUndefined();
+  it('reads the generated DEPLOYMENTS map', () => {
+    expect(typeof DEPLOYMENTS).toBe('object');
+    for (const [chainId, record] of Object.entries(DEPLOYMENTS)) {
+      expect(record.chainId).toBe(Number(chainId));
+      expect(deploymentFor(Number(chainId))).toBe(record);
+      expect(launchpadAddress(Number(chainId))).toBe(getAddress(record.launchpad));
+    }
+    expect(deploymentFor(999_999)).toBeUndefined();
+    expect(launchpadAddress(999_999)).toBeUndefined();
   });
 
-  it('tolerates malformed files', () => {
-    writeFileSync(join(dir, '1.json'), '{not json');
-    writeFileSync(join(dir, '2.json'), JSON.stringify({ launchpad: 'nope' }));
-    expect(launchpadAddress(1, { deploymentsDir: dir })).toBeUndefined();
-    expect(launchpadAddress(2, { deploymentsDir: dir })).toBeUndefined();
-  });
-
-  it('override wins when it is a non-zero address', () => {
-    expect(launchpadAddress(31337, { deploymentsDir: dir, override: '0x' + '11'.repeat(20) })).toBe(getAddress('0x' + '11'.repeat(20)));
-    expect(launchpadAddress(31337, { deploymentsDir: dir, override: '0x' + '00'.repeat(20) })).toBe(getAddress(addr));
-    expect(launchpadAddress(31337, { deploymentsDir: dir, override: 'garbage' })).toBe(getAddress(addr));
+  it('override wins when it is a non-zero address; garbage and zero are ignored', () => {
+    expect(launchpadAddress(999_999, { override: addr })).toBe(getAddress(addr));
+    expect(launchpadAddress(999_999, { override: '0x' + '00'.repeat(20) })).toBeUndefined();
+    expect(launchpadAddress(999_999, { override: 'garbage' })).toBeUndefined();
+    expect(launchpadAddress(999_999, { override: undefined })).toBeUndefined();
   });
 
   it('launchpadAddressFromDeployment accepts alternative keys', () => {
+    expect(launchpadAddressFromDeployment({ launchpad: addr })).toBe(getAddress(addr));
     expect(launchpadAddressFromDeployment({ MindLaunchpad: addr })).toBe(getAddress(addr));
     expect(launchpadAddressFromDeployment({ launchpadAddress: addr })).toBe(getAddress(addr));
+    expect(launchpadAddressFromDeployment({ launchpad: 'nope' })).toBeUndefined();
     expect(launchpadAddressFromDeployment(null)).toBeUndefined();
     expect(launchpadAddressFromDeployment({})).toBeUndefined();
-  });
-
-  it('default deployments dir points at <repo>/contracts/deployments', () => {
-    expect(defaultDeploymentsDir()?.replace(/\\/g, '/')).toMatch(/\/contracts\/deployments$/);
   });
 });
