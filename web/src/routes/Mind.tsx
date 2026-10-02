@@ -2,7 +2,7 @@
  * `/mind/:token` — three columns: (1) stream: live frame, URL, thoughts, actions; (2) trade:
  * curve stats, buy / sell, graduation (the Pons curve in Pons mode, SPEC §9.5); (3) mind: model &
  * persona, compute meter + feed (+ claimable / Harvest in Pons mode), creator tools, memories,
- * receipts. Recent trades below.
+ * receipts. Recent trades below. Pons mode shows the "left" / takeover notice (SPEC §9.7).
  *
  * @module routes/Mind
  */
@@ -21,6 +21,7 @@ import { ReceiptsList } from '../components/ReceiptsList';
 import { StreamPanel } from '../components/StreamPanel';
 import { ThoughtsTicker } from '../components/ThoughtsTicker';
 import { TradePanel } from '../components/TradePanel';
+import { PonsLifecycleNotice } from '../components/pons/PonsLifecycleNotice';
 import { PonsTradePanel } from '../components/pons/PonsTradePanel';
 import { TradesTable, mergeTrades } from '../components/TradesTable';
 import { AddressLink, CopyButton, ExternalLink, MindAvatar, PhaseBadge, StatusBadge, VenueBadge } from '../components/common';
@@ -93,6 +94,7 @@ function MindPage({ token }: { token: Address }) {
   return (
     <div className="space-y-4">
       <MindHeader mind={live} />
+      {VENUE === 'pons' && <PonsLifecycleNotice mind={live} live={data.ponsLive} />}
       {seedError !== null && (
         <p className="rounded border border-amber/40 bg-amber/5 px-3 py-2 text-[12px] text-amber">
           Your coin is live, but seeding its vault did not go through ({seedError}). You can feed the mind from the compute panel.
@@ -188,6 +190,7 @@ function MindHeader({ mind }: { mind: MindDetail }) {
           </h1>
           <div className="flex flex-wrap items-center gap-2">
             <StatusBadge status={mind.status} />
+            {mind.pons?.left === true && <span className="chip border-amber/50 text-amber">creator left</span>}
             <VenueBadge venue={mind.venue} />
             <PhaseBadge phase={mind.phase} venue={mind.venue} />
             <span className="chip">{modelLabel(mind)}</span>
@@ -215,7 +218,7 @@ function MindHeader({ mind }: { mind: MindDetail }) {
         </dd>
         {mind.pons !== null && (
           <>
-            <dt className="text-mute">{mind.pons.launchedHere ? 'launched here' : mind.pons.adopted ? 'adopted' : 'adoption pending'}</dt>
+            <dt className="text-mute">{mind.pons.left ? 'left' : mind.pons.launchedHere ? 'launched here' : mind.pons.adopted ? 'adopted' : 'adoption pending'}</dt>
             <dd>
               account <AddressLink address={mind.pons.account} />
             </dd>

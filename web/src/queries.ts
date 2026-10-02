@@ -7,8 +7,8 @@ import { MODELS, toPublicModelSpec } from '@www-rh/shared';
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 import type { Address } from 'viem';
-import { ApiError, getCompute, getHealth, getLaunchConfig, getMemories, getMind, getMinds, getModels, getStats, getThoughts, getTrades } from './api';
-import type { ComputeInfo, MindsSort, ModelInfo } from './lib/types';
+import { ApiError, getCompute, getHealth, getLaunchConfig, getMemories, getMind, getMindAdoptions, getMinds, getModels, getStats, getThoughts, getTrades } from './api';
+import type { ComputeInfo, MindsSort, ModelInfo, PendingAdoption } from './lib/types';
 
 /** Query keys. */
 export const queryKeys = {
@@ -18,6 +18,7 @@ export const queryKeys = {
   memories: (token: string) => ['memories', token.toLowerCase()] as const,
   thoughts: (token: string) => ['thoughts', token.toLowerCase()] as const,
   compute: (token: string) => ['compute', token.toLowerCase()] as const,
+  adoptions: (token: string) => ['adoptions', token.toLowerCase()] as const,
   models: ['models'] as const,
   stats: ['stats'] as const,
   health: ['health'] as const,
@@ -121,6 +122,20 @@ export function useCompute(token: Address | undefined) {
     queryFn: () => orEmptyOn404<ComputeInfo | null>(() => getCompute(token as Address), null),
     enabled: token !== undefined,
     refetchInterval: 20_000,
+    retry: 1,
+  });
+}
+
+/**
+ * Pending adoption preparations of a token (SPEC §9.7, `GET /api/minds/:token/adoptions`); a 404
+ * (token unknown to the runner, or a pre-§9.7 runner) reads as none.
+ */
+export function useMindAdoptions(token: Address | undefined) {
+  return useQuery({
+    queryKey: queryKeys.adoptions(token ?? ''),
+    queryFn: () => orEmptyOn404<PendingAdoption[]>(() => getMindAdoptions(token as Address), []),
+    enabled: token !== undefined,
+    refetchInterval: 15_000,
     retry: 1,
   });
 }

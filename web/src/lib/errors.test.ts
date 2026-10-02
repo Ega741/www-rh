@@ -83,7 +83,17 @@ describe('launchpad error map', () => {
 });
 
 describe('Pons registry / curve / factory errors (SPEC §9.2)', () => {
-  const REGISTRY_ERRORS = ['AccountExists', 'NotPonsLaunch', 'NotRecipientOrDeployer', 'AdoptionNotReady', 'AlreadyAdopted', 'WrongValue', 'LaunchFailed'] as const;
+  const REGISTRY_ERRORS = [
+    'AccountExists',
+    'NotPonsLaunch',
+    'NotRecipientOrDeployer',
+    'AdoptionNotReady',
+    'AlreadyAdopted',
+    'WrongValue',
+    'LaunchFailed',
+    'BuybackEnabledLaunch',
+    'InvalidRecipient',
+  ] as const;
 
   it('decodes every new registry error from the call ABI with specific copy', () => {
     for (const name of REGISTRY_ERRORS) {
@@ -116,6 +126,19 @@ describe('Pons registry / curve / factory errors (SPEC §9.2)', () => {
     expect(describeError(writeRevert(encodeErrorResult({ abi: ponsFactoryAbi, errorName: 'NotCreatorFeeRecipient' }), ponsFactoryAbi, 'transferCreatorFeeRecipient'))).toMatch(
       /current creator-fee recipient/,
     );
+  });
+
+  it('names the §9.7 errors on prepareAdoption / leave, also via the fallback ABIs and the selector', () => {
+    const buyback = encodeErrorResult({ abi: ponsMindRegistryAbi, errorName: 'BuybackEnabledLaunch' });
+    expect(describeError(writeRevert(buyback, ponsMindRegistryAbi, 'prepareAdoption'))).toMatch(/buyback enabled/);
+    expect(revertErrorName(writeRevert(buyback, erc20Abi, 'approve'))).toBe('BuybackEnabledLaunch');
+    const invalid = encodeErrorResult({ abi: ponsMindRegistryAbi, errorName: 'InvalidRecipient' });
+    expect(decodeKnownRevert(invalid)).toEqual({ errorName: 'InvalidRecipient', args: [] });
+    expect(describeError(writeRevert(invalid, ponsMindRegistryAbi, 'leave'))).toMatch(/zero address, the registry or a mind account/);
+    // a call ABI that does not declare it: named via the fallback registry ABI
+    const bare = new ContractFunctionRevertedError({ abi: [], data: invalid, functionName: 'leave' });
+    expect(revertErrorName(new ContractFunctionExecutionError(bare, { abi: [], functionName: 'leave', contractAddress: LAUNCHPAD }))).toBe('InvalidRecipient');
+    expect(revertMessage('AlreadyAdopted')).toMatch(/still receives its creator fees/);
   });
 
   it('covers every error declared in the Pons registry, curve and factory ABIs', () => {

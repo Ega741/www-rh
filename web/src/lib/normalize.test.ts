@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { parseMemoryBatchUri } from '../api';
-import { normalizeCompute, normalizeHealth, normalizeLaunchConfig, normalizeMindDetail, normalizeMindsPage, normalizeStats, toStatusName } from './normalize';
+import {
+  normalizeCompute,
+  normalizeHealth,
+  normalizeLaunchConfig,
+  normalizeMindDetail,
+  normalizeMindsPage,
+  normalizePendingAdoptions,
+  normalizeStats,
+  toStatusName,
+} from './normalize';
 
 const TOKEN = '0x00000000000000000000000000000000000000AA';
 const HASH = `0x${'cd'.repeat(32)}`;
@@ -109,10 +118,24 @@ describe('Pons fields (SPEC §9.3/§9.4)', () => {
       claimableWei: 1234n,
       launchedHere: true,
       adopted: false,
+      left: false,
       poolId: null,
     });
+    expect(normalizeMindDetail({ ...summary, venue: 'pons', personaHash: HASH, pons: { ...pons, left: true } }).pons?.left).toBe(true);
     expect(normalizeMindDetail({ ...summary, personaHash: HASH, pons: null }).pons).toBeNull();
     expect(normalizeMindDetail({ ...summary, personaHash: HASH, pons: { feeBps: 1 } }).pons).toBeNull();
+  });
+
+  it('normalises GET /api/minds/:token/adoptions (SPEC §9.7), dropping malformed entries', () => {
+    const entry = { preparer: pons.deployer, account: pons.account, modelId: HASH, personaHash: HASH, metadataURI: 'runner://metadata/abc' };
+    const expected = { preparer: pons.deployer, account: pons.account, modelId: HASH, personaHash: HASH, metadataURI: 'runner://metadata/abc' };
+    expect(normalizePendingAdoptions([entry])).toEqual([expected]);
+    expect(normalizePendingAdoptions({ items: [entry] })).toEqual([expected]);
+    expect(normalizePendingAdoptions({ adoptions: [{ preparer: pons.deployer, account: pons.account }] })).toEqual([
+      { preparer: pons.deployer, account: pons.account, modelId: null, personaHash: null, metadataURI: null },
+    ]);
+    expect(normalizePendingAdoptions([{ account: pons.account }, 'junk', entry])).toEqual([expected]);
+    expect(normalizePendingAdoptions(null)).toEqual([]);
   });
 
   it('reads venue and registry from /api/health', () => {

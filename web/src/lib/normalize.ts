@@ -17,6 +17,7 @@ import {
   metadataUploadResponseSchema,
   mindDetailSchema,
   mindsResponseSchema,
+  ponsAdoptionsResponseSchema,
   publicModelSchema,
   statsResponseSchema,
   thoughtSchema,
@@ -56,6 +57,7 @@ import type {
   MindSummary,
   MindsPage,
   ModelInfo,
+  PendingAdoption,
   PonsInfo,
   Stats,
   Thought,
@@ -160,8 +162,33 @@ export function normalizePonsInfo(raw: unknown): PonsInfo | null {
     claimableWei: readBigintOr(raw, 0n, 'claimableWei', 'claimable'),
     launchedHere: readBoolean(raw, 'launchedHere') ?? false,
     adopted: readBoolean(raw, 'adopted') ?? false,
+    left: readBoolean(raw, 'left') ?? false,
     poolId: readHash(raw, 'poolId'),
   };
+}
+
+/** One entry of `GET /api/minds/:token/adoptions` (SPEC §9.7). */
+export function normalizePendingAdoption(raw: unknown): PendingAdoption {
+  const o = obj(raw, 'adoption');
+  const preparer = readAddress(o, 'preparer', 'creator');
+  const account = readAddress(o, 'account');
+  if (preparer === null || account === null) throw new ShapeError('adoption: missing preparer or account');
+  return {
+    preparer,
+    account,
+    modelId: readHash(o, 'modelId'),
+    personaHash: readHash(o, 'personaHash'),
+    metadataURI: readString(o, 'metadataURI', 'metadataUri'),
+  };
+}
+
+/**
+ * `GET /api/minds/:token/adoptions` → pending preparations (shared `ponsAdoptionsResponseSchema`:
+ * a bare array; `{ items }` / `{ adoptions }` are accepted too).
+ */
+export function normalizePendingAdoptions(raw: unknown): PendingAdoption[] {
+  checkShape(ponsAdoptionsResponseSchema, raw, 'GET /api/minds/:token/adoptions');
+  return mapValid(readList(raw, 'items', 'adoptions'), normalizePendingAdoption, 'adoption');
 }
 
 function normalizeLinks(raw: unknown): MindLinks | null {

@@ -1,6 +1,7 @@
 /**
  * Receipt decoding for Pons mode (viem `parseEventLogs`): `MindLaunched` from a `launchMind`
- * receipt (SPEC §9.5), with `MindCreated` as a fallback for the token address.
+ * receipt (SPEC §9.5), with `MindCreated` as a fallback for the token address, and `MindAdopted`
+ * from an `activateAdoption` receipt (SPEC §9.7; a takeover emits it without `MindCreated`).
  *
  * @module lib/pons/events
  */
@@ -37,4 +38,25 @@ export function launchedTokenFromLogs(logs: readonly Log[], registry: Address): 
     (e) => e.address.toLowerCase() === registry.toLowerCase(),
   );
   return created !== undefined ? lower(created.args.token) : null;
+}
+
+/** Decoded `MindAdopted` (SPEC §9.7) plus whether the same receipt registered the mind (`MindCreated`). */
+export interface MindAdoptedEvent {
+  token: Address;
+  account: Address;
+  creator: Address;
+  /** `false` = takeover of an existing mind (no `MindCreated` in the receipt). */
+  created: boolean;
+}
+
+/** `MindAdopted` emitted by `registry` in `logs`, or `null`. */
+export function mindAdoptedFromLogs(logs: readonly Log[], registry: Address): MindAdoptedEvent | null {
+  const fromRegistry = (e: { address: Address }) => e.address.toLowerCase() === registry.toLowerCase();
+  const adopted = parseEventLogs({ abi: ponsMindRegistryAbi, eventName: 'MindAdopted', logs: [...logs], strict: true }).find(fromRegistry);
+  if (adopted === undefined) return null;
+  const { token, account, creator } = adopted.args;
+  const created = parseEventLogs({ abi: ponsMindRegistryAbi, eventName: 'MindCreated', logs: [...logs], strict: true }).some(
+    (e) => fromRegistry(e) && e.args.token.toLowerCase() === token.toLowerCase(),
+  );
+  return { token: lower(token), account: lower(account), creator: lower(creator), created };
 }

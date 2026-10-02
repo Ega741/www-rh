@@ -18,6 +18,7 @@ import {
   normalizeMindDetail,
   normalizeMindsPage,
   normalizeModel,
+  normalizePendingAdoptions,
   normalizeStats,
   normalizeThought,
   normalizeTrade,
@@ -34,6 +35,7 @@ import type {
   MindsPage,
   MindsSort,
   ModelInfo,
+  PendingAdoption,
   Stats,
   Thought,
   Trade,
@@ -138,6 +140,11 @@ export async function getThoughts(token: Address, limit = 100): Promise<Thought[
 /** `GET /api/minds/:token/compute` (balance, burn, runway, ledger, receipts). */
 export async function getCompute(token: Address): Promise<ComputeInfo> {
   return normalizeCompute(await request(`/api/minds/${enc(token.toLowerCase())}/compute`));
+}
+
+/** `GET /api/minds/:token/adoptions` (SPEC §9.7): pending adoption preparations of a token. */
+export async function getMindAdoptions(token: Address): Promise<PendingAdoption[]> {
+  return normalizePendingAdoptions(await request(`/api/minds/${enc(token.toLowerCase())}/adoptions`));
 }
 
 /** `GET /api/models`. */

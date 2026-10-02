@@ -1,6 +1,6 @@
 /**
- * Pons-mode mind page data (SPEC §9.5): the runner's `MindDetail` merged with the registry
- * (`getMind`, `ponsMind`, `mindBalance`, `claimable`), the Pons factory launch record
+ * Pons-mode mind page data (SPEC §9.5/§9.7): the runner's `MindDetail` merged with the registry
+ * (`getMind`, `ponsMind`, `mindBalance`, `claimable`, `hasLeft`), the Pons factory launch record
  * (`getLaunchedToken`: phase, fee recipient) and the Pons curve (`getReserves`, `sellableTokens`,
  * `realQuoteReserve`, `graduationThreshold`, `feeBps`, `creatorTaxBps`, `graduated`,
  * `readyToGraduate`). On-chain values win; the page renders from chain while the runner is down.
@@ -38,6 +38,8 @@ export function usePonsMindData(token: Address | undefined): MindData {
   const record = useReadContract({ ...reg, functionName: 'ponsMind', args, query: { enabled, refetchInterval: 30_000 } });
   const vault = useReadContract({ ...reg, functionName: 'mindBalance', args, query: { enabled, refetchInterval: 5_000 } });
   const claimable = useReadContract({ ...reg, functionName: 'claimable', args, query: { enabled, refetchInterval: 15_000 } });
+  // SPEC §9.7; best-effort (a pre-§9.7 registry has no hasLeft: fall back to the runner's pons.left)
+  const leftRead = useReadContract({ ...reg, functionName: 'hasLeft', args, query: { enabled, refetchInterval: 30_000, retry: false } });
   const factory = usePonsFactory();
   const launch = useReadContract({
     address: factory ?? zeroAddress,
@@ -176,6 +178,7 @@ export function usePonsMindData(token: Address | undefined): MindData {
       launchedAt: launchedAtSec ?? (launchedHere && mind.createdAt > 0 ? Math.floor(mind.createdAt / 1000) : null),
       totalSupply,
       claimableWei: claimable.data ?? null,
+      left: leftRead.data ?? null,
     };
     const base: PonsInfo | null = mind.pons;
     const pons: PonsInfo | null =
@@ -191,6 +194,7 @@ export function usePonsMindData(token: Address | undefined): MindData {
             claimableWei: live.claimableWei ?? base?.claimableWei ?? 0n,
             launchedHere,
             adopted: record.data?.adopted ?? base?.adopted ?? false,
+            left: live.left ?? base?.left ?? false,
             poolId: base?.poolId ?? null,
           };
     const anyPhaseRead = live.factoryPhase !== null || graduated !== null || ready !== null;
@@ -226,6 +230,7 @@ export function usePonsMindData(token: Address | undefined): MindData {
       void record.refetch();
       void vault.refetch();
       void claimable.refetch();
+      void leftRead.refetch();
       void launch.refetch();
       void curve.refetch();
     },

@@ -2,8 +2,9 @@
  * Creator tools (W3), shown only when the connected wallet is the coin's creator:
  * pause / resume the mind (`setCreatorPaused`) and change its model or persona
  * (`setMindConfig` with freshly published metadata), on the launchpad (curve mode) or the
- * registry (Pons mode). Pons mode adds "Leave" (`registry.leave`, SPEC §9.5). There is no
- * withdraw: vault ETH can only pay for compute (D4).
+ * registry (Pons mode). Pons mode adds "Leave" (`registry.leave`, SPEC §9.5 / §9.7) and, in a
+ * collapsed "advanced" section, "Recover tokens" (`registry.recoverAccountTokens`, §9.7). There is
+ * no withdraw: vault ETH can only pay for compute (D4).
  *
  * @module components/CreatorTools
  */
@@ -23,6 +24,7 @@ import { ChainGuard } from './ChainGuard';
 import { ModelSelect } from './ModelSelect';
 import { Panel, TxStatus } from './common';
 import { LeaveMind } from './pons/LeaveMind';
+import { RecoverTokens } from './pons/RecoverTokens';
 
 /** Props of {@link CreatorTools}. */
 export interface CreatorToolsProps {
@@ -160,6 +162,14 @@ export function CreatorTools({ mind, currentModel, onChanged, ponsLive = null }:
           )}
         </div>
         {VENUE === 'pons' && mind.pons !== null && <LeaveMind mind={mind} live={ponsLive} onChanged={refresh} />}
+        {VENUE === 'pons' && mind.pons !== null && (
+          <details className="border-t border-line pt-3">
+            <summary className="label cursor-pointer select-none">advanced</summary>
+            <div className="mt-2">
+              <RecoverTokens mind={mind} account={mind.pons.account} onChanged={refresh} />
+            </div>
+          </details>
+        )}
       </div>
     </Panel>
   );

@@ -74,6 +74,11 @@ export interface PonsInfo {
   claimableWei: bigint;
   launchedHere: boolean;
   adopted: boolean;
+  /**
+   * The creator left (SPEC §9.7 `hasLeft`): creator fees go elsewhere, the mind stays dormant until
+   * someone takes it over with `activateAdoption`. `false` from pre-§9.7 runners.
+   */
+  left: boolean;
   /** Uniswap v4 pool id after graduation (recorded by the operator), when known. */
   poolId: Hex | null;
 }
@@ -102,6 +107,8 @@ export interface PonsLive {
   launchedAt: number | null;
   totalSupply: bigint | null;
   claimableWei: bigint | null;
+  /** `registry.hasLeft(token)` (SPEC §9.7); `null` when the read failed (pre-§9.7 registry). */
+  left: boolean | null;
 }
 
 /** `MindDetail` = summary + resolved metadata and graduation info. */
@@ -117,6 +124,18 @@ export interface MindDetail extends MindSummary {
   lastFrameAt: number | null;
   /** Pons details (SPEC §9.3); `null` for curve minds and pre-Pons runners. */
   pons: PonsInfo | null;
+}
+
+/**
+ * One pending adoption preparation (SPEC §9.7, `GET /api/minds/:token/adoptions`): the preparer's
+ * own account and the config `activateAdoption(token, preparer)` would register.
+ */
+export interface PendingAdoption {
+  preparer: Address;
+  account: Address;
+  modelId: Hex | null;
+  personaHash: Hex | null;
+  metadataURI: string | null;
 }
 
 /** One curve trade (`Trade` event). */

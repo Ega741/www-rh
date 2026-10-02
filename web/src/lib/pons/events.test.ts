@@ -1,7 +1,7 @@
 import { encodeAbiParameters, encodeEventTopics, type Hex, type Log } from 'viem';
 import { describe, expect, it } from 'vitest';
 import { ponsMindRegistryAbi } from './abi';
-import { launchedTokenFromLogs, mindLaunchedFromLogs } from './events';
+import { launchedTokenFromLogs, mindAdoptedFromLogs, mindLaunchedFromLogs } from './events';
 
 const REGISTRY = '0x1111111111111111111111111111111111111111';
 const TOKEN = '0x2222222222222222222222222222222222222222';
@@ -54,5 +54,23 @@ describe('MindLaunched decoding (SPEC §9.5)', () => {
     expect(mindLaunchedFromLogs([mindLaunchedLog(other)], REGISTRY)).toBeNull();
     expect(launchedTokenFromLogs([mindCreatedLog(REGISTRY)], REGISTRY)).toBe(TOKEN);
     expect(launchedTokenFromLogs([mindLaunchedLog(other), mindCreatedLog(other)], REGISTRY)).toBeNull();
+  });
+});
+
+function mindAdoptedLog(address: Hex): Log {
+  const topics = encodeEventTopics({ abi: ponsMindRegistryAbi, eventName: 'MindAdopted', args: { token: TOKEN, account: ACCOUNT, creator: CREATOR } }) as Hex[];
+  return log(address, topics, '0x', 2);
+}
+
+describe('MindAdopted decoding (SPEC §9.7)', () => {
+  it('decodes the 3-topic event and tells a new registration from a takeover', () => {
+    expect(mindAdoptedFromLogs([mindCreatedLog(REGISTRY), mindAdoptedLog(REGISTRY)], REGISTRY)).toEqual({ token: TOKEN, account: ACCOUNT, creator: CREATOR, created: true });
+    expect(mindAdoptedFromLogs([mindAdoptedLog(REGISTRY)], REGISTRY)).toEqual({ token: TOKEN, account: ACCOUNT, creator: CREATOR, created: false });
+  });
+
+  it('ignores other emitters', () => {
+    const other = '0x9999999999999999999999999999999999999999';
+    expect(mindAdoptedFromLogs([mindAdoptedLog(other)], REGISTRY)).toBeNull();
+    expect(mindAdoptedFromLogs([mindCreatedLog(other), mindAdoptedLog(REGISTRY)], REGISTRY)?.created).toBe(false);
   });
 });

@@ -62,7 +62,7 @@ const REVERT_MESSAGES: Record<string, { signature: string; message: string }> = 
   ERC20InsufficientBalance: { signature: 'ERC20InsufficientBalance(address,uint256,uint256)', message: 'You do not hold that many tokens.' },
 };
 
-/** Copy for the `PonsMindRegistry` errors (SPEC §9.2) and the Pons curve / factory errors that bubble up. */
+/** Copy for the `PonsMindRegistry` errors (SPEC §9.2 / §9.7) and the Pons curve / factory errors that bubble up. */
 const PONS_REVERT_MESSAGES: Record<string, { signature: string; message: string }> = {
   // PonsMindRegistry
   AccountExists: {
@@ -75,13 +75,25 @@ const PONS_REVERT_MESSAGES: Record<string, { signature: string; message: string 
   },
   NotRecipientOrDeployer: {
     signature: 'NotRecipientOrDeployer()',
-    message: "Only the Pons launch's current creator-fee recipient or its deployer can adopt this coin.",
+    message: "Only the Pons launch's current creator-fee recipient or its deployer can do that.",
   },
   AdoptionNotReady: {
     signature: 'AdoptionNotReady()',
-    message: "The coin's creator-fee recipient is not the mind account yet: transfer it to the account first (step 2), then activate.",
+    message:
+      "The coin's creator-fee recipient is not this preparation's account (or the preparation no longer exists): transfer it to the account first (step 2), then activate.",
   },
-  AlreadyAdopted: { signature: 'AlreadyAdopted()', message: 'This coin already has a mind on this registry.' },
+  AlreadyAdopted: {
+    signature: 'AlreadyAdopted()',
+    message: "This coin's mind still receives its creator fees, so it cannot be adopted or taken over.",
+  },
+  BuybackEnabledLaunch: {
+    signature: 'BuybackEnabledLaunch()',
+    message: 'This Pons launch has buyback enabled, so part of its fees is spent on buybacks: it cannot get a mind here.',
+  },
+  InvalidRecipient: {
+    signature: 'InvalidRecipient()',
+    message: 'The new fee recipient cannot be the zero address, the registry or a mind account. Use a wallet you control.',
+  },
   WrongValue: {
     signature: 'WrongValue()',
     message: 'The ETH sent does not equal launch fee + initial buy + creation fee (one of the fees may have just changed). Try again.',

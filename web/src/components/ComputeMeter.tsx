@@ -70,7 +70,14 @@ export function ComputeMeter({ mind, compute, computeError, budget, onFunded, cl
   const runwayPct = f.runwayHours === null ? (f.balanceWei > 0n ? 100 : 0) : Math.min(100, (f.runwayHours / targetHours) * 100);
   const tone = f.runwayHours !== null && f.runwayHours < 24 ? 'amber' : 'acid';
   return (
-    <Panel title="compute" right={<span className="normal-case tracking-normal text-mute">{pons ? 'paid by Pons creator fees' : 'paid by trading fees'}</span>}>
+    <Panel
+      title="compute"
+      right={
+        <span className="normal-case tracking-normal text-mute">
+          {!pons ? 'paid by trading fees' : mind.pons?.left === true ? 'creator fees redirected; vault only' : 'paid by Pons creator fees'}
+        </span>
+      }
+    >
       <div className="space-y-3 p-3">
         <div className="flex items-end justify-between gap-3">
           <div>

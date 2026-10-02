@@ -39,7 +39,7 @@ API-база — `VITE_RUNNER_URL` (пусто = тот же origin), WebSocket 
 pnpm --filter @www-rh/web build      # tsc --noEmit + vite build → web/dist
 pnpm --filter @www-rh/web preview    # отдать dist на :4173
 pnpm --filter @www-rh/web typecheck
-pnpm --filter @www-rh/web test       # vitest: форматирование, котировки, WS-парсер, нормализация, хэши, окно выпуска, ошибки, Pons (котировки, запуск, усыновление, фазы, события)
+pnpm --filter @www-rh/web test       # vitest: форматирование, котировки, WS-парсер, нормализация, хэши, окно выпуска, ошибки, Pons (котировки, запуск, усыновление v2, жизненный цикл, Leave/Recover, слияние ABI, фазы, события)
 pnpm --filter @www-rh/web lint       # tsc с --noUnusedLocals/--noUnusedParameters
 ```
 
@@ -122,15 +122,20 @@ pnpm --filter @www-rh/web lint       # tsc с --noUnusedLocals/--noUnusedParamet
      из чека декодируется `MindLaunched` → переход на `/mind/<token>`. Если раннер недоступен,
      launch config читается из фабрики. Показываются предупреждения `paused()` реестра и
      `factory.canLaunch(registry) == false`.
-  2. **adopt an existing Pons coin**: вставить адрес токена → запись запуска
-     (`factory.getLaunchedToken`: кривая, deployer, получатель комиссий, creator tax, фаза) → шаг 1
-     `registry.prepareAdoption(token, modelId, personaHash, uri)` (получатель комиссий или deployer;
-     модель и персона, метаданные публикуются как при создании) → шаг 2 кнопка
-     `factory.transferCreatorFeeRecipient(token, account)` (только текущий получатель; иначе
-     подсказка, кто и что должен вызвать) → шаг 3 `registry.activateAdoption(token)` (кто угодно).
-     Текущий шаг выводится из состояния сети чистой функцией `adoptionStep` (`lib/pons/adoption.ts`),
-     поэтому поток продолжается после перезагрузки и из разных кошельков; запуски с ERC-20 в качестве
-     котируемого актива не поддерживаются.
+  2. **adopt an existing Pons coin** (усыновление v2, §9.7): вставить адрес токена → запись запуска
+     (`factory.getLaunchedToken`: кривая, deployer, получатель комиссий, creator tax, котируемый актив,
+     buyback, фаза) и список ожидающих подготовок из `GET /api/minds/:token/adoptions` (preparer,
+     account; каждая перепроверяется `registry.pendingAdoption(token, preparer)`) → шаг 1
+     `registry.prepareAdoption(token, modelId, personaHash, uri)` создаёт или обновляет **собственную**
+     подготовку кошелька (кто угодно; показывается будущий аккаунт `predictAdoptionAccount(token, wallet)`)
+     → шаг 2 кнопка `factory.transferCreatorFeeRecipient(token, myAccount)` (активна, только если
+     кошелёк — текущий получатель; иначе явное предупреждение и подсказка, кто и что должен вызвать) →
+     шаг 3 `registry.activateAdoption(token, preparer)` (кто угодно, когда получатель у фабрики равен
+     аккаунту этой подготовки; активация предлагается для любой подготовки, чей аккаунт уже получатель).
+     Шаг выводится чистой функцией `adoptionStep` (`lib/pons/adoption.ts`) из записи запуска, моей
+     подготовки, `isMind`, `hasLeft` (запасной вариант — `MindDetail.pons.left`) и того, равен ли
+     аккаунт разума получателю, поэтому поток продолжается после перезагрузки и из разных кошельков.
+     Запуски с ERC-20 в качестве котируемого актива и с `buybackEnabled` не поддерживаются.
 - **`/mind/:token`** — данные: `registry.getMind/ponsMind/mindBalance/claimable`,
   `factory.getLaunchedToken` (фаза, получатель комиссий), кривая Pons (`getReserves`,
   `sellableTokens`, `realQuoteReserve`, `graduationThreshold`, `feeBps`, `creatorTaxBps`, `graduated`,
@@ -151,18 +156,36 @@ pnpm --filter @www-rh/web lint       # tsc с --noUnusedLocals/--noUnusedParamet
   - счётчик вычислений: vault + claimable (кредит в FeeEscrow Pons) и кнопка «Harvest»
     (`registry.harvest(token)`, кто угодно).
   - инструменты создателя: «Leave» — `registry.leave(token, newRecipient)` с подтверждением
-    (галочка); разум засыпает, vault остаётся только для вычислений. Если получатель комиссий уже не
-    аккаунт разума, вместо кнопки показывается, кому идут комиссии.
+    (галочка); диалог объясняет, что заработанные комиссии сначала собираются в vault (как harvest),
+    и проверяет получателя (не ноль, не реестр, не аккаунт разума — через `registry.tokenOf(addr)`).
+    Если получатель комиссий уже не аккаунт разума, вместо кнопки показывается, кому идут комиссии, и
+    путь перехвата. В свёрнутом разделе «advanced» — «Recover tokens»:
+    `registry.recoverAccountTokens(token, erc20)` (адрес ERC-20, баланс аккаунта показывается заранее).
 - **`/`** — на карточках бейдж площадки (`pons`/`curve`, из `MindSummary.venue`), фаза «graduating»
   для Pons; в подвале — адрес реестра и предупреждение, если `venue` раннера (`/api/health`) не
   совпадает со сборкой.
 - Ошибки реестра (`AccountExists`, `NotPonsLaunch`, `NotRecipientOrDeployer`, `AdoptionNotReady`,
-  `AlreadyAdopted`, `WrongValue`, `LaunchFailed`) и всплывающие ошибки кривой/фабрики Pons
+  `AlreadyAdopted`, `WrongValue`, `LaunchFailed`, `BuybackEnabledLaunch`, `InvalidRecipient`) и
+  всплывающие ошибки кривой/фабрики Pons
   (`SlippageExceeded`, `CurveGraduated`, `LaunchEconomicsMismatch`, `NotCreatorFeeRecipient`, …)
   декодируются по ABI вызова, затем по ABI лаунчпада/реестра/кривой/фабрики, затем по селектору.
 
-ABI, адреса Pons и математика котировок берутся из `@www-rh/shared` (§9.3). Локально (в
-`src/lib/pons/`) остаются только недостающие части: ошибки кривой и фабрики Pons,
+**Усыновление v2 и жизненный цикл (SPEC §9.7).** Каждая подготовка привязана к своему автору:
+аккаунт — клон с солью `(token, preparer)`, до активации в реестре ничего не регистрируется, а чужая
+незавершённая подготовка не может перехватить передачу комиссий. Разум, чей аккаунт больше не
+получает комиссии (создатель вызвал `leave`, или получателя сменили), можно **перехватить** тем же
+путём: на странице разума показывается состояние «left» (комиссии перенаправлены, vault по-прежнему
+платит за вычисления, разум спит; «resume» его не будит) со ссылкой
+`/create?tab=adopt&token=…`; активация заменяет создателя, модель, персону и аккаунт, vault остаётся
+у разума. `hasLeft(token)` читается из сети (`PonsLive.left`, `MindDetail.pons.left`), чек активации
+декодируется `mindAdoptedFromLogs` (новый разум или перехват).
+
+ABI, адреса Pons и математика котировок берутся из `@www-rh/shared` (§9.3). Члены §9.7
+(`activateAdoption(token, preparer)`, `predictAdoptionAccount(token, preparer)`, `pendingAdoption`,
+`hasLeft`, `derivedPoolId`, `recoverAccountTokens`, `MindAdopted` с тремя индексами,
+`BuybackEnabledLaunch`, `InvalidRecipient`) продублированы в `ponsMindRegistryV2Abi` и сливаются с ABI
+shared по сигнатуре (`mergeAbi`): то, что уже есть в shared, берётся оттуда, а заменённые сигнатуры §9.2
+отбрасываются. Локально (в `src/lib/pons/`) остаются только недостающие части: ошибки кривой и фабрики Pons,
 `factory.graduate(address)`, `curve.token()`, `FailedDeployment()` реестра, view-функции кривой
 `launchedAt`/`snipeTaxSeconds`/`currentSnipeTaxBps`, свежие резервы конфига
 (`ponsReservedTokens`/`ponsInitialReserves`) и URL приложения Pons.
@@ -181,12 +204,14 @@ src/
   lib/                     нормализация ответов (с проверкой zod-схемами shared), котировки,
                            метаданные, публикация, хэши, редьюсер стрима, ошибки, события
   lib/pons/                Pons-режим: ABI (shared + локальные дополнения), математика запуска,
-                           машина состояний усыновления, фазы, snipe-окно, события, ссылки (+ тесты)
+                           машина состояний усыновления, жизненный цикл (left / перехват), проверки
+                           Leave / Recover tokens, фазы, snipe-окно, события, ссылки (+ тесты)
   hooks/                   поток разума, данные разума (API + сеть; usePonsMindData в Pons-режиме),
                            usePons (фабрика, launch config), транзакции, смена сети, тики
   routes/                  Home, Create (curve) / PonsCreate (launch + adopt), Mind, NotFound
   components/              карточки, панели, кошелёк, ChainGuard, ...
-  components/pons/         PonsLaunchForm, AdoptPanel, PonsTradePanel, HarvestButton, LeaveMind
+  components/pons/         PonsLaunchForm, AdoptPanel, PonsTradePanel, HarvestButton, LeaveMind,
+                           RecoverTokens, PonsLifecycleNotice
 ```
 
 Все ответы API и сообщения WS сначала проверяются zod-схемами из `@www-rh/shared`; при
