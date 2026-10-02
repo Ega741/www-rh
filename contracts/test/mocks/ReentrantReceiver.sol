@@ -56,9 +56,12 @@ contract ReentrantReceiver {
         bool ok;
         bytes memory err;
         if (m == Mode.ReenterSell) {
-            (ok, err) = address(launchpad).call(
-                abi.encodeCall(IMindLaunchpad.sell, (token, IERC20(token).balanceOf(address(this)), 0, block.timestamp))
-            );
+            (ok, err) = address(launchpad)
+                .call(
+                    abi.encodeCall(
+                        IMindLaunchpad.sell, (token, IERC20(token).balanceOf(address(this)), 0, block.timestamp)
+                    )
+                );
         } else if (m == Mode.ReenterBuy) {
             (ok, err) = address(launchpad).call{value: msg.value}(
                 abi.encodeCall(IMindLaunchpad.buy, (token, 0, block.timestamp))

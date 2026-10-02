@@ -68,7 +68,12 @@ contract UniswapV3GraduatorTest is BaseTest {
         (e.token0, e.token1, e.amount0, e.amount1) = tokenIs0
             ? (e.token, address(weth), LP_SUPPLY, e.ethLiquidity)
             : (address(weth), e.token, e.ethLiquidity, LP_SUPPLY);
-        e.expectedSqrtPrice = graduator.computeSqrtPriceX96(e.amount0, e.amount1);
+        e.expectedSqrtPrice = _sqrtPriceX96(e.amount0, e.amount1);
+    }
+
+    /// @dev Reference implementation of the graduator's price derivation (SPEC §2.4 step 2).
+    function _sqrtPriceX96(uint256 amount0, uint256 amount1) internal pure returns (uint160) {
+        return uint160(Math.sqrt(Math.mulDiv(amount1, 1 << 192, amount0)));
     }
 
     function _countSkewEvents(Vm.Log[] memory logs) internal view returns (uint256 n) {
@@ -191,7 +196,7 @@ contract UniswapV3GraduatorTest is BaseTest {
         IUniswapV3Pool(pool).initialize(actual);
 
         uint256 burnBefore = MindToken(e.token).balanceOf(BURN);
-        vm.expectEmit(false, false, false, true, address(graduator));
+        vm.expectEmit(true, false, false, true, address(graduator));
         emit UniswapV3Graduator.GraduatedAtSkewedPrice(e.token, e.expectedSqrtPrice, actual);
         launchpad.graduate(e.token);
 
@@ -291,8 +296,6 @@ contract UniswapV3GraduatorTest is BaseTest {
 
         uint256 mindBefore = launchpad.mindBalance(e.token);
         uint256 burnBefore = MindToken(e.token).balanceOf(BURN);
-        vm.expectEmit(true, false, false, true, address(graduator));
-        emit UniswapV3Graduator.FeesHarvested(e.token, ethFee, tokenFee);
         vm.expectEmit(true, true, false, true, address(launchpad));
         emit IMindLaunchpad.MindFunded(e.token, address(graduator), ethFee);
         vm.expectEmit(true, false, false, true, address(launchpad));
@@ -325,12 +328,9 @@ contract UniswapV3GraduatorTest is BaseTest {
         graduator.harvest(address(0xBEEF));
         vm.stopPrank();
 
-        vm.startPrank(address(launchpad));
+        vm.prank(address(launchpad));
         vm.expectRevert(UniswapV3Graduator.NoPosition.selector);
         graduator.harvest(address(0xBEEF));
-        vm.expectRevert(UniswapV3Graduator.ZeroAmount.selector);
-        graduator.graduate(address(0xBEEF), 1);
-        vm.stopPrank();
     }
 
     function test_cannotGraduateTwice() public {
@@ -348,33 +348,21 @@ contract UniswapV3GraduatorTest is BaseTest {
         vm.prank(alice);
         (bool ok, bytes memory err) = address(graduator).call{value: 1}("");
         assertFalse(ok);
-        assertEq(err, abi.encodeWithSelector(UniswapV3Graduator.UnexpectedEth.selector));
+        assertEq(err, abi.encodeWithSelector(UniswapV3Graduator.UnexpectedEthSender.selector));
     }
 
-    function test_rescueERC20() public {
+    function test_ownerHasNoPowerOverPositions() public {
         _wire(WETH_LOW);
-        address token = _createMind();
-        uint256 bought = _buy(alice, token, 0.1 ether);
+        Expectation memory e = _completeAndExpect();
+        launchpad.graduate(e.token);
+        assertEq(graduator.owner(), owner);
+        // Ownership is two-step and grants nothing over the LP NFT (there is no transfer/rescue function).
+        vm.prank(owner);
+        graduator.transferOwnership(alice);
         vm.prank(alice);
-        assertTrue(MindToken(token).transfer(address(graduator), bought));
-
-        vm.prank(stranger);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
-        graduator.rescueERC20(token, stranger, bought);
-        vm.prank(owner);
-        vm.expectRevert(UniswapV3Graduator.ZeroAddress.selector);
-        graduator.rescueERC20(token, address(0), bought);
-
-        vm.expectEmit(true, true, false, true, address(graduator));
-        emit UniswapV3Graduator.ERC20Rescued(token, alice, bought);
-        vm.prank(owner);
-        graduator.rescueERC20(token, alice, bought);
-        assertEq(MindToken(token).balanceOf(alice), bought);
-
-        // The position manager is an ERC721 ledger: rescueERC20 cannot move positions.
-        vm.prank(owner);
-        vm.expectRevert();
-        graduator.rescueERC20(address(npm), owner, 1);
+        graduator.acceptOwnership();
+        assertEq(graduator.owner(), alice);
+        assertEq(npm.ownerOf(graduator.positionOf(e.token)), address(graduator));
     }
 
     function test_constructor() public {
@@ -388,7 +376,7 @@ contract UniswapV3GraduatorTest is BaseTest {
         new UniswapV3Graduator(owner, lp, address(npm), address(0), WETH_LOW, FEE_TIER);
         vm.expectRevert(UniswapV3Graduator.ZeroAddress.selector);
         new UniswapV3Graduator(owner, lp, address(npm), address(factory), address(0), FEE_TIER);
-        vm.expectRevert(UniswapV3Graduator.FeeTierNotEnabled.selector);
+        vm.expectRevert(UniswapV3Graduator.UnsupportedFeeTier.selector);
         new UniswapV3Graduator(owner, lp, address(npm), address(factory), WETH_LOW, 1234);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
         new UniswapV3Graduator(address(0), lp, address(npm), address(factory), WETH_LOW, FEE_TIER);
@@ -400,29 +388,24 @@ contract UniswapV3GraduatorTest is BaseTest {
         assertEq(address(g.factory()), address(factory));
         assertEq(address(g.weth9()), WETH_LOW);
         assertEq(g.feeTier(), 3000);
-        assertEq(g.tickSpacing(), 60);
-        (int24 lower, int24 upper) = g.tickBounds();
-        assertEq(lower, -887_220);
-        assertEq(upper, 887_220);
+        assertEq(g.tickLower(), -887_220);
+        assertEq(g.tickUpper(), 887_220);
         g = new UniswapV3Graduator(owner, lp, address(npm), address(factory), WETH_LOW, 500);
-        (lower, upper) = g.tickBounds();
-        assertEq(lower, -887_270);
-        assertEq(upper, 887_270);
+        assertEq(g.tickLower(), -887_270);
+        assertEq(g.tickUpper(), 887_270);
+        g = new UniswapV3Graduator(owner, lp, address(npm), address(factory), WETH_LOW, 10_000);
+        assertEq(g.tickLower(), -887_200);
+        assertEq(g.tickUpper(), 887_200);
     }
 
-    function test_computeSqrtPriceX96() public {
-        _wire(WETH_LOW);
-        assertEq(graduator.computeSqrtPriceX96(1e18, 1e18), uint160(1 << 96));
-        assertEq(graduator.computeSqrtPriceX96(1e18, 4e18), uint160(1 << 97));
-        assertEq(graduator.computeSqrtPriceX96(4e18, 1e18), uint160(1 << 95));
-        // A ratio of 2^64 or more overflows Math.mulDiv (never the case for real graduation amounts).
-        vm.expectRevert();
-        graduator.computeSqrtPriceX96(1, 1 << 64);
-        assertEq(graduator.computeSqrtPriceX96(1, (1 << 64) - 1), Math.sqrt(((1 << 64) - 1) << 192));
-    }
-
-    function test_onERC721Received() public {
-        _wire(WETH_LOW);
-        assertEq(graduator.onERC721Received(address(0), address(0), 0, ""), graduator.onERC721Received.selector);
+    function test_expectedPriceMatchesTheCurve() public {
+        _wire(WETH_HIGH); // coin is token0: price = WETH per coin
+        Expectation memory e = _completeAndExpect();
+        launchpad.graduate(e.token);
+        (uint160 sqrtPrice,,,,,,) = IUniswapV3Pool(graduator.poolOf(e.token)).slot0();
+        // (sqrtPrice / 2^96)^2 * 1e18 = wei per 1e18 coins ~ ethLiquidity * 1e18 / LP_SUPPLY (~1.95e-8 ETH per coin).
+        uint256 priceWad = Math.mulDiv(Math.mulDiv(uint256(sqrtPrice), uint256(sqrtPrice), 1 << 96), 1e18, 1 << 96);
+        assertApproxEqRel(priceWad, e.ethLiquidity * 1e18 / LP_SUPPLY, 1e9);
+        assertApproxEqRel(priceWad, 19_500_000_000, 0.01e18);
     }
 }

@@ -18,8 +18,8 @@ library CurveFixtures {
     /// @notice Repo-relative path (from `contracts/`) of the fixture file.
     string internal constant PATH = "../packages/shared/fixtures/curve.json";
 
-    /// @notice One fixture case. Fields not applicable to the op are 0 (`ethOut` for buys; `tokensOut`, `ethUsed`
-    ///         for sells).
+    /// @notice One fixture case. Fields not applicable to the op are 0 and not rendered (`ethOut` for buys;
+    ///         `tokensOut`, `ethUsed` for sells). A buy that sells out the curve is rendered with `"op": "complete"`.
     struct Case {
         bool isBuy;
         uint256 realEthReserve;
@@ -43,20 +43,8 @@ library CurveFixtures {
         List memory l = List(new Case[](128), 0);
 
         // A. Buys on a fresh curve, from 1 wei to just below completion.
-        uint256[12] memory freshBuys = [
-            uint256(1),
-            100,
-            1e9,
-            1e12,
-            1e15,
-            0.01 ether,
-            0.1 ether,
-            0.5 ether,
-            1 ether,
-            2 ether,
-            3 ether,
-            4 ether
-        ];
+        uint256[12] memory freshBuys =
+            [uint256(1), 100, 1e9, 1e12, 1e15, 0.01 ether, 0.1 ether, 0.5 ether, 1 ether, 2 ether, 3 ether, 4 ether];
         for (uint256 i; i < freshBuys.length; ++i) {
             _buy(l, 0, 0, freshBuys[i]);
         }
@@ -83,7 +71,7 @@ library CurveFixtures {
         _completion(l, r1, s1);
         (uint256 r2, uint256 s2) = _state(3.5 ether);
         _completion(l, r2, s2);
-        (uint256 r3, uint256 s3) = _state(4.04 ether); // a few hundred thousand tokens before sell-out
+        (uint256 r3, uint256 s3) = _state(4.04 ether); // ~20k tokens before sell-out
         _completion(l, r3, s3);
         _completion(l, walkR, walkS);
 
@@ -106,9 +94,9 @@ library CurveFixtures {
         }
     }
 
-    /// @notice Renders `cases` as the fixture JSON (decimal strings, one case per line).
+    /// @notice Renders `cases` as the fixture JSON (SPEC §2.6; every number a decimal string, one case per line).
     function render(Case[] memory cases) internal pure returns (string memory json) {
-        json = string.concat('{\n  "tradeFeeBps": ', VM.toString(FEE_BPS), ',\n  "cases": [\n');
+        json = string.concat('{\n  "tradeFeeBps": "', VM.toString(FEE_BPS), '",\n  "cases": [\n');
         for (uint256 i; i < cases.length; ++i) {
             json = string.concat(json, "    ", _renderCase(cases[i]), i + 1 < cases.length ? ",\n" : "\n");
         }
@@ -119,31 +107,23 @@ library CurveFixtures {
     // Internals
     // ---------------------------------------------------------------------------------------------
 
+    /// @dev SPEC §2.6 shape: buys `{realEthReserve, tokensSold, op: "buy"|"complete", amountIn, tokensOut, ethUsed,
+    ///      fee}`, sells `{realEthReserve, tokensSold, op: "sell", amountIn, ethOut, fee}`.
     function _renderCase(Case memory c) private pure returns (string memory) {
         string memory head = string.concat(
-            '{"op": "',
-            c.isBuy ? "buy" : "sell",
-            '", "realEthReserve": "',
+            '{"realEthReserve": "',
             VM.toString(c.realEthReserve),
             '", "tokensSold": "',
             VM.toString(c.tokensSold),
+            '", "op": "',
+            c.isBuy ? (c.completes ? "complete" : "buy") : "sell",
             '", "amountIn": "',
             VM.toString(c.amountIn)
         );
-        return string.concat(
-            head,
-            '", "tokensOut": "',
-            VM.toString(c.tokensOut),
-            '", "ethOut": "',
-            VM.toString(c.ethOut),
-            '", "ethUsed": "',
-            VM.toString(c.ethUsed),
-            '", "fee": "',
-            VM.toString(c.fee),
-            '", "completes": ',
-            c.completes ? "true" : "false",
-            "}"
-        );
+        string memory tail = c.isBuy
+            ? string.concat('", "tokensOut": "', VM.toString(c.tokensOut), '", "ethUsed": "', VM.toString(c.ethUsed))
+            : string.concat('", "ethOut": "', VM.toString(c.ethOut));
+        return string.concat(head, tail, '", "fee": "', VM.toString(c.fee), '"}');
     }
 
     function _push(List memory l, Case memory c) private pure {

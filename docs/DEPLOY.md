@@ -83,8 +83,25 @@ forge script script/Deploy.s.sol \
 ```
 
 После деплоя проверьте: `cast call <LAUNCHPAD> "graduator()(address)" --rpc-url $ROBINHOOD_RPC_URL`
-и `cast call <LAUNCHPAD> "operator()(address)"`. Владение передаётся через `Ownable2Step`
-(`transferOwnership` → `acceptOwnership` с нового адреса).
+и `cast call <LAUNCHPAD> "operator()(address)"`.
+
+**Владение.** Скрипт деплоит от имени деплоера (он становится первым владельцем), связывает
+graduator и, если `OWNER` отличается от деплоера, вызывает `transferOwnership(OWNER)` на
+**обоих** контрактах. Контракты используют `Ownable2Step`, поэтому `OWNER` обязан принять
+владение с своего адреса:
+
+```bash
+cast send <LAUNCHPAD> "acceptOwnership()" --private-key $OWNER_KEY --rpc-url $ROBINHOOD_RPC_URL
+cast send <GRADUATOR> "acceptOwnership()" --private-key $OWNER_KEY --rpc-url $ROBINHOOD_RPC_URL
+cast call <LAUNCHPAD> "owner()(address)" --rpc-url $ROBINHOOD_RPC_URL   # должен вернуть OWNER
+```
+
+Значения по умолчанию в скрипте: `OWNER`/`TREASURY`/`COMPUTE_TREASURY`/`OPERATOR` — адрес
+деплоера; `GRADUATOR_KIND` — `uniswapv3` на chain id 4663 и `mock` на остальных; на 4663
+`WETH9`/`UNIV3_FACTORY`/`UNIV3_POSITION_MANAGER` подставляются из `docs/ROBINHOOD_CHAIN.md`.
+Dry-run (без `--broadcast`) пишет адреса в `contracts/deployments/dry-run/`, реальный деплой —
+в `contracts/deployments/<chainId>.json`. `START_BLOCK` для раннера возьмите из
+`contracts/broadcast/Deploy.s.sol/<chainId>/run-latest.json` (поле `receipts[0].blockNumber`).
 
 ### Синхронизация адресов и ABI в пакеты
 

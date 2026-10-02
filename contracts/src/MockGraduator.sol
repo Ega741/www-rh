@@ -8,7 +8,7 @@ import {IGraduator} from "./interfaces/IGraduator.sol";
 ///         tokens it receives forever, returns `(pool = address(this), positionId = 0, ethReturned = 0)`, and
 ///         {harvest} returns `(0, 0)`.
 contract MockGraduator is IGraduator {
-    /// @notice The only account allowed to call {graduate} / {harvest}.
+    /// @inheritdoc IGraduator
     address public immutable launchpad;
 
     /// @notice ETH received per token.

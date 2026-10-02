@@ -48,6 +48,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     uint256 internal constant MAX_NAME_LENGTH = 64;
     uint256 internal constant MAX_SYMBOL_LENGTH = 16;
     uint256 internal constant MAX_METADATA_URI_LENGTH = 2048;
+    uint32 internal constant MIN_DRAW_EPOCH = 1 hours;
 
     // ---------------------------------------------------------------------------------------------
     // Storage
@@ -96,8 +97,8 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         _;
     }
 
+    /// @dev Unknown tokens have no creator, so this also implies `onlyMind` (SPEC §2.3 rules 8-9 order).
     modifier onlyCreator(address token) {
-        _checkMind(token);
         if (msg.sender != _mindInfo[token].creator) revert NotCreator();
         _;
     }
@@ -149,13 +150,13 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         bytes32 personaHash,
         uint256 minTokensOut
     ) external payable whenNotPaused nonReentrant returns (address token) {
-        uint256 fee = _creationFee;
-        if (msg.value < fee) revert InsufficientCreationFee();
         uint256 nameLength = bytes(name).length;
         if (nameLength == 0 || nameLength > MAX_NAME_LENGTH) revert InvalidName();
         uint256 symbolLength = bytes(symbol).length;
         if (symbolLength == 0 || symbolLength > MAX_SYMBOL_LENGTH) revert InvalidSymbol();
         _checkConfig(modelId, metadataURI);
+        uint256 fee = _creationFee;
+        if (msg.value < fee) revert InsufficientCreationFee();
 
         token = address(new MindToken(name, symbol, address(this), msg.sender));
 
@@ -203,9 +204,9 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     {
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp > deadline) revert Expired();
+        if (tokensIn == 0) revert ZeroAmount();
         CurveState storage curve = _curves[token];
         if (curve.phase != CurvePhase.Bonding) revert WrongPhase();
-        if (tokensIn == 0) revert ZeroAmount();
         uint256 reserve = curve.realEthReserve;
         uint256 sold = curve.tokensSold;
         if (tokensIn > sold) revert ExceedsTokensSold();
@@ -246,12 +247,12 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         uint256 balanceBefore = address(this).balance;
         (address pool, uint256 positionId, uint256 ethReturned) =
             IGraduator(grad).graduate{value: ethLiquidity}(token, LP_SUPPLY);
-        if (address(this).balance != balanceBefore - ethLiquidity + ethReturned) revert BalanceMismatch();
+        if (address(this).balance != balanceBefore - ethLiquidity + ethReturned) revert EthReturnMismatch();
 
         curve.pool = pool;
         curve.positionId = positionId;
-        emit Graduated(token, pool, positionId, ethLiquidity, LP_SUPPLY, graduationFee);
         _creditFromGraduator(token, grad, ethReturned);
+        emit Graduated(token, pool, positionId, ethLiquidity, LP_SUPPLY, graduationFee);
     }
 
     /// @inheritdoc IMindLaunchpad
@@ -261,7 +262,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
 
         uint256 balanceBefore = address(this).balance;
         (uint256 ethOut, uint256 tokensBurned) = IGraduator(grad).harvest(token);
-        if (address(this).balance != balanceBefore + ethOut) revert BalanceMismatch();
+        if (address(this).balance != balanceBefore + ethOut) revert EthReturnMismatch();
 
         _creditFromGraduator(token, grad, ethOut);
         emit Harvested(token, ethOut, tokensBurned);
@@ -287,6 +288,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     {
         CurveState storage curve = _curves[token];
         if (curve.phase != CurvePhase.Bonding) revert WrongPhase();
+        if (ethIn == 0) revert ZeroAmount();
         return CurveMath.quoteBuy(curve.realEthReserve, curve.tokensSold, ethIn, _feeParams.tradeFeeBps);
     }
 
@@ -299,6 +301,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     {
         CurveState storage curve = _curves[token];
         if (curve.phase != CurvePhase.Bonding) revert WrongPhase();
+        if (tokensIn == 0) revert ZeroAmount();
         if (tokensIn > curve.tokensSold) revert ExceedsTokensSold();
         return CurveMath.quoteSell(curve.realEthReserve, curve.tokensSold, tokensIn, _feeParams.tradeFeeBps);
     }
@@ -306,6 +309,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     /// @inheritdoc IMindLaunchpad
     function currentPrice(address token) external view onlyMind(token) returns (uint256 weiPer1e18Tokens) {
         CurveState storage curve = _curves[token];
+        if (curve.phase == CurvePhase.Graduated) revert WrongPhase();
         return CurveMath.price(curve.realEthReserve, curve.tokensSold);
     }
 
@@ -362,9 +366,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     /// @inheritdoc IMindLaunchpad
     function drawnInEpoch(address token) external view returns (uint256 drawn, uint64 epochStart) {
         DrawEpoch storage epoch = _draws[token];
-        epochStart = epoch.epochStart;
-        // forge-lint: disable-next-line(block-timestamp)
-        drawn = block.timestamp >= uint256(epochStart) + _drawEpoch ? 0 : epoch.drawn;
+        return (epoch.drawn, epoch.epochStart);
     }
 
     /// @inheritdoc IMindLaunchpad
@@ -396,7 +398,8 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         external
         onlyCreator(token)
     {
-        _checkConfig(modelId, metadataURI);
+        if (modelId == bytes32(0)) revert InvalidModel();
+        if (bytes(metadataURI).length > MAX_METADATA_URI_LENGTH) revert MetadataTooLong();
         MindInfo storage info = _mindInfo[token];
         info.modelId = modelId;
         info.personaHash = personaHash;
@@ -407,8 +410,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     /// @inheritdoc IMindLaunchpad
     function setCreatorPaused(address token, bool paused) external onlyCreator(token) {
         MindInfo storage info = _mindInfo[token];
-        bool isPaused = info.status == MindStatus.Paused;
-        if (paused == isPaused) revert InvalidStatus();
+        if (paused == (info.status == MindStatus.Paused)) return;
         MindStatus status = paused ? MindStatus.Paused : MindStatus.Alive;
         info.status = status;
         emit MindStatusChanged(token, status);
@@ -514,7 +516,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
 
     /// @inheritdoc IMindLaunchpad
     function setDrawLimit(uint256 maxPerEpoch, uint32 epochSeconds) external onlyOwner {
-        if (epochSeconds == 0) revert ZeroAmount();
+        if (epochSeconds < MIN_DRAW_EPOCH) revert InvalidDrawLimit();
         _maxDrawPerEpoch = maxPerEpoch;
         _drawEpoch = epochSeconds;
         emit DrawLimitUpdated(maxPerEpoch, epochSeconds);
@@ -551,9 +553,9 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         internal
         returns (uint256 tokensOut)
     {
+        if (ethIn == 0) revert ZeroAmount();
         CurveState storage curve = _curves[token];
         if (curve.phase != CurvePhase.Bonding) revert WrongPhase();
-        if (ethIn == 0) revert ZeroAmount();
 
         uint256 reserve = curve.realEthReserve;
         uint256 sold = curve.tokensSold;
@@ -606,9 +608,9 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         if (_mindInfo[token].creator == address(0)) revert NotAMind();
     }
 
-    /// @dev Validates creator-supplied configuration (directive D10).
+    /// @dev Validates the metadata URI length and the model id of {createMind} (directive D10).
     function _checkConfig(bytes32 modelId, string calldata metadataURI) internal pure {
-        if (modelId == bytes32(0)) revert InvalidModelId();
-        if (bytes(metadataURI).length > MAX_METADATA_URI_LENGTH) revert InvalidMetadataURI();
+        if (bytes(metadataURI).length > MAX_METADATA_URI_LENGTH) revert MetadataTooLong();
+        if (modelId == bytes32(0)) revert InvalidModel();
     }
 }

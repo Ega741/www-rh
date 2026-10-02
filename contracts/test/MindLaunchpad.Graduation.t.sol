@@ -70,6 +70,8 @@ contract MindLaunchpadGraduationTest is BaseTest {
         launchpad.graduate(token);
         vm.expectRevert(IMindLaunchpad.WrongPhase.selector);
         launchpad.buy{value: 1 ether}(token, 0, block.timestamp);
+        vm.expectRevert(IMindLaunchpad.WrongPhase.selector);
+        launchpad.currentPrice(token);
     }
 
     function test_graduate_reverts() public {
@@ -156,10 +158,10 @@ contract MindLaunchpadGraduationTest is BaseTest {
         uint256 returned = ethLiquidity / 10;
         uint256 mindBefore = launchpad.mindBalance(token);
 
-        vm.expectEmit(true, false, false, true, address(launchpad));
-        emit IMindLaunchpad.Graduated(token, address(cfg), 7, ethLiquidity, LP_SUPPLY, reserve * 250 / 10_000);
         vm.expectEmit(true, true, false, true, address(launchpad));
         emit IMindLaunchpad.MindFunded(token, address(cfg), returned);
+        vm.expectEmit(true, false, false, true, address(launchpad));
+        emit IMindLaunchpad.Graduated(token, address(cfg), 7, ethLiquidity, LP_SUPPLY, reserve * 250 / 10_000);
         launchpad.graduate(token);
 
         uint256 gradFee = reserve * 250 / 10_000;
@@ -175,17 +177,17 @@ contract MindLaunchpadGraduationTest is BaseTest {
 
         // Over-reporting: claims 1 wei more than it sent.
         cfg.setGraduateBehaviour(1000, 1);
-        vm.expectRevert(IMindLaunchpad.BalanceMismatch.selector);
+        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
         launchpad.graduate(token);
 
         // Under-reporting: sends more than it claims.
         cfg.setGraduateBehaviour(1000, -1);
-        vm.expectRevert(IMindLaunchpad.BalanceMismatch.selector);
+        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
         launchpad.graduate(token);
 
         // Reporting a return without sending anything.
         cfg.setGraduateBehaviour(0, 5);
-        vm.expectRevert(IMindLaunchpad.BalanceMismatch.selector);
+        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
         launchpad.graduate(token);
 
         // Honest again: succeeds, state was rolled back by the failures.
@@ -226,10 +228,10 @@ contract MindLaunchpadGraduationTest is BaseTest {
         assertEq(launchpad.mindBalance(token), mindBefore + 0.3 ether);
 
         cfg.setHarvestBehaviour(0.3 ether, 0, 1);
-        vm.expectRevert(IMindLaunchpad.BalanceMismatch.selector);
+        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
         launchpad.harvest(token);
         cfg.setHarvestBehaviour(0.3 ether, 0, -1);
-        vm.expectRevert(IMindLaunchpad.BalanceMismatch.selector);
+        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
         launchpad.harvest(token);
 
         // Nothing to harvest: no MindFunded, still Harvested.

@@ -72,7 +72,6 @@ contract MindLaunchpadTradingTest is BaseTest {
         vm.expectRevert(IMindLaunchpad.InsufficientCreationFee.selector);
         launchpad.createMind{value: 0.009 ether}("Mind One", "MIND", METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
 
-        vm.recordLogs();
         vm.prank(creator);
         address token =
             launchpad.createMind{value: 0.01 ether}("Mind One", "MIND", METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
@@ -103,10 +102,26 @@ contract MindLaunchpadTradingTest is BaseTest {
         launchpad.createMind("Mind", "", METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
         vm.expectRevert(IMindLaunchpad.InvalidSymbol.selector);
         launchpad.createMind("Mind", symbol17, METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
-        vm.expectRevert(IMindLaunchpad.InvalidMetadataURI.selector);
+        vm.expectRevert(IMindLaunchpad.MetadataTooLong.selector);
         launchpad.createMind("Mind", "MIND", uri2049, MODEL_ID, PERSONA_HASH, 0);
-        vm.expectRevert(IMindLaunchpad.InvalidModelId.selector);
+        vm.expectRevert(IMindLaunchpad.InvalidModel.selector);
         launchpad.createMind("Mind", "MIND", METADATA_URI, bytes32(0), PERSONA_HASH, 0);
+
+        // Rule 1 order: name, symbol, metadata, model, then the creation fee.
+        vm.expectRevert(IMindLaunchpad.MetadataTooLong.selector);
+        launchpad.createMind("Mind", "MIND", uri2049, bytes32(0), PERSONA_HASH, 0);
+        vm.stopPrank();
+        vm.prank(owner);
+        launchpad.setCreationFee(1 ether);
+        vm.startPrank(creator);
+        vm.expectRevert(IMindLaunchpad.InvalidName.selector);
+        launchpad.createMind("", "", METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
+        vm.expectRevert(IMindLaunchpad.InvalidModel.selector);
+        launchpad.createMind("Mind", "MIND", METADATA_URI, bytes32(0), PERSONA_HASH, 0);
+        vm.stopPrank();
+        vm.prank(owner);
+        launchpad.setCreationFee(0);
+        vm.startPrank(creator);
 
         // Boundaries are accepted.
         launchpad.createMind(string(new bytes(64)), string(new bytes(16)), string(new bytes(2048)), MODEL_ID, 0, 0);
@@ -224,6 +239,16 @@ contract MindLaunchpadTradingTest is BaseTest {
         vm.stopPrank();
         vm.expectRevert(IMindLaunchpad.ExceedsTokensSold.selector);
         launchpad.quoteSell(token, bought + 1);
+        vm.expectRevert(IMindLaunchpad.ZeroAmount.selector);
+        launchpad.quoteSell(token, 0);
+        vm.expectRevert(IMindLaunchpad.ZeroAmount.selector);
+        launchpad.quoteBuy(token, 0);
+        vm.expectRevert(IMindLaunchpad.NotAMind.selector);
+        launchpad.quoteBuy(address(0xBEEF), 1);
+        vm.expectRevert(IMindLaunchpad.NotAMind.selector);
+        launchpad.quoteSell(address(0xBEEF), 1);
+        vm.expectRevert(IMindLaunchpad.NotAMind.selector);
+        launchpad.currentPrice(address(0xBEEF));
     }
 
     function test_sell_withoutApprovalReverts() public {
@@ -245,9 +270,7 @@ contract MindLaunchpadTradingTest is BaseTest {
         // Rounding dust stays in the reserve, never negative.
         assertLt(reserve, 10);
         assertEq(MindToken(token).balanceOf(address(launchpad)), TOTAL_SUPPLY);
-        assertGe(
-            address(launchpad).balance, reserve + launchpad.mindBalance(token) + launchpad.protocolBalance()
-        );
+        assertGe(address(launchpad).balance, reserve + launchpad.mindBalance(token) + launchpad.protocolBalance());
     }
 
     function testFuzz_roundTripOnLaunchpadNeverProfits(uint256 seed, uint256 ethIn) public {
@@ -309,6 +332,9 @@ contract MindLaunchpadTradingTest is BaseTest {
         launchpad.quoteBuy(token, 1 ether);
         vm.expectRevert(IMindLaunchpad.WrongPhase.selector);
         launchpad.quoteSell(token, 1);
+        // The curve price is still readable while Complete.
+        (uint256 reserve,) = _curve(token);
+        assertEq(launchpad.currentPrice(token), CurveMath.price(reserve, CURVE_SUPPLY));
     }
 
     function test_exactMinimalCompletingAmount_andOneTwoWeiLess() public {
@@ -379,8 +405,7 @@ contract MindLaunchpadTradingTest is BaseTest {
     function test_createMindWithCompletingInitialBuy() public {
         uint256 balBefore = creator.balance;
         vm.prank(creator);
-        address token =
-            launchpad.createMind{value: 20 ether}("Whale", "WHALE", METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
+        address token = launchpad.createMind{value: 20 ether}("Whale", "WHALE", METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
         assertEq(uint8(launchpad.getCurve(token).phase), uint8(IMindLaunchpad.CurvePhase.Complete));
         assertEq(MindToken(token).balanceOf(creator), CURVE_SUPPLY);
         uint256 used = CurveMath.ethForTokens(0, 0, CURVE_SUPPLY, FEE_BPS);

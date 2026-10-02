@@ -160,7 +160,9 @@ contract LaunchpadHandler is Test {
 
     function setFees(uint16 tradeFeeBps, uint16 mindShareBps, uint16 graduationFeeBps) external {
         IMindLaunchpad.FeeParams memory p = IMindLaunchpad.FeeParams(
-            uint16(bound(tradeFeeBps, 0, 500)), uint16(bound(mindShareBps, 0, 10_000)), uint16(bound(graduationFeeBps, 0, 1000))
+            uint16(bound(tradeFeeBps, 0, 500)),
+            uint16(bound(mindShareBps, 0, 10_000)),
+            uint16(bound(graduationFeeBps, 0, 1000))
         );
         vm.prank(owner);
         launchpad.setFeeParams(p);

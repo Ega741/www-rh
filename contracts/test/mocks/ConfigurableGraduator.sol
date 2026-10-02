@@ -42,8 +42,14 @@ contract ConfigurableGraduator is IGraduator {
     }
 
     /// @inheritdoc IGraduator
-    function graduate(address, uint256) external payable returns (address pool, uint256 positionId, uint256 ethReturned) {
-        if (msg.sender != launchpad) revert NotLaunchpad();
+    function graduate(address, uint256)
+        external
+        payable
+        returns (address pool, uint256 positionId, uint256 ethReturned)
+    {
+        if (msg.sender != launchpad) {
+            revert NotLaunchpad();
+        }
         uint256 sent = msg.value * returnBps / 10_000;
         if (sendExtraOnGraduate) sent += extra;
         _send(sent);

@@ -89,8 +89,9 @@ contract MindLaunchpadVaultTest is BaseTest {
 
         // A new epoch starts at epochStart + drawEpoch.
         vm.warp(uint256(start) + 1 days);
-        (uint256 drawnView,) = launchpad.drawnInEpoch(token);
-        assertEq(drawnView, 0, "view reports the expired epoch as empty");
+        (uint256 drawnView, uint64 startView) = launchpad.drawnInEpoch(token);
+        assertEq(drawnView, 0.25 ether, "the view returns the stored values (no reset applied)");
+        assertEq(startView, start);
         _draw(0.25 ether);
         (uint256 drawn, uint64 newStart) = launchpad.drawnInEpoch(token);
         assertEq(drawn, 0.25 ether);
@@ -131,9 +132,18 @@ contract MindLaunchpadVaultTest is BaseTest {
         _draw(1 ether);
         assertEq(computeTreasury.balance, 2 ether);
 
-        vm.prank(owner);
-        vm.expectRevert(IMindLaunchpad.ZeroAmount.selector);
+        vm.startPrank(owner);
+        vm.expectRevert(IMindLaunchpad.InvalidDrawLimit.selector);
         launchpad.setDrawLimit(1 ether, 0);
+        vm.expectRevert(IMindLaunchpad.InvalidDrawLimit.selector);
+        launchpad.setDrawLimit(1 ether, 3599);
+        // A zero cap is allowed and blocks draws.
+        launchpad.setDrawLimit(0, 3600);
+        vm.stopPrank();
+        vm.warp(block.timestamp + 3600);
+        vm.prank(operator);
+        vm.expectRevert(IMindLaunchpad.DrawLimitExceeded.selector);
+        launchpad.drawCompute(token, 1, RECEIPT);
     }
 
     function test_drawCompute_reverts() public {
@@ -234,9 +244,11 @@ contract MindLaunchpadVaultTest is BaseTest {
         launchpad.setCreatorPaused(token, true);
         assertEq(uint8(_status(token)), uint8(IMindLaunchpad.MindStatus.Paused));
 
+        // Pausing again is a no-op without an event.
+        vm.recordLogs();
         vm.prank(creator);
-        vm.expectRevert(IMindLaunchpad.InvalidStatus.selector);
         launchpad.setCreatorPaused(token, true);
+        assertEq(vm.getRecordedLogs().length, 0);
 
         vm.expectEmit(true, false, false, true, address(launchpad));
         emit IMindLaunchpad.MindStatusChanged(token, IMindLaunchpad.MindStatus.Alive);
@@ -244,9 +256,20 @@ contract MindLaunchpadVaultTest is BaseTest {
         launchpad.setCreatorPaused(token, false);
         assertEq(uint8(_status(token)), uint8(IMindLaunchpad.MindStatus.Alive));
 
+        vm.recordLogs();
         vm.prank(creator);
-        vm.expectRevert(IMindLaunchpad.InvalidStatus.selector);
         launchpad.setCreatorPaused(token, false);
+        assertEq(vm.getRecordedLogs().length, 0, "unpausing a non-paused mind is a no-op");
+        assertEq(uint8(_status(token)), uint8(IMindLaunchpad.MindStatus.Alive));
+
+        // Unpausing a mind that is not paused leaves a Dormant status untouched.
+        vm.prank(operator);
+        launchpad.setMindStatus(token, IMindLaunchpad.MindStatus.Dormant);
+        vm.recordLogs();
+        vm.prank(creator);
+        launchpad.setCreatorPaused(token, false);
+        assertEq(vm.getRecordedLogs().length, 0);
+        assertEq(uint8(_status(token)), uint8(IMindLaunchpad.MindStatus.Dormant));
     }
 
     function test_onlyCreatorPauses() public {
@@ -256,8 +279,12 @@ contract MindLaunchpadVaultTest is BaseTest {
             vm.expectRevert(IMindLaunchpad.NotCreator.selector);
             launchpad.setCreatorPaused(token, true);
         }
-        vm.expectRevert(IMindLaunchpad.NotAMind.selector);
+        // Unknown tokens have no creator.
+        vm.expectRevert(IMindLaunchpad.NotCreator.selector);
         launchpad.setCreatorPaused(address(0xBEEF), true);
+        vm.prank(creator);
+        vm.expectRevert(IMindLaunchpad.NotCreator.selector);
+        launchpad.setMindConfig(address(0xBEEF), MODEL_ID, PERSONA_HASH, "");
     }
 
     function test_pausedVaultIsNotWithdrawableByCreator() public {
@@ -288,10 +315,13 @@ contract MindLaunchpadVaultTest is BaseTest {
         assertEq(info.metadataURI, "ipfs://cid");
 
         vm.startPrank(creator);
-        vm.expectRevert(IMindLaunchpad.InvalidModelId.selector);
+        vm.expectRevert(IMindLaunchpad.InvalidModel.selector);
         launchpad.setMindConfig(token, bytes32(0), persona, "ipfs://cid");
-        vm.expectRevert(IMindLaunchpad.InvalidMetadataURI.selector);
+        vm.expectRevert(IMindLaunchpad.MetadataTooLong.selector);
         launchpad.setMindConfig(token, model, persona, string(new bytes(2049)));
+        // Rule 8 order: the model is checked before the metadata length.
+        vm.expectRevert(IMindLaunchpad.InvalidModel.selector);
+        launchpad.setMindConfig(token, bytes32(0), persona, string(new bytes(2049)));
         vm.stopPrank();
 
         vm.prank(stranger);

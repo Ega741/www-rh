@@ -33,17 +33,24 @@ contract FixtureTest is BaseTest {
     }
 
     function _case(uint256 i) internal view returns (CurveFixtures.Case memory c) {
-        string memory op = _str(i, "op");
-        c.isBuy = keccak256(bytes(op)) == keccak256("buy");
-        assertTrue(c.isBuy || keccak256(bytes(op)) == keccak256("sell"), "op must be buy or sell");
+        bytes32 op = keccak256(bytes(_str(i, "op")));
+        c.completes = op == keccak256("complete");
+        c.isBuy = c.completes || op == keccak256("buy");
+        assertTrue(c.isBuy || op == keccak256("sell"), "op must be buy, complete or sell");
         c.realEthReserve = _uint(i, "realEthReserve");
         c.tokensSold = _uint(i, "tokensSold");
         c.amountIn = _uint(i, "amountIn");
-        c.tokensOut = _uint(i, "tokensOut");
-        c.ethOut = _uint(i, "ethOut");
-        c.ethUsed = _uint(i, "ethUsed");
         c.fee = _uint(i, "fee");
-        c.completes = vm.parseJsonBool(json, string.concat(".cases[", vm.toString(i), "].completes"));
+        string memory prefix = string.concat(".cases[", vm.toString(i), "]");
+        if (c.isBuy) {
+            c.tokensOut = _uint(i, "tokensOut");
+            c.ethUsed = _uint(i, "ethUsed");
+            assertFalse(vm.keyExistsJson(json, string.concat(prefix, ".ethOut")));
+        } else {
+            c.ethOut = _uint(i, "ethOut");
+            assertFalse(vm.keyExistsJson(json, string.concat(prefix, ".tokensOut")));
+            assertFalse(vm.keyExistsJson(json, string.concat(prefix, ".ethUsed")));
+        }
     }
 
     function test_fixtureIsUpToDate() public view {
@@ -51,13 +58,14 @@ contract FixtureTest is BaseTest {
     }
 
     function test_fixtureShape() public view {
-        assertEq(vm.parseJsonUint(json, ".tradeFeeBps"), 100);
+        assertEq(vm.parseJsonString(json, ".tradeFeeBps"), "100");
         assertGe(count, 40);
         uint256 completing;
         uint256 refunds;
         uint256 sells;
         uint256 sellsToZero;
         uint256 guards;
+        uint256 nearThreshold;
         for (uint256 i; i < count; ++i) {
             CurveFixtures.Case memory c = _case(i);
             if (c.completes) ++completing;
@@ -65,12 +73,17 @@ contract FixtureTest is BaseTest {
             if (!c.isBuy) ++sells;
             if (!c.isBuy && c.amountIn == c.tokensSold) ++sellsToZero;
             if (c.isBuy && c.completes && _guardTriggers(c.realEthReserve, c.tokensSold, c.amountIn)) ++guards;
+            if (c.isBuy && c.completes) {
+                uint256 minEth = CurveMath.minEthToComplete(c.realEthReserve, c.tokensSold, FEE_BPS);
+                if (c.amountIn <= minEth + 2) ++nearThreshold;
+            }
         }
         assertGe(completing, 10, "completing buys");
         assertGe(refunds, 5, "completing buys with refund");
         assertGe(sells, 10, "sells");
         assertGe(sellsToZero, 3, "sells back to zero");
         assertGe(guards, 5, "minimal completing amounts hitting the 1-wei guard");
+        assertGe(nearThreshold, 3, "completing buys within 2 wei of the minimal completing amount");
     }
 
     function test_fixtureMatchesCurveMath() public view {

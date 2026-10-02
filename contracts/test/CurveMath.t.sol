@@ -96,10 +96,7 @@ contract CurveMathTest is BaseTest {
         assertLe(tokensBack, tokensIn, "round trip profit");
     }
 
-    function testFuzz_kNeverDecreases(uint256 seedBuy, uint256 sellBps, uint256 ethIn, uint256 tokensBps)
-        public
-        pure
-    {
+    function testFuzz_kNeverDecreases(uint256 seedBuy, uint256 sellBps, uint256 ethIn, uint256 tokensBps) public pure {
         (uint256 reserve, uint256 sold) = _state(seedBuy, sellBps);
         uint256 k0 = _k(reserve, sold);
         assertGe(k0, CurveMath.VIRTUAL_ETH * CurveMath.VIRTUAL_TOKENS);
@@ -214,10 +211,7 @@ contract CurveMathTest is BaseTest {
         assertEq(fee, minEth * FEE_BPS / 10_000, "fee absorbs the clamp");
     }
 
-    function testFuzz_ethForTokensBuysAtLeastThatMany(uint256 seedBuy, uint256 sellBps, uint256 tokensBps)
-        public
-        pure
-    {
+    function testFuzz_ethForTokensBuysAtLeastThatMany(uint256 seedBuy, uint256 sellBps, uint256 tokensBps) public pure {
         (uint256 reserve, uint256 sold) = _state(seedBuy, sellBps);
         vm.assume(sold < CURVE_SUPPLY);
         uint256 want = bound(tokensBps, 1, 10_000) * (CURVE_SUPPLY - sold) / 10_000;

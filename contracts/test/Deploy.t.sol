@@ -50,7 +50,7 @@ contract DeployScriptTest is Test {
         assertEq(vm.parseJsonString(json, ".graduatorKind"), "mock");
         assertEq(vm.parseJsonUint(json, ".chainId"), block.chainid);
         assertEq(vm.parseJsonUint(json, ".deployedAt"), block.timestamp);
-        assertEq(vm.parseJsonUint(json, ".startBlock"), block.number);
+        assertFalse(vm.keyExistsJson(json, ".startBlock"));
     }
 
     function test_deploy_uniswapv3_withSeparateOwner() public {
@@ -79,6 +79,10 @@ contract DeployScriptTest is Test {
 
         UniswapV3Graduator g = UniswapV3Graduator(payable(d.graduator));
         assertEq(launchpad.graduator(), address(g));
+        assertEq(g.owner(), deployer, "graduator ownership is two-step too");
+        assertEq(g.pendingOwner(), owner);
+        vm.prank(owner);
+        g.acceptOwnership();
         assertEq(g.owner(), owner);
         assertEq(g.launchpad(), d.launchpad);
         assertEq(address(g.weth9()), address(weth));
@@ -96,7 +100,17 @@ contract DeployScriptTest is Test {
     }
 
     function test_configFromEnv_defaults() public {
-        string[5] memory vars = ["GRADUATOR_KIND", "WETH9", "UNIV3_FACTORY", "UNIV3_POSITION_MANAGER", "UNIV3_FEE_TIER"];
+        string[9] memory vars = [
+            "GRADUATOR_KIND",
+            "WETH9",
+            "UNIV3_FACTORY",
+            "UNIV3_POSITION_MANAGER",
+            "UNIV3_FEE_TIER",
+            "OWNER",
+            "TREASURY",
+            "COMPUTE_TREASURY",
+            "OPERATOR"
+        ];
         for (uint256 i; i < vars.length; ++i) {
             // The defaults are only observable when the deployment env is not set in this shell.
             if (bytes(vm.envOr(vars[i], string(""))).length > 0) vm.skip(true);
@@ -112,5 +126,7 @@ contract DeployScriptTest is Test {
         assertEq(c.weth9, 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73);
         assertEq(c.factory, 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA);
         assertEq(c.positionManager, 0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3);
+        assertEq(c.owner, address(0), "roles default to the deployer");
+        assertEq(c.operator, address(0));
     }
 }
