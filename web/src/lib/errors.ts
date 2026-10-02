@@ -91,6 +91,7 @@ const PONS_REVERT_MESSAGES: Record<string, { signature: string; message: string 
     message: 'The Pons factory rejected the launch (public launches may be closed to this registry, or the launch terms changed).',
   },
   FailedDeployment: { signature: 'FailedDeployment()', message: 'Deploying the mind account failed (its address may already be taken). Try again.' },
+  InsufficientBalance: { signature: 'InsufficientBalance(uint256,uint256)', message: 'The registry does not hold enough ETH for this operation.' },
   // PonsV2BondingCurve
   CurveGraduated: {
     signature: 'CurveGraduated()',

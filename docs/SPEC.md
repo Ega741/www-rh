@@ -1426,7 +1426,7 @@ in-house bonding curve of §2 remains the venue for testnet/anvil (`VENUE=curve`
 | Graduation | automatic in the crossing buy (`graduate` = sweep + drain, phase `Swept`), then permissionless `factory.createGraduatedPool(token)` seeds the locked full-range Uniswap v4 pool (phase `PoolCreated`); `getLaunchedToken(token).phase` ∈ {NotGraduated, Swept, PoolCreated, Rescued} |
 | Post-graduation fees | the hook accrues fees per pool; `hook.sweepPoolFees(poolId, minConversionQuoteOut, minBuybackTokensOut)` by the operator or by the pool's `creator` (= `creatorFeeRecipient` at `registerPool`); creator share → escrow |
 | Recipient hand-off | `factory.transferCreatorFeeRecipient(token, newRecipient)` by the current recipient (also valid after graduation) |
-| Events | factory `TokenLaunched(address indexed token, address indexed curve, address indexed deployer, address pairToken, uint256 launchConfigId, uint256 graduationThreshold)`, `LaunchSwept(token, quoteOut, tokenOut)`, `PoolGraduated(token, positionId, tokenAmount, pairTokenAmount)`, `CreatorFeeRecipientUpdated`; curve `CurveBuy(address indexed buyer, address indexed recipient, uint256 quoteIn, uint256 tokensOut, uint256 fee, uint256 tax)`, `CurveSell(seller, recipient, tokensIn, quoteOut, fee, tax)`, `CurveBuyRefunded(buyer, refund)`, `FeesSwept(protocolAmount, buybackAmount, creatorAmount)`, `CurveCompleted(recipient, quoteOut, tokenOut)`; escrow `Credited(recipient, depositor, amount)`, `Claimed(recipient, amount)`; hook `PoolRegistered(PoolId indexed poolId, address memecoin, address quoteToken, address creator)`, `PoolFeesSwept(poolId, quoteToken, protocolAmount, creatorAmount)` |
+| Events | factory `TokenLaunched(address indexed token, address indexed curve, address indexed deployer, address pairToken, uint256 launchConfigId, uint256 graduationThreshold)`, `LaunchSwept(token, quoteOut, tokenOut)`, `PoolGraduated(token, positionId, tokenAmount, pairTokenAmount)`, `CreatorFeeRecipientUpdated`; curve `CurveBuy(address indexed buyer, address indexed recipient, uint256 quoteIn, uint256 tokensOut, uint256 fee, uint256 tax)`, `CurveSell(seller, recipient, tokensIn, quoteOut, fee, tax)`, `CurveBuyRefunded(buyer, refund)`, `FeesSwept(protocolAmount, buybackAmount, creatorAmount)`, `CurveCompleted(recipient, quoteOut, tokenOut)`; escrow `Credited(recipient, depositor, amount)`, `Claimed(recipient, amount)`; hook `PoolRegistered(PoolId indexed poolId, address memecoin, address quoteToken, address creator)`, `PoolFeesSwept(bytes32 indexed poolId, uint256 protocolAmount, uint256 buybackAmount, uint256 creatorAmount, uint256 tokensLocked)` (verified on chain) |
 
 Full sources for reference (read-only, not vendored): the Pons repository is cloned at
 `/tmp/claude-0/-home-user-www-rh/f3be3359-fbf3-5def-b406-b91250afd9a1/scratchpad/pons/pons-labs`
@@ -1507,6 +1507,7 @@ function predictAccount(address creator, bytes32 salt) external view returns (ad
 function predictAdoptionAccount(address token) external view returns (address);
 function claimable(address token) external view returns (uint256);      // feeEscrow.balanceOf(account)
 function launchQuote(uint256 launchConfigId, uint256 quoteIn) external view returns (uint256 launchFee, uint256 total, bytes32 economics);
+function poolIdOf(address token) external view returns (bytes32);
 function factory() / feeEscrow() / memeHook() / accountImplementation() external view;
 function mindFeeBps() external view returns (uint16);                    // default 0, max 1000; owner: setMindFeeBps
 
@@ -1520,13 +1521,18 @@ event PoolIdSet(address indexed token, bytes32 poolId);
 event MindFeeUpdated(uint16 bps);
 error AccountExists(); error NotPonsLaunch(); error NotRecipientOrDeployer(); error AdoptionNotReady();
 error AlreadyAdopted(); error WrongValue(); error LaunchFailed();
+// inherited from OpenZeppelin Clones/Errors and present in the compiled ABI: FailedDeployment(), InsufficientBalance(uint256,uint256)
 ```
 
 `MindAccount` (`src/MindAccount.sol`, clone target): `initialize(address registry)` once (clone), `registry()` view,
 `receive()` accepts ETH from anyone (escrow payouts), `claim(IPonsV2FeeEscrow escrow) external onlyRegistry returns (uint256)`:
 `amount = escrow.claim()` then sends `address(this).balance` to the registry by full-gas call (returns the amount sent),
 `sweepPool(IPonsV2MemeHook hook, bytes32 poolId, uint256, uint256) onlyRegistry`,
-`transferFeeRecipient(IPonsV2LaunchFactory factory, address token, address to) onlyRegistry`. No other functions.
+`transferFeeRecipient(IPonsV2LaunchFactory factory, address token, address to) onlyRegistry`,
+`sweepCurve(IPonsV2BondingCurve curve, uint256 minBuybackTokensOut) onlyRegistry` (the live curve's `sweepFees` authorizes its
+`deployer` variable, which holds the creator fee recipient, i.e. the account). Errors `AlreadyInitialized`, `NotRegistry`,
+`ZeroAddress`, `EthTransferFailed`. No other functions. `MindAccount.claim` skips `escrow.claim()` when the escrow balance is 0
+(the real escrow reverts on an empty claim).
 
 Rules: native quote only (`pairToken = 0`) in this version; `buybackEnabled` is always false for
 minds launched here; `pause()` pauses `launchMind` and `prepareAdoption`; `MindLaunchpad`-only
@@ -1560,7 +1566,7 @@ with `{..., registry, venue: "pons"}`; `Deploy.s.sol` writes `venue: "curve"`.
 - Indexer in Pons mode: registry events (MindCreated/MindLaunched/AdoptionPrepared/MindAdopted/MindLeft/MindFunded/FeeAccrued/ComputeDrawn/MemoryAnchored/MindConfigUpdated/MindStatusChanged/Harvested/PoolIdSet) plus, for every registered token, the curve's `CurveBuy/CurveSell/CurveBuyRefunded/FeesSwept/CurveCompleted` (address-filtered `getLogs` over the set of known curves), the factory's `LaunchSwept/PoolGraduated/CreatorFeeRecipientUpdated` filtered by token, the escrow's `Credited/Claimed` filtered by our accounts, and the hook's `PoolRegistered` filtered by memecoin (→ `setPoolId` tx by the operator, DRY_RUN-aware). Trades map to the §5 `Trade` DTO (`ethAmountWei` = spent/quoteOut, `feeWei` = fee + tax, post-trade `priceWei` from reserves).
 - Budget: `vaultWei = mindBalance(token)`, `claimableWei = claimable(token)`; `availableUsd` counts the vault only; the scheduler calls `harvest(token)` (operator tx) when `claimableWei ≥ HARVEST_MIN_WEI` or when the vault cannot cover the next tick while claimable can; harvest is also attempted in the hourly sweep.
 - Status/draw/anchor/settlement logic is unchanged (same MindCore ABI). Graduation: nothing to trigger on the curve (Pons auto-graduates); when phase is `Swept` for > 10 min the runner calls `createGraduatedPool(token)` (best-effort).
-- API: `/api/health` gains `venue` and `registry`; `MindSummary.venue`, `MindDetail.pons` per §9.3; `/api/launch-config` → `{ launchFee, configs: [{ id, supply, curveFeeBps, phantomQuote, graduationThreshold, enabled }], maxCreatorTaxBps, snipeTaxSeconds }` (read-through cache 60 s).
+- API: `/api/health` gains `venue` and `registry`; `MindSummary.venue`, `MindDetail.pons` per §9.3; `/api/launch-config` → `{ launchFee, configs: [{ id, supply, curveFeeBps, phantomQuote, graduationThreshold, enabled }], maxCreatorTaxBps, snipeTaxSeconds }` (wei values as decimal strings without the `Wei` suffix, matching the Pons names; read-through cache 60 s; 404 in curve mode). Harvest policy: at most one harvest per mind per 5 min; graduated pools with a known pool id are harvested every `HARVEST_INTERVAL_MS`; Pons transactions run inside the scheduler (so they need `ANTHROPIC_API_KEY`, like curve-mode graduate/harvest).
 
 ### 9.5 Web
 
