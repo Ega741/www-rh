@@ -57,11 +57,30 @@ Raydium/PumpSwap) заменяется на EVM-эквиваленты.
 | Модель | «модель на выбор» | Семейство Claude через официальный Anthropic SDK (Opus 5.5 по умолчанию, Sonnet 5.5, Haiku 4.5, Fable 5.1); id модели хранится ончейн как `bytes32` |
 | Браузер | Облачный браузер | Playwright + Chromium в раннере; кадры и мысли транслируются по WebSocket на страницу монеты |
 
+
+### Pons: прямой аналог pump.fun на Robinhood Chain
+
+Оригинальный worldwideweb не делает собственный лаунчпад: он надстраивается над pump.fun и живёт
+на creator fees, которые pump.fun и так платит создателю. На Robinhood Chain роль pump.fun играет
+**Pons V2** (ponsfamily.com): бондинг-кривая в ETH, 1 % комиссии с каждой сделки до и после выпуска,
+70 % комиссии создателю, выпуск при 4.2 ETH в запертый пул Uniswap v4. В параметрах запуска
+`creatorFeeRecipient` — произвольный адрес, а комиссии копятся в эскроу и забираются вызовом
+`claim()`. Поэтому **основной режим проекта — Pons**: разум монеты получает ровно те же creator
+fees, что и у оригинала, а собственная кривая из раздела 4 остаётся режимом для testnet.
+
+| Элемент | Режим Pons (mainnet) |
+|---|---|
+| Запуск монеты | `PonsMindRegistry.launchMind` одной транзакцией: клон `MindAccount` → `factory.launchToken` с `creatorFeeRecipient = account` → регистрация разума → первая покупка создателя (освобождена от snipe tax) |
+| Существующая монета Pons | «усыновление»: `prepareAdoption` → создатель переводит получателя комиссий на `MindAccount` → `activateAdoption` |
+| Доход разума | creator share (70 % от 1 %) + опциональный creator tax, из эскроу Pons через `harvest()`; после выпуска — комиссии хука Uniswap v4 |
+| Торговля | напрямую на кривой Pons (`buy`/`sell`), после выпуска на Pons/Uniswap v4 |
+| Compute, память, статусы | без изменений: `drawCompute` с квитанциями, `anchorMemory`, пауза создателя |
+
 ## 4. Архитектура порта (кратко)
 
 ```
-contracts/   Solidity (Foundry): MindToken, MindLaunchpad (кривая + комиссии + vault + реестр),
-             UniswapV3Graduator (выпуск на DEX и сбор комиссий), MockGraduator (testnet без DEX)
+contracts/   Solidity (Foundry): MindCore (vault, списания, память, статусы); PonsMindRegistry + MindAccount
+             (режим Pons, mainnet); MindLaunchpad + UniswapV3Graduator (собственная кривая, testnet)
 packages/shared/  TypeScript: описание сетей Robinhood Chain, ABI, зеркало математики кривой,
              каталог моделей, типы API
 runner/      TypeScript: индексатор событий → SQLite; планировщик разумов; агентный цикл

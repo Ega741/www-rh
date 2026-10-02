@@ -47,6 +47,29 @@ Chainlink Data Feeds are live on Robinhood Chain mainnet (Chainlink is the chain
 partner). The ETH/USD feed address is **not** hard-coded here: set `ETH_USD_FEED` in the runner
 env once you confirm it from `data.chain.link`, otherwise the runner uses `ETH_USD_PRICE`.
 
+## Pons V2 launchpad (mainnet 4663)
+
+Pons (ponsfamily.com) is the pump.fun-style launchpad of Robinhood Chain and the primary venue of
+this project (`VENUE=pons`). Source: ponsdotdev/pons-labs (MIT), verified on chain.
+
+| Contract | Address |
+|---|---|
+| `PonsV2LaunchFactory` | `0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e` |
+| `PonsV2LaunchAndBuy` (router) | `0xe33e9e479df8802cb0866d5d05258bec4cf62948` |
+| `FeeEscrow` | `0xd3afeb2a57f70ef218aa82451c51b2fb0416ac9e` |
+| `PonsV2MemeHook` | `0xe5e702641ea86f4ae6cc3cdaed2b886f976be044` |
+| `PonsV2LaunchLocker` | `0x267444d099b10fb5ed7c3cc7b7c767adca574952` |
+| `PonsV2BuybackVault` | `0x42df2a798f82289e177311362e8f5ccc45c1219c` |
+| `PonsV2GraduationExecutor` | `0xc7819b64a1daecd7ec19856d026cb14efbd89046` |
+| `PonsV2LaunchDeployer` | `0x3711cea4feade896c913c68f01eda97cb06d1a42` |
+| V1 `PonsLaunchFactory` (closed for new launches) | `0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB` |
+
+Economics (read live from the factory, values at the time of writing): launch fee 0.0005 ETH,
+curve fee 1 % of the quote leg, protocol share 30 % of the fee, creator share the rest (minus a
+buyback slice only when buyback is enabled), optional creator tax up to 10 % paid entirely to the
+creator, graduation at 4.2 ETH into a locked full-range Uniswap v4 pool, snipe tax 99 % decaying
+over 15 s. Creator fees accrue in the FeeEscrow on sweeps and are claimed by the recipient.
+
 ## Testnet (46630)
 
 | Contract | Address |
