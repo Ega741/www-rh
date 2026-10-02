@@ -296,8 +296,26 @@ contract PonsMindRegistryAdminTest is PonsBaseTest {
         assertEq(registry.accountOf(random), address(0));
         assertEq(registry.tokenOf(random), address(0));
         assertEq(registry.mindBalance(random), 0);
+        assertEq(registry.claimable(random), 0);
+        assertFalse(registry.hasLeft(random));
+        assertEq(registry.derivedPoolId(random), bytes32(0));
+        (address account, bytes32 modelId, bytes32 personaHash, string memory uri) =
+            registry.pendingAdoption(random, creator);
+        assertEq(account, address(0));
+        assertEq(modelId, bytes32(0));
+        assertEq(personaHash, bytes32(0));
+        assertEq(bytes(uri).length, 0);
         vm.expectRevert();
         registry.mindAt(5);
+    }
+
+    function test_recoverAccountTokens_and_leave_creatorOnly() public {
+        vm.prank(operator);
+        vm.expectRevert(IMindCore.NotCreator.selector);
+        registry.recoverAccountTokens(token, token);
+        vm.prank(owner);
+        vm.expectRevert(IMindCore.NotCreator.selector);
+        registry.leave(token, owner);
     }
 }
 

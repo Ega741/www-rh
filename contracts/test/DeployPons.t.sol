@@ -204,6 +204,59 @@ contract DeployPonsScriptTest is Test {
         assertGt(registry.mindBalance(token), 0);
     }
 
+    function test_deployPonsLocal_surplusRefund_andAdoptionV2() public {
+        DeployPonsLocal.Config memory c;
+        c.outFile = "cache/deploy-pons-local-test-adoption.json";
+        PonsDeployBase.Deployment memory d = localScript.deployWith(c, DEPLOYER_KEY);
+        PonsMindRegistry registry = PonsMindRegistry(payable(d.registry));
+        MockPonsFactory f = MockPonsFactory(payable(d.pons.factory));
+        address user = makeAddr("user");
+        vm.deal(user, 10 ether);
+
+        // Over-paying (e.g. a launch fee quoted before a decrease) is refunded in the same transaction.
+        IPonsMindRegistry.LaunchParams memory p;
+        p.name = "Local Mind";
+        p.symbol = "LOCAL";
+        p.salt = keccak256("local-2");
+        (, uint256 total,) = registry.launchQuote(0, 0.1 ether);
+        uint256 before = user.balance;
+        vm.prank(user);
+        registry.launchMind{value: total + 0.5 ether}(p, 0.1 ether, 0, keccak256("m"), bytes32(0), "");
+        assertEq(before - user.balance, total, "surplus refunded");
+
+        // Adoption v2 (SPEC §9.7): a coin launched directly on the Pons mock, prepared by its recipient, handed to the
+        // preparer's account, activated by anyone; then left and taken over by the heir.
+        IPonsV2LaunchFactory.TokenParams memory tp;
+        tp.name = "Wild Local";
+        tp.symbol = "WLOC";
+        tp.salt = keccak256("wild-local");
+        uint256 launchFee = f.launchFee();
+        vm.prank(user);
+        (address wild,) = f.launchToken{value: launchFee}(tp, 0, address(0), new address[](0));
+        vm.prank(user);
+        address account = registry.prepareAdoption(wild, keccak256("m"), bytes32(0), "");
+        assertEq(account, registry.predictAdoptionAccount(wild, user));
+        assertFalse(registry.isMind(wild));
+        vm.prank(user);
+        f.transferCreatorFeeRecipient(wild, account);
+        registry.activateAdoption(wild, user);
+        assertEq(registry.getMind(wild).creator, user);
+        assertEq(registry.accountOf(wild), account);
+
+        address heir = makeAddr("heir");
+        vm.prank(user);
+        registry.leave(wild, heir);
+        assertTrue(registry.hasLeft(wild));
+        vm.prank(heir);
+        address heirAccount = registry.prepareAdoption(wild, keccak256("m"), bytes32(0), "");
+        vm.prank(heir);
+        f.transferCreatorFeeRecipient(wild, heirAccount);
+        registry.activateAdoption(wild, heir);
+        assertEq(registry.getMind(wild).creator, heir);
+        assertFalse(registry.hasLeft(wild));
+        assertEq(registry.mindsLength(), 2);
+    }
+
     function test_deployPonsLocal_rolesAndMainnetGuard() public {
         DeployPonsLocal.Config memory c;
         c.outFile = "cache/deploy-pons-local-test-roles.json";
