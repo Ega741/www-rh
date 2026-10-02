@@ -50,10 +50,10 @@ interface IPonsMindRegistry is IMindCore {
     event MindLaunched(
         address indexed token, address indexed curve, address indexed account, address creator, uint256 launchConfigId
     );
-    /// @notice `creator` (the preparer) prepared, or updated, a pending adoption of `token` with its own `account`.
-    ///         Informational: nothing is registered until the launch's creator fee recipient is handed to `account`
+    /// @notice `preparer` prepared, or updated, a pending adoption of `token` with its own `account`. Informational:
+    ///         nothing is registered until the launch's creator fee recipient is handed to `account`
     ///         (`factory.transferCreatorFeeRecipient(token, account)`) and anyone calls {activateAdoption}.
-    event AdoptionPrepared(address indexed token, address indexed account, address indexed creator);
+    event AdoptionPrepared(address indexed token, address indexed account, address indexed preparer);
     /// @notice An adoption was activated: `account` (the creator fee recipient) is now the mind's account and
     ///         `creator` its creator. Follows {IMindCore-MindCreated} for a new mind, or {IMindCore-MindConfigUpdated}
     ///         for a takeover of an existing one.

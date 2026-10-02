@@ -457,8 +457,9 @@ contract PonsMindRegistryHarvestTest is PonsBaseTest {
         public
         pure
     {
-        IPonsV2MemeHook.PoolKey memory key =
-            IPonsV2MemeHook.PoolKey({currency0: address(0), currency1: coin, fee: fee, tickSpacing: tickSpacing, hooks: hk});
+        IPonsV2MemeHook.PoolKey memory key = IPonsV2MemeHook.PoolKey({
+            currency0: address(0), currency1: coin, fee: fee, tickSpacing: tickSpacing, hooks: hk
+        });
         assertEq(keccak256(abi.encode(key)), _v4ToId(key));
         assertEq(keccak256(abi.encode(address(0), coin, fee, tickSpacing, hk)), _v4ToId(key));
     }

@@ -270,10 +270,9 @@ contract PonsMindRegistryLaunchTest is PonsBaseTest {
         IPonsMindRegistry.LaunchParams memory p = _params(SALT);
         uint256 creatorBefore = creator.balance;
         vm.prank(creator);
-        (address token, address curve,) =
-            registry.launchMind{value: LAUNCH_FEE + 0.01 ether + 1 ether + 0.7 ether}(
-                p, 1 ether, 0, MODEL_ID, PERSONA_HASH, METADATA_URI
-            );
+        (address token, address curve,) = registry.launchMind{value: LAUNCH_FEE + 0.01 ether + 1 ether + 0.7 ether}(
+            p, 1 ether, 0, MODEL_ID, PERSONA_HASH, METADATA_URI
+        );
         assertEq(creatorBefore - creator.balance, LAUNCH_FEE + 0.01 ether + 1 ether, "surplus back in the same tx");
         assertEq(address(registry).balance, 0.01 ether, "only the creation fee stays");
         assertEq(registry.protocolBalance(), 0.01 ether);
