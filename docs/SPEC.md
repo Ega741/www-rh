@@ -1397,3 +1397,173 @@ Routes:
   §3.1), `anvil:e2e` (`bash scripts/anvil-e2e.sh`: starts anvil, deploys with
   `GRADUATOR_KIND=mock`, runs the runner with `CHAIN_ID=31337`, `LAUNCHPAD_ADDRESS` from the
   deployment file and `DRY_RUN=true`).
+
+---
+
+## 9. Pons mode (primary venue on mainnet)
+
+The original worldwideweb does not run its own launchpad: it layers minds on pump.fun coins and
+pays for compute from the creator fees pump.fun already pays. On Robinhood Chain the equivalent
+venue is **Pons V2** (ponsfamily.com). Pons mode is the **primary mode on mainnet (4663)**; the
+in-house bonding curve of §2 remains the venue for testnet/anvil (`VENUE=curve`). Everything in
+§3-§7 stays as specified unless this section says otherwise; §2's `MindLaunchpad` is unchanged.
+
+### 9.1 Pons V2 facts this design relies on (source: ponsdotdev/pons-labs, verified on chain)
+
+| Item | Value |
+|---|---|
+| `PonsV2LaunchFactory` | `0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e` |
+| `PonsV2LaunchAndBuy` (router; not used by the registry) | `0xe33e9e479df8802cb0866d5d05258bec4cf62948` |
+| `FeeEscrow` (`IPonsV2FeeEscrow`) | `0xd3afeb2a57f70ef218aa82451c51b2fb0416ac9e` |
+| `PonsV2MemeHook` (fee policy + post-graduation fees) | `0xe5e702641ea86f4ae6cc3cdaed2b886f976be044` |
+| `PonsV2LaunchLocker`, `PonsV2BuybackVault`, `GraduationExecutor` | `0x267444d099b10fb5ed7c3cc7b7c767adca574952`, `0x42df2a798f82289e177311362e8f5ccc45c1219c`, `0xc7819b64a1daecd7ec19856d026cb14efbd89046` |
+| Uniswap v4 PoolManager (graduated pools) | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
+| Launch | `factory.launchToken(TokenParams, launchConfigId, pairToken, address[] snipeTaxExemptions) payable returns (address token, address curve)`; `msg.value == factory.launchFee()` (0.0005 ETH at launch); `canLaunch(msg.sender)` = `launchEnabled || whitelistedLaunchers[msg.sender]` |
+| `TokenParams` | `(string name, string symbol, string logo, string description, Socials socials, address creatorFeeRecipient, uint16 creatorTaxBps, bool buybackEnabled, bytes32 expectedEconomics, bytes32 salt)`; `Socials = (string twitter, string telegram, string discord, string website, string farcaster)`; `expectedEconomics` = `factory.previewLaunchEconomics(launchConfigId, pairToken)` or 0 to skip the guard; `salt` namespaced by the factory as `keccak256(deployer, salt)` |
+| Curve | `buy(uint256 quoteIn, uint256 minTokensOut, address recipient) payable` (native: `msg.value == quoteIn`; refund of unspent quote goes to `msg.sender`), `sell(uint256 tokensIn, uint256 minQuoteOut, address recipient)`, `getReserves() → (quoteReserve, tokenReserve)` (quote includes the phantom reserve, excludes pending fees), `sellableTokens()`, `feeBps()`, `creatorTaxBps()`, `graduated()`, `readyToGraduate()`, `graduationThreshold()`, `realQuoteReserve()`, `sweepFees(uint256 minBuybackTokensOut)` (callable by Pons' `feeSweepOperator` or the launch `deployer`; with buyback disabled no internal swap is needed) |
+| Curve math | `tokensOut = getAmountOut(spent − fee − tax, quoteReserve, tokenReserve)` constant product; `fee = spent·feeBps/10000`, `tax = spent·creatorTaxBps/10000`; a buy that would exceed `sellableTokens()` is capped and the remainder refunded; price = `quoteReserve/tokenReserve`; snipe tax 99 % decaying over `snipeTaxSeconds` (15 s) after launch for non-exempt buyers |
+| Fees | 1 % (`curveFeeBps`, read from `getLaunchConfig(id)`) on the quote leg before and after graduation; split per `FeePolicySnapshot` frozen at launch: protocol share (30 %), creator share, buyback share only when `buybackEnabled`; creator tax (0..`maxCreatorTaxBps`, ≤ 10 %) paid entirely to the creator. Creator amounts are **credited to `creatorFeeRecipient` in the FeeEscrow on sweep**, not pushed; `escrow.claim()` pays `msg.sender` by ETH call |
+| Graduation | automatic in the crossing buy (`graduate` = sweep + drain, phase `Swept`), then permissionless `factory.createGraduatedPool(token)` seeds the locked full-range Uniswap v4 pool (phase `PoolCreated`); `getLaunchedToken(token).phase` ∈ {NotGraduated, Swept, PoolCreated, Rescued} |
+| Post-graduation fees | the hook accrues fees per pool; `hook.sweepPoolFees(poolId, minConversionQuoteOut, minBuybackTokensOut)` by the operator or by the pool's `creator` (= `creatorFeeRecipient` at `registerPool`); creator share → escrow |
+| Recipient hand-off | `factory.transferCreatorFeeRecipient(token, newRecipient)` by the current recipient (also valid after graduation) |
+| Events | factory `TokenLaunched(address indexed token, address indexed curve, address indexed deployer, address pairToken, uint256 launchConfigId, uint256 graduationThreshold)`, `LaunchSwept(token, quoteOut, tokenOut)`, `PoolGraduated(token, positionId, tokenAmount, pairTokenAmount)`, `CreatorFeeRecipientUpdated`; curve `CurveBuy(address indexed buyer, address indexed recipient, uint256 quoteIn, uint256 tokensOut, uint256 fee, uint256 tax)`, `CurveSell(seller, recipient, tokensIn, quoteOut, fee, tax)`, `CurveBuyRefunded(buyer, refund)`, `FeesSwept(protocolAmount, buybackAmount, creatorAmount)`, `CurveCompleted(recipient, quoteOut, tokenOut)`; escrow `Credited(recipient, depositor, amount)`, `Claimed(recipient, amount)`; hook `PoolRegistered(PoolId indexed poolId, address memecoin, address quoteToken, address creator)`, `PoolFeesSwept(poolId, quoteToken, protocolAmount, creatorAmount)` |
+
+Full sources for reference (read-only, not vendored): the Pons repository is cloned at
+`/tmp/claude-0/-home-user-www-rh/f3be3359-fbf3-5def-b406-b91250afd9a1/scratchpad/pons/pons-labs`
+(`contractsV2/src/v2/*`); generated ABIs at `.../scratchpad/pons/ponscli/src/abi/*.ts`. Our
+contracts declare **minimal local interfaces** (`src/interfaces/pons/*.sol`) with exactly the
+members above; the TypeScript side keeps human-readable ABIs in `@www-rh/shared/abi` (`ponsFactoryAbi`,
+`ponsCurveAbi`, `ponsFeeEscrowAbi`, `ponsMemeHookAbi`) derived from the same sources.
+
+### 9.2 Contracts: `MindCore`, `PonsMindRegistry`, `MindAccount`
+
+`MindCore` (abstract, `src/MindCore.sol`) is extracted from `MindLaunchpad` without behaviour change
+and holds everything venue-independent: roles (`Ownable2Step`, `operator`, `treasury`,
+`computeTreasury`), `Pausable`, `ReentrancyGuard`, the registry (`MindInfo`, `mindsLength/mindAt/isMind`,
+`setMindConfig`, `setCreatorPaused`, `setMindStatus`), the vault (`mindBalance`, `fundMind`,
+`drawCompute` + epoch caps + `MAX_DRAW_PER_EPOCH`, `protocolBalance`, `withdrawProtocolFees`),
+`anchorMemory`, the returned-ETH counter (`_returnFrom/_returned`, gated `receive()`), the
+`renounceOwnership` block and all the shared events/errors of §2.3. `MindLaunchpad` becomes
+`MindCore` + the curve; its ABI, behaviour and tests stay identical.
+
+`PonsMindRegistry` (`src/PonsMindRegistry.sol`) = `MindCore` + Pons integration. Constructor
+`(address initialOwner, address treasury, address computeTreasury, address operator, address factory, address feeEscrow, address memeHook)`;
+`accountImplementation` (a `MindAccount`) is deployed in the constructor and cloned with EIP-1167
+(`Clones.cloneDeterministic`).
+
+```solidity
+struct Socials { string twitter; string telegram; string discord; string website; string farcaster; }
+struct LaunchParams {
+    string name; string symbol; string logo; string description; Socials socials;
+    uint16 creatorTaxBps;        // 0..factory.maxCreatorTaxBps(); paid to the mind vault
+    bytes32 expectedEconomics;   // from factory.previewLaunchEconomics(launchConfigId, 0) or 0
+    bytes32 salt;                // CREATE2 salt for the Pons token; also namespaces the account
+    uint256 launchConfigId;
+}
+struct PonsMind { address curve; address account; uint256 launchConfigId; bool launchedHere; bool adopted; }
+
+// --- creator ---
+function launchMind(LaunchParams calldata p, uint256 quoteIn, uint256 minTokensOut,
+    bytes32 modelId, bytes32 personaHash, string calldata metadataURI)
+    external payable returns (address token, address curve, address account);
+    // msg.value == factory.launchFee() + quoteIn + creationFee(). Steps: (1) account = clone with
+    // salt keccak256(abi.encode(msg.sender, p.salt)) (revert AccountExists if already deployed);
+    // (2) factory.launchToken{value: launchFee}(TokenParams{..., creatorFeeRecipient: account,
+    // buybackEnabled: false, ...}, p.launchConfigId, address(0) /*native quote only*/, [msg.sender]);
+    // (3) register MindInfo{creator: msg.sender, modelId, personaHash, metadataURI, createdAt, Alive}
+    // and PonsMind{curve, account, launchConfigId, launchedHere: true}; (4) if quoteIn > 0:
+    // IPonsV2BondingCurve(curve).buy{value: quoteIn}(quoteIn, minTokensOut, msg.sender) and forward
+    // any refund the curve returns to the registry back to msg.sender; (5) creationFee → protocolBalance.
+    // Emits MindCreated (as §2.3, with the Pons token) and MindLaunched(token, curve, account, creator, launchConfigId).
+function prepareAdoption(address token, bytes32 modelId, bytes32 personaHash, string calldata metadataURI)
+    external returns (address account);
+    // token must exist in the factory (getLaunchedToken(token).exists); msg.sender must be the launch's
+    // current creatorFeeRecipient or its deployer; account = clone with salt keccak256(abi.encode(token));
+    // registers the mind with status Dormant and PonsMind{adopted: false}; emits AdoptionPrepared(token, account, creator).
+function activateAdoption(address token) external;
+    // anyone; requires factory.getLaunchedToken(token).creatorFeeRecipient == account; sets adopted = true,
+    // status Alive unless creator-paused; emits MindAdopted(token, account).
+function leave(address token, address newRecipient) external;
+    // creator only; account.transferFeeRecipient(factory, token, newRecipient); status Dormant; emits MindLeft.
+    // The vault keeps its balance (still drawable for compute); fundMind still works.
+
+// --- permissionless ---
+function harvest(address token) external nonReentrant;
+    // (1) sweep best-effort, each in try/catch: if phase == NotGraduated && launchedHere → curve.sweepFees(0)
+    //     (registry is the deployer); if phase == PoolCreated && poolId known → account.sweepPool(hook, poolId, 0, 0);
+    // (2) claim: _returnFrom = account; ethOut = account.claim(feeEscrow); require(_returned == ethOut)
+    //     else EthReturnMismatch; mindFee = ethOut·mindFeeBps/10000 → protocolBalance (FeeAccrued),
+    //     rest → mindBalance[token]; emits Harvested(token, ethOut − mindFee, 0) and MindFunded(token, account, …).
+function createGraduatedPool(address token) external; // forwards to factory.createGraduatedPool (anyone; convenience)
+function setPoolId(address token, bytes32 poolId) external; // operator; recorded from the hook's PoolRegistered log (the hook has no memecoin→poolId view)
+
+// --- views ---
+function ponsMind(address token) external view returns (PonsMind memory);
+function accountOf(address token) external view returns (address);
+function tokenOf(address account) external view returns (address);
+function predictAccount(address creator, bytes32 salt) external view returns (address);
+function predictAdoptionAccount(address token) external view returns (address);
+function claimable(address token) external view returns (uint256);      // feeEscrow.balanceOf(account)
+function launchQuote(uint256 launchConfigId, uint256 quoteIn) external view returns (uint256 launchFee, uint256 total, bytes32 economics);
+function factory() / feeEscrow() / memeHook() / accountImplementation() external view;
+function mindFeeBps() external view returns (uint16);                    // default 0, max 1000; owner: setMindFeeBps
+
+// --- events / errors (in addition to §2.3 shared ones) ---
+event MindLaunched(address indexed token, address indexed curve, address indexed account, address creator, uint256 launchConfigId);
+event AdoptionPrepared(address indexed token, address indexed account, address indexed creator);
+event MindAdopted(address indexed token, address indexed account);
+event MindLeft(address indexed token, address newRecipient);
+event SweepAttempted(address indexed token, bool curveSwept, bool poolSwept);
+event PoolIdSet(address indexed token, bytes32 poolId);
+event MindFeeUpdated(uint16 bps);
+error AccountExists(); error NotPonsLaunch(); error NotRecipientOrDeployer(); error AdoptionNotReady();
+error AlreadyAdopted(); error WrongValue(); error LaunchFailed();
+```
+
+`MindAccount` (`src/MindAccount.sol`, clone target): `initialize(address registry)` once (clone), `registry()` view,
+`receive()` accepts ETH from anyone (escrow payouts), `claim(IPonsV2FeeEscrow escrow) external onlyRegistry returns (uint256)`:
+`amount = escrow.claim()` then sends `address(this).balance` to the registry by full-gas call (returns the amount sent),
+`sweepPool(IPonsV2MemeHook hook, bytes32 poolId, uint256, uint256) onlyRegistry`,
+`transferFeeRecipient(IPonsV2LaunchFactory factory, address token, address to) onlyRegistry`. No other functions.
+
+Rules: native quote only (`pairToken = 0`) in this version; `buybackEnabled` is always false for
+minds launched here; `pause()` pauses `launchMind` and `prepareAdoption`; `MindLaunchpad`-only
+members (`buy/sell/graduate/quote*`, `CurveState`, graduation grace) do not exist on the registry;
+`getCurve` is replaced by `ponsMind` + reads from the Pons curve. The registry must hold no ETH
+besides `Σ mindBalance + protocolBalance` (invariant), so launch/buy refunds are forwarded in the
+same transaction.
+
+Tests: realistic mocks under `test/mocks/pons/` (factory with `launchToken`/`launchTokenFor`/`canLaunch`/
+`transferCreatorFeeRecipient`/`getLaunchedToken`/`createGraduatedPool`, a curve with the real
+fee/tax/cap math, `sweepFees` authorization and escrow crediting, an escrow with `credit/claim/balanceOf`,
+a hook with `registerPool`/`sweepPoolFees` authorization) + unit/fuzz/invariant tests for launch
+(value accounting, refunds, exemptions, economics guard), adoption (both steps, wrong caller,
+recipient not yet transferred), harvest (sweep auth paths, claim accounting, mindFee split,
+EthReturnMismatch), leave, draw/anchor/status via MindCore, and the vault invariant. A fork test
+(`test/fork/PonsFork.t.sol`) against mainnet addresses runs only when `ROBINHOOD_RPC_URL` is set.
+`script/DeployPons.s.sol` deploys the registry with env `PONS_FACTORY`, `PONS_FEE_ESCROW`,
+`PONS_MEME_HOOK` (defaults to the mainnet addresses on 4663) and writes `deployments/<chainId>.json`
+with `{..., registry, venue: "pons"}`; `Deploy.s.sol` writes `venue: "curve"`.
+
+### 9.3 Shared package
+
+- `addresses.ts`: `PONS` constants for 4663 (factory, router, feeEscrow, memeHook, locker, buybackVault, poolManager); `DeploymentRecord` gains `venue: 'pons' | 'curve'` and `registry?: Address`.
+- `abi.ts`: `ponsMindRegistryAbi` (full §9.2 surface + MindCore surface), `mindAccountAbi`, `ponsFactoryAbi`, `ponsCurveAbi`, `ponsFeeEscrowAbi`, `ponsMemeHookAbi` (members listed in §9.1 only).
+- `ponsCurve.ts`: bigint mirror of the Pons quote math: `ponsQuoteBuy({ quoteIn, quoteReserve, tokenReserve, sellable, feeBps, taxBps }) → { tokensOut, spent, fee, tax, refund }` and `ponsQuoteSell`, `ponsPrice`, `ponsProgressBps = realQuoteReserve·10000/graduationThreshold`, with tests against hand-computed cases from the Solidity formulas.
+- `types.ts`: `venue: 'pons' | 'curve'` on `MindSummary`/`MindDetail`; `pons: { curve, account, deployer, launchConfigId, feeBps, creatorTaxBps, claimableWei, launchedHere, adopted, poolId } | null`; `phase` keeps `'bonding' | 'complete' | 'graduated'` (Pons `Swept` → `complete`, `PoolCreated`/`Rescued` → `graduated`).
+
+### 9.4 Runner
+
+- Env: `VENUE` (`pons` default on 4663, `curve` otherwise), `REGISTRY_ADDRESS` (Pons mode), `LAUNCHPAD_ADDRESS` (curve mode), `HARVEST_MIN_WEI` (default 0.002 ether: harvest when `claimable ≥` this), `PONS_*` address overrides.
+- Indexer in Pons mode: registry events (MindCreated/MindLaunched/AdoptionPrepared/MindAdopted/MindLeft/MindFunded/FeeAccrued/ComputeDrawn/MemoryAnchored/MindConfigUpdated/MindStatusChanged/Harvested/PoolIdSet) plus, for every registered token, the curve's `CurveBuy/CurveSell/CurveBuyRefunded/FeesSwept/CurveCompleted` (address-filtered `getLogs` over the set of known curves), the factory's `LaunchSwept/PoolGraduated/CreatorFeeRecipientUpdated` filtered by token, the escrow's `Credited/Claimed` filtered by our accounts, and the hook's `PoolRegistered` filtered by memecoin (→ `setPoolId` tx by the operator, DRY_RUN-aware). Trades map to the §5 `Trade` DTO (`ethAmountWei` = spent/quoteOut, `feeWei` = fee + tax, post-trade `priceWei` from reserves).
+- Budget: `vaultWei = mindBalance(token)`, `claimableWei = claimable(token)`; `availableUsd` counts the vault only; the scheduler calls `harvest(token)` (operator tx) when `claimableWei ≥ HARVEST_MIN_WEI` or when the vault cannot cover the next tick while claimable can; harvest is also attempted in the hourly sweep.
+- Status/draw/anchor/settlement logic is unchanged (same MindCore ABI). Graduation: nothing to trigger on the curve (Pons auto-graduates); when phase is `Swept` for > 10 min the runner calls `createGraduatedPool(token)` (best-effort).
+- API: `/api/health` gains `venue` and `registry`; `MindSummary.venue`, `MindDetail.pons` per §9.3; `/api/launch-config` → `{ launchFee, configs: [{ id, supply, curveFeeBps, phantomQuote, graduationThreshold, enabled }], maxCreatorTaxBps, snipeTaxSeconds }` (read-through cache 60 s).
+
+### 9.5 Web
+
+- `VITE_VENUE` (`pons` default) and `VITE_REGISTRY_ADDRESS`. In Pons mode: **Create** = the Pons launch form (name, symbol, logo URL, description, socials, creator tax slider 0..max %, launch config from `/api/launch-config`, initial buy with the `ponsQuoteBuy` preview, model, persona) → `registry.launchMind{value: launchFee + quoteIn}` with `expectedEconomics` read from the factory just before sending and `salt = keccak256(utf8(name + ' ' + symbol + ' ' + nonce))`; decode `MindLaunched` from the receipt. **Adopt**: paste a Pons token address → show its launch record → `prepareAdoption` → instruct the user to call `transferCreatorFeeRecipient(token, account)` (button, wagmi) → `activateAdoption`. **Mind page**: curve stats from the Pons curve (`getReserves`, `sellableTokens`, `realQuoteReserve/graduationThreshold`), buy/sell directly on the curve (`buy{value}` / approve + `sell`), snipe-tax warning during the first 15 s after launch, phase labels (bonding / graduating / graduated), after graduation "Trade on Pons" and Uniswap/Blockscout links instead of a trade form; compute meter shows vault + claimable with a "Harvest" button; creator tools gain "Leave" (transfer the fee recipient away). Curve mode keeps the §7 UI.
+
+### 9.6 Docs and ops
+
+README/DEPLOY describe Pons mode as the mainnet path: deploy `PonsMindRegistry` (`DeployPons.s.sol`), set the operator, run the runner with `VENUE=pons`; note that the registry must pass `factory.canLaunch` (public launches enabled, or Pons whitelists the registry), that creator fees reach the escrow only on sweeps (Pons operator, or our registry/account where permitted), and that Pons' own contracts are outside our audit.
