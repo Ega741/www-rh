@@ -14,7 +14,8 @@ const LAUNCHPAD_CUSTOM_ERRORS = [
   'NotAMind', 'WrongPhase', 'Slippage', 'Expired', 'ZeroAmount', 'ExceedsTokensSold', 'NotCreator', 'NotOperator',
   'InvalidStatus', 'InvalidName', 'InvalidSymbol', 'MetadataTooLong', 'InvalidModel', 'InsufficientCreationFee',
   'InsufficientMindBalance', 'DrawLimitExceeded', 'InvalidDrawLimit', 'FeeTooHigh', 'ZeroAddress', 'EthTransferFailed',
-  'GraduatorNotSet', 'EthReturnMismatch', 'DirectEthNotAccepted',
+  'GraduatorNotSet', 'EthReturnMismatch', 'DirectEthNotAccepted', 'InvalidGraduationGrace', 'InvalidGraduator',
+  'RenounceDisabled', 'PoolPriceSkewed',
 ];
 
 /** ABI copied by `pnpm abi:sync` into `packages/shared/abi/<Name>.json` (SPEC §3.3). */
@@ -71,18 +72,18 @@ describe('human-readable ABI (SPEC §2.3, §3.3)', () => {
       'setFeeParams', 'setCreationFee', 'setDrawLimit', 'pause', 'unpause', 'withdrawProtocolFees', 'quoteBuy', 'quoteSell',
       'currentPrice', 'getMind', 'getCurve', 'mindBalance', 'protocolBalance', 'mindsLength', 'mindAt', 'isMind', 'feeParams',
       'creationFee', 'drawLimit', 'drawnInEpoch', 'operator', 'treasury', 'computeTreasury', 'graduator', 'graduatorOf',
-      'isGraduator', 'TOTAL_SUPPLY', 'CURVE_SUPPLY', 'LP_SUPPLY', 'VIRTUAL_ETH', 'VIRTUAL_TOKENS',
+      'completedAt', 'graduationGrace', 'setGraduationGrace', 'TOTAL_SUPPLY', 'CURVE_SUPPLY', 'LP_SUPPLY', 'VIRTUAL_ETH', 'VIRTUAL_TOKENS',
       'owner', 'pendingOwner', 'transferOwnership', 'acceptOwnership', 'renounceOwnership', 'paused',
     ]) {
       expect(fns.has(name), `function ${name}`).toBe(true);
     }
-    expect(fns.size).toBe(52);
+    expect(fns.size).toBe(54);
     const events = names(mindLaunchpadAbi, 'event');
     for (const name of [
       'MindCreated', 'Trade', 'CurveCompleted', 'Graduated', 'FeeAccrued', 'MindFunded', 'Harvested', 'ComputeDrawn',
       'MemoryAnchored', 'MindConfigUpdated', 'MindStatusChanged', 'ProtocolFeesWithdrawn', 'OperatorUpdated',
       'TreasuryUpdated', 'ComputeTreasuryUpdated', 'GraduatorUpdated', 'FeeParamsUpdated', 'CreationFeeUpdated',
-      'DrawLimitUpdated', 'OwnershipTransferStarted', 'OwnershipTransferred', 'Paused', 'Unpaused',
+      'DrawLimitUpdated', 'CurveReopened', 'GraduationGraceUpdated', 'OwnershipTransferStarted', 'OwnershipTransferred', 'Paused', 'Unpaused',
     ]) {
       expect(events.has(name), `event ${name}`).toBe(true);
     }
@@ -93,7 +94,7 @@ describe('human-readable ABI (SPEC §2.3, §3.3)', () => {
     ]) {
       expect(errors.has(name), `error ${name}`).toBe(true);
     }
-    for (const removed of ['creditMind', 'retireMind', 'withdrawRetiredMind', 'graduateFor', 'RetiredMindWithdrawn', 'PoolPriceSkewed', 'Retired', 'NotGraduator']) {
+    for (const removed of ['creditMind', 'retireMind', 'withdrawRetiredMind', 'graduateFor', 'RetiredMindWithdrawn', 'Retired', 'NotGraduator', 'isGraduator']) {
       expect(fns.has(removed) || events.has(removed) || errors.has(removed), removed).toBe(false);
     }
     expect(mindLaunchpadAbi.some((i) => i.type === 'receive')).toBe(true);
@@ -110,6 +111,8 @@ describe('human-readable ABI (SPEC §2.3, §3.3)', () => {
     expect(event('CreationFeeUpdated').inputs.map((i) => i.name)).toEqual(['newCreationFee']);
     expect(event('ComputeDrawn').inputs.map((i) => `${i.name}${i.indexed === true ? '*' : ''}`)).toEqual(['token*', 'amount', 'receiptHash']);
     expect(event('MemoryAnchored').inputs.map((i) => `${i.name}${i.indexed === true ? '*' : ''}`)).toEqual(['token*', 'seq*', 'contentHash', 'uri']);
+    expect(event('CurveReopened').inputs.map((i) => `${i.name}${i.indexed === true ? '*' : ''}`)).toEqual(['token*']);
+    expect(event('GraduationGraceUpdated').inputs.map((i) => i.name)).toEqual(['graceSeconds']);
   });
 
   it('well-known selectors / topics are stable', () => {
@@ -138,7 +141,10 @@ describe('human-readable ABI (SPEC §2.3, §3.3)', () => {
     const skew = graduatorAbi.find((i) => i.type === 'event') as AbiEvent;
     expect(skew.inputs[0]).toMatchObject({ name: 'token', indexed: true });
     expect(names(graduatorAbi, 'error')).toEqual(
-      new Set(['NotLaunchpad', 'AlreadyGraduated', 'NoPosition', 'UnexpectedEthSender', 'UnsupportedFeeTier', 'ZeroAddress', 'EthTransferFailed']),
+      new Set([
+        'NotLaunchpad', 'AlreadyGraduated', 'NoPosition', 'UnexpectedEthSender', 'UnsupportedFeeTier', 'ZeroAddress', 'EthTransferFailed',
+        'PoolPriceSkewed', 'UnauthorizedCallback', 'InvalidPriceTolerance',
+      ]),
     );
   });
 
@@ -200,6 +206,16 @@ describe.skipIf(graduatorArtifact === undefined)('IGraduator ABI equivalence wit
     const theirs = selectorsOf(graduatorArtifact ?? []);
     expect(missing(ours.functions, theirs.functions)).toEqual([]);
     expect(missing(theirs.functions, ours.functions)).toEqual([]);
+  });
+  it('every extra event / error comes from a compiled graduator implementation', () => {
+    const impl = new Map<string, string>();
+    for (const name of ['UniswapV3Graduator', 'MockGraduator']) {
+      const s = selectorsOf(loadSyncedAbi(name) ?? []);
+      for (const [k, v] of [...s.events, ...s.errors]) impl.set(k, v);
+    }
+    const ours = selectorsOf(graduatorAbi);
+    const theirs = selectorsOf(graduatorArtifact ?? []);
+    for (const [k, v] of [...ours.events, ...ours.errors]) expect(theirs.events.has(k) || theirs.errors.has(k) || impl.has(k), v).toBe(true);
   });
 });
 

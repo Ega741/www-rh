@@ -151,6 +151,7 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
         break;
       case 'mind:status':
       case 'curve:complete':
+      case 'curve:reopened':
       case 'graduated':
         publishStatus(ev.token);
         break;

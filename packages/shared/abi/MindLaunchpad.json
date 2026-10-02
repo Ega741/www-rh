@@ -160,6 +160,25 @@
   },
   {
     "type": "function",
+    "name": "completedAt",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "computeTreasury",
     "inputs": [],
     "outputs": [
@@ -467,6 +486,19 @@
   },
   {
     "type": "function",
+    "name": "graduationGrace",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "graduator",
     "inputs": [],
     "outputs": [
@@ -509,25 +541,6 @@
     ],
     "outputs": [],
     "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
-    "name": "isGraduator",
-    "inputs": [
-      {
-        "name": "account",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bool",
-        "internalType": "bool"
-      }
-    ],
-    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -739,7 +752,7 @@
     "name": "renounceOwnership",
     "inputs": [],
     "outputs": [],
-    "stateMutability": "nonpayable"
+    "stateMutability": "pure"
   },
   {
     "type": "function",
@@ -862,6 +875,19 @@
             "internalType": "uint16"
           }
         ]
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "setGraduationGrace",
+    "inputs": [
+      {
+        "name": "graceSeconds",
+        "type": "uint32",
+        "internalType": "uint32"
       }
     ],
     "outputs": [],
@@ -1070,6 +1096,19 @@
   },
   {
     "type": "event",
+    "name": "CurveReopened",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "DrawLimitUpdated",
     "inputs": [
       {
@@ -1176,6 +1215,19 @@
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "GraduationGraceUpdated",
+    "inputs": [
+      {
+        "name": "graceSeconds",
+        "type": "uint32",
+        "indexed": false,
+        "internalType": "uint32"
       }
     ],
     "anonymous": false
@@ -1604,6 +1656,16 @@
   },
   {
     "type": "error",
+    "name": "InvalidGraduationGrace",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidGraduator",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "InvalidModel",
     "inputs": []
   },
@@ -1666,7 +1728,28 @@
   },
   {
     "type": "error",
+    "name": "PoolPriceSkewed",
+    "inputs": [
+      {
+        "name": "expectedSqrtPriceX96",
+        "type": "uint160",
+        "internalType": "uint160"
+      },
+      {
+        "name": "actualSqrtPriceX96",
+        "type": "uint160",
+        "internalType": "uint160"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "ReentrancyGuardReentrantCall",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "RenounceDisabled",
     "inputs": []
   },
   {

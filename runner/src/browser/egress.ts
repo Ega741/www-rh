@@ -50,8 +50,8 @@ const V4_BLOCKS: readonly Cidr4[] = (
     ['198.51.100.0', 24, 'documentation'],
     ['203.0.113.0', 24, 'documentation'],
     ['224.0.0.0', 4, 'multicast'],
-    ['240.0.0.0', 4, 'reserved'],
     ['255.255.255.255', 32, 'broadcast'],
+    ['240.0.0.0', 4, 'reserved'],
   ] as const
 ).map(([ip, bits, label]) => ({ base: v4ToInt(ip) as number, bits, label }));
 

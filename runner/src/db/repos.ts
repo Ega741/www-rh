@@ -290,6 +290,11 @@ export class MindsRepo {
     this.db.run('UPDATE minds SET phase = 1, real_eth_reserve = ?, price_wei = ?, mcap_sort = ? WHERE token = ?', realEthReserve, priceWei, mcapSort, token);
   }
 
+  /** `CurveReopened`: a `Complete` curve is `Bonding` again. */
+  setReopened(token: string): void {
+    this.db.run('UPDATE minds SET phase = 0 WHERE token = ? AND phase = 1', token);
+  }
+
   setGraduated(token: string, pool: string, positionId: string): void {
     this.db.run("UPDATE minds SET phase = 2, pool = ?, position_id = ?, real_eth_reserve = '0' WHERE token = ?", pool, positionId, token);
   }
@@ -558,12 +563,20 @@ export class TicksRepo {
     return this.db.all<ThoughtRow>('SELECT * FROM thoughts WHERE token = ? ORDER BY id DESC LIMIT ?', token, limit);
   }
 
-  /** Inserts a receipt and attaches `tickIds` to it. */
+  /**
+   * Inserts a receipt and attaches `tickIds` to it. A previously `failed` receipt with the same hash
+   * (identical ticks and price) is revived instead of duplicated.
+   */
   insertReceipt(r: Omit<ReceiptRow, 'id'>, tickIds: readonly number[]): number {
-    const id = this.db.run(
-      'INSERT INTO receipts (token, receipt_hash, receipt_json, amount_wei, status, tx_hash, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      r.token, r.receipt_hash, r.receipt_json, r.amount_wei, r.status, r.tx_hash, r.error, r.created_at, r.updated_at,
-    ).lastInsertRowid;
+    const existing = this.receiptByHash(r.receipt_hash);
+    if (existing !== undefined && existing.status !== 'failed') throw new Error(`receipt ${r.receipt_hash} already exists (${existing.status})`);
+    const id =
+      existing !== undefined
+        ? (this.db.run('UPDATE receipts SET status = ?, tx_hash = NULL, error = NULL, updated_at = ? WHERE id = ?', r.status, r.updated_at, existing.id), existing.id)
+        : this.db.run(
+            'INSERT INTO receipts (token, receipt_hash, receipt_json, amount_wei, status, tx_hash, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            r.token, r.receipt_hash, r.receipt_json, r.amount_wei, r.status, r.tx_hash, r.error, r.created_at, r.updated_at,
+          ).lastInsertRowid;
     for (const t of tickIds) this.db.run('UPDATE ticks SET receipt_id = ? WHERE id = ?', id, t);
     return id;
   }

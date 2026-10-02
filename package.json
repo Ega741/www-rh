@@ -15,6 +15,7 @@
     "contracts:build": "cd contracts && forge build",
     "contracts:test": "cd contracts && forge test -vv",
     "abi:sync": "node scripts/sync-abi.mjs",
+    "deployments:sync": "node scripts/sync-deployments.mjs",
     "anvil:e2e": "bash scripts/anvil-e2e.sh"
   }
 }

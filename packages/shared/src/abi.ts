@@ -36,12 +36,14 @@ export const mindLaunchpadAbiSignatures = [
   'struct CurveState { uint128 realEthReserve; uint128 tokensSold; uint8 phase; address pool; uint256 positionId; }',
   'struct FeeParams { uint16 tradeFeeBps; uint16 mindShareBps; uint16 graduationFeeBps; }',
   'constructor(address initialOwner, address treasury, address computeTreasury, address operator)',
-  // accepts ETH only from isGraduator[msg.sender], else DirectEthNotAccepted()
+  // accepts ETH only from the graduator being called by graduate()/harvest(), else DirectEthNotAccepted()
   'receive() external payable',
   // ---------------------------------------------------------------- events
   'event MindCreated(address indexed token, address indexed creator, string name, string symbol, string metadataURI, bytes32 modelId, bytes32 personaHash)',
   'event Trade(address indexed token, address indexed trader, bool isBuy, uint256 ethAmount, uint256 tokenAmount, uint256 fee, uint256 realEthReserve, uint256 tokensSold)',
   'event CurveCompleted(address indexed token, uint256 realEthReserve)',
+  // a Complete curve not graduated within graduationGrace() was reopened by a sell: phase is Bonding again
+  'event CurveReopened(address indexed token)',
   'event Graduated(address indexed token, address pool, uint256 positionId, uint256 ethLiquidity, uint256 tokenLiquidity, uint256 graduationFee)',
   'event FeeAccrued(address indexed token, uint256 mindAmount, uint256 protocolAmount)',
   'event MindFunded(address indexed token, address indexed from, uint256 amount)',
@@ -58,6 +60,7 @@ export const mindLaunchpadAbiSignatures = [
   'event FeeParamsUpdated(uint16 tradeFeeBps, uint16 mindShareBps, uint16 graduationFeeBps)',
   'event CreationFeeUpdated(uint256 newCreationFee)',
   'event DrawLimitUpdated(uint256 maxPerEpoch, uint32 epochSeconds)',
+  'event GraduationGraceUpdated(uint32 graceSeconds)',
   // inherited (Ownable2Step, Pausable)
   'event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner)',
   'event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)',
@@ -81,6 +84,11 @@ export const mindLaunchpadAbiSignatures = [
   'error InsufficientMindBalance()',
   'error DrawLimitExceeded()',
   'error InvalidDrawLimit()',
+  'error InvalidGraduationGrace()',
+  'error InvalidGraduator()',
+  'error RenounceDisabled()',
+  // bubbled up from UniswapV3Graduator.graduate: the coin stays Complete, graduate can be retried later
+  'error PoolPriceSkewed(uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96)',
   'error FeeTooHigh()',
   'error ZeroAddress()',
   'error EthTransferFailed()',
@@ -117,6 +125,7 @@ export const mindLaunchpadAbiSignatures = [
   'function setFeeParams(FeeParams params)',
   'function setCreationFee(uint256 newCreationFee)',
   'function setDrawLimit(uint256 maxPerEpoch, uint32 epochSeconds)',
+  'function setGraduationGrace(uint32 graceSeconds)',
   'function pause()',
   'function unpause()',
   // ---------------------------------------------------------------- owner or treasury
@@ -141,7 +150,9 @@ export const mindLaunchpadAbiSignatures = [
   'function computeTreasury() view returns (address)',
   'function graduator() view returns (address)',
   'function graduatorOf(address token) view returns (address)',
-  'function isGraduator(address account) view returns (bool)',
+  // 0 while never completed or after a post-grace sell reopened the curve; kept after graduation
+  'function completedAt(address token) view returns (uint64)',
+  'function graduationGrace() view returns (uint32)',
   'function TOTAL_SUPPLY() view returns (uint256)',
   'function CURVE_SUPPLY() view returns (uint256)',
   'function LP_SUPPLY() view returns (uint256)',
@@ -220,6 +231,9 @@ export const graduatorAbiSignatures = [
   'error UnsupportedFeeTier()',
   'error ZeroAddress()',
   'error EthTransferFailed()',
+  'error PoolPriceSkewed(uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96)',
+  'error UnauthorizedCallback()',
+  'error InvalidPriceTolerance()',
 ] as const;
 
 /** Parsed ABI of `IGraduator` (+ `GraduatedAtSkewedPrice` and implementation errors). */

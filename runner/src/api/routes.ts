@@ -7,6 +7,7 @@
 import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import {
+  canonicalJson,
   MAX_METADATA_JSON_BYTES,
   MODELS,
   toPublicModelSpec,
@@ -171,7 +172,8 @@ export function createApi(deps: ApiDeps): Hono {
     if (to - from + 1 > 1000) return fail(c, 400, 'range too large (max 1000)');
     const rows = deps.repos.memories.range(m.token, from, to);
     if (rows.length !== to - from + 1) return fail(c, 404, 'range not found');
-    return c.json(buildAnchorBatch(m.token, rows));
+    // canonical bytes: keccak256(response body) == contentHash of the anchored batch
+    return c.body(canonicalJson(buildAnchorBatch(m.token, rows)), 200, { 'Content-Type': 'application/json; charset=utf-8' });
   });
 
   app.get('/api/minds/:token/memories', (c) => {

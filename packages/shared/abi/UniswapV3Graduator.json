@@ -222,8 +222,34 @@
   },
   {
     "type": "function",
+    "name": "priceToleranceBps",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "renounceOwnership",
     "inputs": [],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "setPriceToleranceBps",
+    "inputs": [
+      {
+        "name": "newToleranceBps",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
     "outputs": [],
     "stateMutability": "nonpayable"
   },
@@ -261,6 +287,29 @@
         "name": "newOwner",
         "type": "address",
         "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "uniswapV3SwapCallback",
+    "inputs": [
+      {
+        "name": "amount0Delta",
+        "type": "int256",
+        "internalType": "int256"
+      },
+      {
+        "name": "amount1Delta",
+        "type": "int256",
+        "internalType": "int256"
+      },
+      {
+        "name": "data",
+        "type": "bytes",
+        "internalType": "bytes"
       }
     ],
     "outputs": [],
@@ -343,6 +392,19 @@
     "anonymous": false
   },
   {
+    "type": "event",
+    "name": "PriceToleranceUpdated",
+    "inputs": [
+      {
+        "name": "toleranceBps",
+        "type": "uint16",
+        "indexed": false,
+        "internalType": "uint16"
+      }
+    ],
+    "anonymous": false
+  },
+  {
     "type": "error",
     "name": "AlreadyGraduated",
     "inputs": []
@@ -350,6 +412,11 @@
   {
     "type": "error",
     "name": "EthTransferFailed",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidPriceTolerance",
     "inputs": []
   },
   {
@@ -386,8 +453,35 @@
   },
   {
     "type": "error",
+    "name": "PoolPriceSkewed",
+    "inputs": [
+      {
+        "name": "expectedSqrtPriceX96",
+        "type": "uint160",
+        "internalType": "uint160"
+      },
+      {
+        "name": "actualSqrtPriceX96",
+        "type": "uint160",
+        "internalType": "uint160"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "ReentrancyGuardReentrantCall",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "SafeCastOverflowedIntToUint",
+    "inputs": [
+      {
+        "name": "value",
+        "type": "int256",
+        "internalType": "int256"
+      }
+    ]
   },
   {
     "type": "error",
@@ -407,6 +501,17 @@
   },
   {
     "type": "error",
+    "name": "SafeCastOverflowedUintToInt",
+    "inputs": [
+      {
+        "name": "value",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "SafeERC20FailedOperation",
     "inputs": [
       {
@@ -415,6 +520,11 @@
         "internalType": "address"
       }
     ]
+  },
+  {
+    "type": "error",
+    "name": "UnauthorizedCallback",
+    "inputs": []
   },
   {
     "type": "error",

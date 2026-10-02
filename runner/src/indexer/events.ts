@@ -25,6 +25,7 @@ export type IndexedEvent =
   | (Base & { type: 'fee:accrued'; mindAmount: bigint })
   | (Base & { type: 'mind:funded'; amount: bigint })
   | (Base & { type: 'curve:complete' })
+  | (Base & { type: 'curve:reopened' })
   | (Base & { type: 'graduated' })
   | (Base & { type: 'compute:drawn'; amount: bigint; receiptHash: string })
   | (Base & { type: 'memory:anchored'; seq: number; contentHash: string; uri: string })

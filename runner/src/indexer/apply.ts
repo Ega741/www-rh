@@ -100,6 +100,14 @@ export function applyLogs(repos: Repos, decoded: readonly { log: RawLog; parsed:
         out.push({ type: 'curve:complete', token: t, ...base });
         break;
       }
+      case 'CurveReopened': {
+        // a post-grace sell reopened a Complete curve: phase is Bonding again; the reserve and price
+        // follow from that sell's Trade log, which comes next in the same transaction
+        const t = parsed.args.token.toLowerCase();
+        repos.minds.setReopened(t);
+        out.push({ type: 'curve:reopened', token: t, ...base });
+        break;
+      }
       case 'Graduated': {
         const a = parsed.args;
         const t = a.token.toLowerCase();
