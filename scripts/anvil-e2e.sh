@@ -8,8 +8,8 @@ export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 PORT="${ANVIL_PORT:-8545}"
 RPC="http://127.0.0.1:${PORT}"
 API_PORT="${E2E_API_PORT:-8790}"
-# anvil default account #0
-PK=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d396ba4c7a9
+# anvil default account #0 (derived from the default mnemonic so the key is never mistyped)
+PK=$(cast wallet derive-private-key "test test test test test test test test test test test junk" 0 | tail -n1)
 ADDR=$(cast wallet address --private-key "$PK")
 
 cleanup() {
