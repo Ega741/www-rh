@@ -5,30 +5,32 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
-import {INonfungiblePositionManager} from "../../src/interfaces/uniswap/INonfungiblePositionManager.sol";
-import {IUniswapV3Factory} from "../../src/interfaces/uniswap/IUniswapV3Factory.sol";
-import {IUniswapV3Pool} from "../../src/interfaces/uniswap/IUniswapV3Pool.sol";
-import {MockUniswapV3Pool} from "./MockUniswapV3Pool.sol";
+import {INonfungiblePositionManager} from "../../../src/interfaces/uniswap/INonfungiblePositionManager.sol";
+import {IUniswapV3Factory} from "../../../src/interfaces/uniswap/IUniswapV3Factory.sol";
+import {IUniswapV3Pool} from "../../../src/interfaces/uniswap/IUniswapV3Pool.sol";
+import {UniV3Math as M} from "./UniV3Math.sol";
+import {UniV3Pool} from "./UniV3Pool.sol";
 
-/// @notice Position manager stand-in. `mint` uses the pool's current price to decide how much of each token a
-///         full-range position takes (the side in excess is left with the caller), pulls those amounts into the
-///         pool and mints an incrementing position id. `collect` pays fees seeded with {accrueFees}.
-contract MockNonfungiblePositionManager is INonfungiblePositionManager {
+/// @notice NonfungiblePositionManager model following v3-periphery: `createAndInitializePoolIfNecessary` creates
+///         and/or initializes the pool only when needed (an initialized pool keeps its price); `mint` validates the
+///         ticks, computes `LiquidityAmounts.getLiquidityForAmounts` at slot0's price, adds the position to the pool,
+///         applies the "Price slippage check" against the minimums and pulls exactly the owed amounts. NFTs are
+///         recorded with `_mint` semantics (no receiver callback). `collect` pays the position's swap fees plus
+///         fees seeded with {accrueFees}; {burnAll} is a test shortcut for decreaseLiquidity + collect.
+contract UniV3PositionManager is INonfungiblePositionManager {
     using SafeERC20 for IERC20;
-
-    int24 internal constant MIN_TICK = -887272;
-    int24 internal constant MAX_TICK = 887272;
-    uint256 internal constant Q96 = 1 << 96;
 
     struct Position {
         address owner;
+        address pool;
+        uint256 rangeId;
         address token0;
         address token1;
         uint24 fee;
         int24 tickLower;
         int24 tickUpper;
         uint128 liquidity;
-        uint128 owed0;
+        uint128 owed0; // seeded with accrueFees
         uint128 owed1;
     }
 
@@ -36,16 +38,15 @@ contract MockNonfungiblePositionManager is INonfungiblePositionManager {
     uint256 public nextId = 1;
     mapping(uint256 tokenId => Position) internal _positions;
 
-    event Minted(uint256 indexed tokenId, address indexed recipient, uint256 amount0, uint256 amount1);
+    event Minted(uint256 indexed tokenId, address indexed recipient, uint128 liquidity, uint256 amount0, uint256 amount1);
 
     error UnorderedTokens();
     error PoolMissing();
     error PoolNotInitialized();
     error InvalidTicks();
     error Expired();
-    error MinAmounts();
+    error PriceSlippageCheck();
     error NotOwner();
-    error ZeroLiquidity();
 
     constructor(address factory_) {
         factory = IUniswapV3Factory(factory_);
@@ -83,25 +84,24 @@ contract MockNonfungiblePositionManager is INonfungiblePositionManager {
         if (sqrtPriceX96 == 0) revert PoolNotInitialized();
         int24 spacing = IUniswapV3Pool(pool).tickSpacing();
         if (
-            params.tickLower >= params.tickUpper || params.tickLower < MIN_TICK || params.tickUpper > MAX_TICK
+            params.tickLower >= params.tickUpper || params.tickLower < M.MIN_TICK || params.tickUpper > M.MAX_TICK
                 || params.tickLower % spacing != 0 || params.tickUpper % spacing != 0
         ) revert InvalidTicks();
 
-        (amount0, amount1) = _amountsAtPrice(sqrtPriceX96, params.amount0Desired, params.amount1Desired);
-        if (amount0 < params.amount0Min || amount1 < params.amount1Min) revert MinAmounts();
-        // Liquidity is only bookkeeping here; a one-sided deposit (price at the range edge) still counts.
-        uint256 l = Math.sqrt(amount0 * amount1);
-        if (l == 0) l = Math.max(amount0, amount1);
-        if (l == 0) revert ZeroLiquidity();
-        liquidity = uint128(Math.min(l, type(uint128).max));
-
-        IERC20(params.token0).safeTransferFrom(msg.sender, pool, amount0);
-        IERC20(params.token1).safeTransferFrom(msg.sender, pool, amount1);
-        MockUniswapV3Pool(pool).addLiquidity(liquidity);
+        uint160 a = M.getSqrtRatioAtTick(params.tickLower);
+        uint160 b = M.getSqrtRatioAtTick(params.tickUpper);
+        liquidity = M.getLiquidityForAmounts(sqrtPriceX96, a, b, params.amount0Desired, params.amount1Desired);
+        uint256 rangeId;
+        (rangeId, amount0, amount1) = UniV3Pool(pool).mintRange(a, b, liquidity);
+        if (amount0 < params.amount0Min || amount1 < params.amount1Min) revert PriceSlippageCheck();
+        if (amount0 > 0) IERC20(params.token0).safeTransferFrom(msg.sender, pool, amount0);
+        if (amount1 > 0) IERC20(params.token1).safeTransferFrom(msg.sender, pool, amount1);
 
         tokenId = nextId++;
         _positions[tokenId] = Position({
             owner: params.recipient,
+            pool: pool,
+            rangeId: rangeId,
             token0: params.token0,
             token1: params.token1,
             fee: params.fee,
@@ -111,32 +111,26 @@ contract MockNonfungiblePositionManager is INonfungiblePositionManager {
             owed0: 0,
             owed1: 0
         });
-        emit Minted(tokenId, params.recipient, amount0, amount1);
-    }
-
-    /// @notice Test helper: pulls `amount0`/`amount1` of the position's tokens from the caller and makes them
-    ///         collectable as fees.
-    function accrueFees(uint256 tokenId, uint128 amount0, uint128 amount1) external {
-        Position storage p = _positions[tokenId];
-        if (amount0 > 0) IERC20(p.token0).safeTransferFrom(msg.sender, address(this), amount0);
-        if (amount1 > 0) IERC20(p.token1).safeTransferFrom(msg.sender, address(this), amount1);
-        p.owed0 += amount0;
-        p.owed1 += amount1;
+        emit Minted(tokenId, params.recipient, liquidity, amount0, amount1);
     }
 
     /// @inheritdoc INonfungiblePositionManager
     function collect(CollectParams calldata params) external payable returns (uint256 amount0, uint256 amount1) {
         Position storage p = _positions[params.tokenId];
         if (msg.sender != p.owner) revert NotOwner();
-        amount0 = Math.min(p.owed0, params.amount0Max);
-        amount1 = Math.min(p.owed1, params.amount1Max);
-        // Both amounts are capped by the uint128 owed values above.
+        (amount0, amount1) =
+            UniV3Pool(p.pool).collectRange(p.rangeId, params.recipient, params.amount0Max, params.amount1Max);
+        uint256 seeded0 = Math.min(p.owed0, params.amount0Max - amount0);
+        uint256 seeded1 = Math.min(p.owed1, params.amount1Max - amount1);
+        // Both are capped by the uint128 owed values above.
         // forge-lint: disable-next-line(unsafe-typecast)
-        p.owed0 -= uint128(amount0);
+        p.owed0 -= uint128(seeded0);
         // forge-lint: disable-next-line(unsafe-typecast)
-        p.owed1 -= uint128(amount1);
-        if (amount0 > 0) IERC20(p.token0).safeTransfer(params.recipient, amount0);
-        if (amount1 > 0) IERC20(p.token1).safeTransfer(params.recipient, amount1);
+        p.owed1 -= uint128(seeded1);
+        if (seeded0 > 0) IERC20(p.token0).safeTransfer(params.recipient, seeded0);
+        if (seeded1 > 0) IERC20(p.token1).safeTransfer(params.recipient, seeded1);
+        amount0 += seeded0;
+        amount1 += seeded1;
     }
 
     /// @inheritdoc INonfungiblePositionManager
@@ -167,16 +161,27 @@ contract MockNonfungiblePositionManager is INonfungiblePositionManager {
         return _positions[tokenId].owner;
     }
 
-    /// @dev Full-range deposit at price `P = (sqrtPriceX96 / 2^96)^2` (token1 per token0): the side in excess of
-    ///      `P` is only partially used.
-    function _amountsAtPrice(uint160 sqrtPriceX96, uint256 desired0, uint256 desired1)
-        internal
-        pure
-        returns (uint256 amount0, uint256 amount1)
-    {
-        uint256 needed1 = Math.mulDiv(Math.mulDiv(desired0, sqrtPriceX96, Q96), sqrtPriceX96, Q96);
-        if (needed1 <= desired1) return (desired0, needed1);
-        uint256 needed0 = Math.mulDiv(Math.mulDiv(desired1, Q96, sqrtPriceX96), Q96, sqrtPriceX96);
-        return (Math.min(needed0, desired0), desired1);
+    /// @notice Pool of a position.
+    function poolOf(uint256 tokenId) external view returns (address) {
+        return _positions[tokenId].pool;
+    }
+
+    /// @notice Test helper: pulls `amount0`/`amount1` of the position's tokens from the caller and makes them
+    ///         collectable as fees.
+    function accrueFees(uint256 tokenId, uint128 amount0, uint128 amount1) external {
+        Position storage p = _positions[tokenId];
+        if (amount0 > 0) IERC20(p.token0).safeTransferFrom(msg.sender, address(this), amount0);
+        if (amount1 > 0) IERC20(p.token1).safeTransferFrom(msg.sender, address(this), amount1);
+        p.owed0 += amount0;
+        p.owed1 += amount1;
+    }
+
+    /// @notice Test helper (decreaseLiquidity(all) + collect(principal)): the owner withdraws the position's
+    ///         liquidity at the current price to `recipient`. Fees stay collectable with {collect}.
+    function burnAll(uint256 tokenId, address recipient) external returns (uint256 amount0, uint256 amount1) {
+        Position storage p = _positions[tokenId];
+        if (msg.sender != p.owner) revert NotOwner();
+        p.liquidity = 0;
+        return UniV3Pool(p.pool).burnRange(p.rangeId, recipient);
     }
 }

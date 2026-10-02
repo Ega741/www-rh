@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
-import {AuditUniV3Math as M} from "./mocks/AuditUniV3Math.sol";
+import {UniV3Math as M} from "../mocks/uniswapv3/UniV3Math.sol";
 
 /// @notice Sanity checks that the audit port of TickMath reproduces the canonical Uniswap v3 constants, so the
 ///         realistic PoC mocks built on it are trustworthy.

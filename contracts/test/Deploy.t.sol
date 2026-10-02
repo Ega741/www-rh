@@ -7,9 +7,10 @@ import {MindLaunchpad} from "../src/MindLaunchpad.sol";
 import {MockGraduator} from "../src/MockGraduator.sol";
 import {UniswapV3Graduator} from "../src/UniswapV3Graduator.sol";
 import {Deploy} from "../script/Deploy.s.sol";
-import {MockNonfungiblePositionManager} from "./mocks/MockNonfungiblePositionManager.sol";
-import {MockUniswapV3Factory} from "./mocks/MockUniswapV3Factory.sol";
+import {IMindLaunchpad} from "../src/interfaces/IMindLaunchpad.sol";
 import {MockWETH9} from "./mocks/MockWETH9.sol";
+import {UniV3Factory} from "./mocks/uniswapv3/UniV3Factory.sol";
+import {UniV3PositionManager} from "./mocks/uniswapv3/UniV3PositionManager.sol";
 
 /// @notice Runs the deployment script in-process for both graduator kinds and checks the wiring and the JSON.
 contract DeployScriptTest is Test {
@@ -41,8 +42,8 @@ contract DeployScriptTest is Test {
         assertEq(launchpad.computeTreasury(), deployer);
         assertEq(launchpad.operator(), deployer);
         assertEq(launchpad.graduator(), d.graduator);
-        assertTrue(launchpad.isGraduator(d.graduator));
         assertEq(MockGraduator(d.graduator).launchpad(), d.launchpad);
+        assertEq(launchpad.graduationGrace(), 1 days);
 
         string memory json = vm.readFile(out);
         assertEq(vm.parseJsonAddress(json, ".launchpad"), d.launchpad);
@@ -54,8 +55,8 @@ contract DeployScriptTest is Test {
     }
 
     function test_deploy_uniswapv3_withSeparateOwner() public {
-        MockUniswapV3Factory factory = new MockUniswapV3Factory();
-        MockNonfungiblePositionManager npm = new MockNonfungiblePositionManager(address(factory));
+        UniV3Factory factory = new UniV3Factory();
+        UniV3PositionManager npm = new UniV3PositionManager(address(factory));
         MockWETH9 weth = new MockWETH9();
         address owner = makeAddr("multisig");
         Deploy.Config memory c = _cfg("uniswapv3", owner, "cache/deploy-test-uniswapv3.json");
@@ -89,7 +90,27 @@ contract DeployScriptTest is Test {
         assertEq(address(g.factory()), address(factory));
         assertEq(address(g.positionManager()), address(npm));
         assertEq(g.feeTier(), 10_000);
+        assertEq(g.priceToleranceBps(), 100);
         assertEq(vm.parseJsonString(vm.readFile(d.outFile), ".graduatorKind"), "uniswapv3");
+    }
+
+    function test_deploy_refusesMockGraduatorOnMainnet() public {
+        vm.chainId(4663);
+        vm.expectRevert(abi.encodeWithSelector(Deploy.MockGraduatorNotAllowedOnMainnet.selector, 4663));
+        script.deployWith(_cfg("mock", address(0), "cache/x.json"), DEPLOYER_KEY);
+        // Testnet and local chains still accept the mock.
+        vm.chainId(46_630);
+        Deploy.Deployment memory d = script.deployWith(_cfg("mock", address(0), "cache/deploy-test-mock.json"), DEPLOYER_KEY);
+        assertEq(MindLaunchpad(payable(d.launchpad)).graduator(), d.graduator);
+    }
+
+    function test_deployedLaunchpadRejectsForeignGraduator() public {
+        Deploy.Deployment memory d =
+            script.deployWith(_cfg("mock", address(0), "cache/deploy-test-mock.json"), DEPLOYER_KEY);
+        MockGraduator foreign = new MockGraduator(address(0xBEEF));
+        vm.prank(deployer);
+        vm.expectRevert(IMindLaunchpad.InvalidGraduator.selector);
+        MindLaunchpad(payable(d.launchpad)).setGraduator(address(foreign));
     }
 
     function test_deploy_rejectsBadConfig() public {

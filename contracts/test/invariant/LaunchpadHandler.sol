@@ -93,9 +93,14 @@ contract LaunchpadHandler is Test {
         calls["buy"]++;
     }
 
+    /// @dev Sells on Bonding curves and, once the graduation grace has elapsed, on Complete curves (which reopens
+    ///      them).
     function sell(uint256 actorSeed, uint256 tokenSeed, uint256 bps) external {
         (address token, bool ok) = _token(tokenSeed);
-        if (!ok || _phase(token) != IMindLaunchpad.CurvePhase.Bonding) return;
+        if (!ok) return;
+        IMindLaunchpad.CurvePhase phase = _phase(token);
+        bool reopening = phase == IMindLaunchpad.CurvePhase.Complete && _graceElapsed(token);
+        if (phase != IMindLaunchpad.CurvePhase.Bonding && !reopening) return;
         address a = _actor(actorSeed);
         uint256 amount = MindToken(token).balanceOf(a) * bound(bps, 1, 10_000) / 10_000;
         if (amount == 0) return;
@@ -107,6 +112,23 @@ contract LaunchpadHandler is Test {
         vm.stopPrank();
         _trackK(token);
         calls["sell"]++;
+        if (reopening) {
+            assertEq(uint8(_phase(token)), uint8(IMindLaunchpad.CurvePhase.Bonding), "post-grace sell reopens");
+            calls["sellAfterGrace"]++;
+        }
+    }
+
+    /// @dev Jumps past the graduation grace of a Complete curve so post-grace sells get exercised.
+    function warpPastGrace(uint256 tokenSeed, uint256 extra) external {
+        (address token, bool ok) = _token(tokenSeed);
+        if (!ok || _phase(token) != IMindLaunchpad.CurvePhase.Complete || _graceElapsed(token)) return;
+        uint256 target = uint256(launchpad.completedAt(token)) + launchpad.graduationGrace() + bound(extra, 0, 1 hours);
+        vm.warp(target);
+        calls["warpPastGrace"]++;
+    }
+
+    function _graceElapsed(address token) internal view returns (bool) {
+        return block.timestamp >= uint256(launchpad.completedAt(token)) + launchpad.graduationGrace();
     }
 
     function graduate(uint256 tokenSeed, uint256 returnBps) external {

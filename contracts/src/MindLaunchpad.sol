@@ -19,9 +19,11 @@ import {MindToken} from "./MindToken.sol";
 ///         protocol), mind vault (compute budget drawn by the operator to the compute treasury) and mind
 ///         registry. See SPEC §1 for the economics and §2.3 for the external interface.
 /// @dev Accounting invariant: `address(this).balance >= Σ realEthReserve + Σ mindBalance + protocolBalance`.
-///      ETH enters through payable functions or, from graduators only, through {receive} (no accounting there:
-///      {graduate} and {harvest} verify the exact balance change and credit the mind vault themselves).
-///      Every ETH-sending external function is `nonReentrant`; all ETH transfers use `call`.
+///      ETH enters through payable functions or through {receive}, which only accepts ETH from the graduator that
+///      {graduate}/{harvest} is calling at that moment and counts it; after the call the count must equal the
+///      graduator's reported return, which is then credited to the mind vault (no balance-delta accounting).
+///      Every ETH-sending or graduator-calling external function, and {fundMind}, is `nonReentrant`; all ETH
+///      transfers use `call`. Ownership cannot be renounced.
 contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
@@ -49,6 +51,13 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     uint256 internal constant MAX_SYMBOL_LENGTH = 16;
     uint256 internal constant MAX_METADATA_URI_LENGTH = 2048;
     uint32 internal constant MIN_DRAW_EPOCH = 1 hours;
+    /// @dev Hard ceiling of {setDrawLimit}'s `maxPerEpoch`: with fixed epochs, at most `2 * MAX_DRAW_PER_EPOCH`
+    ///      (4 ether) can leave one mind vault within any `epochSeconds` window (end of one epoch + start of the
+    ///      next), whatever the owner configures.
+    uint256 internal constant MAX_DRAW_PER_EPOCH = 2 ether;
+    uint32 internal constant MIN_GRADUATION_GRACE = 1 hours;
+    uint32 internal constant MAX_GRADUATION_GRACE = 30 days;
+    uint32 internal constant DEFAULT_GRADUATION_GRACE = 1 days;
 
     // ---------------------------------------------------------------------------------------------
     // Storage
@@ -69,6 +78,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     uint256 private _creationFee;
     uint256 private _maxDrawPerEpoch;
     uint32 private _drawEpoch;
+    uint32 private _graduationGrace;
 
     uint256 private _protocolBalance;
 
@@ -77,11 +87,16 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     mapping(address token => CurveState) private _curves;
     mapping(address token => uint256) private _mindBalances;
     mapping(address token => DrawEpoch) private _draws;
+    mapping(address token => uint64) private _completedAt;
 
     /// @inheritdoc IMindLaunchpad
     mapping(address token => address) public graduatorOf;
-    /// @inheritdoc IMindLaunchpad
-    mapping(address account => bool) public isGraduator;
+
+    /// @dev Graduator whose {graduate}/{harvest} call is in progress: the only account {receive} accepts ETH from.
+    ///      Zero outside those calls.
+    address private _returnFrom;
+    /// @dev Wei received by {receive} from `_returnFrom` during the current graduator call. Zero outside those calls.
+    uint256 private _returned;
 
     // ---------------------------------------------------------------------------------------------
     // Modifiers
@@ -124,17 +139,22 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         _feeParams = FeeParams({tradeFeeBps: 100, mindShareBps: 7000, graduationFeeBps: 250});
         _maxDrawPerEpoch = 0.25 ether;
         _drawEpoch = 1 days;
+        _graduationGrace = DEFAULT_GRADUATION_GRACE;
         emit TreasuryUpdated(treasury_);
         emit ComputeTreasuryUpdated(computeTreasury_);
         emit OperatorUpdated(operator_);
         emit FeeParamsUpdated(100, 7000, 250);
         emit DrawLimitUpdated(0.25 ether, 1 days);
+        emit GraduationGraceUpdated(DEFAULT_GRADUATION_GRACE);
     }
 
-    /// @notice Accepts plain ETH only from graduators (leftovers / harvest proceeds). No accounting happens here:
-    ///         {graduate} and {harvest} check the exact balance change and credit the mind vault.
+    /// @notice Accepts plain ETH only from the graduator whose {graduate}/{harvest} call is in progress (leftovers /
+    ///         harvest proceeds) and counts it; that call then requires the count to equal the reported amount.
+    ///         Anything else reverts `DirectEthNotAccepted()`. Writes storage: graduators must send with a full-gas
+    ///         `call`, not `transfer`/`send`.
     receive() external payable {
-        if (!isGraduator[msg.sender]) revert DirectEthNotAccepted();
+        if (msg.sender != _returnFrom) revert DirectEthNotAccepted();
+        _returned += msg.value;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -206,7 +226,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         if (block.timestamp > deadline) revert Expired();
         if (tokensIn == 0) revert ZeroAmount();
         CurveState storage curve = _curves[token];
-        if (curve.phase != CurvePhase.Bonding) revert WrongPhase();
+        if (_checkSellPhase(token, curve.phase)) _reopen(token, curve);
         uint256 reserve = curve.realEthReserve;
         uint256 sold = curve.tokensSold;
         if (tokensIn > sold) revert ExceedsTokensSold();
@@ -244,10 +264,10 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         _accrueFee(token, graduationFee);
 
         IERC20(token).safeTransfer(grad, LP_SUPPLY);
-        uint256 balanceBefore = address(this).balance;
+        _openReturn(grad);
         (address pool, uint256 positionId, uint256 ethReturned) =
             IGraduator(grad).graduate{value: ethLiquidity}(token, LP_SUPPLY);
-        if (address(this).balance != balanceBefore - ethLiquidity + ethReturned) revert EthReturnMismatch();
+        _closeReturn(ethReturned);
 
         curve.pool = pool;
         curve.positionId = positionId;
@@ -260,16 +280,17 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         if (_curves[token].phase != CurvePhase.Graduated) revert WrongPhase();
         address grad = graduatorOf[token];
 
-        uint256 balanceBefore = address(this).balance;
+        _openReturn(grad);
         (uint256 ethOut, uint256 tokensBurned) = IGraduator(grad).harvest(token);
-        if (address(this).balance != balanceBefore + ethOut) revert EthReturnMismatch();
+        _closeReturn(ethOut);
 
         _creditFromGraduator(token, grad, ethOut);
         emit Harvested(token, ethOut, tokensBurned);
     }
 
     /// @inheritdoc IMindLaunchpad
-    function fundMind(address token) external payable onlyMind(token) {
+    /// @dev `nonReentrant`: a graduator cannot route its return through here during {graduate}/{harvest}.
+    function fundMind(address token) external payable nonReentrant onlyMind(token) {
         if (msg.value == 0) revert ZeroAmount();
         _mindBalances[token] += msg.value;
         emit MindFunded(token, msg.sender, msg.value);
@@ -300,7 +321,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         returns (uint256 ethOut, uint256 fee)
     {
         CurveState storage curve = _curves[token];
-        if (curve.phase != CurvePhase.Bonding) revert WrongPhase();
+        _checkSellPhase(token, curve.phase);
         if (tokensIn == 0) revert ZeroAmount();
         if (tokensIn > curve.tokensSold) revert ExceedsTokensSold();
         return CurveMath.quoteSell(curve.realEthReserve, curve.tokensSold, tokensIn, _feeParams.tradeFeeBps);
@@ -389,6 +410,16 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         return _graduator;
     }
 
+    /// @inheritdoc IMindLaunchpad
+    function completedAt(address token) external view returns (uint64) {
+        return _completedAt[token];
+    }
+
+    /// @inheritdoc IMindLaunchpad
+    function graduationGrace() external view returns (uint32) {
+        return _graduationGrace;
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Creator
     // ---------------------------------------------------------------------------------------------
@@ -421,6 +452,9 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     // ---------------------------------------------------------------------------------------------
 
     /// @inheritdoc IMindLaunchpad
+    /// @dev Fixed epochs: a draw at `epochStart + epochSeconds - 1` and another at `epochStart + epochSeconds`
+    ///      fall in different epochs, so up to `2 * maxPerEpoch` (<= 2 * MAX_DRAW_PER_EPOCH = 4 ether) can leave a
+    ///      vault within any `epochSeconds` window. Accepted and documented (SPEC §2.3).
     function drawCompute(address token, uint256 amount, bytes32 receiptHash)
         external
         nonReentrant
@@ -493,8 +527,8 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     /// @inheritdoc IMindLaunchpad
     /// @dev Already graduated coins keep using `graduatorOf(token)`.
     function setGraduator(address newGraduator) external onlyOwner {
+        if (newGraduator != address(0) && !_servesThisLaunchpad(newGraduator)) revert InvalidGraduator();
         _graduator = newGraduator;
-        if (newGraduator != address(0)) isGraduator[newGraduator] = true;
         emit GraduatorUpdated(newGraduator);
     }
 
@@ -516,10 +550,25 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
 
     /// @inheritdoc IMindLaunchpad
     function setDrawLimit(uint256 maxPerEpoch, uint32 epochSeconds) external onlyOwner {
-        if (epochSeconds < MIN_DRAW_EPOCH) revert InvalidDrawLimit();
+        if (epochSeconds < MIN_DRAW_EPOCH || maxPerEpoch > MAX_DRAW_PER_EPOCH) revert InvalidDrawLimit();
         _maxDrawPerEpoch = maxPerEpoch;
         _drawEpoch = epochSeconds;
         emit DrawLimitUpdated(maxPerEpoch, epochSeconds);
+    }
+
+    /// @inheritdoc IMindLaunchpad
+    function setGraduationGrace(uint32 graceSeconds) external onlyOwner {
+        if (graceSeconds < MIN_GRADUATION_GRACE || graceSeconds > MAX_GRADUATION_GRACE) {
+            revert InvalidGraduationGrace();
+        }
+        _graduationGrace = graceSeconds;
+        emit GraduationGraceUpdated(graceSeconds);
+    }
+
+    /// @notice Disabled: always reverts `RenounceDisabled()`. The launchpad must keep an owner (graduator wiring,
+    ///         fee parameters, draw limits, pause); ownership can still be transferred with the two-step flow.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     /// @inheritdoc IMindLaunchpad
@@ -574,6 +623,7 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         emit Trade(token, buyer, true, ethUsed, tokensOut, fee, newReserve, newSold);
         if (newSold == CURVE_SUPPLY) {
             curve.phase = CurvePhase.Complete;
+            _completedAt[token] = uint64(block.timestamp);
             emit CurveCompleted(token, newReserve);
         }
 
@@ -582,7 +632,29 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
         if (refund > 0) _sendEth(buyer, refund);
     }
 
-    /// @dev Credits ETH a graduator returned during {graduate}/{harvest} (already balance-checked).
+    /// @dev A post-grace sell on a `Complete` curve puts it back to `Bonding` (before the sell itself executes; a
+    ///      failing sell reverts this too).
+    function _reopen(address token, CurveState storage curve) internal {
+        curve.phase = CurvePhase.Bonding;
+        delete _completedAt[token];
+        emit CurveReopened(token);
+    }
+
+    /// @dev Opens the ETH return window of a graduator call: {receive} accepts and counts ETH from `grad` only.
+    function _openReturn(address grad) internal {
+        _returnFrom = grad;
+        _returned = 0;
+    }
+
+    /// @dev Closes the return window and requires that exactly `reported` wei arrived through {receive}.
+    function _closeReturn(uint256 reported) internal {
+        uint256 returned = _returned;
+        _returnFrom = address(0);
+        _returned = 0;
+        if (returned != reported) revert EthReturnMismatch();
+    }
+
+    /// @dev Credits ETH a graduator returned during {graduate}/{harvest} (already checked against the counter).
     function _creditFromGraduator(address token, address grad, uint256 amount) internal {
         if (amount == 0) return;
         _mindBalances[token] += amount;
@@ -606,6 +678,24 @@ contract MindLaunchpad is IMindLaunchpad, Ownable2Step, Pausable, ReentrancyGuar
     /// @dev Reverts {NotAMind} unless `token` was created here.
     function _checkMind(address token) internal view {
         if (_mindInfo[token].creator == address(0)) revert NotAMind();
+    }
+
+    /// @dev Sell rule of {sell}/{quoteSell}: `Bonding`, or `Complete` once the graduation grace has elapsed (the sell
+    ///      then reopens the curve: `reopen == true`). Reverts {WrongPhase} otherwise.
+    function _checkSellPhase(address token, CurvePhase phase) internal view returns (bool reopen) {
+        if (phase == CurvePhase.Bonding) return false;
+        // forge-lint: disable-next-line(block-timestamp)
+        if (phase != CurvePhase.Complete || block.timestamp < uint256(_completedAt[token]) + _graduationGrace) {
+            revert WrongPhase();
+        }
+        return true;
+    }
+
+    /// @dev Whether `account` is a contract whose `IGraduator.launchpad()` returns this launchpad.
+    function _servesThisLaunchpad(address account) internal view returns (bool) {
+        if (account.code.length == 0) return false;
+        (bool ok, bytes memory ret) = account.staticcall(abi.encodeCall(IGraduator.launchpad, ()));
+        return ok && ret.length >= 32 && abi.decode(ret, (uint256)) == uint256(uint160(address(this)));
     }
 
     /// @dev Validates the metadata URI length and the model id of {createMind} (directive D10).

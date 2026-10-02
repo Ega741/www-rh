@@ -79,6 +79,9 @@ interface IMindLaunchpad {
     );
     /// @notice The curve sold out (`tokensSold == CURVE_SUPPLY`); the coin can now be graduated.
     event CurveCompleted(address indexed token, uint256 realEthReserve);
+    /// @notice A `Complete` curve that was not graduated within `graduationGrace()` was reopened by a sell: the
+    ///         phase is `Bonding` again (emitted before that sell's `FeeAccrued`/`Trade`).
+    event CurveReopened(address indexed token);
     /// @notice The coin's liquidity was moved to the DEX through `graduatorOf(token)`.
     event Graduated(
         address indexed token,
@@ -119,6 +122,8 @@ interface IMindLaunchpad {
     event CreationFeeUpdated(uint256 newCreationFee);
     /// @notice The per-mind compute draw cap changed.
     event DrawLimitUpdated(uint256 maxPerEpoch, uint32 epochSeconds);
+    /// @notice The graduation grace period (after which a `Complete` curve accepts sells again) changed.
+    event GraduationGraceUpdated(uint32 graceSeconds);
 
     // ---------------------------------------------------------------------------------------------
     // Errors
@@ -142,8 +147,19 @@ interface IMindLaunchpad {
     error InvalidStatus();
     /// @notice The draw would exceed the per-mind epoch cap.
     error DrawLimitExceeded();
-    /// @notice `setDrawLimit` with an epoch shorter than one hour.
+    /// @notice `setDrawLimit` with an epoch shorter than one hour or a cap above `MAX_DRAW_PER_EPOCH` (2 ether).
     error InvalidDrawLimit();
+    /// @notice `setGraduationGrace` outside [1 hour, 30 days].
+    error InvalidGraduationGrace();
+    /// @notice `setGraduator` with a non-zero address that has no code or whose `launchpad()` is not this
+    ///         launchpad.
+    error InvalidGraduator();
+    /// @notice `renounceOwnership` is disabled: the launchpad always keeps an owner.
+    error RenounceDisabled();
+    /// @notice Bubbled up from `UniswapV3Graduator.graduate` (declared here so clients can decode `graduate`
+    ///         reverts): the DEX pool's price could not be brought within the graduator's tolerance of the price
+    ///         implied by the graduation amounts. The coin stays `Complete`; anyone may retry later.
+    error PoolPriceSkewed(uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96);
     /// @notice The draw exceeds the mind vault balance.
     error InsufficientMindBalance();
     /// @notice A fee parameter exceeds its bound.
@@ -154,11 +170,11 @@ interface IMindLaunchpad {
     error ZeroAddress();
     /// @notice An ETH transfer with `call` failed.
     error EthTransferFailed();
-    /// @notice Plain ETH transfers are only accepted from graduators.
+    /// @notice Plain ETH is only accepted from the graduator currently being called by `graduate`/`harvest`.
     error DirectEthNotAccepted();
     /// @notice No graduator is configured.
     error GraduatorNotSet();
-    /// @notice The graduator's reported ETH return does not match the launchpad's balance change.
+    /// @notice The graduator's reported ETH return does not match the ETH it sent to `receive()` during the call.
     error EthReturnMismatch();
     /// @notice Token name must be 1..64 bytes.
     error InvalidName();
@@ -202,7 +218,10 @@ interface IMindLaunchpad {
     function buy(address token, uint256 minTokensOut, uint256 deadline) external payable returns (uint256 tokensOut);
 
     /// @notice Sells `tokensIn` of `token` on its bonding curve. Tokens are pulled with `transferFrom`
-    ///         (approve the launchpad first); ETH is sent with `call{value}`.
+    ///         (approve the launchpad first); ETH is sent with `call{value}`. Allowed while `Bonding`, and while
+    ///         `Complete` once `block.timestamp >= completedAt(token) + graduationGrace()` (escape hatch for a
+    ///         coin that could not be graduated): such a sell first reopens the curve (phase `Bonding`,
+    ///         `CurveReopened`).
     /// @param token     The coin.
     /// @param tokensIn  Tokens to sell.
     /// @param minEthOut Minimum ETH to receive, else `Slippage()`.
@@ -222,7 +241,7 @@ interface IMindLaunchpad {
     /// @param token The coin.
     function harvest(address token) external;
 
-    /// @notice Anyone can feed a mind: adds `msg.value` to `mindBalance(token)`.
+    /// @notice Anyone can feed a mind: adds `msg.value` to `mindBalance(token)`. `nonReentrant`.
     /// @param token The coin.
     function fundMind(address token) external payable;
 
@@ -240,8 +259,9 @@ interface IMindLaunchpad {
         view
         returns (uint256 tokensOut, uint256 ethUsed, uint256 fee);
 
-    /// @notice Quotes a sell of `tokensIn` on `token`'s curve (SPEC §1). Reverts `WrongPhase()` unless Bonding,
-    ///         `ZeroAmount()` for `tokensIn == 0` and `ExceedsTokensSold()` above `tokensSold`.
+    /// @notice Quotes a sell of `tokensIn` on `token`'s curve (SPEC §1). Reverts `WrongPhase()` unless Bonding or
+    ///         Complete past the graduation grace (same rule as {sell}), `ZeroAmount()` for `tokensIn == 0` and
+    ///         `ExceedsTokensSold()` above `tokensSold`.
     /// @return ethOut ETH out, net of fee.
     /// @return fee    Fee taken.
     function quoteSell(address token, uint256 tokensIn) external view returns (uint256 ethOut, uint256 fee);
@@ -276,7 +296,9 @@ interface IMindLaunchpad {
     /// @notice Flat ETH fee charged by {createMind}.
     function creationFee() external view returns (uint256);
 
-    /// @notice Per-mind compute draw cap: at most `maxPerEpoch` wei per `epochSeconds`.
+    /// @notice Per-mind compute draw cap: at most `maxPerEpoch` wei per fixed epoch of `epochSeconds`. Epochs are
+    ///         fixed windows, so up to `2 * maxPerEpoch` can be drawn within any `epochSeconds`-long interval
+    ///         straddling an epoch boundary (at most `2 * MAX_DRAW_PER_EPOCH` = 4 ether).
     function drawLimit() external view returns (uint256 maxPerEpoch, uint32 epochSeconds);
 
     /// @notice Stored draw accounting of `token` (no elapsed-epoch reset is applied: the allowance is
@@ -298,8 +320,13 @@ interface IMindLaunchpad {
     /// @notice Graduator that holds `token`'s DEX liquidity (`address(0)` until graduated).
     function graduatorOf(address token) external view returns (address);
 
-    /// @notice Whether `account` was ever set as graduator (such accounts may send ETH to `receive()`).
-    function isGraduator(address account) external view returns (bool);
+    /// @notice `block.timestamp` at which `token`'s curve last completed (0 while it never completed or after a
+    ///         post-grace sell reopened it; kept after graduation).
+    function completedAt(address token) external view returns (uint64);
+
+    /// @notice Seconds after completion during which a `Complete` curve only waits for `graduate`; afterwards
+    ///         sells are allowed again (they reopen the curve).
+    function graduationGrace() external view returns (uint32);
 
     // solhint-disable func-name-mixedcase
     /// @notice Virtual ETH reserve (x0).
@@ -351,15 +378,20 @@ interface IMindLaunchpad {
     function setTreasury(address newTreasury) external;
     /// @notice Sets the compute treasury (non-zero).
     function setComputeTreasury(address newComputeTreasury) external;
-    /// @notice Sets the graduator for future graduations; `address(0)` disables graduation. Every non-zero
-    ///         graduator ever set stays recorded in {isGraduator}.
+    /// @notice Sets the graduator for future graduations; `address(0)` disables graduation. A non-zero graduator
+    ///         must be a contract whose `launchpad()` is this launchpad, else `InvalidGraduator()`.
     function setGraduator(address newGraduator) external;
     /// @notice Bounds: trade <= 500, mindShare <= 10000, graduation <= 1000 (bps).
     function setFeeParams(FeeParams calldata params) external;
     /// @notice Sets the flat creation fee.
     function setCreationFee(uint256 newCreationFee) external;
-    /// @notice Sets the per-mind compute draw cap (`epochSeconds >= 3600`; `maxPerEpoch = 0` blocks draws).
+    /// @notice Sets the per-mind compute draw cap (`epochSeconds >= 3600`, `maxPerEpoch <= MAX_DRAW_PER_EPOCH`
+    ///         = 2 ether; `maxPerEpoch = 0` blocks draws). Fixed epochs allow a burst of `2 * maxPerEpoch` around
+    ///         an epoch boundary.
     function setDrawLimit(uint256 maxPerEpoch, uint32 epochSeconds) external;
+    /// @notice Sets the graduation grace period, within [1 hour, 30 days]. Applies to every `Complete` curve,
+    ///         including those already waiting.
+    function setGraduationGrace(uint32 graceSeconds) external;
     /// @notice Pauses {createMind} and {buy} only; sell/graduate/harvest/fund/draw stay enabled.
     function pause() external;
     /// @notice Lifts {pause}.

@@ -36,6 +36,7 @@ contract MindLaunchpadAdminTest is BaseTest {
         assertEq(launchpad.LP_SUPPLY(), 200_000_000e18);
         assertEq(launchpad.VIRTUAL_ETH(), 1.365 ether);
         assertEq(launchpad.VIRTUAL_TOKENS(), 1_073_000_000e18);
+        assertEq(launchpad.graduationGrace(), 1 days);
         assertFalse(launchpad.paused());
     }
 
@@ -50,6 +51,8 @@ contract MindLaunchpadAdminTest is BaseTest {
         emit IMindLaunchpad.FeeParamsUpdated(100, 7000, 250);
         vm.expectEmit(false, false, false, true);
         emit IMindLaunchpad.DrawLimitUpdated(0.25 ether, 1 days);
+        vm.expectEmit(false, false, false, true);
+        emit IMindLaunchpad.GraduationGraceUpdated(1 days);
         MindLaunchpad fresh = new MindLaunchpad(owner, treasury, computeTreasury, operator);
         assertEq(fresh.graduator(), address(0));
 
@@ -116,6 +119,63 @@ contract MindLaunchpadAdminTest is BaseTest {
         vm.stopPrank();
     }
 
+    function test_renounceOwnership_disabled() public {
+        vm.prank(owner);
+        vm.expectRevert(IMindLaunchpad.RenounceDisabled.selector);
+        launchpad.renounceOwnership();
+        vm.prank(stranger);
+        vm.expectRevert(IMindLaunchpad.RenounceDisabled.selector);
+        launchpad.renounceOwnership();
+        assertEq(launchpad.owner(), owner);
+        // Transfers still work.
+        vm.prank(owner);
+        launchpad.transferOwnership(alice);
+        vm.prank(alice);
+        launchpad.acceptOwnership();
+        vm.prank(alice);
+        vm.expectRevert(IMindLaunchpad.RenounceDisabled.selector);
+        launchpad.renounceOwnership();
+        assertEq(launchpad.owner(), alice);
+    }
+
+    function test_setDrawLimit_hardCeiling() public {
+        vm.startPrank(owner);
+        vm.expectEmit(false, false, false, true, address(launchpad));
+        emit IMindLaunchpad.DrawLimitUpdated(2 ether, 3600);
+        launchpad.setDrawLimit(2 ether, 3600); // MAX_DRAW_PER_EPOCH
+        vm.expectRevert(IMindLaunchpad.InvalidDrawLimit.selector);
+        launchpad.setDrawLimit(2 ether + 1, 3600);
+        vm.expectRevert(IMindLaunchpad.InvalidDrawLimit.selector);
+        launchpad.setDrawLimit(type(uint256).max, 1 days);
+        vm.stopPrank();
+        (uint256 maxPerEpoch, uint32 epochSeconds) = launchpad.drawLimit();
+        assertEq(maxPerEpoch, 2 ether);
+        assertEq(epochSeconds, 3600);
+    }
+
+    /// @dev Documented bound: with fixed epochs at most 2 x MAX_DRAW_PER_EPOCH leaves a vault around a boundary,
+    ///      and never more than MAX_DRAW_PER_EPOCH within one epoch.
+    function test_drawBurst_boundedByTwiceTheCeiling() public {
+        address token = _createMind();
+        vm.prank(alice);
+        launchpad.fundMind{value: 10 ether}(token);
+        vm.prank(owner);
+        launchpad.setDrawLimit(2 ether, 3600);
+        vm.startPrank(operator);
+        launchpad.drawCompute(token, 1, bytes32(0));
+        (, uint64 start) = launchpad.drawnInEpoch(token);
+        vm.warp(uint256(start) + 3599);
+        launchpad.drawCompute(token, 2 ether - 1, bytes32(0));
+        vm.expectRevert(IMindLaunchpad.DrawLimitExceeded.selector);
+        launchpad.drawCompute(token, 1, bytes32(0));
+        vm.warp(uint256(start) + 3600);
+        launchpad.drawCompute(token, 2 ether, bytes32(0));
+        vm.expectRevert(IMindLaunchpad.DrawLimitExceeded.selector);
+        launchpad.drawCompute(token, 1, bytes32(0));
+        vm.stopPrank();
+        assertEq(computeTreasury.balance, 4 ether, "2 x MAX_DRAW_PER_EPOCH within two seconds, no more");
+    }
+
     function test_ownershipIsTwoStep() public {
         vm.prank(owner);
         launchpad.transferOwnership(alice);
@@ -153,6 +213,8 @@ contract MindLaunchpadAdminTest is BaseTest {
             launchpad.setCreationFee(0);
             vm.expectRevert(err);
             launchpad.setDrawLimit(1, 1);
+            vm.expectRevert(err);
+            launchpad.setGraduationGrace(1 days);
             vm.expectRevert(err);
             launchpad.pause();
             vm.expectRevert(err);

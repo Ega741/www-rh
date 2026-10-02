@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
 import {MindToken} from "../../src/MindToken.sol";
 import {IGraduator} from "../../src/interfaces/IGraduator.sol";
 import {IMindLaunchpad} from "../../src/interfaces/IMindLaunchpad.sol";
@@ -50,7 +52,10 @@ contract AuditLaunchpadTest is BaseTest {
         DoubleCreditGraduator evil = new DoubleCreditGraduator(address(launchpad));
         vm.prank(owner);
         launchpad.setGraduator(address(evil));
-        launchpad.graduate(done); // passes the EthReturnMismatch check
+        // [fix] fundMind is nonReentrant and returns are counted in receive() only: the double-credit graduation
+        // now reverts instead of passing the (former) balance check; `done` stays Complete.
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        launchpad.graduate(done);
 
         uint256 bal = address(launchpad).balance;
         uint256 liab = _liabilities();
@@ -100,12 +105,21 @@ contract AuditLaunchpadTest is BaseTest {
         vm.startPrank(owner);
         launchpad.setOperator(owner);
         launchpad.setComputeTreasury(owner);
+        // [fix] the cap has a hard ceiling (MAX_DRAW_PER_EPOCH = 2 ether): an unbounded limit is rejected...
+        vm.expectRevert(IMindLaunchpad.InvalidDrawLimit.selector);
         launchpad.setDrawLimit(type(uint256).max, 3600);
+        launchpad.setDrawLimit(2 ether, 3600);
+        // ...so the whole vault cannot be drawn in one block.
+        vm.expectRevert(IMindLaunchpad.DrawLimitExceeded.selector);
         launchpad.drawCompute(token, vault, bytes32(0));
+        launchpad.drawCompute(token, 2 ether, bytes32(0));
         vm.stopPrank();
 
         // README/SPEC: "nobody (creator, owner, operator) can withdraw it otherwise"; draws are "epoch-capped".
-        assertEq(owner.balance - ownerBefore, 0, "owner pulled the whole vault in one block");
+        // [edit] The owner keeps the (documented) power to repoint operator and compute treasury; the fix bounds
+        // what that power yields per block to MAX_DRAW_PER_EPOCH instead of making it zero.
+        assertLe(owner.balance - ownerBefore, 2 ether, "owner pulled more than MAX_DRAW_PER_EPOCH in one block");
+        assertGe(launchpad.mindBalance(token), vault - 2 ether, "vault emptied in one block");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -128,6 +142,9 @@ contract AuditLaunchpadTest is BaseTest {
         vm.prank(operator);
         launchpad.drawCompute(token, 0.25 ether, bytes32(0));
 
-        assertLe(computeTreasury.balance - t0, 0.25 ether, "drew 2x maxPerEpoch within one second");
+        // [edit] Fixed epochs are kept by design (SPEC §2.3, NatSpec of drawLimit/drawCompute): the documented bound
+        // is 2 x maxPerEpoch around an epoch boundary (<= 2 x MAX_DRAW_PER_EPOCH overall).
+        (uint256 maxPerEpoch,) = launchpad.drawLimit();
+        assertLe(computeTreasury.balance - t0, 2 * maxPerEpoch, "drew more than the documented 2x burst");
     }
 }

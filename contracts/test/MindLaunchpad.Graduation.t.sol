@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
 import {MindToken} from "../src/MindToken.sol";
 import {MockGraduator} from "../src/MockGraduator.sol";
 import {IMindLaunchpad} from "../src/interfaces/IMindLaunchpad.sol";
 import {ConfigurableGraduator} from "./mocks/ConfigurableGraduator.sol";
+import {MaliciousGraduator} from "./mocks/MaliciousGraduator.sol";
+import {MockWETH9} from "./mocks/MockWETH9.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
 
-/// @notice graduate / harvest through graduators, receive() gating and the balance check (directives D1, D2).
+/// @notice graduate / harvest through graduators, receive() gating and the ETH return counter (directives D1, D2;
+///         audit M-1), setGraduator sanity checks.
 contract MindLaunchpadGraduationTest is BaseTest {
     ConfigurableGraduator internal cfg;
 
@@ -106,13 +111,10 @@ contract MindLaunchpadGraduationTest is BaseTest {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // setGraduator / graduatorOf / isGraduator
+    // setGraduator / graduatorOf
     // ---------------------------------------------------------------------------------------------
 
-    function test_setGraduator_recordsEveryGraduatorAndAffectsOnlyFutureGraduations() public {
-        assertTrue(launchpad.isGraduator(address(mockGraduator)));
-        assertFalse(launchpad.isGraduator(address(cfg)));
-
+    function test_setGraduator_affectsOnlyFutureGraduations() public {
         address t1 = _createMind();
         _complete(alice, t1);
         launchpad.graduate(t1);
@@ -122,13 +124,12 @@ contract MindLaunchpadGraduationTest is BaseTest {
         emit IMindLaunchpad.GraduatorUpdated(address(cfg));
         _useCfg();
         assertEq(launchpad.graduator(), address(cfg));
-        assertTrue(launchpad.isGraduator(address(cfg)));
-        assertTrue(launchpad.isGraduator(address(mockGraduator)), "never unset");
 
+        vm.expectEmit(false, false, false, true, address(launchpad));
+        emit IMindLaunchpad.GraduatorUpdated(address(0));
         vm.prank(owner);
         launchpad.setGraduator(address(0));
-        assertFalse(launchpad.isGraduator(address(0)));
-        assertTrue(launchpad.isGraduator(address(cfg)));
+        assertEq(launchpad.graduator(), address(0));
         _useCfg();
 
         // t1 keeps harvesting through its own graduator.
@@ -241,6 +242,128 @@ contract MindLaunchpadGraduationTest is BaseTest {
         assertEq(vm.getRecordedLogs().length, 1);
     }
 
+    function test_setGraduator_sanityChecks() public {
+        vm.startPrank(owner);
+        // An EOA (e.g. a mistyped address).
+        vm.expectRevert(IMindLaunchpad.InvalidGraduator.selector);
+        launchpad.setGraduator(makeAddr("eoa"));
+        // A contract without launchpad().
+        address noLaunchpad = address(new MockWETH9());
+        vm.expectRevert(IMindLaunchpad.InvalidGraduator.selector);
+        launchpad.setGraduator(noLaunchpad);
+        // A graduator wired to another launchpad.
+        MockGraduator foreign = new MockGraduator(address(0xBEEF));
+        vm.expectRevert(IMindLaunchpad.InvalidGraduator.selector);
+        launchpad.setGraduator(address(foreign));
+        vm.stopPrank();
+        assertEq(launchpad.graduator(), address(mockGraduator), "unchanged by the failures");
+
+        // Zero (disables graduation) and a correctly wired graduator are accepted.
+        vm.startPrank(owner);
+        launchpad.setGraduator(address(0));
+        launchpad.setGraduator(address(cfg));
+        vm.stopPrank();
+        assertEq(launchpad.graduator(), address(cfg));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ETH return counter (audit M-1)
+    // ---------------------------------------------------------------------------------------------
+
+    function _useMalicious(MaliciousGraduator.Mode mode) internal returns (MaliciousGraduator m) {
+        m = new MaliciousGraduator(address(launchpad));
+        m.setMode(mode, false);
+        vm.prank(owner);
+        launchpad.setGraduator(address(m));
+    }
+
+    function _liabilities() internal view returns (uint256 total) {
+        total = launchpad.protocolBalance();
+        for (uint256 i; i < launchpad.mindsLength(); ++i) {
+            address t = launchpad.mindAt(i);
+            total += launchpad.getCurve(t).realEthReserve + launchpad.mindBalance(t);
+        }
+    }
+
+    /// @dev fundMind is nonReentrant: a graduator cannot push the liquidity back through it during graduate and also
+    ///      report it as returned (the same wei would be credited twice).
+    function test_graduate_fundMindDuringGraduateCannotDoubleCredit() public {
+        address token = _createMind();
+        _complete(alice, token);
+        _useMalicious(MaliciousGraduator.Mode.FundMind);
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        launchpad.graduate(token);
+        assertEq(uint8(launchpad.getCurve(token).phase), uint8(IMindLaunchpad.CurvePhase.Complete));
+        assertEq(address(launchpad).balance, _liabilities());
+    }
+
+    /// @dev Same on harvest: proceeds pushed through fundMind cannot also be reported; the honest return works.
+    function test_harvest_fundMindDuringHarvestCannotDoubleCredit() public {
+        address token = _createMind();
+        _complete(alice, token);
+        MaliciousGraduator m = _useMalicious(MaliciousGraduator.Mode.FundMind);
+        m.setMode(MaliciousGraduator.Mode.FundMind, true); // graduate keeps the liquidity (like the mock)
+        launchpad.graduate(token);
+        assertEq(launchpad.graduatorOf(token), address(m));
+        assertGt(address(m).balance, 3 ether);
+
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        launchpad.harvest(token);
+
+        // Returned through receive() in two calls instead: counted once, credited once.
+        m.setMode(MaliciousGraduator.Mode.Split, true);
+        uint256 proceeds = address(m).balance;
+        uint256 mindBefore = launchpad.mindBalance(token);
+        vm.expectEmit(true, true, false, true, address(launchpad));
+        emit IMindLaunchpad.MindFunded(token, address(m), proceeds);
+        launchpad.harvest(token);
+        assertEq(launchpad.mindBalance(token), mindBefore + proceeds);
+        assertEq(address(launchpad).balance, _liabilities());
+    }
+
+    /// @dev ETH force-sent with selfdestruct is invisible to the counter: reporting it as returned reverts, and
+    ///      the forced wei is never credited.
+    function test_graduate_forcedEthIsNotCounted() public {
+        address token = _createMind();
+        _complete(alice, token);
+        _useMalicious(MaliciousGraduator.Mode.ForceSend);
+        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
+        launchpad.graduate(token);
+    }
+
+    /// @dev The launchpad's receive() writes storage, so a 2300-gas `transfer` cannot return ETH (IGraduator NatSpec).
+    function test_graduate_returnWithTransferStipendFails() public {
+        address token = _createMind();
+        _complete(alice, token);
+        _useMalicious(MaliciousGraduator.Mode.TransferStipend);
+        vm.expectRevert();
+        launchpad.graduate(token);
+        assertEq(uint8(launchpad.getCurve(token).phase), uint8(IMindLaunchpad.CurvePhase.Complete));
+    }
+
+    /// @dev During graduate, ETH from any address but the graduator being called is rejected.
+    function test_graduate_returnFromAnotherAddressIsRejected() public {
+        address token = _createMind();
+        _complete(alice, token);
+        _useMalicious(MaliciousGraduator.Mode.ViaHelper);
+        vm.expectRevert(IMindLaunchpad.DirectEthNotAccepted.selector);
+        launchpad.graduate(token);
+    }
+
+    /// @dev Several separate returns within one graduate call are summed by the counter.
+    function test_graduate_counterSumsPartialReturns() public {
+        address token = _createMind();
+        _complete(alice, token);
+        _useMalicious(MaliciousGraduator.Mode.Split);
+        (uint256 reserve,) = _curve(token);
+        uint256 gradFee = reserve * 250 / 10_000;
+        uint256 ethLiquidity = reserve - gradFee;
+        uint256 mindBefore = launchpad.mindBalance(token);
+        launchpad.graduate(token);
+        assertEq(launchpad.mindBalance(token), mindBefore + gradFee * 7000 / 10_000 + ethLiquidity);
+        assertEq(address(launchpad).balance, _liabilities());
+    }
+
     // ---------------------------------------------------------------------------------------------
     // receive() gating
     // ---------------------------------------------------------------------------------------------
@@ -257,19 +380,29 @@ contract MindLaunchpadGraduationTest is BaseTest {
         assertFalse(ok);
     }
 
-    function test_receive_acceptsGraduatorsWithoutAccounting() public {
+    /// @dev Outside a graduate/harvest call nobody, not even the current or a former graduator, can send ETH.
+    function test_receive_onlyFromTheGraduatorBeingCalled() public {
         vm.deal(address(mockGraduator), 1 ether);
         vm.prank(address(mockGraduator));
-        (bool ok,) = address(launchpad).call{value: 1 ether}("");
-        assertTrue(ok);
-        assertEq(address(launchpad).balance, 1 ether);
-        assertEq(launchpad.protocolBalance(), 0);
+        (bool ok, bytes memory err) = address(launchpad).call{value: 1 ether}("");
+        assertFalse(ok, "current graduator outside a call");
+        assertEq(err, abi.encodeWithSelector(IMindLaunchpad.DirectEthNotAccepted.selector));
 
-        // A former graduator stays accepted.
         _useCfg();
         vm.deal(address(mockGraduator), 1 ether);
         vm.prank(address(mockGraduator));
         (ok,) = address(launchpad).call{value: 1 ether}("");
-        assertTrue(ok);
+        assertFalse(ok, "former graduator");
+        vm.prank(address(cfg));
+        (ok,) = address(launchpad).call{value: 1 ether}("");
+        assertFalse(ok, "new graduator outside a call");
+        assertEq(address(launchpad).balance, 0);
+
+        // Inside its own graduate call the graduator's return is accepted and counted.
+        cfg.setGraduateBehaviour(10_000, 0);
+        address token = _createMind();
+        _complete(alice, token);
+        launchpad.graduate(token);
+        assertEq(address(launchpad).balance, _liabilities());
     }
 }

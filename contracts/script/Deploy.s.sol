@@ -19,7 +19,8 @@ import {UniswapV3Graduator} from "../src/UniswapV3Graduator.sol";
 /// @dev Environment:
 ///      - `DEPLOYER_PRIVATE_KEY`  (required) broadcaster key.
 ///      - `OWNER`, `TREASURY`, `COMPUTE_TREASURY`, `OPERATOR`  each defaults to the deployer when unset/empty.
-///      - `GRADUATOR_KIND`        `uniswapv3` | `mock` (default: `uniswapv3` on 4663, `mock` elsewhere).
+///      - `GRADUATOR_KIND`        `uniswapv3` | `mock` (default: `uniswapv3` on 4663, `mock` elsewhere). `mock` is
+///        refused on Robinhood Chain mainnet (4663): the mock keeps the graduation liquidity forever.
 ///      - `WETH9`, `UNIV3_FACTORY`, `UNIV3_POSITION_MANAGER`  required for `uniswapv3`; on 4663 they default to the
 ///        addresses in docs/ROBINHOOD_CHAIN.md.
 ///      - `UNIV3_FEE_TIER`        pool fee tier (default 10000 = 1 %).
@@ -59,6 +60,9 @@ contract Deploy is Script {
     error UnknownGraduatorKind(string kind);
     /// @notice A Uniswap v3 address required for `uniswapv3` is missing.
     error MissingUniswapAddress(string name);
+    /// @notice `GRADUATOR_KIND=mock` on Robinhood Chain mainnet (4663): the mock graduator keeps every graduated
+    ///         coin's ETH and tokens forever, so it must never be deployed there. Use `uniswapv3`.
+    error MockGraduatorNotAllowedOnMainnet(uint256 chainId);
     /// @notice Post-deployment wiring check failed.
     error WiringFailed();
 
@@ -100,6 +104,7 @@ contract Deploy is Script {
         bytes32 kind = keccak256(bytes(cfg.graduatorKind));
         bool uniswap = kind == keccak256("uniswapv3");
         if (!uniswap && kind != keccak256("mock")) revert UnknownGraduatorKind(cfg.graduatorKind);
+        if (!uniswap && block.chainid == ROBINHOOD_MAINNET) revert MockGraduatorNotAllowedOnMainnet(block.chainid);
         if (uniswap) {
             if (cfg.weth9 == address(0)) revert MissingUniswapAddress("WETH9");
             if (cfg.factory == address(0)) revert MissingUniswapAddress("UNIV3_FACTORY");
@@ -122,8 +127,8 @@ contract Deploy is Script {
             if (uniswap) UniswapV3Graduator(payable(graduator)).transferOwnership(r.owner);
         }
         vm.stopBroadcast();
-        // (5) Sanity check.
-        if (launchpad.graduator() != graduator || !launchpad.isGraduator(graduator)) revert WiringFailed();
+        // (5) Sanity check (setGraduator itself already required graduator.launchpad() == launchpad).
+        if (launchpad.graduator() != graduator) revert WiringFailed();
 
         d = Deployment({
             launchpad: address(launchpad),

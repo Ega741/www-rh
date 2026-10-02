@@ -11,7 +11,8 @@ import {CurveMath} from "../../src/libraries/CurveMath.sol";
 import {ConfigurableGraduator} from "../mocks/ConfigurableGraduator.sol";
 import {LaunchpadHandler} from "./LaunchpadHandler.sol";
 
-/// @notice SPEC §2.6 invariants under random trading, graduation, harvesting, funding and draws.
+/// @notice SPEC §2.6 invariants under random trading (including post-grace sells that reopen Complete curves),
+///         graduation, harvesting, funding and draws.
 contract LaunchpadInvariantsTest is StdInvariant, Test {
     MindLaunchpad internal launchpad;
     ConfigurableGraduator internal graduator;
@@ -57,6 +58,19 @@ contract LaunchpadInvariantsTest is StdInvariant, Test {
                 assertEq(MindToken(token).balanceOf(address(launchpad)), 0);
                 assertEq(launchpad.graduatorOf(token), address(graduator));
             }
+        }
+    }
+
+    /// @dev `completedAt` is set exactly while the curve is (or was, once graduated) complete; a reopened curve is
+    ///      Bonding with `completedAt == 0`.
+    function invariant_completedAtMatchesPhase() public view {
+        uint256 n = handler.tokensLength();
+        for (uint256 i; i < n; ++i) {
+            address token = handler.tokens(i);
+            IMindLaunchpad.CurvePhase phase = launchpad.getCurve(token).phase;
+            uint64 completedAt = launchpad.completedAt(token);
+            if (phase == IMindLaunchpad.CurvePhase.Bonding) assertEq(completedAt, 0);
+            else assertTrue(completedAt != 0 && completedAt <= block.timestamp);
         }
     }
 

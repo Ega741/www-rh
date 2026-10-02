@@ -26,4 +26,29 @@ interface IUniswapV3Pool {
 
     /// @notice Sets the initial price. Reverts if already initialized.
     function initialize(uint160 sqrtPriceX96) external;
+
+    /// @notice Swaps token0 for token1 (`zeroForOne`) or token1 for token0. The caller is paid the output first and
+    ///         must pay the input in {IUniswapV3SwapCallback.uniswapV3SwapCallback}.
+    /// @param recipient         Receiver of the output.
+    /// @param zeroForOne        Direction (true: token0 in, price falls).
+    /// @param amountSpecified   Exact input when positive, exact output when negative.
+    /// @param sqrtPriceLimitX96 The price cannot move past this value (Q64.96).
+    /// @param data              Passed through to the callback.
+    /// @return amount0 Delta of token0 owed by (positive) or paid to (negative) the caller.
+    /// @return amount1 Delta of token1 owed by (positive) or paid to (negative) the caller.
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
+}
+
+/// @title IUniswapV3SwapCallback
+/// @notice Callback for {IUniswapV3Pool.swap}: the pool calls it on `msg.sender` after sending the output.
+interface IUniswapV3SwapCallback {
+    /// @notice Pays the pool. Positive deltas are owed to the pool by the end of the call; zero deltas (a swap that
+    ///         only moved the price through a range without liquidity) owe nothing.
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external;
 }

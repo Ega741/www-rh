@@ -8,11 +8,14 @@ import {UniswapV3Graduator} from "../../src/UniswapV3Graduator.sol";
 import {IMindLaunchpad} from "../../src/interfaces/IMindLaunchpad.sol";
 import {MockWETH9} from "../mocks/MockWETH9.sol";
 import {BaseTest} from "../utils/BaseTest.sol";
-import {AuditFactory, AuditPool, AuditPositionManager} from "./mocks/AuditUniV3.sol";
+import {UniV3Factory as AuditFactory} from "../mocks/uniswapv3/UniV3Factory.sol";
+import {UniV3Pool as AuditPool} from "../mocks/uniswapv3/UniV3Pool.sol";
+import {UniV3PositionManager as AuditPositionManager} from "../mocks/uniswapv3/UniV3PositionManager.sol";
 
 /// @notice AUDIT PoCs for UniswapV3Graduator + MindLaunchpad.graduate against a pool that an attacker created and
-///         initialized before graduation. Uses audit mocks with the real Uniswap v3 liquidity / swap math
-///         (test/audit/mocks), unlike test/mocks/MockNonfungiblePositionManager which never yields zero liquidity.
+///         initialized before graduation. Uses the Uniswap v3 models with the real liquidity / swap math
+///         (moved from test/audit/mocks to test/mocks/uniswapv3), unlike the former naive position manager mock
+///         which never yielded zero liquidity.
 ///         Tests named test_POC_* assert the SAFE behaviour and are expected to FAIL against the current code.
 contract AuditGraduatorSkewTest is BaseTest {
     uint24 internal constant FEE_TIER = 10_000;
