@@ -8,30 +8,30 @@ import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Recei
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IGraduator} from "./interfaces/IGraduator.sol";
-import {IMindLaunchpad} from "./interfaces/IMindLaunchpad.sol";
 import {INonfungiblePositionManager} from "./interfaces/uniswap/INonfungiblePositionManager.sol";
 import {IUniswapV3Factory} from "./interfaces/uniswap/IUniswapV3Factory.sol";
 import {IUniswapV3Pool} from "./interfaces/uniswap/IUniswapV3Pool.sol";
 import {IWETH9} from "./interfaces/uniswap/IWETH9.sol";
 
 /// @title UniswapV3Graduator
-/// @notice Moves a graduated coin's liquidity (`LP_SUPPLY` tokens + the curve's ETH) into a full-range
-///         Uniswap v3 position owned by this contract forever, and harvests the position's fees back
-///         into the coin's mind vault (ETH) while burning the token side. SPEC §2.4.
-/// @dev The LP NFT is never transferred out; there is no rescue function for it.
+/// @notice Moves a graduated coin's liquidity (`LP_SUPPLY` tokens + the curve's ETH as WETH) into a full-range
+///         Uniswap v3 position owned by this contract forever, and harvests the position's fees: the ETH side
+///         goes back to the launchpad (credited to the coin's mind vault there), the token side is burned.
+/// @dev A pool that already exists and is initialized at another price never blocks graduation (directive D3):
+///      the position is minted at the pool's current price with zero minimums, unused ETH is returned to the
+///      launchpad, unused tokens are burned, and {GraduatedAtSkewedPrice} is emitted. The LP NFT is never
+///      transferred out; nothing in this contract can move it.
 contract UniswapV3Graduator is IGraduator, Ownable2Step, IERC721Receiver {
     using SafeERC20 for IERC20;
 
-    /// @dev Uniswap v3 tick bounds.
+    /// @dev Uniswap v3 tick bounds (TickMath.MIN_TICK / MAX_TICK).
     int24 internal constant MIN_TICK = -887272;
     int24 internal constant MAX_TICK = 887272;
-    uint256 internal constant BPS = 10_000;
-    /// @notice Collected tokens are burned by sending them here.
+    /// @notice Unused and harvested tokens are burned by sending them here.
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     /// @dev Scratch data of one graduation (memory struct keeps the stack shallow).
     struct Deployment {
-        bool tokenIs0;
         address token0;
         address token1;
         uint256 amount0;
@@ -40,7 +40,7 @@ contract UniswapV3Graduator is IGraduator, Ownable2Step, IERC721Receiver {
         uint256 used1;
     }
 
-    /// @notice The {MindLaunchpad} allowed to call {graduate} / {harvest}.
+    /// @notice The {MindLaunchpad} allowed to call {graduate} / {harvest}; receives all returned ETH.
     address public immutable launchpad;
     /// @notice Uniswap v3 NonfungiblePositionManager.
     INonfungiblePositionManager public immutable positionManager;
@@ -50,62 +50,82 @@ contract UniswapV3Graduator is IGraduator, Ownable2Step, IERC721Receiver {
     IWETH9 public immutable weth9;
     /// @notice Pool fee tier used for every graduation (e.g. 10000 = 1 %).
     uint24 public immutable feeTier;
-
-    /// @notice Max allowed deviation (bps) between an existing pool's price and the curve's final price.
-    uint16 public maxDeviationBps = 2000;
+    /// @notice Tick spacing of {feeTier}, read from the factory at deployment.
+    int24 public immutable tickSpacing;
 
     /// @notice LP position id per token (0 = not graduated through this contract).
-    mapping(address token => uint256) public positionId;
+    mapping(address token => uint256) public positionOf;
     /// @notice Pool per token.
     mapping(address token => address) public poolOf;
 
-    event MaxDeviationUpdated(uint16 maxDeviationBps);
+    /// @notice Liquidity for `token` was deployed into `pool` as position `positionId`.
     event LiquidityDeployed(
         address indexed token,
         address indexed pool,
         uint256 positionId,
-        uint256 tokenAmount,
-        uint256 ethAmount,
-        uint256 targetPriceWei
+        uint256 tokensUsed,
+        uint256 ethUsed,
+        uint256 ethReturned,
+        uint256 tokensBurned
     );
+    /// @notice The pool already existed at a price different from the one implied by the graduation amounts;
+    ///         liquidity was minted at the pool's price and the leftovers returned (ETH) / burned (tokens).
+    event GraduatedAtSkewedPrice(address token, uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96);
+    /// @notice Position fees of `token` were collected.
     event FeesHarvested(address indexed token, uint256 ethOut, uint256 tokensBurned);
+    /// @notice The owner rescued an ERC20 sent here by mistake.
+    event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
 
+    /// @notice Caller is not {launchpad}.
     error NotLaunchpad();
-    error PoolPriceSkewed();
+    /// @notice `token` has already been graduated through this contract.
+    error AlreadyGraduated();
+    /// @notice `token` has no position here.
     error NoPosition();
-    error InvalidBps();
+    /// @notice {feeTier} is not enabled on the factory.
+    error FeeTierNotEnabled();
+    /// @notice A required address is zero.
     error ZeroAddress();
+    /// @notice Zero ETH or token amount.
     error ZeroAmount();
+    /// @notice Plain ETH is accepted only from WETH9 (unwrapping).
     error UnexpectedEth();
+    /// @notice Returning ETH to the launchpad failed.
+    error EthTransferFailed();
+    /// @notice The amounts imply a price outside the uint160 `sqrtPriceX96` range.
+    error PriceOutOfRange();
 
     modifier onlyLaunchpad() {
         if (msg.sender != launchpad) revert NotLaunchpad();
         _;
     }
 
-    /// @param owner_           Initial owner (may tune {maxDeviationBps}).
+    /// @param initialOwner     Initial owner (may rescue stray ERC20s; has no power over positions).
     /// @param launchpad_       {MindLaunchpad}.
     /// @param positionManager_ Uniswap v3 NonfungiblePositionManager.
     /// @param factory_         Uniswap v3 factory.
     /// @param weth9_           WETH9.
     /// @param feeTier_         Pool fee tier (must be enabled on the factory).
     constructor(
-        address owner_,
+        address initialOwner,
         address launchpad_,
         address positionManager_,
         address factory_,
         address weth9_,
         uint24 feeTier_
-    ) Ownable(owner_) {
+    ) Ownable(initialOwner) {
         if (
             launchpad_ == address(0) || positionManager_ == address(0) || factory_ == address(0)
                 || weth9_ == address(0)
         ) revert ZeroAddress();
+        int24 spacing = IUniswapV3Factory(factory_).feeAmountTickSpacing(feeTier_);
+        if (spacing <= 0) revert FeeTierNotEnabled();
         launchpad = launchpad_;
         positionManager = INonfungiblePositionManager(positionManager_);
         factory = IUniswapV3Factory(factory_);
         weth9 = IWETH9(weth9_);
         feeTier = feeTier_;
+        tickSpacing = spacing;
     }
 
     /// @dev Only WETH9 may push ETH here (on `withdraw`). The launchpad pays through {graduate}.
@@ -118,82 +138,98 @@ contract UniswapV3Graduator is IGraduator, Ownable2Step, IERC721Receiver {
     // ---------------------------------------------------------------------------------------------
 
     /// @inheritdoc IGraduator
-    function graduate(address token, uint256 tokenAmount, uint256 targetPriceWei)
+    /// @dev 1. wrap `msg.value`; 2. order `token0 < token1` and derive `sqrtPriceX96` solely from the amounts;
+    ///      3. create/initialize the pool at that price, or use an existing initialized pool at its own price;
+    ///      4. mint a full-range position (zero minimums) owned by this contract;
+    ///      5. unwrap and return unused ETH to the launchpad, burn unused tokens.
+    function graduate(address token, uint256 tokenAmount)
         external
         payable
         onlyLaunchpad
-        returns (address pool, uint256 tokenId)
+        returns (address pool, uint256 positionId, uint256 ethReturned)
     {
         if (msg.value == 0 || tokenAmount == 0) revert ZeroAmount();
+        if (positionOf[token] != 0) revert AlreadyGraduated();
         weth9.deposit{value: msg.value}();
 
         Deployment memory d;
-        d.tokenIs0 = token < address(weth9);
-        (d.token0, d.token1, d.amount0, d.amount1) = d.tokenIs0
+        bool tokenIs0 = token < address(weth9);
+        (d.token0, d.token1, d.amount0, d.amount1) = tokenIs0
             ? (token, address(weth9), tokenAmount, msg.value)
             : (address(weth9), token, msg.value, tokenAmount);
 
-        pool = _ensurePool(d.token0, d.token1, computeSqrtPriceX96(d.amount0, d.amount1));
-        (tokenId, d.used0, d.used1) = _mintFullRange(d);
-        positionId[token] = tokenId;
+        uint160 expected = computeSqrtPriceX96(d.amount0, d.amount1);
+        uint160 actual;
+        (pool, actual) = _ensurePool(d.token0, d.token1, expected);
+
+        (positionId, d.used0, d.used1) = _mintFullRange(d);
+        positionOf[token] = positionId;
         poolOf[token] = pool;
 
-        (uint256 usedTokens, uint256 usedEth) = d.tokenIs0 ? (d.used0, d.used1) : (d.used1, d.used0);
-        _creditEth(token, msg.value - usedEth);
-        _burnTokens(token, tokenAmount - usedTokens);
+        (uint256 tokensUsed, uint256 ethUsed) = tokenIs0 ? (d.used0, d.used1) : (d.used1, d.used0);
+        ethReturned = msg.value - ethUsed;
+        uint256 tokensBurned = tokenAmount - tokensUsed;
 
-        emit LiquidityDeployed(token, pool, tokenId, usedTokens, usedEth, targetPriceWei);
+        if (actual != expected) emit GraduatedAtSkewedPrice(token, expected, actual);
+        emit LiquidityDeployed(token, pool, positionId, tokensUsed, ethUsed, ethReturned, tokensBurned);
+
+        _burnTokens(token, tokensBurned);
+        _returnEth(ethReturned);
     }
 
     /// @inheritdoc IGraduator
     function harvest(address token) external onlyLaunchpad returns (uint256 ethOut, uint256 tokensBurned) {
-        uint256 tokenId = positionId[token];
-        if (tokenId == 0) revert NoPosition();
+        uint256 positionId = positionOf[token];
+        if (positionId == 0) revert NoPosition();
         (uint256 amount0, uint256 amount1) = positionManager.collect(
             INonfungiblePositionManager.CollectParams({
-                tokenId: tokenId,
+                tokenId: positionId,
                 recipient: address(this),
                 amount0Max: type(uint128).max,
                 amount1Max: type(uint128).max
             })
         );
         (tokensBurned, ethOut) = token < address(weth9) ? (amount0, amount1) : (amount1, amount0);
-        _creditEth(token, ethOut);
-        _burnTokens(token, tokensBurned);
         emit FeesHarvested(token, ethOut, tokensBurned);
+        _burnTokens(token, tokensBurned);
+        _returnEth(ethOut);
     }
 
     // ---------------------------------------------------------------------------------------------
     // Owner
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice Sets the max price deviation (bps, <= 10000) tolerated for pre-existing pools.
-    function setMaxDeviationBps(uint16 newMaxDeviationBps) external onlyOwner {
-        if (newMaxDeviationBps > BPS) revert InvalidBps();
-        maxDeviationBps = newMaxDeviationBps;
-        emit MaxDeviationUpdated(newMaxDeviationBps);
+    /// @notice Rescues an ERC20 sent here by mistake. Between calls this contract holds no graduation tokens or
+    ///         WETH (everything is deposited, returned or burned within {graduate}/{harvest}); LP positions are
+    ///         ERC721s held by the position manager's ledger and cannot be moved by this function.
+    /// @param token  The ERC20 to rescue.
+    /// @param to     Recipient.
+    /// @param amount Amount to send.
+    function rescueERC20(address token, address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        IERC20(token).safeTransfer(to, amount);
+        emit ERC20Rescued(token, to, amount);
     }
 
     // ---------------------------------------------------------------------------------------------
     // Views / pure helpers
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice Full-range tick bounds for {feeTier}: `(MIN_TICK / spacing) * spacing` and the mirror.
+    /// @notice Full-range tick bounds for {tickSpacing}: `(MIN_TICK / spacing) * spacing` and the mirror.
     function tickBounds() public view returns (int24 tickLower, int24 tickUpper) {
-        int24 spacing = factory.feeAmountTickSpacing(feeTier);
-        if (spacing <= 0) revert InvalidBps();
-        // Division first is intentional: round the tick bounds inwards to a multiple of `spacing`.
+        int24 spacing = tickSpacing;
+        // Division first is intentional: round the bounds towards zero to a multiple of `spacing`.
         // forge-lint: disable-next-line(divide-before-multiply)
         tickLower = (MIN_TICK / spacing) * spacing;
         // forge-lint: disable-next-line(divide-before-multiply)
         tickUpper = (MAX_TICK / spacing) * spacing;
     }
 
-    /// @notice `sqrt(amount1 * 2^192 / amount0)` as a Q64.96 fixed-point number (Uniswap v3 `sqrtPriceX96`).
+    /// @notice `sqrt(amount1 * 2^192 / amount0)` as a Q64.96 number (Uniswap v3 `sqrtPriceX96`), with
+    ///         `amount0`/`amount1` the amounts of the ordered `token0 < token1` pair.
     function computeSqrtPriceX96(uint256 amount0, uint256 amount1) public pure returns (uint160) {
-        uint256 ratioX192 = Math.mulDiv(amount1, 1 << 192, amount0);
-        uint256 sqrtPrice = Math.sqrt(ratioX192);
-        if (sqrtPrice > type(uint160).max) revert PoolPriceSkewed();
+        uint256 sqrtPrice = Math.sqrt(Math.mulDiv(amount1, 1 << 192, amount0));
+        if (sqrtPrice > type(uint160).max) revert PriceOutOfRange();
         // forge-lint: disable-next-line(unsafe-typecast)
         return uint160(sqrtPrice);
     }
@@ -207,25 +243,26 @@ contract UniswapV3Graduator is IGraduator, Ownable2Step, IERC721Receiver {
     // Internals
     // ---------------------------------------------------------------------------------------------
 
-    /// @dev Returns the pool for the pair, creating/initializing it at `sqrtPriceX96` when it has no price
-    ///      yet, or checking an existing price against `sqrtPriceX96` (reverts {PoolPriceSkewed}).
-    function _ensurePool(address token0, address token1, uint160 sqrtPriceX96) internal returns (address pool) {
+    /// @dev Returns the pool for the pair and its price. A missing or uninitialized pool is created/initialized
+    ///      at `expected`; an initialized pool is used as is, at its current price.
+    function _ensurePool(address token0, address token1, uint160 expected)
+        internal
+        returns (address pool, uint160 actual)
+    {
         pool = factory.getPool(token0, token1, feeTier);
-        uint160 currentSqrtPriceX96;
-        if (pool != address(0)) (currentSqrtPriceX96,,,,,,) = IUniswapV3Pool(pool).slot0();
-        if (currentSqrtPriceX96 == 0) {
-            pool = positionManager.createAndInitializePoolIfNecessary(token0, token1, feeTier, sqrtPriceX96);
-        } else {
-            _checkDeviation(currentSqrtPriceX96, sqrtPriceX96);
+        if (pool != address(0)) (actual,,,,,,) = IUniswapV3Pool(pool).slot0();
+        if (actual == 0) {
+            pool = positionManager.createAndInitializePoolIfNecessary(token0, token1, feeTier, expected);
+            actual = expected;
         }
     }
 
     /// @dev Mints a full-range position to this contract and returns the amounts actually used.
-    function _mintFullRange(Deployment memory d) internal returns (uint256 tokenId, uint256 used0, uint256 used1) {
+    function _mintFullRange(Deployment memory d) internal returns (uint256 positionId, uint256 used0, uint256 used1) {
         (int24 tickLower, int24 tickUpper) = tickBounds();
         IERC20(d.token0).forceApprove(address(positionManager), d.amount0);
         IERC20(d.token1).forceApprove(address(positionManager), d.amount1);
-        (tokenId,, used0, used1) = positionManager.mint(
+        (positionId,, used0, used1) = positionManager.mint(
             INonfungiblePositionManager.MintParams({
                 token0: d.token0,
                 token1: d.token1,
@@ -244,20 +281,12 @@ contract UniswapV3Graduator is IGraduator, Ownable2Step, IERC721Receiver {
         IERC20(d.token1).forceApprove(address(positionManager), 0);
     }
 
-    /// @dev Reverts with {PoolPriceSkewed} if `|current^2 / target^2 - 1| > maxDeviationBps / 10000`.
-    function _checkDeviation(uint160 current, uint160 target) internal view {
-        // A pool price more than 4x the target is always skewed; this guard also keeps mulDiv in range.
-        if (current > 2 * uint256(target)) revert PoolPriceSkewed();
-        uint256 scaled = Math.mulDiv(current, current, target); // current^2 / target, in units of target
-        uint256 diff = scaled > target ? scaled - target : target - scaled;
-        if (diff * BPS / target > maxDeviationBps) revert PoolPriceSkewed();
-    }
-
-    /// @dev Unwraps `amount` WETH and credits it to `token`'s mind vault.
-    function _creditEth(address token, uint256 amount) internal {
+    /// @dev Unwraps `amount` WETH and sends the ETH to the launchpad (accepted by its graduator-gated `receive`).
+    function _returnEth(uint256 amount) internal {
         if (amount == 0) return;
         weth9.withdraw(amount);
-        IMindLaunchpad(launchpad).creditMind{value: amount}(token);
+        (bool ok,) = launchpad.call{value: amount}("");
+        if (!ok) revert EthTransferFailed();
     }
 
     /// @dev Burns `amount` of `token` by sending it to {BURN_ADDRESS}.

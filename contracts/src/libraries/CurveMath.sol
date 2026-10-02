@@ -86,6 +86,43 @@ library CurveMath {
         ethOut = ethGross - fee;
     }
 
+    /// @notice ETH (fee included) needed to buy exactly `tokensOut` tokens:
+    ///         `net = ceilDiv(k, y - tokensOut) - x`, `fee = ceilDiv(net * tradeFeeBps, BPS - tradeFeeBps)`,
+    ///         returns `net + fee` (the gross-up used for the completing buy). Precondition:
+    ///         `tokensOut <= CURVE_SUPPLY - tokensSold`.
+    function ethForTokens(uint256 realEthReserve, uint256 tokensSold, uint256 tokensOut, uint256 tradeFeeBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 x = VIRTUAL_ETH + realEthReserve;
+        uint256 y = VIRTUAL_TOKENS - tokensSold;
+        uint256 net = Math.ceilDiv(x * y, y - tokensOut) - x;
+        return net + Math.ceilDiv(net * tradeFeeBps, BPS - tradeFeeBps);
+    }
+
+    /// @notice The smallest `ethIn` for which {quoteBuy} sells out the curve from the given state.
+    /// @dev The completing net amount is `netNeeded = ceilDiv(k, y - remaining) - x`; the buy completes iff
+    ///      `ethIn - ethIn * tradeFeeBps / BPS >= netNeeded`. That left side is non-decreasing in `ethIn` (it grows
+    ///      by 0 or 1 per wei), so starting from the gross-up {ethForTokens} a few single-wei steps reach the
+    ///      exact minimum. Precondition: `tokensSold < CURVE_SUPPLY`.
+    function minEthToComplete(uint256 realEthReserve, uint256 tokensSold, uint256 tradeFeeBps)
+        internal
+        pure
+        returns (uint256 ethIn)
+    {
+        uint256 x = VIRTUAL_ETH + realEthReserve;
+        uint256 y = VIRTUAL_TOKENS - tokensSold;
+        uint256 netNeeded = Math.ceilDiv(x * y, y - (CURVE_SUPPLY - tokensSold)) - x;
+        ethIn = netNeeded + Math.ceilDiv(netNeeded * tradeFeeBps, BPS - tradeFeeBps);
+        while (_netOf(ethIn, tradeFeeBps) < netNeeded) {
+            ++ethIn;
+        }
+        while (ethIn > 0 && _netOf(ethIn - 1, tradeFeeBps) >= netNeeded) {
+            --ethIn;
+        }
+    }
+
     /// @notice Spot price in wei per 1e18 tokens: `x * 1e18 / y`.
     function price(uint256 realEthReserve, uint256 tokensSold) internal pure returns (uint256) {
         return (VIRTUAL_ETH + realEthReserve) * 1e18 / (VIRTUAL_TOKENS - tokensSold);
@@ -99,6 +136,11 @@ library CurveMath {
     /// @notice Progress to graduation in bps: `tokensSold * 10000 / CURVE_SUPPLY`.
     function progressBps(uint256 tokensSold) internal pure returns (uint256) {
         return tokensSold * BPS / CURVE_SUPPLY;
+    }
+
+    /// @dev `ethIn` net of the (floored) trade fee.
+    function _netOf(uint256 ethIn, uint256 tradeFeeBps) private pure returns (uint256) {
+        return ethIn - ethIn * tradeFeeBps / BPS;
     }
 
     /// @notice Splits `fee` between the mind vault and the protocol.
