@@ -1,8 +1,9 @@
 /**
  * Creator tools (W3), shown only when the connected wallet is the coin's creator:
  * pause / resume the mind (`setCreatorPaused`) and change its model or persona
- * (`setMindConfig` with freshly published metadata). There is no withdraw: vault ETH can only
- * pay for compute (D4).
+ * (`setMindConfig` with freshly published metadata), on the launchpad (curve mode) or the
+ * registry (Pons mode). Pons mode adds "Leave" (`registry.leave`, SPEC §9.5). There is no
+ * withdraw: vault ETH can only pay for compute (D4).
  *
  * @module components/CreatorTools
  */
@@ -10,17 +11,18 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import type { Address } from 'viem';
 import { useWriteContract } from 'wagmi';
-import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
+import { CORE_ADDRESS, TARGET_CHAIN, VENUE } from '../config';
 import { useTxFlow } from '../hooks/useTxFlow';
 import { mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
 import { describeError } from '../lib/errors';
 import { METADATA_LIMITS, buildMetadata, modelHashOf, personaHashOf, validateDraft, type MetadataDraft } from '../lib/metadata';
 import { publishMetadata } from '../lib/publish';
-import type { MindDetail } from '../lib/types';
+import type { MindDetail, PonsLive } from '../lib/types';
 import { queryKeys, useModels } from '../queries';
 import { ChainGuard } from './ChainGuard';
 import { ModelSelect } from './ModelSelect';
 import { Panel, TxStatus } from './common';
+import { LeaveMind } from './pons/LeaveMind';
 
 /** Props of {@link CreatorTools}. */
 export interface CreatorToolsProps {
@@ -28,10 +30,12 @@ export interface CreatorToolsProps {
   /** Catalog id of the current model, if known. */
   currentModel: string | null;
   onChanged: () => void;
+  /** Live Pons state (Pons mode), for the "Leave" tool. */
+  ponsLive?: PonsLive | null;
 }
 
 /** See module docs. */
-export function CreatorTools({ mind, currentModel, onChanged }: CreatorToolsProps) {
+export function CreatorTools({ mind, currentModel, onChanged, ponsLive = null }: CreatorToolsProps) {
   const queryClient = useQueryClient();
   const models = useModels();
   const write = useWriteContract();
@@ -68,7 +72,7 @@ export function CreatorTools({ mind, currentModel, onChanged }: CreatorToolsProp
   const unchanged = model === currentModel && mind.persona !== null && personaHashOf(persona.trim()) === mind.personaHash;
 
   async function saveConfig() {
-    if (LAUNCHPAD_ADDRESS === null || blocking !== null) return;
+    if (CORE_ADDRESS === null || blocking !== null) return;
     setPublishError(null);
     setPublishing(true);
     const meta = buildMetadata(draft);
@@ -77,7 +81,7 @@ export function CreatorTools({ mind, currentModel, onChanged }: CreatorToolsProp
       setPublishing(false);
       await configTx.run(() =>
         write.mutateAsync({
-          address: LAUNCHPAD_ADDRESS as Address,
+          address: CORE_ADDRESS as Address,
           abi: launchpadAbi,
           functionName: 'setMindConfig',
           args: [mind.token, modelHashOf(meta.model), pub.personaHash, pub.uri],
@@ -107,7 +111,7 @@ export function CreatorTools({ mind, currentModel, onChanged }: CreatorToolsProp
               onClick={() =>
                 void pauseTx.run(() =>
                   write.mutateAsync({
-                    address: LAUNCHPAD_ADDRESS as Address,
+                    address: CORE_ADDRESS as Address,
                     abi: launchpadAbi,
                     functionName: 'setCreatorPaused',
                     args: [mind.token, !paused],
@@ -155,6 +159,7 @@ export function CreatorTools({ mind, currentModel, onChanged }: CreatorToolsProp
             </>
           )}
         </div>
+        {VENUE === 'pons' && mind.pons !== null && <LeaveMind mind={mind} live={ponsLive} onChanged={refresh} />}
       </div>
     </Panel>
   );

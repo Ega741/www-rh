@@ -6,7 +6,7 @@
  */
 import { z } from 'zod';
 import { getAddress, isAddress, type Address, type Hex } from 'viem';
-import { launchpadAddress } from '@www-rh/shared';
+import { defaultVenue, launchpadAddress, ponsAddressesFor, registryAddress, type Venue } from '@www-rh/shared';
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
@@ -50,10 +50,33 @@ const optionalPrivateKey = z
     return key as Hex;
   });
 
+/** Wei amount as a non-negative decimal integer string. */
+const weiString = (fallback: bigint) =>
+  z
+    .string()
+    .optional()
+    .transform((v, ctx): bigint => {
+      if (v === undefined) return fallback;
+      if (!/^\d{1,78}$/.test(v)) {
+        ctx.addIssue({ code: 'custom', message: `expected a wei amount (decimal integer), got "${v}"` });
+        return z.NEVER;
+      }
+      return BigInt(v);
+    });
+
+/** Default `HARVEST_MIN_WEI` (0.002 ether, `docs/SPEC.md` §9.4). */
+export const DEFAULT_HARVEST_MIN_WEI = 2_000_000_000_000_000n;
+
 const envSchema = z.object({
   CHAIN_ID: int(46630, 1),
   RPC_URL: z.url({ protocol: /^https?$/, error: 'RPC_URL is required (http(s) JSON-RPC endpoint)' }),
+  VENUE: z.enum(['pons', 'curve']).optional(),
   LAUNCHPAD_ADDRESS: optionalAddress,
+  REGISTRY_ADDRESS: optionalAddress,
+  HARVEST_MIN_WEI: weiString(DEFAULT_HARVEST_MIN_WEI),
+  PONS_FACTORY: optionalAddress,
+  PONS_FEE_ESCROW: optionalAddress,
+  PONS_MEME_HOOK: optionalAddress,
   START_BLOCK: int(0, 0),
   CONFIRMATIONS: int(0, 0, 10_000),
   OPERATOR_PRIVATE_KEY: optionalPrivateKey,
@@ -83,12 +106,27 @@ const envSchema = z.object({
   IPFS_GATEWAY: z.url({ protocol: /^https?$/ }).default('https://ipfs.io/ipfs/'),
 });
 
+/** Pons V2 contracts the runner reads (`PONS_*` overrides → `@www-rh/shared` `PONS` on 4663 → `null`: read from the registry). */
+export interface PonsContracts {
+  factory: Address | null;
+  feeEscrow: Address | null;
+  memeHook: Address | null;
+}
+
 /** Validated runner configuration. */
 export interface RunnerConfig {
   chainId: number;
   rpcUrl: string;
-  /** `LAUNCHPAD_ADDRESS` (zero = unset) → `launchpadAddress(CHAIN_ID)`; `null` when neither yields one. */
+  /** `VENUE`; default `pons` on 4663, `curve` elsewhere (`docs/SPEC.md` §9.4). */
+  venue: Venue;
+  /** `LAUNCHPAD_ADDRESS` (zero = unset) → `launchpadAddress(CHAIN_ID)`; `null` when neither yields one. Curve mode. */
   launchpad: Address | null;
+  /** `REGISTRY_ADDRESS` (zero = unset) → `registryAddress(CHAIN_ID)`; `null` when neither yields one. Pons mode. */
+  registry: Address | null;
+  /** Pons mode: harvest when `claimable(token) >= harvestMinWei` (`HARVEST_MIN_WEI`). */
+  harvestMinWei: bigint;
+  /** Pons V2 addresses (`PONS_FACTORY`, `PONS_FEE_ESCROW`, `PONS_MEME_HOOK`). */
+  pons: PonsContracts;
   startBlock: bigint;
   confirmations: number;
   operatorPrivateKey: Hex | null;
@@ -122,6 +160,11 @@ export interface RunnerConfig {
   ipfsGateway: string;
 }
 
+/** The contract the runner indexes and sends operator transactions to: the registry (Pons) or the launchpad (curve). */
+export function mindContract(config: Pick<RunnerConfig, 'venue' | 'launchpad' | 'registry'>): Address | null {
+  return config.venue === 'pons' ? config.registry : config.launchpad;
+}
+
 /** Invalid environment; `issues` lists every problem in `VAR: message` form. */
 export class ConfigError extends Error {
   constructor(readonly issues: string[]) {
@@ -149,10 +192,19 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const e = parsed.data;
   if (e.ETH_USD_MIN >= e.ETH_USD_MAX) throw new ConfigError([`ETH_USD_MIN: must be below ETH_USD_MAX (${e.ETH_USD_MIN} >= ${e.ETH_USD_MAX})`]);
   const operatorPrivateKey = e.OPERATOR_PRIVATE_KEY ?? null;
+  const known = ponsAddressesFor(e.CHAIN_ID);
   return {
     chainId: e.CHAIN_ID,
     rpcUrl: e.RPC_URL,
+    venue: e.VENUE ?? defaultVenue(e.CHAIN_ID),
     launchpad: e.LAUNCHPAD_ADDRESS ?? launchpadAddress(e.CHAIN_ID) ?? null,
+    registry: e.REGISTRY_ADDRESS ?? registryAddress(e.CHAIN_ID) ?? null,
+    harvestMinWei: e.HARVEST_MIN_WEI,
+    pons: {
+      factory: e.PONS_FACTORY ?? known?.factory ?? null,
+      feeEscrow: e.PONS_FEE_ESCROW ?? known?.feeEscrow ?? null,
+      memeHook: e.PONS_MEME_HOOK ?? known?.memeHook ?? null,
+    },
     startBlock: BigInt(e.START_BLOCK),
     confirmations: e.CONFIRMATIONS,
     operatorPrivateKey,

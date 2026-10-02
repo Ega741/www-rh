@@ -217,6 +217,50 @@ CREATE INDEX ticks_by_receipt ON ticks (receipt_id);
 CREATE TABLE block_hashes (number INTEGER PRIMARY KEY, hash TEXT NOT NULL);
 `;
 
+/**
+ * v3 — Pons mode (`docs/SPEC.md` §9): the venue of every mind and the Pons launch state of minds
+ * registered by `PonsMindRegistry`.
+ *
+ * - `pons_minds.claimable`: Σ escrow `Credited` − Σ `Claimed` for the mind account (= the escrow
+ *   balance, exact because every change of it is evented);
+ * - `quote_reserve` / `token_reserve`: tradeable curve reserves after the last indexed trade (the
+ *   fallback when the per-block `getReserves()` read is unavailable);
+ * - `pending_fee` / `pending_tax`: Σ curve fee / creator tax since the last `FeesSwept` (what a
+ *   sweep inside `harvest` would credit to the account);
+ * - `pool_id`: from the hook's `PoolRegistered`; `registry_pool_id`: from the registry's `PoolIdSet`.
+ */
+const SCHEMA_V3 = `
+ALTER TABLE minds ADD COLUMN venue TEXT NOT NULL DEFAULT 'curve';
+
+CREATE TABLE pons_minds (
+  token TEXT PRIMARY KEY,
+  curve TEXT NOT NULL,
+  account TEXT NOT NULL,
+  deployer TEXT,
+  launch_config_id INTEGER,
+  fee_bps INTEGER,
+  creator_tax_bps INTEGER,
+  launched_here INTEGER NOT NULL DEFAULT 0,
+  adopted INTEGER NOT NULL DEFAULT 0,
+  fee_recipient TEXT,
+  pool_id TEXT,
+  registry_pool_id TEXT,
+  claimable TEXT NOT NULL DEFAULT '0',
+  phantom_quote TEXT,
+  supply TEXT,
+  graduation_threshold TEXT,
+  quote_reserve TEXT,
+  token_reserve TEXT,
+  pending_fee TEXT NOT NULL DEFAULT '0',
+  pending_tax TEXT NOT NULL DEFAULT '0',
+  launch_phase INTEGER NOT NULL DEFAULT 0,
+  swept_at INTEGER,
+  last_harvest_at INTEGER
+);
+CREATE INDEX pons_minds_by_curve ON pons_minds (curve);
+CREATE INDEX pons_minds_by_account ON pons_minds (account);
+`;
+
 /** Ordered migrations; index + 1 is the resulting `user_version`. */
 const MIGRATIONS: readonly ((db: Db) => void)[] = [
   (db) => {
@@ -228,6 +272,7 @@ const MIGRATIONS: readonly ((db: Db) => void)[] = [
     }
   },
   (db) => db.exec(SCHEMA_V2),
+  (db) => db.exec(SCHEMA_V3),
 ];
 
 /** Latest schema version. */

@@ -22,9 +22,9 @@ import type { LaunchpadReader } from '../chain/launchpad.js';
 import type { Repos } from '../db/repos.js';
 import { errorMessage, type Logger } from '../log.js';
 import { backoffMs, sleep } from '../util.js';
-import { applyLogs, blocksNeedingTimestamps, decodeLaunchpadLogs } from './apply.js';
 import type { IndexerEvents } from './events.js';
 import type { LogSource } from './source.js';
+import { CurveIndexerVenue, type IndexerVenue } from './venue.js';
 
 /** Poll interval (SPEC §4.1). */
 export const INDEXER_POLL_MS = 1_000;
@@ -37,8 +37,10 @@ export const BALANCE_DRIFT_CHECK_MS = 10 * 60_000;
 
 /** Options of {@link Indexer}. */
 export interface IndexerOptions {
-  /** Launchpad address; `null` = only track the head. */
+  /** Launchpad address (curve mode, when no `venue` is given); `null` = only track the head. */
   address: Address | null;
+  /** Venue log handling; default: {@link CurveIndexerVenue} over `address`. */
+  venue?: IndexerVenue;
   startBlock: bigint;
   confirmations: number;
   pollMs?: number;
@@ -86,6 +88,7 @@ export class Indexer {
   #loop: Promise<void> | null = null;
   readonly #liveWaiters: (() => void)[] = [];
   #lastDriftCheck = 0;
+  readonly #venue: IndexerVenue;
 
   constructor(
     private readonly repos: Repos,
@@ -93,7 +96,9 @@ export class Indexer {
     private readonly events: IndexerEvents,
     private readonly opts: IndexerOptions,
     private readonly log: Logger,
-  ) {}
+  ) {
+    this.#venue = opts.venue ?? new CurveIndexerVenue(opts.address);
+  }
 
   /** Health snapshot for `/api/health`. */
   get status(): IndexerStatus {
@@ -127,14 +132,13 @@ export class Indexer {
     this.#head = head;
     this.#liveFrom ??= head;
     const result: SyncResult = { head, toBlock: null, logs: 0, events: 0, caughtUp: true };
-    const address = this.opts.address;
-    if (address === null) return result;
+    if (this.#venue.address === null) return result;
     const target = head - BigInt(this.opts.confirmations);
     const last = this.repos.state.lastBlock();
     let from = last === undefined ? this.opts.startBlock : last + 1n;
     while (from <= target && !this.#stopped) {
       const to = from + INDEXER_MAX_RANGE - 1n < target ? from + INDEXER_MAX_RANGE - 1n : target;
-      const raw = await this.source.getLogs(address, from, to);
+      const batch = await this.#venue.fetchRange(this.source, from, to, this.repos);
       const toHeader = await this.source.getBlockHeader(to);
       const fromHeader = from === to ? toHeader : await this.source.getBlockHeader(from);
       const prevHash = from > 0n ? this.repos.chain.blockHash(Number(from - 1n)) : undefined;
@@ -143,22 +147,21 @@ export class Indexer {
         result.caughtUp = false;
         return result;
       }
-      if (raw.length === 0) {
+      if (batch.rawCount === 0) {
         // a lagging node answers [] for blocks it has not seen: verify its head before skipping them
         const nodeHead = await this.source.getBlockNumber();
         if (nodeHead < to) throw new Error(`RPC head ${nodeHead} is behind block ${to} after an empty eth_getLogs; not advancing`);
       }
-      const decoded = decodeLaunchpadLogs(raw);
-      const timestamps = await this.#timestamps(blocksNeedingTimestamps(decoded));
+      const timestamps = await this.#timestamps(batch.blocksNeedingTimestamps);
       const applied = this.repos.tx(() => {
-        const evs = applyLogs(this.repos, decoded, (b) => timestamps.get(b) ?? 0n, (message, fields) => this.log.error(message, fields));
+        const evs = batch.apply(this.repos, (b) => timestamps.get(b) ?? 0n, (message, fields) => this.log.error(message, fields));
         this.repos.state.setLastBlock(to);
         this.repos.chain.putBlockHash(Number(to), toHeader.hash);
         return evs;
       });
       const liveFrom = this.#liveFrom;
       for (const ev of applied) if (BigInt(ev.blockNumber) >= liveFrom) this.events.emit(ev);
-      result.logs += decoded.length;
+      result.logs += batch.logCount;
       result.events += applied.length;
       result.toBlock = to;
       from = to + 1n;
@@ -229,7 +232,7 @@ export class Indexer {
   /** Starts the polling loop. */
   start(): void {
     if (this.#loop !== null) return;
-    if (this.opts.address === null) this.log.warn('no launchpad address: tracking the chain head only');
+    if (this.#venue.address === null) this.log.warn(`no ${this.#venue.venue === 'pons' ? 'registry' : 'launchpad'} address: tracking the chain head only`);
     this.#loop = this.#run();
   }
 

@@ -7,7 +7,7 @@ import { MODELS, toPublicModelSpec } from '@www-rh/shared';
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 import type { Address } from 'viem';
-import { ApiError, getCompute, getHealth, getMemories, getMind, getMinds, getModels, getStats, getThoughts, getTrades } from './api';
+import { ApiError, getCompute, getHealth, getLaunchConfig, getMemories, getMind, getMinds, getModels, getStats, getThoughts, getTrades } from './api';
 import type { ComputeInfo, MindsSort, ModelInfo } from './lib/types';
 
 /** Query keys. */
@@ -21,6 +21,7 @@ export const queryKeys = {
   models: ['models'] as const,
   stats: ['stats'] as const,
   health: ['health'] as const,
+  launchConfig: ['launch-config'] as const,
 };
 
 /** Paged mind list for the home grid. */
@@ -160,4 +161,9 @@ export function useStats() {
 /** Runner health (footer indicator). */
 export function useHealth() {
   return useQuery({ queryKey: queryKeys.health, queryFn: getHealth, refetchInterval: 30_000, retry: 0 });
+}
+
+/** `GET /api/launch-config` (Pons mode; the runner caches it for 60 s). */
+export function useLaunchConfigApi(enabled = true) {
+  return useQuery({ queryKey: queryKeys.launchConfig, queryFn: getLaunchConfig, enabled, staleTime: 60_000, refetchInterval: 60_000, retry: 1 });
 }

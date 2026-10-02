@@ -7,6 +7,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {MindLaunchpad} from "../../src/MindLaunchpad.sol";
 import {MindToken} from "../../src/MindToken.sol";
 import {MockGraduator} from "../../src/MockGraduator.sol";
+import {IMindCore} from "../../src/interfaces/IMindCore.sol";
 import {IMindLaunchpad} from "../../src/interfaces/IMindLaunchpad.sol";
 import {CurveMath} from "../../src/libraries/CurveMath.sol";
 
@@ -79,7 +80,7 @@ abstract contract BaseTest is Test {
         return (c.realEthReserve, c.tokensSold);
     }
 
-    function _status(address token) internal view returns (IMindLaunchpad.MindStatus) {
+    function _status(address token) internal view returns (IMindCore.MindStatus) {
         return launchpad.getMind(token).status;
     }
 

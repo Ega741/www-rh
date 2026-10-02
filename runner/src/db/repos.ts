@@ -51,6 +51,44 @@ export interface MindRow {
   meta_resolved_at: number | null;
   cooling_until: number | null;
   failed_ticks: number;
+  /** `pons` (registered by `PonsMindRegistry`) or `curve` (`MindLaunchpad`). */
+  venue: 'pons' | 'curve';
+}
+
+/** `pons_minds` row: the Pons launch state of a mind (`docs/SPEC.md` §9). */
+export interface PonsMindRow {
+  token: string;
+  curve: string;
+  account: string;
+  deployer: string | null;
+  launch_config_id: number | null;
+  fee_bps: number | null;
+  creator_tax_bps: number | null;
+  launched_here: number;
+  adopted: number;
+  /** Last observed `creatorFeeRecipient` of the launch. */
+  fee_recipient: string | null;
+  /** From the hook's `PoolRegistered`. */
+  pool_id: string | null;
+  /** From the registry's `PoolIdSet`. */
+  registry_pool_id: string | null;
+  /** Escrow balance of the account (Σ `Credited` − Σ `Claimed`). */
+  claimable: string;
+  phantom_quote: string | null;
+  supply: string | null;
+  graduation_threshold: string | null;
+  quote_reserve: string | null;
+  token_reserve: string | null;
+  /** Σ curve fee since the last `FeesSwept`. */
+  pending_fee: string;
+  /** Σ curve creator tax since the last `FeesSwept`. */
+  pending_tax: string;
+  /** Raw Pons `GraduationPhase` (0 NotGraduated, 1 Swept, 2 PoolCreated, 3 Rescued). */
+  launch_phase: number;
+  /** Block time (ms) of the sweep (`LaunchSwept` / `CurveCompleted`). */
+  swept_at: number | null;
+  /** Block time (ms) of the last indexed `Harvested`. */
+  last_harvest_at: number | null;
 }
 
 /** `trades` row. */
@@ -282,6 +320,8 @@ export interface NewMind {
   createdAt: number;
   priceWei: string;
   mcapSort: number;
+  /** Default `curve`. */
+  venue?: 'pons' | 'curve';
 }
 
 /** Sort orders of `GET /api/minds` (SPEC §5). */
@@ -312,8 +352,8 @@ export class MindsRepo {
     return (
       this.db.run(
         `INSERT OR IGNORE INTO minds (token, creator, name, symbol, metadata_uri, model_id, persona_hash, price_wei, mcap_sort,
-           created_block, created_log_index, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        m.token, m.creator, m.name, m.symbol, m.metadataUri, m.modelId, m.personaHash, m.priceWei, m.mcapSort, m.blockNumber, m.logIndex, m.createdAt,
+           created_block, created_log_index, created_at, venue) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        m.token, m.creator, m.name, m.symbol, m.metadataUri, m.modelId, m.personaHash, m.priceWei, m.mcapSort, m.blockNumber, m.logIndex, m.createdAt, m.venue ?? 'curve',
       ).changes === 1
     );
   }
@@ -356,8 +396,18 @@ export class MindsRepo {
     this.db.run('UPDATE minds SET phase = 0 WHERE token = ? AND phase = 1', token);
   }
 
-  setGraduated(token: string, pool: string, positionId: string): void {
-    this.db.run("UPDATE minds SET phase = 2, pool = ?, position_id = ?, real_eth_reserve = '0' WHERE token = ?", pool, positionId, token);
+  setGraduated(token: string, pool: string | null, positionId: string | null): void {
+    this.db.run("UPDATE minds SET phase = 2, pool = ?, position_id = coalesce(?, position_id), real_eth_reserve = '0' WHERE token = ?", pool, positionId, token);
+  }
+
+  /** Sets the phase only (Pons: `Swept` → 1, `PoolCreated` / `Rescued` → 2); never moves a phase backwards. */
+  advancePhase(token: string, phase: 1 | 2): void {
+    this.db.run('UPDATE minds SET phase = ? WHERE token = ? AND phase < ?', phase, token, phase);
+  }
+
+  /** Pons curve state after a trade / at registration: real reserve, tokens sold, price and its sort key. */
+  setMarket(token: string, s: { realEthReserve: string; tokensSold: string; priceWei: string; mcapSort: number }): void {
+    this.applyTrade(token, s);
   }
 
   /**
@@ -769,6 +819,74 @@ export class TicksRepo {
   }
 }
 
+/** Columns of `pons_minds` a {@link PonsRepo.patch} may set. */
+const PONS_COLUMNS = new Set<keyof PonsMindRow>([
+  'curve', 'account', 'deployer', 'launch_config_id', 'fee_bps', 'creator_tax_bps', 'launched_here', 'adopted', 'fee_recipient', 'pool_id',
+  'registry_pool_id', 'claimable', 'phantom_quote', 'supply', 'graduation_threshold', 'quote_reserve', 'token_reserve', 'pending_fee', 'pending_tax',
+  'launch_phase', 'swept_at', 'last_harvest_at',
+]);
+
+/** Pons launch state of minds registered by `PonsMindRegistry` (`docs/SPEC.md` §9). */
+export class PonsRepo {
+  constructor(private readonly db: Db) {}
+
+  /** Inserts the row if missing (registration); returns whether it was inserted. */
+  insert(r: { token: string; curve: string; account: string; launchedHere: boolean }): boolean {
+    return (
+      this.db.run('INSERT OR IGNORE INTO pons_minds (token, curve, account, launched_here) VALUES (?, ?, ?, ?)', r.token, r.curve, r.account, r.launchedHere ? 1 : 0)
+        .changes === 1
+    );
+  }
+
+  get(token: string): PonsMindRow | undefined {
+    return this.db.get<PonsMindRow>('SELECT * FROM pons_minds WHERE token = ?', token.toLowerCase());
+  }
+
+  byCurve(curve: string): PonsMindRow | undefined {
+    return this.db.get<PonsMindRow>('SELECT * FROM pons_minds WHERE curve = ?', curve.toLowerCase());
+  }
+
+  byAccount(account: string): PonsMindRow | undefined {
+    return this.db.get<PonsMindRow>('SELECT * FROM pons_minds WHERE account = ?', account.toLowerCase());
+  }
+
+  all(): PonsMindRow[] {
+    return this.db.all<PonsMindRow>('SELECT * FROM pons_minds ORDER BY token');
+  }
+
+  /** Rows of `tokens`, keyed by token. */
+  many(tokens: readonly string[]): Map<string, PonsMindRow> {
+    if (tokens.length === 0) return new Map();
+    const rows = this.db.all<PonsMindRow>(`SELECT * FROM pons_minds WHERE token IN (${tokens.map(() => '?').join(',')})`, ...tokens.map((t) => t.toLowerCase()));
+    return new Map(rows.map((r) => [r.token, r]));
+  }
+
+  /** Updates the given columns (unknown keys are rejected). */
+  patch(token: string, fields: { [K in Exclude<keyof PonsMindRow, 'token'>]?: PonsMindRow[K] | undefined }): void {
+    const entries = Object.entries(fields).filter(([, v]) => v !== undefined) as [keyof PonsMindRow, string | number | null][];
+    if (entries.length === 0) return;
+    for (const [k] of entries) if (!PONS_COLUMNS.has(k)) throw new Error(`unknown pons_minds column ${k}`);
+    this.db.run(`UPDATE pons_minds SET ${entries.map(([k]) => `${k} = ?`).join(', ')} WHERE token = ?`, ...entries.map(([, v]) => v), token.toLowerCase());
+  }
+
+  /** Adds a signed delta to the indexed escrow balance; below zero is stored as 0 and reported. */
+  addClaimable(token: string, delta: bigint): { claimable: bigint; clampedFrom: bigint | null } | undefined {
+    const row = this.get(token);
+    if (row === undefined) return undefined;
+    const next = BigInt(row.claimable) + delta;
+    const stored = next < 0n ? 0n : next;
+    this.patch(token, { claimable: stored.toString(10) });
+    return { claimable: stored, clampedFrom: next < 0n ? next : null };
+  }
+
+  /** Accumulates curve fee / tax pending a sweep. */
+  addPending(token: string, fee: bigint, tax: bigint): void {
+    const row = this.get(token);
+    if (row === undefined) return;
+    this.patch(token, { pending_fee: (BigInt(row.pending_fee) + fee).toString(10), pending_tax: (BigInt(row.pending_tax) + tax).toString(10) });
+  }
+}
+
 /** Uploaded metadata documents. */
 export class MetadataRepo {
   constructor(private readonly db: Db) {}
@@ -792,8 +910,10 @@ export class Repos {
   readonly memories: MemoriesRepo;
   readonly ticks: TicksRepo;
   readonly metadata: MetadataRepo;
+  readonly pons: PonsRepo;
 
   constructor(readonly db: Db) {
+    this.pons = new PonsRepo(db);
     this.state = new StateRepo(db);
     this.chain = new ChainRepo(db);
     this.minds = new MindsRepo(db);

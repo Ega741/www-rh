@@ -3,6 +3,12 @@
  * Writes are not sent from here directly: they go through the FIFO {@link TxQueue} (`txQueue.ts`),
  * which uses {@link LaunchpadSender} to simulate, send and await each transaction.
  *
+ * Pons mode (§9): the `MindCore` reads (`getMind`, `mindBalance`, `drawLimit`, `drawnInEpoch`,
+ * `operator`) and writes (`drawCompute`, `anchorMemory`, `setMindStatus`, `harvest`) have the same
+ * selectors on `PonsMindRegistry`, so {@link ViemLaunchpadReader} is pointed at the registry;
+ * {@link ViemLaunchpadSender} simulates with the registry ABI and adds `createGraduatedPool` /
+ * `setPoolId`. `getCurve` / `feeParams` / `graduate` exist on the launchpad only.
+ *
  * @module chain/launchpad
  */
 import {
@@ -15,7 +21,7 @@ import {
   type Address,
   type Hex,
 } from 'viem';
-import { mindLaunchpadAbi } from '@www-rh/shared';
+import { mindLaunchpadAbi, ponsMindRegistryAbi, type Venue } from '@www-rh/shared';
 import type { RunnerPublicClient, RunnerWalletClient } from './clients.js';
 
 /** `MindInfo` as returned by `getMind`. */
@@ -58,7 +64,11 @@ export type LaunchpadWrite =
   | { functionName: 'anchorMemory'; args: readonly [Address, bigint, Hex, string] }
   | { functionName: 'setMindStatus'; args: readonly [Address, 0 | 1] }
   | { functionName: 'graduate'; args: readonly [Address] }
-  | { functionName: 'harvest'; args: readonly [Address] };
+  | { functionName: 'harvest'; args: readonly [Address] }
+  /** Pons mode: registry convenience forwarding to `factory.createGraduatedPool`. */
+  | { functionName: 'createGraduatedPool'; args: readonly [Address] }
+  /** Pons mode: records the hook's pool id (operator). */
+  | { functionName: 'setPoolId'; args: readonly [Address, Hex] };
 
 /** A transaction signed locally; nothing has been broadcast yet. */
 export interface SignedTx {
@@ -158,18 +168,50 @@ export class ViemLaunchpadReader implements LaunchpadReader {
 
 /** viem implementation of {@link LaunchpadSender}. */
 export class ViemLaunchpadSender implements LaunchpadSender {
+  /**
+   * @param launchpad the contract operator transactions go to: `MindLaunchpad` (curve) or `PonsMindRegistry` (pons).
+   */
   constructor(
     private readonly launchpad: Address,
     private readonly publicClient: RunnerPublicClient,
     private readonly walletClient: RunnerWalletClient,
+    private readonly venue: Venue = 'curve',
   ) {}
 
   get account(): Address {
     return this.walletClient.account.address;
   }
 
+  /** Pons mode: simulates `write` against the registry ABI and returns its calldata. */
+  async #simulateAndEncodePons(write: LaunchpadWrite): Promise<Hex> {
+    const base = { account: this.walletClient.account, address: this.launchpad, abi: ponsMindRegistryAbi } as const;
+    switch (write.functionName) {
+      case 'drawCompute':
+        await this.publicClient.simulateContract({ ...base, functionName: 'drawCompute', args: [...write.args] });
+        return encodeFunctionData({ abi: ponsMindRegistryAbi, functionName: 'drawCompute', args: [...write.args] });
+      case 'anchorMemory':
+        await this.publicClient.simulateContract({ ...base, functionName: 'anchorMemory', args: [...write.args] });
+        return encodeFunctionData({ abi: ponsMindRegistryAbi, functionName: 'anchorMemory', args: [...write.args] });
+      case 'setMindStatus':
+        await this.publicClient.simulateContract({ ...base, functionName: 'setMindStatus', args: [...write.args] });
+        return encodeFunctionData({ abi: ponsMindRegistryAbi, functionName: 'setMindStatus', args: [...write.args] });
+      case 'harvest':
+        await this.publicClient.simulateContract({ ...base, functionName: 'harvest', args: [...write.args] });
+        return encodeFunctionData({ abi: ponsMindRegistryAbi, functionName: 'harvest', args: [...write.args] });
+      case 'createGraduatedPool':
+        await this.publicClient.simulateContract({ ...base, functionName: 'createGraduatedPool', args: [...write.args] });
+        return encodeFunctionData({ abi: ponsMindRegistryAbi, functionName: 'createGraduatedPool', args: [...write.args] });
+      case 'setPoolId':
+        await this.publicClient.simulateContract({ ...base, functionName: 'setPoolId', args: [...write.args] });
+        return encodeFunctionData({ abi: ponsMindRegistryAbi, functionName: 'setPoolId', args: [...write.args] });
+      case 'graduate':
+        throw new Error('graduate() does not exist on PonsMindRegistry (Pons launches graduate automatically)');
+    }
+  }
+
   /** Simulates `write` (decoded custom-error reverts) and returns its calldata. */
   async #simulateAndEncode(write: LaunchpadWrite): Promise<Hex> {
+    if (this.venue === 'pons') return this.#simulateAndEncodePons(write);
     const base = { account: this.walletClient.account, address: this.launchpad, abi: mindLaunchpadAbi } as const;
     switch (write.functionName) {
       case 'drawCompute':
@@ -187,6 +229,9 @@ export class ViemLaunchpadSender implements LaunchpadSender {
       case 'harvest':
         await this.publicClient.simulateContract({ ...base, functionName: 'harvest', args: [...write.args] });
         return encodeFunctionData({ abi: mindLaunchpadAbi, functionName: 'harvest', args: [...write.args] });
+      case 'createGraduatedPool':
+      case 'setPoolId':
+        throw new Error(`${write.functionName}() exists on PonsMindRegistry only (VENUE=pons)`);
     }
   }
 

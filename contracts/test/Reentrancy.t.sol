@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {MindToken} from "../src/MindToken.sol";
+import {IMindCore} from "../src/interfaces/IMindCore.sol";
 import {IMindLaunchpad} from "../src/interfaces/IMindLaunchpad.sol";
 import {ReentrantReceiver} from "./mocks/ReentrantReceiver.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
@@ -41,7 +42,7 @@ contract ReentrancyTest is BaseTest {
         uint256 balance = MindToken(token).balanceOf(address(attacker));
         (uint256 reserve, uint256 sold) = _curve(token);
         attacker.configure(token, ReentrantReceiver.Mode.ReenterSell, true);
-        vm.expectRevert(IMindLaunchpad.EthTransferFailed.selector);
+        vm.expectRevert(IMindCore.EthTransferFailed.selector);
         attacker.doSell(balance / 2);
         (uint256 reserveAfter, uint256 soldAfter) = _curve(token);
         assertEq(reserveAfter, reserve);

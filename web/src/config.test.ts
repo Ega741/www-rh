@@ -1,6 +1,6 @@
 import { robinhoodChain, robinhoodChainTestnet } from '@www-rh/shared';
 import { describe, expect, it } from 'vitest';
-import { resolveApiBase, resolveChain, resolveLaunchpad, resolveRpcUrl, resolveWsBase, type WebEnv } from './config';
+import { resolveApiBase, resolveChain, resolveLaunchpad, resolveRegistry, resolveRpcUrl, resolveVenue, resolveWsBase, type WebEnv } from './config';
 
 const loc = { protocol: 'https:', host: 'app.example' };
 
@@ -37,5 +37,22 @@ describe('chain and launchpad', () => {
     expect(resolveLaunchpad({ DEV: false, VITE_LAUNCHPAD_ADDRESS: addr }, 46630)).toBe(addr);
     expect(resolveLaunchpad({ DEV: false, VITE_LAUNCHPAD_ADDRESS: '0x0000000000000000000000000000000000000000' }, 999)).toBeNull();
     expect(resolveLaunchpad({ DEV: false, VITE_LAUNCHPAD_ADDRESS: 'garbage' }, 999)).toBeNull();
+  });
+});
+
+describe('venue and registry (SPEC §9.5)', () => {
+  it('defaults to Pons mode; only an explicit curve selects the launchpad', () => {
+    expect(resolveVenue({ DEV: false })).toBe('pons');
+    expect(resolveVenue({ DEV: false, VITE_VENUE: 'pons' })).toBe('pons');
+    expect(resolveVenue({ DEV: false, VITE_VENUE: ' Curve ' })).toBe('curve');
+    expect(resolveVenue({ DEV: false, VITE_VENUE: 'pump' })).toBe('pons');
+  });
+
+  it('prefers a non-zero VITE_REGISTRY_ADDRESS, else the deployment record, else null', () => {
+    const addr = '0x2222222222222222222222222222222222222222';
+    expect(resolveRegistry({ DEV: false, VITE_REGISTRY_ADDRESS: ` ${addr} ` }, 46630)).toBe(addr);
+    expect(resolveRegistry({ DEV: false, VITE_REGISTRY_ADDRESS: '0x0000000000000000000000000000000000000000' }, 999)).toBeNull();
+    expect(resolveRegistry({ DEV: false, VITE_REGISTRY_ADDRESS: 'nope' }, 999)).toBeNull();
+    expect(resolveRegistry({ DEV: false }, 999)).toBeNull();
   });
 });

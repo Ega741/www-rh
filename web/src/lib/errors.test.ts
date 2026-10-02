@@ -1,7 +1,8 @@
 import { mindLaunchpadAbi } from '@www-rh/shared';
 import { ContractFunctionExecutionError, ContractFunctionRevertedError, encodeErrorResult, erc20Abi, type Abi, type Hex } from 'viem';
 import { describe, expect, it } from 'vitest';
-import { decodeLaunchpadRevert, describeError, hasRevertMessage, isRetryLaterRevert, revertErrorName, revertMessage } from './errors';
+import { decodeKnownRevert, decodeLaunchpadRevert, describeError, hasRevertMessage, isRetryLaterRevert, revertErrorName, revertMessage } from './errors';
+import { ponsCurveAbi, ponsFactoryAbi, ponsMindRegistryAbi } from './pons/abi';
 
 const LAUNCHPAD = '0x1111111111111111111111111111111111111111';
 const TOKEN = '0x2222222222222222222222222222222222222222';
@@ -78,5 +79,49 @@ describe('launchpad error map', () => {
     expect(revertMessage('SomethingNew')).toBe('Reverted: SomethingNew');
     expect(decodeLaunchpadRevert('0x')).toBeNull();
     expect(decodeLaunchpadRevert('0xdeadbeef')).toBeNull();
+  });
+});
+
+describe('Pons registry / curve / factory errors (SPEC §9.2)', () => {
+  const REGISTRY_ERRORS = ['AccountExists', 'NotPonsLaunch', 'NotRecipientOrDeployer', 'AdoptionNotReady', 'AlreadyAdopted', 'WrongValue', 'LaunchFailed'] as const;
+
+  it('decodes every new registry error from the call ABI with specific copy', () => {
+    for (const name of REGISTRY_ERRORS) {
+      const data = encodeErrorResult({ abi: ponsMindRegistryAbi, errorName: name });
+      const err = writeRevert(data, ponsMindRegistryAbi, 'launchMind');
+      expect(revertErrorName(err)).toBe(name);
+      expect(describeError(err)).toBe(revertMessage(name));
+      expect(revertMessage(name)).not.toMatch(/^Reverted:/);
+    }
+    expect(revertMessage('AdoptionNotReady')).toMatch(/transfer it to the account first/);
+    expect(revertMessage('WrongValue')).toMatch(/launch fee \+ initial buy \+ creation fee/);
+  });
+
+  it('decodes registry errors when the call ABI does not declare them (fallback ABIs, then selector)', () => {
+    const data = encodeErrorResult({ abi: ponsMindRegistryAbi, errorName: 'NotRecipientOrDeployer' });
+    expect(decodeKnownRevert(data)).toEqual({ errorName: 'NotRecipientOrDeployer', args: [] });
+    expect(revertErrorName(writeRevert(data, erc20Abi, 'approve'))).toBe('NotRecipientOrDeployer');
+    expect(revertErrorName(writeRevert(data, mindLaunchpadAbi, 'fundMind'))).toBe('NotRecipientOrDeployer');
+  });
+
+  it('decodes Pons errors that bubble up through the registry, with their arguments', () => {
+    const expected = `0x${'11'.repeat(32)}` as Hex;
+    const actual = `0x${'22'.repeat(32)}` as Hex;
+    const mismatch = encodeErrorResult({ abi: ponsFactoryAbi, errorName: 'LaunchEconomicsMismatch', args: [expected, actual] });
+    expect(decodeKnownRevert(mismatch)).toEqual({ errorName: 'LaunchEconomicsMismatch', args: [expected, actual] });
+    expect(describeError(writeRevert(mismatch, ponsMindRegistryAbi, 'launchMind'))).toMatch(/launch terms changed/);
+    const slip = encodeErrorResult({ abi: ponsCurveAbi, errorName: 'SlippageExceeded', args: [5n, 9n] });
+    expect(revertErrorName(writeRevert(slip, ponsCurveAbi, 'buy'))).toBe('SlippageExceeded');
+    expect(describeError(writeRevert(encodeErrorResult({ abi: ponsCurveAbi, errorName: 'CurveGraduated' }), ponsCurveAbi, 'sell'))).toMatch(/graduated/);
+    expect(describeError(writeRevert(encodeErrorResult({ abi: ponsFactoryAbi, errorName: 'NotCreatorFeeRecipient' }), ponsFactoryAbi, 'transferCreatorFeeRecipient'))).toMatch(
+      /current creator-fee recipient/,
+    );
+  });
+
+  it('covers every error declared in the Pons registry, curve and factory ABIs', () => {
+    for (const abi of [ponsMindRegistryAbi, ponsCurveAbi, ponsFactoryAbi] as const) {
+      const names = (abi as Abi).filter((item) => item.type === 'error').map((item) => (item as { name: string }).name);
+      expect(names.filter((name) => !hasRevertMessage(name))).toEqual([]);
+    }
   });
 });

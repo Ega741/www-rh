@@ -1,6 +1,7 @@
 /**
- * "Feed the mind": sends ETH to the coin's mind vault via `fundMind(token)`. Vault ETH can only
- * ever be spent on the mind's compute (D4/D5).
+ * "Feed the mind": sends ETH to the coin's mind vault via `fundMind(token)` on the launchpad
+ * (curve mode) or the registry (Pons mode; same MindCore selector). Vault ETH can only ever be
+ * spent on the mind's compute (D4/D5).
  *
  * @module components/FeedMind
  */
@@ -8,7 +9,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import type { Address } from 'viem';
 import { useWriteContract } from 'wagmi';
-import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
+import { CORE_ADDRESS, TARGET_CHAIN } from '../config';
 import { formatEth, formatRunway, formatUsd, parseAmount, weiToEth } from '../format';
 import { useTxFlow } from '../hooks/useTxFlow';
 import { mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
@@ -48,10 +49,10 @@ export function FeedMind({ token, symbol, ethUsd = null, burnUsdPerHour = null, 
   const hours = usd !== null && burnUsdPerHour !== null && burnUsdPerHour > 0 ? usd / burnUsdPerHour : null;
 
   function submit() {
-    if (!valid || LAUNCHPAD_ADDRESS === null) return;
+    if (!valid || CORE_ADDRESS === null) return;
     void tx.run(() =>
       write.mutateAsync({
-        address: LAUNCHPAD_ADDRESS as Address,
+        address: CORE_ADDRESS as Address,
         abi: launchpadAbi,
         functionName: 'fundMind',
         args: [token],

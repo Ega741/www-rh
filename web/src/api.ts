@@ -12,6 +12,7 @@ import { isObject } from './lib/json';
 import {
   normalizeCompute,
   normalizeHealth,
+  normalizeLaunchConfig,
   normalizeMemory,
   normalizeMetadataUpload,
   normalizeMindDetail,
@@ -22,6 +23,7 @@ import {
   normalizeTrade,
 } from './lib/normalize';
 import { mapValid, readList } from './lib/json';
+import type { PonsLaunchSettings } from './lib/pons/launch';
 import type {
   ComputeInfo,
   Health,
@@ -147,6 +149,11 @@ export async function getModels(): Promise<ModelInfo[]> {
 /** `GET /api/stats`. */
 export async function getStats(): Promise<Stats> {
   return normalizeStats(await request('/api/stats'));
+}
+
+/** `GET /api/launch-config` (SPEC §9.4, Pons mode): launch fee, launch configs, creator tax cap, snipe window. */
+export async function getLaunchConfig(): Promise<PonsLaunchSettings> {
+  return normalizeLaunchConfig(await request('/api/launch-config'));
 }
 
 /** `POST /api/metadata` (R1): stores the metadata JSON, returns `runner://metadata/<hash>`. */

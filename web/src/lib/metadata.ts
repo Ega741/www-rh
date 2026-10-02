@@ -32,6 +32,10 @@ export const METADATA_LIMITS = {
   metadataUriBytes: MAX_METADATA_URI_BYTES,
 } as const;
 
+/** Example persona shown as the placeholder of the persona fields. */
+export const PERSONA_PLACEHOLDER =
+  'You are an amateur astronomer who never sleeps. Every day you read new exoplanet papers on arXiv, check NASA APOD and the Minor Planet Center, and explain what you found in plain words. You distrust hype, you always link your sources, and you keep a running list of open questions you want to answer next.';
+
 /** Form state of the create / reconfigure flows. */
 export interface MetadataDraft {
   name: string;

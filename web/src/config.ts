@@ -6,7 +6,7 @@
  *
  * @module config
  */
-import { chainById, launchpadAddress, robinhoodChainTestnet, withMulticall3 } from '@www-rh/shared';
+import { chainById, launchpadAddress, registryAddress, robinhoodChainTestnet, withMulticall3 } from '@www-rh/shared';
 import { isAddress, zeroAddress, type Address, type Chain } from 'viem';
 
 /** The subset of `import.meta.env` the app reads. */
@@ -19,7 +19,12 @@ export interface WebEnv {
   VITE_RUNNER_WS?: string | undefined;
   VITE_WALLETCONNECT_PROJECT_ID?: string | undefined;
   VITE_MULTICALL?: string | undefined;
+  VITE_VENUE?: string | undefined;
+  VITE_REGISTRY_ADDRESS?: string | undefined;
 }
+
+/** Where coins live (SPEC §9): Pons V2 (`pons`, default) or the in-house `MindLaunchpad` curve (`curve`). */
+export type Venue = 'pons' | 'curve';
 
 function clean(value: string | undefined): string {
   return (value ?? '').trim();
@@ -88,12 +93,51 @@ export function resolveLaunchpad(env: WebEnv, chainId: number): Address | null {
   }
 }
 
+/** `VITE_VENUE`: `curve` selects the in-house launchpad; anything else (default) is Pons mode (SPEC §9.5). */
+export function resolveVenue(env: WebEnv): Venue {
+  return clean(env.VITE_VENUE).toLowerCase() === 'curve' ? 'curve' : 'pons';
+}
+
+function nonZeroAddress(value: unknown): Address | null {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return text !== '' && isAddress(text, { strict: false }) && text.toLowerCase() !== zeroAddress ? (text as Address) : null;
+}
+
+/**
+ * The `PonsMindRegistry` address: `VITE_REGISTRY_ADDRESS` when set to a non-zero address, else the
+ * generated deployment map in `@www-rh/shared` (`registryAddress(chainId)`, SPEC §9.3), else `null`.
+ */
+export function resolveRegistry(env: WebEnv, chainId: number): Address | null {
+  const fromEnv = nonZeroAddress(env.VITE_REGISTRY_ADDRESS);
+  if (fromEnv !== null) return fromEnv;
+  try {
+    return nonZeroAddress(registryAddress(chainId));
+  } catch {
+    return null;
+  }
+}
+
 const env: WebEnv = import.meta.env;
 
 /** Chain the app reads from and writes to. */
 export const TARGET_CHAIN: Chain = resolveChain(env);
-/** Launchpad address, or `null` when not configured (writes and reads are disabled). */
+/** Venue of this build (SPEC §9.5). */
+export const VENUE: Venue = resolveVenue(env);
+/** Launchpad address, or `null` when not configured (curve mode: writes and reads are disabled). */
 export const LAUNCHPAD_ADDRESS: Address | null = resolveLaunchpad(env, TARGET_CHAIN.id);
+/** `PonsMindRegistry` address, or `null` when not configured (Pons mode: writes and reads are disabled). */
+export const REGISTRY_ADDRESS: Address | null = resolveRegistry(env, TARGET_CHAIN.id);
+/**
+ * The contract holding the venue-independent MindCore surface (`getMind`, `mindBalance`,
+ * `fundMind`, `setMindConfig`, `setCreatorPaused`, `creationFee`, `paused`): the registry in Pons
+ * mode, the launchpad in curve mode. Both expose it with identical selectors (SPEC §9.2).
+ */
+export const CORE_ADDRESS: Address | null = VENUE === 'pons' ? REGISTRY_ADDRESS : LAUNCHPAD_ADDRESS;
+/** Human name of {@link CORE_ADDRESS} for copy. */
+export const CORE_LABEL: string = VENUE === 'pons' ? 'registry' : 'launchpad';
+/** The env variable that configures {@link CORE_ADDRESS}. */
+export const CORE_ENV_VAR: string = VENUE === 'pons' ? 'VITE_REGISTRY_ADDRESS' : 'VITE_LAUNCHPAD_ADDRESS';
 /** Runner HTTP base ('' = same origin). */
 export const API_BASE: string = resolveApiBase(env);
 /** Runner WebSocket base URL. */

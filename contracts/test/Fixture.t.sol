@@ -11,7 +11,7 @@ import {BaseTest} from "./utils/BaseTest.sol";
 ///         replays bit-for-bit on a real {MindLaunchpad} (quote views and executed trades).
 contract FixtureTest is BaseTest {
     /// @dev Storage slot of `MindLaunchpad._curves` (`forge inspect MindLaunchpad storageLayout`); verified below.
-    uint256 internal constant CURVES_SLOT = 13;
+    uint256 internal constant CURVES_SLOT = 18;
 
     string internal json;
     uint256 internal count;

@@ -1,5 +1,5 @@
 /**
- * HTTP API (`docs/SPEC.md` §5) as a Hono app under `/api`, CORS for the `PUBLIC_WEB_ORIGIN` list.
+ * HTTP API (`docs/SPEC.md` §5, §9.4) as a Hono app under `/api`, CORS for the `PUBLIC_WEB_ORIGIN` list.
  * Errors are `{ error }` with 400 / 404 / 413 / 429 / 500.
  *
  * @module api/routes
@@ -14,8 +14,10 @@ import {
   toPublicModelSpec,
   type ComputeResponse,
   type HealthResponse,
+  type LaunchConfigResponse,
   type MindsResponse,
   type StatsResponse,
+  type Venue,
 } from '@www-rh/shared';
 import type { Repos } from '../db/repos.js';
 import { microToUsd } from '../economics/budget.js';
@@ -34,7 +36,11 @@ const DAY_MS = 86_400_000;
 /** Runtime facts the API reports. */
 export interface ApiStatus {
   chainId: number;
+  /** Indexed venue (default `curve`). */
+  venue?: Venue;
   launchpad: string | null;
+  /** `PonsMindRegistry` (Pons mode). */
+  registry?: string | null;
   dryRun(): boolean;
   indexer(): { live: boolean; lastError: string | null; headBlock: bigint | null; lastIndexedBlock: bigint | null };
   activeMinds(): number;
@@ -51,6 +57,8 @@ export interface ApiDeps {
   now?: () => number;
   /** POST /api/metadata requests per minute (global). */
   metadataRateLimit?: number;
+  /** `GET /api/launch-config` source (Pons mode, read-through cached); absent in curve mode (404). */
+  launchConfig?: (() => Promise<LaunchConfigResponse>) | null;
 }
 
 /** Sliding one-minute window limiter. */
@@ -183,10 +191,14 @@ export function createApi(deps: ApiDeps): Hono {
 
   app.get('/api/health', (c) => {
     const ix = deps.status.indexer();
+    const venue = deps.status.venue ?? 'curve';
+    const registry = deps.status.registry ?? null;
     const body: HealthResponse = {
-      ok: deps.status.launchpad !== null && ix.lastError === null,
+      ok: (venue === 'pons' ? registry !== null : deps.status.launchpad !== null) && ix.lastError === null,
       chainId: deps.status.chainId,
+      venue,
       launchpad: (deps.status.launchpad ?? ZERO_ADDRESS).toLowerCase() as `0x${string}`,
+      registry: registry === null ? null : (registry.toLowerCase() as `0x${string}`),
       lastIndexedBlock: ix.lastIndexedBlock === null ? 0 : Number(ix.lastIndexedBlock),
       headBlock: ix.headBlock === null ? 0 : Number(ix.headBlock),
       activeMinds: deps.status.activeMinds(),
@@ -205,8 +217,9 @@ export function createApi(deps: ApiDeps): Hono {
     const rows = deps.repos.minds.list(sort, limit + 1, offset);
     const page = rows.slice(0, limit);
     const activity = activityByToken(deps.repos.trades.since(page.map((r) => r.token), now() - DAY_MS));
+    const pons = deps.repos.pons.many(page.filter((r) => r.venue === 'pons').map((r) => r.token));
     const body: MindsResponse = {
-      items: page.map((r) => mindSummaryDto(r, activity.get(r.token))),
+      items: page.map((r) => mindSummaryDto(r, activity.get(r.token), pons.get(r.token))),
       nextCursor: rows.length > limit ? encodeCursor(offset + limit) : null,
     };
     return c.json(body);
@@ -218,7 +231,17 @@ export function createApi(deps: ApiDeps): Hono {
     const row = deps.repos.minds.get(m.token);
     if (row === undefined) return fail(c, 404, 'unknown mind');
     const activity = activityByToken(deps.repos.trades.since([m.token], now() - DAY_MS));
-    return c.json(mindDetailDto(row, activity.get(m.token)));
+    return c.json(mindDetailDto(row, activity.get(m.token), row.venue === 'pons' ? deps.repos.pons.get(m.token) : undefined));
+  });
+
+  app.get('/api/launch-config', async (c) => {
+    if (deps.launchConfig == null) return fail(c, 404, 'launch config is only available in Pons mode (VENUE=pons with a registry)');
+    try {
+      return c.json(await deps.launchConfig());
+    } catch (err) {
+      deps.log.warn('launch config unavailable', { error: errorMessage(err) });
+      return fail(c, 500, 'launch config unavailable (Pons factory read failed)');
+    }
   });
 
   app.get('/api/minds/:token/trades', (c) => {

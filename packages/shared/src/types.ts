@@ -93,6 +93,27 @@ export function curvePhaseName(value: number): CurvePhaseName {
   }
 }
 
+/**
+ * Maps a Pons `GraduationPhase` (`getLaunchedToken(token).phase`) to its wire name (§9.3):
+ * `NotGraduated` → `bonding`, `Swept` → `complete`, `PoolCreated` / `Rescued` → `graduated`.
+ */
+export function ponsPhaseName(value: number): CurvePhaseName {
+  switch (value) {
+    case 0:
+      return 'bonding';
+    case 1:
+      return 'complete';
+    case 2:
+    case 3:
+      return 'graduated';
+    default:
+      throw new RangeError(`unknown Pons GraduationPhase ${value}`);
+  }
+}
+
+/** Where a mind trades (§9): `pons` (Pons V2 launch) or `curve` (in-house bonding curve). */
+export const venueSchema = z.enum(['pons', 'curve']);
+
 /** Maps a wire status name back to the on-chain value. */
 export function mindStatusValue(name: MindStatusName): 0 | 1 | 2 {
   return name === 'alive' ? 0 : name === 'dormant' ? 1 : 2;
@@ -226,7 +247,10 @@ export const mindSummarySchema = z.object({
   modelId: hash32Schema,
   /** Catalog id; `null` when `modelId` is not in the catalog. */
   model: modelIdSchema.nullable(),
+  /** `pons` or `curve` (§9.3). */
+  venue: venueSchema,
   status: mindStatusNameSchema,
+  /** Pons: `Swept` → `complete`, `PoolCreated` / `Rescued` → `graduated`. */
   phase: curvePhaseNameSchema,
   /** Wei per 1e18 tokens (frozen final curve price once graduated). */
   priceWei: bigintStringSchema,
@@ -243,6 +267,28 @@ export const mindSummarySchema = z.object({
 });
 export type MindSummary = z.infer<typeof mindSummarySchema>;
 
+/** Pons launch details of a mind (`MindDetail.pons`, §9.3). */
+export const ponsMindInfoSchema = z.object({
+  /** The launch's `PonsV2BondingCurve`. */
+  curve: addressSchema,
+  /** The mind's `MindAccount` (creator fee recipient once adopted / launched here). */
+  account: addressSchema,
+  /** The launch's deployer (the registry for minds launched here); `null` when unknown. */
+  deployer: addressSchema.nullable(),
+  launchConfigId: z.number().int().min(0).nullable(),
+  /** Base trade fee of the curve (bps); `null` when unknown. */
+  feeBps: z.number().int().min(0).max(10_000).nullable(),
+  /** Creator tax of the curve (bps); `null` when unknown. */
+  creatorTaxBps: z.number().int().min(0).max(10_000).nullable(),
+  /** `feeEscrow.balanceOf(account)`: creator fees credited and not yet harvested into the vault. */
+  claimableWei: bigintStringSchema,
+  launchedHere: z.boolean(),
+  adopted: z.boolean(),
+  /** Uniswap v4 pool id of the graduated pool (from the hook's `PoolRegistered`); `null` before. */
+  poolId: hash32Schema.nullable(),
+});
+export type PonsMindInfo = z.infer<typeof ponsMindInfoSchema>;
+
 /** Full view of a mind. */
 export const mindDetailSchema = mindSummarySchema.extend({
   personaHash: hash32Schema,
@@ -256,6 +302,8 @@ export const mindDetailSchema = mindSummarySchema.extend({
   /** Decimal; `"0"` for MockGraduator. */
   positionId: bigintStringSchema.nullable(),
   lastFrameAt: isoTimestampSchema.nullable(),
+  /** Pons launch details; `null` for curve minds. */
+  pons: ponsMindInfoSchema.nullable(),
 });
 export type MindDetail = z.infer<typeof mindDetailSchema>;
 
@@ -360,7 +408,12 @@ export type ComputeResponse = z.infer<typeof computeResponseSchema>;
 export const healthResponseSchema = z.object({
   ok: z.boolean(),
   chainId: z.number().int().min(1),
+  /** Venue the runner indexes (§9.4). */
+  venue: venueSchema,
+  /** `MindLaunchpad` (curve mode); the zero address when unset. */
   launchpad: addressSchema,
+  /** `PonsMindRegistry` (Pons mode); `null` when unset. */
+  registry: addressSchema.nullable(),
   lastIndexedBlock: count,
   headBlock: count,
   /** Ticks currently in flight. */
@@ -401,6 +454,30 @@ export const statsResponseSchema = z.object({
   totalFeesToMindsWei: bigintStringSchema,
 });
 export type StatsResponse = z.infer<typeof statsResponseSchema>;
+
+/** One Pons launch config (`factory.getLaunchConfig(id)`). */
+export const launchConfigSchema = z.object({
+  id: z.number().int().min(0),
+  /** Token supply (18 decimals). */
+  supply: bigintStringSchema,
+  curveFeeBps: z.number().int().min(0).max(10_000),
+  /** Virtual quote reserve (wei). */
+  phantomQuote: bigintStringSchema,
+  /** Real quote reserve at which the curve graduates (wei). */
+  graduationThreshold: bigintStringSchema,
+  enabled: z.boolean(),
+});
+export type LaunchConfig = z.infer<typeof launchConfigSchema>;
+
+/** `GET /api/launch-config` (Pons mode, §9.4; read-through cache 60 s). */
+export const launchConfigResponseSchema = z.object({
+  /** `factory.launchFee()` (wei). */
+  launchFee: bigintStringSchema,
+  configs: z.array(launchConfigSchema),
+  maxCreatorTaxBps: z.number().int().min(0).max(10_000),
+  snipeTaxSeconds: z.number().int().min(0),
+});
+export type LaunchConfigResponse = z.infer<typeof launchConfigResponseSchema>;
 
 // ---------------------------------------------------------------------------
 // §6 WebSocket protocol

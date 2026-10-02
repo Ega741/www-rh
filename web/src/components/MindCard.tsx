@@ -8,19 +8,28 @@
 import { modelById } from '@www-rh/shared';
 import { useRef, useState } from 'react';
 import { Link } from 'react-router';
+import { VENUE } from '../config';
 import { displayUrl, formatEth, formatPrice, timeAgo } from '../format';
 import { useInView } from '../hooks/useInView';
 import { useLiveFrame } from '../hooks/useLiveFrame';
 import { useNow } from '../hooks/useTick';
 import type { MindSummary } from '../lib/types';
 import { FeedMind } from './FeedMind';
-import { MindAvatar, PhaseBadge, ProgressBar, StatusBadge } from './common';
+import { MindAvatar, PhaseBadge, ProgressBar, StatusBadge, VenueBadge } from './common';
 
 /** Display label of a mind's model: catalog label, else `model ?? 'unsupported model'` (SPEC §7). */
 export function modelLabel(mind: Pick<MindSummary, 'model' | 'modelId'>): string {
   const spec = modelById(mind.modelId);
   if (spec !== undefined) return spec.label;
   return mind.model ?? 'unsupported model';
+}
+
+/** Caption of the card's progress bar. */
+function progressLabel(mind: Pick<MindSummary, 'phase' | 'venue'>): string {
+  const pons = (mind.venue ?? VENUE) === 'pons';
+  if (mind.phase === 'graduated') return pons ? 'graduated to Uniswap' : 'graduated to the DEX';
+  if (pons) return mind.phase === 'complete' ? 'graduating' : 'pons curve';
+  return 'bonding curve';
 }
 
 /** One card of the home grid. */
@@ -60,8 +69,9 @@ export function MindCard({ mind }: { mind: MindSummary }) {
               {mind.name} <span className="text-dim">${mind.symbol}</span>
             </Link>
             <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+              <VenueBadge venue={mind.venue} />
               <span className="chip">{modelLabel(mind)}</span>
-              {mind.phase !== 'bonding' && <PhaseBadge phase={mind.phase} />}
+              {mind.phase !== 'bonding' && <PhaseBadge phase={mind.phase} venue={mind.venue} />}
             </div>
           </div>
         </div>
@@ -85,7 +95,7 @@ export function MindCard({ mind }: { mind: MindSummary }) {
         </dl>
         <div>
           <div className="mb-1 flex justify-between text-[11px] text-mute">
-            <span>{mind.phase === 'graduated' ? 'graduated to the DEX' : 'bonding curve'}</span>
+            <span>{progressLabel(mind)}</span>
             <span className="tabular-nums">{(mind.progressBps / 100).toFixed(1)}%</span>
           </div>
           <ProgressBar percent={mind.progressBps / 100} tone={mind.phase === 'graduated' ? 'violet' : mind.phase === 'complete' ? 'amber' : 'acid'} />

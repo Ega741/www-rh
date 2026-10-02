@@ -8,6 +8,7 @@
 export * from './chains.js';
 export * from './abi.js';
 export * from './curve.js';
+export * from './ponsCurve.js';
 export * from './models.js';
 export * from './types.js';
 export * from './canonical.js';

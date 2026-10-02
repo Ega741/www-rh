@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+import {IMindCore} from "../../src/interfaces/IMindCore.sol";
 import {IMindLaunchpad} from "../../src/interfaces/IMindLaunchpad.sol";
 
 /// @notice Trader / ETH recipient that misbehaves when it receives ETH: it re-enters the launchpad (sell, buy,
@@ -69,7 +70,7 @@ contract ReentrantReceiver {
         } else if (m == Mode.ReenterGraduate) {
             (ok, err) = address(launchpad).call(abi.encodeCall(IMindLaunchpad.graduate, (token)));
         } else {
-            (ok, err) = address(launchpad).call(abi.encodeCall(IMindLaunchpad.drawCompute, (token, 1, bytes32(0))));
+            (ok, err) = address(launchpad).call(abi.encodeCall(IMindCore.drawCompute, (token, 1, bytes32(0))));
         }
         reentrySucceeded = ok;
         reentryError = err;

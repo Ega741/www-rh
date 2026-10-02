@@ -12,6 +12,7 @@
 import {
   computeResponseSchema,
   healthResponseSchema,
+  launchConfigResponseSchema,
   memorySchema,
   metadataUploadResponseSchema,
   mindDetailSchema,
@@ -55,10 +56,13 @@ import type {
   MindSummary,
   MindsPage,
   ModelInfo,
+  PonsInfo,
   Stats,
   Thought,
   Trade,
+  VenueName,
 } from './types';
+import type { PonsLaunchConfig, PonsLaunchSettings } from './pons/launch';
 
 function obj(raw: unknown, what: string): Record<string, unknown> {
   if (!isObject(raw)) throw new ShapeError(`${what}: expected an object`);
@@ -92,6 +96,11 @@ export function toStatusName(value: unknown): MindStatusName {
   if (value === 'alive' || value === 0) return 'alive';
   if (value === 'paused' || value === 2) return 'paused';
   return 'dormant';
+}
+
+/** Venue name, or `null` when absent / unknown (SPEC §9.3). */
+export function toVenueName(value: unknown): VenueName | null {
+  return value === 'pons' || value === 'curve' ? value : null;
 }
 
 /** Maps any phase value (R11 name or on-chain enum number) to a phase name. */
@@ -128,6 +137,30 @@ export function normalizeMindSummary(raw: unknown): MindSummary {
     createdAt: readTime(o, 'createdAt') ?? 0,
     trades24h: readNumber(o, 'trades24h') ?? 0,
     volume24hWei: readBigintOr(o, 0n, 'volume24hWei', 'volume24h'),
+    venue: toVenueName(o['venue']),
+  };
+}
+
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+/** `MindDetail.pons` (SPEC §9.3), or `null` when absent or without a curve / account. */
+export function normalizePonsInfo(raw: unknown): PonsInfo | null {
+  if (!isObject(raw)) return null;
+  const curve = readAddress(raw, 'curve');
+  const account = readAddress(raw, 'account');
+  if (curve === null || account === null) return null;
+  const deployer = readAddress(raw, 'deployer');
+  return {
+    curve,
+    account,
+    deployer: deployer === ZERO_ADDRESS ? null : deployer,
+    launchConfigId: readBigint(raw, 'launchConfigId'),
+    feeBps: readNumber(raw, 'feeBps'),
+    creatorTaxBps: readNumber(raw, 'creatorTaxBps'),
+    claimableWei: readBigintOr(raw, 0n, 'claimableWei', 'claimable'),
+    launchedHere: readBoolean(raw, 'launchedHere') ?? false,
+    adopted: readBoolean(raw, 'adopted') ?? false,
+    poolId: readHash(raw, 'poolId'),
   };
 }
 
@@ -161,6 +194,7 @@ export function normalizeMindDetail(raw: unknown): MindDetail {
     persona: readText(o, 'persona') ?? readText(meta, 'persona'),
     links: normalizeLinks(o['links'] ?? meta['links']),
     lastFrameAt: readTime(o, 'lastFrameAt'),
+    pons: normalizePonsInfo(o['pons']),
   };
 }
 
@@ -337,6 +371,41 @@ export function normalizeHealth(raw: unknown): Health {
     headBlock: readNumber(o, 'headBlock'),
     activeMinds: readNumber(o, 'activeMinds'),
     dryRun: readBoolean(o, 'dryRun'),
+    venue: toVenueName(o['venue']),
+    registry: readAddress(o, 'registry'),
+  };
+}
+
+function normalizeLaunchConfigItem(raw: unknown): PonsLaunchConfig {
+  const o = obj(raw, 'launch config');
+  const id = readBigint(o, 'id', 'launchConfigId');
+  const supply = readBigint(o, 'supply');
+  const phantomQuote = readBigint(o, 'phantomQuote', 'phantomQuoteWei');
+  const graduationThreshold = readBigint(o, 'graduationThreshold', 'graduationThresholdWei');
+  if (id === null || supply === null || phantomQuote === null || graduationThreshold === null) {
+    throw new ShapeError('launch config: missing id, supply, phantomQuote or graduationThreshold');
+  }
+  return {
+    id,
+    supply,
+    curveFeeBps: readNumber(o, 'curveFeeBps') ?? 0,
+    phantomQuote,
+    graduationThreshold,
+    enabled: readBoolean(o, 'enabled') ?? true,
+  };
+}
+
+/** `GET /api/launch-config` (SPEC §9.4). */
+export function normalizeLaunchConfig(raw: unknown): PonsLaunchSettings {
+  checkShape(launchConfigResponseSchema, raw, 'GET /api/launch-config');
+  const o = obj(raw, 'launch config');
+  const launchFee = readBigint(o, 'launchFee', 'launchFeeWei');
+  if (launchFee === null) throw new ShapeError('launch config: missing launchFee');
+  return {
+    launchFee,
+    configs: mapValid(readList(o['configs']), normalizeLaunchConfigItem, 'launch config'),
+    maxCreatorTaxBps: readNumber(o, 'maxCreatorTaxBps') ?? 0,
+    snipeTaxSeconds: readNumber(o, 'snipeTaxSeconds') ?? 15,
   };
 }
 

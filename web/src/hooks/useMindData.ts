@@ -2,6 +2,7 @@
  * Mind page data: the runner's `MindDetail` merged with fresh on-chain reads (`getMind`,
  * `getCurve`, `mindBalance`, token `name`/`symbol`). On-chain values win for status, phase,
  * reserves and vault balance; when the runner is unreachable the page still renders from chain.
+ * In Pons mode {@link useMindData} is {@link usePonsMindData} (registry + Pons curve reads).
  *
  * @module hooks/useMindData
  */
@@ -9,13 +10,14 @@ import { marketCap, mindLaunchpadAbi as launchpadAbi, priceOf, progressBps } fro
 import { useEffect, useState } from 'react';
 import { erc20Abi, zeroAddress, type Address } from 'viem';
 import { useReadContract } from 'wagmi';
-import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
+import { LAUNCHPAD_ADDRESS, TARGET_CHAIN, VENUE } from '../config';
 import { decodeJsonDataUri } from '../lib/dataUri';
 import { readText } from '../lib/json';
 import { personaHashOf } from '../lib/metadata';
 import { toPhaseName, toStatusName } from '../lib/normalize';
-import type { MindDetail } from '../lib/types';
+import type { MindDetail, PonsLive } from '../lib/types';
 import { useMindDetail } from '../queries';
+import { usePonsMindData } from './usePonsMindData';
 
 /** What the chain says about the token. */
 export type ChainLookup = 'disabled' | 'pending' | 'mind' | 'not-a-mind' | 'error';
@@ -31,10 +33,12 @@ export interface MindData {
   chainError: unknown;
   /** Re-reads on-chain state (after a transaction). */
   refetchChain: () => void;
+  /** Live Pons curve / launch state (Pons mode only; `null` in curve mode). */
+  ponsLive: PonsLive | null;
 }
 
-/** Loads and merges runner + chain data for `token`. */
-export function useMindData(token: Address | undefined): MindData {
+/** Curve mode: loads and merges runner + `MindLaunchpad` data for `token`. */
+export function useCurveMindData(token: Address | undefined): MindData {
   const enabled = token !== undefined && LAUNCHPAD_ADDRESS !== null;
   const api = useMindDetail(token);
   const base = { address: LAUNCHPAD_ADDRESS ?? zeroAddress, abi: launchpadAbi, chainId: TARGET_CHAIN.id } as const;
@@ -85,6 +89,8 @@ export function useMindData(token: Address | undefined): MindData {
       createdAt: Number(chainInfo.createdAt) * 1000,
       trades24h: 0,
       volume24hWei: 0n,
+      venue: 'curve',
+      pons: null,
       personaHash: chainInfo.personaHash,
       personaVerified: null,
       pool: null,
@@ -145,5 +151,12 @@ export function useMindData(token: Address | undefined): MindData {
       void curve.refetch();
       void vault.refetch();
     },
+    ponsLive: null,
   };
 }
+
+/**
+ * Loads and merges runner + chain data for `token` from the venue of this build (SPEC §9.5).
+ * `VENUE` is a build-time constant, so the hook choice never changes between renders.
+ */
+export const useMindData: (token: Address | undefined) => MindData = VENUE === 'pons' ? usePonsMindData : useCurveMindData;

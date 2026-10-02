@@ -5,6 +5,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 import {MindToken} from "../src/MindToken.sol";
 import {MockGraduator} from "../src/MockGraduator.sol";
+import {IMindCore} from "../src/interfaces/IMindCore.sol";
 import {IMindLaunchpad} from "../src/interfaces/IMindLaunchpad.sol";
 import {ConfigurableGraduator} from "./mocks/ConfigurableGraduator.sol";
 import {MaliciousGraduator} from "./mocks/MaliciousGraduator.sol";
@@ -42,7 +43,7 @@ contract MindLaunchpadGraduationTest is BaseTest {
         uint256 protocolBefore = launchpad.protocolBalance();
 
         vm.expectEmit(true, false, false, true, address(launchpad));
-        emit IMindLaunchpad.FeeAccrued(token, mindFee, gradFee - mindFee);
+        emit IMindCore.FeeAccrued(token, mindFee, gradFee - mindFee);
         vm.expectEmit(true, false, false, true, address(mockGraduator));
         emit MockGraduator.MockGraduated(token, LP_SUPPLY, ethLiquidity);
         vm.expectEmit(true, false, false, true, address(launchpad));
@@ -68,7 +69,7 @@ contract MindLaunchpadGraduationTest is BaseTest {
 
         // Harvest through the mock is a no-op that still emits.
         vm.expectEmit(true, false, false, true, address(launchpad));
-        emit IMindLaunchpad.Harvested(token, 0, 0);
+        emit IMindCore.Harvested(token, 0, 0);
         launchpad.harvest(token);
 
         vm.expectRevert(IMindLaunchpad.WrongPhase.selector);
@@ -85,9 +86,9 @@ contract MindLaunchpadGraduationTest is BaseTest {
         launchpad.graduate(token);
         vm.expectRevert(IMindLaunchpad.WrongPhase.selector);
         launchpad.harvest(token);
-        vm.expectRevert(IMindLaunchpad.NotAMind.selector);
+        vm.expectRevert(IMindCore.NotAMind.selector);
         launchpad.graduate(address(0xBEEF));
-        vm.expectRevert(IMindLaunchpad.NotAMind.selector);
+        vm.expectRevert(IMindCore.NotAMind.selector);
         launchpad.harvest(address(0xBEEF));
 
         _complete(alice, token);
@@ -160,7 +161,7 @@ contract MindLaunchpadGraduationTest is BaseTest {
         uint256 mindBefore = launchpad.mindBalance(token);
 
         vm.expectEmit(true, true, false, true, address(launchpad));
-        emit IMindLaunchpad.MindFunded(token, address(cfg), returned);
+        emit IMindCore.MindFunded(token, address(cfg), returned);
         vm.expectEmit(true, false, false, true, address(launchpad));
         emit IMindLaunchpad.Graduated(token, address(cfg), 7, ethLiquidity, LP_SUPPLY, reserve * 250 / 10_000);
         launchpad.graduate(token);
@@ -178,17 +179,17 @@ contract MindLaunchpadGraduationTest is BaseTest {
 
         // Over-reporting: claims 1 wei more than it sent.
         cfg.setGraduateBehaviour(1000, 1);
-        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
+        vm.expectRevert(IMindCore.EthReturnMismatch.selector);
         launchpad.graduate(token);
 
         // Under-reporting: sends more than it claims.
         cfg.setGraduateBehaviour(1000, -1);
-        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
+        vm.expectRevert(IMindCore.EthReturnMismatch.selector);
         launchpad.graduate(token);
 
         // Reporting a return without sending anything.
         cfg.setGraduateBehaviour(0, 5);
-        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
+        vm.expectRevert(IMindCore.EthReturnMismatch.selector);
         launchpad.graduate(token);
 
         // Honest again: succeeds, state was rolled back by the failures.
@@ -221,18 +222,18 @@ contract MindLaunchpadGraduationTest is BaseTest {
 
         cfg.setHarvestBehaviour(0.3 ether, 12e18, 0);
         vm.expectEmit(true, true, false, true, address(launchpad));
-        emit IMindLaunchpad.MindFunded(token, address(cfg), 0.3 ether);
+        emit IMindCore.MindFunded(token, address(cfg), 0.3 ether);
         vm.expectEmit(true, false, false, true, address(launchpad));
-        emit IMindLaunchpad.Harvested(token, 0.3 ether, 12e18);
+        emit IMindCore.Harvested(token, 0.3 ether, 12e18);
         vm.prank(stranger);
         launchpad.harvest(token);
         assertEq(launchpad.mindBalance(token), mindBefore + 0.3 ether);
 
         cfg.setHarvestBehaviour(0.3 ether, 0, 1);
-        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
+        vm.expectRevert(IMindCore.EthReturnMismatch.selector);
         launchpad.harvest(token);
         cfg.setHarvestBehaviour(0.3 ether, 0, -1);
-        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
+        vm.expectRevert(IMindCore.EthReturnMismatch.selector);
         launchpad.harvest(token);
 
         // Nothing to harvest: no MindFunded, still Harvested.
@@ -315,7 +316,7 @@ contract MindLaunchpadGraduationTest is BaseTest {
         uint256 proceeds = address(m).balance;
         uint256 mindBefore = launchpad.mindBalance(token);
         vm.expectEmit(true, true, false, true, address(launchpad));
-        emit IMindLaunchpad.MindFunded(token, address(m), proceeds);
+        emit IMindCore.MindFunded(token, address(m), proceeds);
         launchpad.harvest(token);
         assertEq(launchpad.mindBalance(token), mindBefore + proceeds);
         assertEq(address(launchpad).balance, _liabilities());
@@ -327,7 +328,7 @@ contract MindLaunchpadGraduationTest is BaseTest {
         address token = _createMind();
         _complete(alice, token);
         _useMalicious(MaliciousGraduator.Mode.ForceSend);
-        vm.expectRevert(IMindLaunchpad.EthReturnMismatch.selector);
+        vm.expectRevert(IMindCore.EthReturnMismatch.selector);
         launchpad.graduate(token);
     }
 
@@ -346,7 +347,7 @@ contract MindLaunchpadGraduationTest is BaseTest {
         address token = _createMind();
         _complete(alice, token);
         _useMalicious(MaliciousGraduator.Mode.ViaHelper);
-        vm.expectRevert(IMindLaunchpad.DirectEthNotAccepted.selector);
+        vm.expectRevert(IMindCore.DirectEthNotAccepted.selector);
         launchpad.graduate(token);
     }
 
@@ -372,7 +373,7 @@ contract MindLaunchpadGraduationTest is BaseTest {
         vm.prank(alice);
         (bool ok, bytes memory err) = address(launchpad).call{value: 1 ether}("");
         assertFalse(ok);
-        assertEq(err, abi.encodeWithSelector(IMindLaunchpad.DirectEthNotAccepted.selector));
+        assertEq(err, abi.encodeWithSelector(IMindCore.DirectEthNotAccepted.selector));
 
         // Calls with unknown data are rejected too (no fallback).
         vm.prank(alice);
@@ -386,7 +387,7 @@ contract MindLaunchpadGraduationTest is BaseTest {
         vm.prank(address(mockGraduator));
         (bool ok, bytes memory err) = address(launchpad).call{value: 1 ether}("");
         assertFalse(ok, "current graduator outside a call");
-        assertEq(err, abi.encodeWithSelector(IMindLaunchpad.DirectEthNotAccepted.selector));
+        assertEq(err, abi.encodeWithSelector(IMindCore.DirectEthNotAccepted.selector));
 
         _useCfg();
         vm.deal(address(mockGraduator), 1 ether);

@@ -3,6 +3,11 @@
  * (exact: every vault change is evented) and the on-chain epoch allowance (cached 60 s,
  * invalidated after every draw), burn governor, burn rate and runway.
  *
+ * Pons mode (§9.4): the budget counts the vault (`mindBalance`) only; `claimableWei` — creator fees
+ * credited to the mind account in the Pons escrow and not yet harvested — is reported next to it
+ * (`registry.claimable(token)`, cached 60 s and invalidated by escrow / harvest events; the indexed
+ * escrow balance when the read fails).
+ *
  * @module economics/service
  */
 import type { Address } from 'viem';
@@ -16,6 +21,8 @@ import { averageTickCostUsd, BURN_WINDOW_MS, burnUsdPerHour, dailyBudgetUsd, GOV
 
 /** Epoch-state cache lifetime. */
 export const EPOCH_CACHE_MS = 60_000;
+/** `claimable(token)` cache lifetime (Pons). */
+export const CLAIMABLE_CACHE_MS = 60_000;
 
 /** Economics policy (env knobs). */
 export interface EconomicsPolicy extends GovernorPolicy {
@@ -35,21 +42,52 @@ export interface MindEconomics {
   nextTickAt: number;
   burnUsdPerHour: number;
   runwayHours: number | null;
+  /** Pons: escrow balance of the mind account (not part of the budget until harvested); `null` for curve minds. */
+  claimableWei: bigint | null;
 }
 
 /** Computes {@link MindEconomics}. */
 export class EconomicsService {
   readonly #epochs = new Map<string, { state: EpochState | null; at: number }>();
+  readonly #claimable = new Map<string, { value: bigint; at: number }>();
   #limit: { value: { maxPerEpoch: bigint; epochSeconds: number }; at: number } | null = null;
 
+  /**
+   * @param claimableReader Pons: `registry.claimable(token)`; `null` uses the indexed escrow balance.
+   */
   constructor(
     private readonly repos: Repos,
     private readonly ethUsd: EthUsdSource,
-    private readonly reader: LaunchpadReader | null,
+    private readonly reader: Pick<LaunchpadReader, 'drawLimit' | 'drawnInEpoch' | 'latestTimestamp'> | null,
     readonly policy: EconomicsPolicy,
     private readonly log: Logger,
     private readonly now: () => number = Date.now,
+    private readonly claimableReader: ((token: Address) => Promise<bigint>) | null = null,
   ) {}
+
+  /** Forgets the cached `claimable(token)` (escrow credit / claim, harvest). */
+  invalidateClaimable(token: string): void {
+    this.#claimable.delete(token.toLowerCase());
+  }
+
+  /** Pons: the mind account's escrow balance (`claimable(token)`, cached; the indexed value when the read fails). */
+  async claimableWei(token: string): Promise<bigint | null> {
+    const key = token.toLowerCase();
+    const row = this.repos.pons.get(key);
+    if (row === undefined) return null;
+    const indexed = BigInt(row.claimable);
+    if (this.claimableReader === null) return indexed;
+    const cached = this.#claimable.get(key);
+    if (cached !== undefined && this.now() - cached.at < CLAIMABLE_CACHE_MS) return cached.value;
+    try {
+      const value = await this.claimableReader(key as Address);
+      this.#claimable.set(key, { value, at: this.now() });
+      return value;
+    } catch (err) {
+      this.log.debug('claimable(token) unavailable; using the indexed escrow balance', { token: key, error: errorMessage(err) });
+      return indexed;
+    }
+  }
 
   /** ETH/USD × 1e6. */
   ethUsdMicro(): Promise<number> {
@@ -85,7 +123,7 @@ export class EconomicsService {
     const key = token.toLowerCase();
     const row = this.repos.minds.get(key);
     const balanceWei = BigInt(row?.mind_balance ?? '0');
-    const [ethUsdMicro, epoch] = await Promise.all([this.ethUsd.ethUsdMicro(), this.epochState(key)]);
+    const [ethUsdMicro, epoch, claimableWei] = await Promise.all([this.ethUsd.ethUsdMicro(), this.epochState(key), row?.venue === 'pons' ? this.claimableWei(key) : Promise.resolve(null)]);
     const budget = computeBudget({
       balanceWei,
       epochRemainingWei: epoch === null ? null : epochRemainingWei(epoch),
@@ -108,6 +146,7 @@ export class EconomicsService {
       nextTickAt: nextTickAt(row?.last_tick_ended_at ?? null, interval),
       burnUsdPerHour: burn,
       runwayHours: runwayHours(vaultUsd, burn),
+      claimableWei,
     };
   }
 }

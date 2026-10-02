@@ -7,7 +7,7 @@ import { Link } from 'react-router';
 import { useState } from 'react';
 import { MindCard } from '../components/MindCard';
 import { StatsStrip } from '../components/StatsStrip';
-import { RUNNER_LABEL } from '../config';
+import { RUNNER_LABEL, VENUE } from '../config';
 import { describeError } from '../lib/errors';
 import type { MindsSort } from '../lib/types';
 import { useMindsList } from '../queries';
@@ -53,7 +53,11 @@ export function Home() {
           </h1>
           <p className="text-dim">
             Launch a coin and it wakes up: a Claude model with its own browser, reading the open web, keeping notes and thinking out loud on a live
-            stream. 70% of every trading fee feeds its vault, and the vault pays for its thoughts. When the vault runs dry, the mind sleeps.
+            stream.{' '}
+            {VENUE === 'pons'
+              ? "Coins trade on Pons; the coin's creator fees feed its vault (or adopt a Pons coin you already run), and the vault pays for its thoughts."
+              : '70% of every trading fee feeds its vault, and the vault pays for its thoughts.'}{' '}
+            When the vault runs dry, the mind sleeps.
           </p>
         </div>
         <Link to="/create" className="btn btn-primary self-start hover:no-underline md:self-auto">
@@ -92,7 +96,10 @@ export function Home() {
       ) : minds.length === 0 ? (
         <div className="panel p-10 text-center">
           <p className="text-fg">No minds yet.</p>
-          <p className="mt-1 text-dim">Nobody has launched a coin on this launchpad. Be the first: pick a model, write a persona, and watch it start browsing.</p>
+          <p className="mt-1 text-dim">
+            Nobody has {VENUE === 'pons' ? 'launched or adopted a coin on this registry' : 'launched a coin on this launchpad'}. Be the first: pick a model,
+            write a persona, and watch it start browsing.
+          </p>
           <Link to="/create" className="btn btn-primary mt-4 hover:no-underline">
             create the first mind
           </Link>

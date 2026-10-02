@@ -1,6 +1,6 @@
 /**
  * In-process events emitted by the indexer after each range commits (`docs/SPEC.md` §4.1
- * `indexer/`). They are emitted **only for live logs** (blocks ≥ the head observed at startup);
+ * `indexer/`, §9.4). Pons mode maps `Swept` to `curve:complete` and `PoolCreated` to `graduated`. They are emitted **only for live logs** (blocks ≥ the head observed at startup);
  * replayed history never reaches listeners, so it can never trigger graduate / harvest / status /
  * settlement transactions.
  *
@@ -29,7 +29,18 @@ export type IndexedEvent =
   | (Base & { type: 'graduated' })
   | (Base & { type: 'compute:drawn'; amount: bigint; receiptHash: string })
   | (Base & { type: 'memory:anchored'; seq: number; contentHash: string; uri: string })
-  | (Base & { type: 'harvested'; ethOut: bigint });
+  | (Base & { type: 'harvested'; ethOut: bigint })
+  // ---------------------------------------------------------------- Pons mode (docs/SPEC.md §9)
+  /** Escrow `Credited` to the mind account (creator fees swept by Pons, the registry or the account). */
+  | (Base & { type: 'pons:credited'; amount: bigint })
+  /** Escrow `Claimed` by the mind account (part of `harvest`). */
+  | (Base & { type: 'pons:claimed'; amount: bigint })
+  /** The hook's `PoolRegistered` for a mind's token: the operator records it with `setPoolId`. */
+  | (Base & { type: 'pons:pool-registered'; poolId: string })
+  /** `MindAdopted` (the fee recipient was handed to the mind account). */
+  | (Base & { type: 'pons:adopted' })
+  /** `MindLeft` (the creator moved the fee recipient away). */
+  | (Base & { type: 'pons:left' });
 
 /** Event type names. */
 export type IndexedEventType = IndexedEvent['type'];

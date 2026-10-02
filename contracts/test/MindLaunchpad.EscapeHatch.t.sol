@@ -5,6 +5,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Vm} from "forge-std/Vm.sol";
 
 import {MindToken} from "../src/MindToken.sol";
+import {IMindCore} from "../src/interfaces/IMindCore.sol";
 import {IMindLaunchpad} from "../src/interfaces/IMindLaunchpad.sol";
 import {CurveMath} from "../src/libraries/CurveMath.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
@@ -82,7 +83,7 @@ contract MindLaunchpadEscapeHatchTest is BaseTest {
         vm.expectEmit(true, false, false, true, address(launchpad));
         emit IMindLaunchpad.CurveReopened(token);
         vm.expectEmit(true, false, false, true, address(launchpad));
-        emit IMindLaunchpad.FeeAccrued(token, mindFee, quoteFee - mindFee);
+        emit IMindCore.FeeAccrued(token, mindFee, quoteFee - mindFee);
         vm.expectEmit(true, true, false, true, address(launchpad));
         emit IMindLaunchpad.Trade(
             token, alice, false, quoteOut, amount, quoteFee, reserve - quoteOut - quoteFee, sold - amount

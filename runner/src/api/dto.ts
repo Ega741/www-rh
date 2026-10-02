@@ -8,6 +8,7 @@ import {
   marketCapAtPrice,
   mindStatusName,
   modelById,
+  ponsProgressBps,
   progressBps,
   type Draw,
   type DrawReceipt,
@@ -15,10 +16,11 @@ import {
   type LedgerEntry,
   type MindDetail,
   type MindSummary,
+  type PonsMindInfo,
   type Thought,
   type Trade,
 } from '@www-rh/shared';
-import type { DrawRow, MindRow, ReceiptRow, ThoughtRow, TickRow, TradeRow } from '../db/repos.js';
+import type { DrawRow, MindRow, PonsMindRow, ReceiptRow, ThoughtRow, TickRow, TradeRow } from '../db/repos.js';
 import { microToUsd } from '../economics/budget.js';
 
 type Hex = `0x${string}`;
@@ -48,9 +50,43 @@ export function activityByToken(trades: readonly TradeRow[]): Map<string, Activi
   return out;
 }
 
-/** `MindSummary` of a row. */
-export function mindSummaryDto(row: MindRow, activity: Activity24h | undefined): MindSummary {
-  const tokensSold = BigInt(row.tokens_sold);
+const WAD = 10n ** 18n;
+
+/**
+ * Market cap and graduation progress. Curve: `price·TOTAL_SUPPLY/1e18` and `tokensSold/CURVE_SUPPLY`.
+ * Pons: `price·supply/1e18` and `realQuoteReserve·10000/graduationThreshold` while bonding, 10000
+ * once swept (§9.3).
+ */
+function marketOf(row: MindRow, pons: PonsMindRow | undefined): { marketCapWei: bigint; progressBps: number } {
+  const price = BigInt(row.price_wei);
+  if (row.venue !== 'pons') return { marketCapWei: marketCapAtPrice(price), progressBps: Number(progressBps(BigInt(row.tokens_sold))) };
+  const supply = pons?.supply == null ? null : BigInt(pons.supply);
+  const threshold = pons?.graduation_threshold == null ? null : BigInt(pons.graduation_threshold);
+  return {
+    marketCapWei: supply === null ? marketCapAtPrice(price) : (price * supply) / WAD,
+    progressBps: row.phase >= 1 ? 10_000 : threshold === null ? 0 : Number(ponsProgressBps(BigInt(row.real_eth_reserve), threshold)),
+  };
+}
+
+/** `MindDetail.pons` of a `pons_minds` row. */
+export function ponsInfoDto(p: PonsMindRow): PonsMindInfo {
+  return {
+    curve: p.curve as Hex,
+    account: p.account as Hex,
+    deployer: p.deployer as Hex | null,
+    launchConfigId: p.launch_config_id,
+    feeBps: p.fee_bps,
+    creatorTaxBps: p.creator_tax_bps,
+    claimableWei: p.claimable,
+    launchedHere: p.launched_here === 1,
+    adopted: p.adopted === 1,
+    poolId: (p.pool_id ?? p.registry_pool_id) as Hex | null,
+  };
+}
+
+/** `MindSummary` of a row (`pons`: the mind's `pons_minds` row in Pons mode). */
+export function mindSummaryDto(row: MindRow, activity: Activity24h | undefined, pons?: PonsMindRow): MindSummary {
+  const market = marketOf(row, pons);
   return {
     token: row.token as Hex,
     name: row.name,
@@ -60,11 +96,12 @@ export function mindSummaryDto(row: MindRow, activity: Activity24h | undefined):
     image: row.meta_image,
     modelId: row.model_id as Hex,
     model: modelById(row.model_id)?.id ?? null,
+    venue: row.venue,
     status: mindStatusName(row.status),
     phase: curvePhaseName(row.phase),
     priceWei: row.price_wei,
-    marketCapWei: marketCapAtPrice(BigInt(row.price_wei)).toString(10),
-    progressBps: Number(progressBps(tokensSold)),
+    marketCapWei: market.marketCapWei.toString(10),
+    progressBps: market.progressBps,
     realEthReserveWei: row.real_eth_reserve,
     tokensSold: row.tokens_sold,
     mindBalanceWei: row.mind_balance,
@@ -88,11 +125,11 @@ function parseLinks(json: string | null): MindDetail['links'] {
   }
 }
 
-/** `MindDetail` of a row. */
-export function mindDetailDto(row: MindRow, activity: Activity24h | undefined): MindDetail {
+/** `MindDetail` of a row (`pons`: the mind's `pons_minds` row in Pons mode). */
+export function mindDetailDto(row: MindRow, activity: Activity24h | undefined, pons?: PonsMindRow): MindDetail {
   const verified = row.meta_status === 'ok' && row.meta_persona_verified === 1;
   return {
-    ...mindSummaryDto(row, activity),
+    ...mindSummaryDto(row, activity, pons),
     personaHash: row.persona_hash as Hex,
     persona: verified ? row.meta_persona : null,
     personaVerified: verified,
@@ -101,6 +138,7 @@ export function mindDetailDto(row: MindRow, activity: Activity24h | undefined): 
     pool: row.pool as Hex | null,
     positionId: row.position_id,
     lastFrameAt: isoOrNull(row.last_frame_at),
+    pons: pons === undefined ? null : ponsInfoDto(pons),
   };
 }
 

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {MindToken} from "../src/MindToken.sol";
+import {IMindCore} from "../src/interfaces/IMindCore.sol";
 import {IMindLaunchpad} from "../src/interfaces/IMindLaunchpad.sol";
 import {CurveMath} from "../src/libraries/CurveMath.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
@@ -14,19 +15,19 @@ contract MindLaunchpadTradingTest is BaseTest {
 
     function test_createMind_registersTokenAndMind() public {
         vm.expectEmit(false, true, false, true, address(launchpad));
-        emit IMindLaunchpad.MindCreated(address(0), creator, "Mind One", "MIND", METADATA_URI, MODEL_ID, PERSONA_HASH);
+        emit IMindCore.MindCreated(address(0), creator, "Mind One", "MIND", METADATA_URI, MODEL_ID, PERSONA_HASH);
         address token = _createMind();
 
         assertTrue(launchpad.isMind(token));
         assertEq(launchpad.mindsLength(), 1);
         assertEq(launchpad.mindAt(0), token);
-        IMindLaunchpad.MindInfo memory info = launchpad.getMind(token);
+        IMindCore.MindInfo memory info = launchpad.getMind(token);
         assertEq(info.creator, creator);
         assertEq(info.modelId, MODEL_ID);
         assertEq(info.personaHash, PERSONA_HASH);
         assertEq(info.metadataURI, METADATA_URI);
         assertEq(info.createdAt, block.timestamp);
-        assertEq(uint8(info.status), uint8(IMindLaunchpad.MindStatus.Alive));
+        assertEq(uint8(info.status), uint8(IMindCore.MindStatus.Alive));
 
         IMindLaunchpad.CurveState memory c = launchpad.getCurve(token);
         assertEq(c.realEthReserve, 0);
@@ -94,29 +95,29 @@ contract MindLaunchpadTradingTest is BaseTest {
         string memory symbol17 = string(new bytes(17));
         string memory uri2049 = string(new bytes(2049));
         vm.startPrank(creator);
-        vm.expectRevert(IMindLaunchpad.InvalidName.selector);
+        vm.expectRevert(IMindCore.InvalidName.selector);
         launchpad.createMind("", "MIND", METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
-        vm.expectRevert(IMindLaunchpad.InvalidName.selector);
+        vm.expectRevert(IMindCore.InvalidName.selector);
         launchpad.createMind(name65, "MIND", METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
-        vm.expectRevert(IMindLaunchpad.InvalidSymbol.selector);
+        vm.expectRevert(IMindCore.InvalidSymbol.selector);
         launchpad.createMind("Mind", "", METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
-        vm.expectRevert(IMindLaunchpad.InvalidSymbol.selector);
+        vm.expectRevert(IMindCore.InvalidSymbol.selector);
         launchpad.createMind("Mind", symbol17, METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
-        vm.expectRevert(IMindLaunchpad.MetadataTooLong.selector);
+        vm.expectRevert(IMindCore.MetadataTooLong.selector);
         launchpad.createMind("Mind", "MIND", uri2049, MODEL_ID, PERSONA_HASH, 0);
-        vm.expectRevert(IMindLaunchpad.InvalidModel.selector);
+        vm.expectRevert(IMindCore.InvalidModel.selector);
         launchpad.createMind("Mind", "MIND", METADATA_URI, bytes32(0), PERSONA_HASH, 0);
 
         // Rule 1 order: name, symbol, metadata, model, then the creation fee.
-        vm.expectRevert(IMindLaunchpad.MetadataTooLong.selector);
+        vm.expectRevert(IMindCore.MetadataTooLong.selector);
         launchpad.createMind("Mind", "MIND", uri2049, bytes32(0), PERSONA_HASH, 0);
         vm.stopPrank();
         vm.prank(owner);
         launchpad.setCreationFee(1 ether);
         vm.startPrank(creator);
-        vm.expectRevert(IMindLaunchpad.InvalidName.selector);
+        vm.expectRevert(IMindCore.InvalidName.selector);
         launchpad.createMind("", "", METADATA_URI, MODEL_ID, PERSONA_HASH, 0);
-        vm.expectRevert(IMindLaunchpad.InvalidModel.selector);
+        vm.expectRevert(IMindCore.InvalidModel.selector);
         launchpad.createMind("Mind", "MIND", METADATA_URI, bytes32(0), PERSONA_HASH, 0);
         vm.stopPrank();
         vm.prank(owner);
@@ -142,7 +143,7 @@ contract MindLaunchpadTradingTest is BaseTest {
         uint256 mindShare = fee * 7000 / 10_000;
 
         vm.expectEmit(true, false, false, true, address(launchpad));
-        emit IMindLaunchpad.FeeAccrued(token, mindShare, fee - mindShare);
+        emit IMindCore.FeeAccrued(token, mindShare, fee - mindShare);
         vm.expectEmit(true, true, false, true, address(launchpad));
         emit IMindLaunchpad.Trade(token, alice, true, ethIn, out, fee, ethIn - fee, out);
         uint256 got = _buy(alice, token, ethIn);
@@ -161,9 +162,9 @@ contract MindLaunchpadTradingTest is BaseTest {
         vm.startPrank(alice);
         vm.expectRevert(IMindLaunchpad.Expired.selector);
         launchpad.buy{value: 1 ether}(token, 0, block.timestamp - 1);
-        vm.expectRevert(IMindLaunchpad.ZeroAmount.selector);
+        vm.expectRevert(IMindCore.ZeroAmount.selector);
         launchpad.buy(token, 0, block.timestamp);
-        vm.expectRevert(IMindLaunchpad.NotAMind.selector);
+        vm.expectRevert(IMindCore.NotAMind.selector);
         launchpad.buy{value: 1 ether}(address(0xBEEF), 0, block.timestamp);
         (uint256 out,,) = launchpad.quoteBuy(token, 1 ether);
         vm.expectRevert(IMindLaunchpad.Slippage.selector);
@@ -224,7 +225,7 @@ contract MindLaunchpadTradingTest is BaseTest {
         MindToken(token).approve(address(launchpad), type(uint256).max);
         vm.expectRevert(IMindLaunchpad.Expired.selector);
         launchpad.sell(token, 1e18, 0, block.timestamp - 1);
-        vm.expectRevert(IMindLaunchpad.ZeroAmount.selector);
+        vm.expectRevert(IMindCore.ZeroAmount.selector);
         launchpad.sell(token, 0, 0, block.timestamp);
         vm.expectRevert(IMindLaunchpad.ExceedsTokensSold.selector);
         launchpad.sell(token, bought + 1, 0, block.timestamp);
@@ -232,22 +233,22 @@ contract MindLaunchpadTradingTest is BaseTest {
         vm.expectRevert(IMindLaunchpad.Slippage.selector);
         launchpad.sell(token, bought, ethOut + 1, block.timestamp);
         // A dust sell that would pay out nothing is refused.
-        vm.expectRevert(IMindLaunchpad.ZeroAmount.selector);
+        vm.expectRevert(IMindCore.ZeroAmount.selector);
         launchpad.sell(token, 1, 0, block.timestamp);
-        vm.expectRevert(IMindLaunchpad.NotAMind.selector);
+        vm.expectRevert(IMindCore.NotAMind.selector);
         launchpad.sell(address(0xBEEF), 1, 0, block.timestamp);
         vm.stopPrank();
         vm.expectRevert(IMindLaunchpad.ExceedsTokensSold.selector);
         launchpad.quoteSell(token, bought + 1);
-        vm.expectRevert(IMindLaunchpad.ZeroAmount.selector);
+        vm.expectRevert(IMindCore.ZeroAmount.selector);
         launchpad.quoteSell(token, 0);
-        vm.expectRevert(IMindLaunchpad.ZeroAmount.selector);
+        vm.expectRevert(IMindCore.ZeroAmount.selector);
         launchpad.quoteBuy(token, 0);
-        vm.expectRevert(IMindLaunchpad.NotAMind.selector);
+        vm.expectRevert(IMindCore.NotAMind.selector);
         launchpad.quoteBuy(address(0xBEEF), 1);
-        vm.expectRevert(IMindLaunchpad.NotAMind.selector);
+        vm.expectRevert(IMindCore.NotAMind.selector);
         launchpad.quoteSell(address(0xBEEF), 1);
-        vm.expectRevert(IMindLaunchpad.NotAMind.selector);
+        vm.expectRevert(IMindCore.NotAMind.selector);
         launchpad.currentPrice(address(0xBEEF));
     }
 
@@ -396,7 +397,7 @@ contract MindLaunchpadTradingTest is BaseTest {
         address token = _createMind();
         Rejecter r = new Rejecter();
         vm.deal(address(r), 20 ether);
-        vm.expectRevert(IMindLaunchpad.EthTransferFailed.selector);
+        vm.expectRevert(IMindCore.EthTransferFailed.selector);
         r.buy(launchpad, token, 10 ether);
         // A non-completing buy needs no refund and works.
         r.buy(launchpad, token, 1 ether);
@@ -427,7 +428,7 @@ contract MindLaunchpadTradingTest is BaseTest {
         (uint256 out,, uint256 fee) = CurveMath.quoteBuy(0, 0, ethIn, tradeFeeBps);
         uint256 mindAmount = fee * mindShareBps / 10_000;
         vm.expectEmit(true, false, false, true, address(launchpad));
-        emit IMindLaunchpad.FeeAccrued(token, mindAmount, fee - mindAmount);
+        emit IMindCore.FeeAccrued(token, mindAmount, fee - mindAmount);
         _buy(alice, token, ethIn);
         assertEq(launchpad.mindBalance(token), mindAmount);
         assertEq(launchpad.protocolBalance(), fee - mindAmount);

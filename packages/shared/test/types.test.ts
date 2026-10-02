@@ -10,6 +10,7 @@ import {
   fromBigintString,
   hash32Schema,
   healthResponseSchema,
+  launchConfigResponseSchema,
   ledgerEntrySchema,
   memorySchema,
   metadataUploadResponseSchema,
@@ -19,6 +20,8 @@ import {
   mindStatusValue,
   mindSummarySchema,
   mindsResponseSchema,
+  ponsMindInfoSchema,
+  ponsPhaseName,
   redactActionInput,
   statsResponseSchema,
   thoughtSchema,
@@ -42,6 +45,7 @@ const summary: MindSummary = {
   image: null,
   modelId: hash,
   model: 'claude-opus-5-5',
+  venue: 'curve',
   status: 'alive',
   phase: 'bonding',
   priceWei: '1272134203168685',
@@ -67,6 +71,20 @@ const detail = {
   pool: null,
   positionId: null,
   lastFrameAt: null,
+  pons: null,
+};
+
+const ponsInfo = {
+  curve: token,
+  account: token,
+  deployer: null,
+  launchConfigId: 0,
+  feeBps: 100,
+  creatorTaxBps: 500,
+  claimableWei: '2000000000000000',
+  launchedHere: true,
+  adopted: false,
+  poolId: null,
 };
 
 const receiptObject = {
@@ -102,6 +120,9 @@ describe('primitives', () => {
     expect(curvePhaseName(2)).toBe('graduated');
     expect(mindStatusValue('paused')).toBe(2);
     expect(curvePhaseValue('complete')).toBe(1);
+    // Pons GraduationPhase { NotGraduated, Swept, PoolCreated, Rescued } (SPEC §9.3)
+    expect([0, 1, 2, 3].map(ponsPhaseName)).toEqual(['bonding', 'complete', 'graduated', 'graduated']);
+    expect(() => ponsPhaseName(4)).toThrow(RangeError);
   });
 });
 
@@ -112,6 +133,31 @@ describe('§5 DTOs', () => {
     expect(mindSummarySchema.safeParse({ ...summary, status: 'retired' }).success).toBe(false);
     expect(mindSummarySchema.safeParse({ ...summary, progressBps: 10001 }).success).toBe(false);
     expect(mindSummarySchema.safeParse({ ...summary, model: 'gpt-5' }).success).toBe(false);
+    expect(mindSummarySchema.safeParse({ ...summary, venue: 'pump' }).success).toBe(false);
+  });
+
+  it('Pons mode: MindSummary.venue and MindDetail.pons (SPEC §9.3)', () => {
+    const ponsDetail = { ...detail, venue: 'pons', pons: { ...ponsInfo, poolId: hash.toUpperCase().replace('0X', '0x') } };
+    expect(mindDetailSchema.parse(ponsDetail).pons).toEqual({ ...ponsInfo, poolId: hash });
+    expect(ponsMindInfoSchema.parse(ponsInfo)).toEqual(ponsInfo);
+    for (const key of ['deployer', 'launchConfigId', 'feeBps', 'creatorTaxBps', 'poolId'] as const) {
+      expect(ponsMindInfoSchema.safeParse({ ...ponsInfo, [key]: undefined }).success, key).toBe(false);
+    }
+    expect(ponsMindInfoSchema.safeParse({ ...ponsInfo, claimableWei: '-1' }).success).toBe(false);
+    expect(mindDetailSchema.safeParse({ ...detail, pons: undefined }).success).toBe(false);
+    expect(mindSummarySchema.safeParse({ ...summary, venue: undefined }).success).toBe(false);
+  });
+
+  it('GET /api/launch-config (SPEC §9.4)', () => {
+    const body = {
+      launchFee: '500000000000000',
+      configs: [{ id: 0, supply: '1000000000000000000000000000', curveFeeBps: 100, phantomQuote: '1680000000000000000', graduationThreshold: '4200000000000000000', enabled: true }],
+      maxCreatorTaxBps: 1000,
+      snipeTaxSeconds: 15,
+    };
+    expect(launchConfigResponseSchema.parse(body)).toEqual(body);
+    expect(launchConfigResponseSchema.safeParse({ ...body, launchFee: 0.0005 }).success).toBe(false);
+    expect(launchConfigResponseSchema.safeParse({ ...body, configs: [{ ...body.configs[0], enabled: undefined }] }).success).toBe(false);
   });
 
   it('nullable fields must be present (undefined is rejected)', () => {
@@ -155,7 +201,9 @@ describe('§5 DTOs', () => {
   });
 
   it('Health / Minds / Stats / AnchorBatch / metadata upload', () => {
-    expect(healthResponseSchema.parse({ ok: false, chainId: 46630, launchpad: token, lastIndexedBlock: 0, headBlock: 0, activeMinds: 0, dryRun: true }).ok).toBe(false);
+    expect(healthResponseSchema.parse({ ok: false, chainId: 46630, venue: 'curve', launchpad: token, registry: null, lastIndexedBlock: 0, headBlock: 0, activeMinds: 0, dryRun: true }).ok).toBe(false);
+    expect(healthResponseSchema.parse({ ok: true, chainId: 4663, venue: 'pons', launchpad: `0x${'00'.repeat(20)}`, registry: token, lastIndexedBlock: 1, headBlock: 1, activeMinds: 0, dryRun: true }).registry).toBe(token);
+    expect(healthResponseSchema.safeParse({ ok: true, chainId: 4663, launchpad: token, lastIndexedBlock: 1, headBlock: 1, activeMinds: 0, dryRun: true }).success).toBe(false);
     expect(mindsResponseSchema.parse({ items: [summary], nextCursor: null }).items).toHaveLength(1);
     expect(statsResponseSchema.parse({ minds: 1, alive: 1, graduated: 0, totalVolumeWei: '0', totalFeesToMindsWei: '0' }).minds).toBe(1);
     expect(anchorBatchSchema.parse({ token, fromSeq: 1, toSeq: 1, memories: [{ seq: 1, kind: 'note', content: 'a', url: null, createdAt: at }] }).toSeq).toBe(1);

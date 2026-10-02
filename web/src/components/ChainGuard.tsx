@@ -1,13 +1,13 @@
 /**
  * Gate for write actions: renders `children` only when a wallet is connected to the target
- * chain and the launchpad address is configured; otherwise shows the next step (connect,
- * switch / add Robinhood Chain, or a configuration notice).
+ * chain and the launchpad (curve mode) or registry (Pons mode) address is configured; otherwise
+ * shows the next step (connect, switch / add Robinhood Chain, or a configuration notice).
  *
  * @module components/ChainGuard
  */
 import { useState, type ReactNode } from 'react';
 import { useConnection } from 'wagmi';
-import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
+import { CORE_ADDRESS, CORE_ENV_VAR, CORE_LABEL, TARGET_CHAIN, VENUE } from '../config';
 import { useChainSwitch } from '../hooks/useChainSwitch';
 import { ConnectMenu } from './WalletButton';
 
@@ -28,11 +28,12 @@ export function ChainGuard({ children, action = 'continue', compact = false, inl
   const chainSwitch = useChainSwitch();
   const [picking, setPicking] = useState(false);
 
-  if (LAUNCHPAD_ADDRESS === null) {
-    if (inline) return <span className="self-center text-[11px] text-amber">launchpad not configured</span>;
+  if (CORE_ADDRESS === null) {
+    if (inline) return <span className="self-center text-[11px] text-amber">{CORE_LABEL} not configured</span>;
     return (
       <p className="rounded border border-amber/40 bg-amber/5 p-2 text-[12px] text-amber">
-        No launchpad is configured for {TARGET_CHAIN.name}. Set VITE_LAUNCHPAD_ADDRESS (or sync contracts/deployments) to enable on-chain actions.
+        No {VENUE === 'pons' ? 'PonsMindRegistry' : 'launchpad'} is configured for {TARGET_CHAIN.name}. Set {CORE_ENV_VAR} (or sync contracts/deployments) to
+        enable on-chain actions.
       </p>
     );
   }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseMemoryBatchUri } from '../api';
-import { normalizeCompute, normalizeMindDetail, normalizeMindsPage, normalizeStats, toStatusName } from './normalize';
+import { normalizeCompute, normalizeHealth, normalizeLaunchConfig, normalizeMindDetail, normalizeMindsPage, normalizeStats, toStatusName } from './normalize';
 
 const TOKEN = '0x00000000000000000000000000000000000000AA';
 const HASH = `0x${'cd'.repeat(32)}`;
@@ -78,5 +78,63 @@ describe('normalizers', () => {
   it('parses runner:// memory batch URIs', () => {
     expect(parseMemoryBatchUri(`runner://memories/${TOKEN}/5-9`)).toEqual({ token: TOKEN.toLowerCase(), fromSeq: 5, toSeq: 9 });
     expect(parseMemoryBatchUri('ipfs://x')).toBeNull();
+  });
+});
+
+describe('Pons fields (SPEC §9.3/§9.4)', () => {
+  const pons = {
+    curve: '0x00000000000000000000000000000000000000C1',
+    account: '0x00000000000000000000000000000000000000c2',
+    deployer: '0x00000000000000000000000000000000000000c3',
+    launchConfigId: 1,
+    feeBps: 100,
+    creatorTaxBps: 250,
+    claimableWei: '1234',
+    launchedHere: true,
+    adopted: false,
+    poolId: null,
+  };
+
+  it('reads venue on summaries and pons on details', () => {
+    expect(normalizeMindsPage({ items: [{ ...summary, venue: 'pons' }], nextCursor: null }).items[0]?.venue).toBe('pons');
+    expect(normalizeMindsPage({ items: [summary], nextCursor: null }).items[0]?.venue).toBeNull();
+    const m = normalizeMindDetail({ ...summary, venue: 'pons', personaHash: HASH, pons });
+    expect(m.pons).toEqual({
+      curve: pons.curve.toLowerCase(),
+      account: pons.account,
+      deployer: pons.deployer,
+      launchConfigId: 1n,
+      feeBps: 100,
+      creatorTaxBps: 250,
+      claimableWei: 1234n,
+      launchedHere: true,
+      adopted: false,
+      poolId: null,
+    });
+    expect(normalizeMindDetail({ ...summary, personaHash: HASH, pons: null }).pons).toBeNull();
+    expect(normalizeMindDetail({ ...summary, personaHash: HASH, pons: { feeBps: 1 } }).pons).toBeNull();
+  });
+
+  it('reads venue and registry from /api/health', () => {
+    const h = normalizeHealth({ ok: true, chainId: 4663, launchpad: null, lastIndexedBlock: 1, headBlock: 2, activeMinds: 0, dryRun: false, venue: 'pons', registry: pons.account });
+    expect(h.venue).toBe('pons');
+    expect(h.registry).toBe(pons.account);
+  });
+
+  it('normalises /api/launch-config', () => {
+    const cfg = normalizeLaunchConfig({
+      launchFee: '500000000000000',
+      configs: [
+        { id: 0, supply: '1000000000000000000000000000', curveFeeBps: 100, phantomQuote: '1500000000000000000', graduationThreshold: '4000000000000000000', enabled: true },
+        { id: 1, supply: 'oops' },
+      ],
+      maxCreatorTaxBps: 1000,
+      snipeTaxSeconds: 15,
+    });
+    expect(cfg.launchFee).toBe(5n * 10n ** 14n);
+    expect(cfg.configs).toEqual([{ id: 0n, supply: 10n ** 27n, curveFeeBps: 100, phantomQuote: 15n * 10n ** 17n, graduationThreshold: 4n * 10n ** 18n, enabled: true }]);
+    expect(cfg.maxCreatorTaxBps).toBe(1000);
+    expect(cfg.snipeTaxSeconds).toBe(15);
+    expect(() => normalizeLaunchConfig({ configs: [] })).toThrow(/launchFee/);
   });
 });

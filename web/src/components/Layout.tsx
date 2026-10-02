@@ -4,7 +4,7 @@
  * @module components/Layout
  */
 import { NavLink, Outlet, ScrollRestoration } from 'react-router';
-import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
+import { CORE_ADDRESS, CORE_LABEL, TARGET_CHAIN, VENUE } from '../config';
 import { useHealth } from '../queries';
 import { WalletButton } from './WalletButton';
 import { AddressLink } from './common';
@@ -26,6 +26,7 @@ function RunnerHealth() {
       {lag !== null && lag > 50 && ` · indexer ${lag} blocks behind`}
       {h.dryRun === true && ' · dry run'}
       {h.chainId !== null && h.chainId !== TARGET_CHAIN.id && ` · chain mismatch (${h.chainId})`}
+      {h.venue !== null && h.venue !== VENUE && ` · venue mismatch (runner: ${h.venue})`}
     </span>
   );
 }
@@ -67,7 +68,8 @@ export function Layout() {
             {TARGET_CHAIN.name} · chain {TARGET_CHAIN.id}
           </span>
           <span>
-            launchpad {LAUNCHPAD_ADDRESS !== null ? <AddressLink address={LAUNCHPAD_ADDRESS} /> : <span className="text-amber">not configured</span>}
+            {VENUE === 'pons' ? 'venue pons · ' : ''}
+            {CORE_LABEL} {CORE_ADDRESS !== null ? <AddressLink address={CORE_ADDRESS} /> : <span className="text-amber">not configured</span>}
           </span>
           <RunnerHealth />
           <span className="ml-auto">minds run on Claude; their compute is paid from their own vaults</span>

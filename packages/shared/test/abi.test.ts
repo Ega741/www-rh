@@ -3,7 +3,21 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { toEventSelector, toFunctionSelector, type Abi, type AbiEvent, type AbiFunction } from 'viem';
-import { BURN_ADDRESS, CurvePhase, MindStatus, graduatorAbi, mindLaunchpadAbi, mindTokenAbi } from '../src/abi.js';
+import {
+  BURN_ADDRESS,
+  CurvePhase,
+  MindStatus,
+  PonsGraduationPhase,
+  graduatorAbi,
+  mindAccountAbi,
+  mindLaunchpadAbi,
+  mindTokenAbi,
+  ponsCurveAbi,
+  ponsFactoryAbi,
+  ponsFeeEscrowAbi,
+  ponsMemeHookAbi,
+  ponsMindRegistryAbi,
+} from '../src/abi.js';
 
 type AbiError = Extract<Abi[number], { type: 'error' }>;
 
@@ -219,7 +233,153 @@ describe.skipIf(graduatorArtifact === undefined)('IGraduator ABI equivalence wit
   });
 });
 
-for (const [name, abi] of [['MindLaunchpad', launchpadArtifact], ['MindToken', tokenArtifact]] as const) {
+// ===================================================================================== Pons mode (§9)
+
+const sorted = (abi: Abi, type: 'function' | 'event' | 'error'): string[] => [...names(abi, type)].sort();
+
+describe('Pons V2 ABIs carry exactly the §9.1 members (verified mainnet signatures)', () => {
+  it('factory / curve / escrow / hook member sets', () => {
+    expect(sorted(ponsFactoryAbi, 'function')).toEqual(
+      [
+        'canLaunch', 'createGraduatedPool', 'getLaunchConfig', 'getLaunchedToken', 'launchConfigCount', 'launchEnabled', 'launchFee', 'launchToken',
+        'maxCreatorTaxBps', 'previewLaunchEconomics', 'snipeTaxSeconds', 'transferCreatorFeeRecipient', 'whitelistedLaunchers',
+      ].sort(),
+    );
+    expect(sorted(ponsFactoryAbi, 'event')).toEqual(['CreatorFeeRecipientUpdated', 'LaunchSwept', 'PoolGraduated', 'TokenLaunched']);
+    expect(sorted(ponsCurveAbi, 'function')).toEqual(
+      ['buy', 'creatorTaxBps', 'feeBps', 'getReserves', 'graduated', 'graduationThreshold', 'readyToGraduate', 'realQuoteReserve', 'sell', 'sellableTokens', 'sweepFees'].sort(),
+    );
+    expect(sorted(ponsCurveAbi, 'event')).toEqual(['CurveBuy', 'CurveBuyRefunded', 'CurveCompleted', 'CurveSell', 'FeesSwept']);
+    expect(sorted(ponsFeeEscrowAbi, 'function')).toEqual(['balanceOf', 'claim', 'credit']);
+    expect(sorted(ponsFeeEscrowAbi, 'event')).toEqual(['Claimed', 'Credited']);
+    expect(sorted(ponsMemeHookAbi, 'function')).toEqual(['sweepPoolFees']);
+    expect(sorted(ponsMemeHookAbi, 'event')).toEqual(['PoolFeesSwept', 'PoolRegistered']);
+    for (const abi of [ponsFactoryAbi, ponsCurveAbi, ponsFeeEscrowAbi, ponsMemeHookAbi]) expect(names(abi, 'error').size).toBe(0);
+  });
+
+  it('selectors and topics equal the verified mainnet contracts', () => {
+    const f = selectorsOf(ponsFactoryAbi);
+    expect(f.functions.get('0xa72101af')).toBe('launchToken((string,string,string,string,(string,string,string,string,string),address,uint16,bool,bytes32,bytes32),uint256,address,address[])');
+    expect(f.functions.has(toFunctionSelector('createGraduatedPool(address)'))).toBe(true);
+    expect(f.functions.has(toFunctionSelector('transferCreatorFeeRecipient(address,address)'))).toBe(true);
+    // topic0s observed on chain (V2 factory logs)
+    expect(f.events.has('0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607')).toBe(true); // TokenLaunched
+    expect(f.events.has('0xcdb72f157fd3666758a6ce201387ffb52038c7562e4fff352828da1096c4b6b4')).toBe(true); // LaunchSwept
+    expect(f.events.has('0x0a44ef75df69c534f43cd6c1aa3ef8983065fe5fe79ef9e79f6494e6f258c259')).toBe(true); // PoolGraduated
+    const c = selectorsOf(ponsCurveAbi);
+    expect(c.functions.get('0x59a87bc1')).toBe('buy(uint256,uint256,address)');
+    expect(c.functions.get('0xd04c6983')).toBe('sell(uint256,uint256,address)');
+    expect(c.functions.get('0x0902f1ac')).toBe('getReserves()');
+    expect(c.events.get(toEventSelector('CurveBuy(address,address,uint256,uint256,uint256,uint256)'))).toBeDefined();
+    expect(c.events.get(toEventSelector('CurveCompleted(address,uint256,uint256)'))).toBeDefined();
+    const e = selectorsOf(ponsFeeEscrowAbi);
+    expect(e.functions.get('0x4e71d92d')).toBe('claim()');
+    expect(e.events.has(toEventSelector('Credited(address,address,uint256)'))).toBe(true);
+    const h = selectorsOf(ponsMemeHookAbi);
+    expect(h.functions.get('0x3d61055e')).toBe('sweepPoolFees(bytes32,uint256,uint256)');
+    expect(h.events.has(toEventSelector('PoolRegistered(bytes32,address,address,address)'))).toBe(true);
+    expect(h.events.has(toEventSelector('PoolFeesSwept(bytes32,uint256,uint256,uint256,uint256)'))).toBe(true);
+  });
+
+  it('decoded names: indexed event params and struct outputs', () => {
+    const ev = (abi: Abi, name: string): string[] =>
+      (abi.find((i) => i.type === 'event' && i.name === name) as AbiEvent).inputs.map((i) => `${i.name}${i.indexed === true ? '*' : ''}`);
+    expect(ev(ponsCurveAbi, 'CurveBuy')).toEqual(['buyer*', 'recipient*', 'quoteIn', 'tokensOut', 'fee', 'tax']);
+    expect(ev(ponsCurveAbi, 'CurveSell')).toEqual(['seller*', 'recipient*', 'tokensIn', 'quoteOut', 'fee', 'tax']);
+    expect(ev(ponsFactoryAbi, 'LaunchSwept')).toEqual(['token*', 'quoteOut', 'tokenOut']);
+    expect(ev(ponsFeeEscrowAbi, 'Claimed')).toEqual(['recipient*', 'amount']);
+    expect(ev(ponsMemeHookAbi, 'PoolRegistered')).toEqual(['poolId*', 'memecoin', 'quoteToken', 'creator']);
+    const launched = (ponsFactoryAbi.find((i) => i.type === 'function' && i.name === 'getLaunchedToken') as AbiFunction).outputs[0] as { components: readonly { name: string }[] };
+    expect(launched.components.map((c) => c.name)).toEqual([
+      'token', 'curve', 'deployer', 'creatorFeeRecipient', 'pairToken', 'graduationThreshold', 'poolFee', 'tickSpacing', 'creatorTaxBps', 'buybackEnabled', 'phase',
+      'sweptQuote', 'sweptTokens', 'sweptAt', 'exists',
+    ]);
+    expect(PonsGraduationPhase).toEqual({ NotGraduated: 0, Swept: 1, PoolCreated: 2, Rescued: 3 });
+  });
+});
+
+/** MindLaunchpad-only members (§9.2: they do not exist on the registry). */
+const CURVE_ONLY = [
+  'createMind', 'buy', 'sell', 'graduate', 'quoteBuy', 'quoteSell', 'currentPrice', 'getCurve', 'completedAt', 'graduationGrace', 'setGraduationGrace',
+  'graduator', 'graduatorOf', 'setGraduator', 'feeParams', 'setFeeParams', 'TOTAL_SUPPLY', 'CURVE_SUPPLY', 'LP_SUPPLY', 'VIRTUAL_ETH', 'VIRTUAL_TOKENS',
+  'Trade', 'CurveCompleted', 'CurveReopened', 'Graduated', 'GraduatorUpdated', 'FeeParamsUpdated', 'GraduationGraceUpdated',
+  'WrongPhase', 'Slippage', 'Expired', 'ExceedsTokensSold', 'GraduatorNotSet', 'InvalidGraduationGrace', 'InvalidGraduator', 'PoolPriceSkewed',
+];
+
+describe('PonsMindRegistry / MindAccount ABIs (§9.2)', () => {
+  it('registry = MindCore surface + Pons integration, without MindLaunchpad-only members', () => {
+    const fns = names(ponsMindRegistryAbi, 'function');
+    for (const name of [
+      'launchMind', 'prepareAdoption', 'activateAdoption', 'leave', 'harvest', 'createGraduatedPool', 'setPoolId', 'ponsMind', 'accountOf', 'tokenOf',
+      'predictAccount', 'predictAdoptionAccount', 'claimable', 'launchQuote', 'factory', 'feeEscrow', 'memeHook', 'accountImplementation', 'mindFeeBps', 'setMindFeeBps',
+      'fundMind', 'drawCompute', 'anchorMemory', 'setMindStatus', 'setMindConfig', 'setCreatorPaused', 'getMind', 'mindBalance', 'protocolBalance', 'mindsLength',
+      'mindAt', 'isMind', 'creationFee', 'setCreationFee', 'drawLimit', 'setDrawLimit', 'drawnInEpoch', 'operator', 'treasury', 'computeTreasury', 'setOperator',
+      'setTreasury', 'setComputeTreasury', 'pause', 'unpause', 'paused', 'withdrawProtocolFees', 'owner', 'pendingOwner', 'transferOwnership', 'acceptOwnership',
+      'renounceOwnership',
+    ]) {
+      expect(fns.has(name), `function ${name}`).toBe(true);
+    }
+    const events = names(ponsMindRegistryAbi, 'event');
+    for (const name of ['MindLaunched', 'AdoptionPrepared', 'MindAdopted', 'MindLeft', 'SweepAttempted', 'PoolIdSet', 'MindFeeUpdated', 'MindCreated', 'FeeAccrued', 'MindFunded', 'Harvested', 'ComputeDrawn', 'MemoryAnchored', 'MindConfigUpdated', 'MindStatusChanged']) {
+      expect(events.has(name), `event ${name}`).toBe(true);
+    }
+    const errors = names(ponsMindRegistryAbi, 'error');
+    for (const name of ['AccountExists', 'NotPonsLaunch', 'NotRecipientOrDeployer', 'AdoptionNotReady', 'AlreadyAdopted', 'WrongValue', 'LaunchFailed', 'NotAMind', 'EthReturnMismatch', 'DirectEthNotAccepted']) {
+      expect(errors.has(name), `error ${name}`).toBe(true);
+    }
+    for (const name of CURVE_ONLY) expect(fns.has(name) || events.has(name) || errors.has(name), name).toBe(false);
+    const ctor = ponsMindRegistryAbi.find((i) => i.type === 'constructor') as { inputs: readonly { name: string }[] };
+    expect(ctor.inputs.map((i) => i.name)).toEqual(['initialOwner', 'treasury', 'computeTreasury', 'operator', 'factory', 'feeEscrow', 'memeHook']);
+    const launch = ponsMindRegistryAbi.find((i) => i.type === 'function' && i.name === 'launchMind') as AbiFunction;
+    expect(launch.stateMutability).toBe('payable');
+    expect(launch.outputs.map((o) => o.name)).toEqual(['token', 'curve', 'account']);
+    const pons = (ponsMindRegistryAbi.find((i) => i.type === 'function' && i.name === 'ponsMind') as AbiFunction).outputs[0] as { components: readonly { name: string }[] };
+    expect(pons.components.map((c) => c.name)).toEqual(['curve', 'account', 'launchConfigId', 'launchedHere', 'adopted']);
+  });
+
+  it('every MindCore member has the same selector / topic as on MindLaunchpad (the runner reuses one code path)', () => {
+    const reg = selectorsOf(ponsMindRegistryAbi);
+    const lp = selectorsOf(mindLaunchpadAbi);
+    for (const sig of ['drawCompute(address,uint256,bytes32)', 'anchorMemory(address,uint64,bytes32,string)', 'setMindStatus(address,uint8)', 'harvest(address)', 'mindBalance(address)', 'getMind(address)', 'operator()']) {
+      const s = toFunctionSelector(sig);
+      expect(reg.functions.get(s), sig).toBe(lp.functions.get(s));
+    }
+    for (const [topic, sig] of lp.events) if (names(ponsMindRegistryAbi, 'event').has(sig.slice(0, sig.indexOf('(')))) expect(reg.events.get(topic), sig).toBe(sig);
+  });
+
+  it('MindAccount has exactly the §9.2 functions', () => {
+    expect(sorted(mindAccountAbi, 'function')).toEqual(['claim', 'initialize', 'registry', 'sweepPool', 'transferFeeRecipient']);
+    expect(mindAccountAbi.some((i) => i.type === 'receive')).toBe(true);
+  });
+});
+
+const registryArtifact = loadSyncedAbi('PonsMindRegistry');
+const accountArtifact = loadSyncedAbi('MindAccount');
+
+describe.skipIf(registryArtifact === undefined)('PonsMindRegistry ABI equivalence with abi/PonsMindRegistry.json', () => {
+  const ours = selectorsOf(ponsMindRegistryAbi);
+  const theirs = selectorsOf(registryArtifact ?? []);
+  it('functions and events are set-equal; every compiled error is declared', () => {
+    expect(missing(ours.functions, theirs.functions)).toEqual([]);
+    expect(missing(theirs.functions, ours.functions)).toEqual([]);
+    expect(missing(ours.events, theirs.events)).toEqual([]);
+    expect(missing(theirs.events, ours.events)).toEqual([]);
+    expect(missing(theirs.errors, ours.errors)).toEqual([]);
+  });
+});
+
+describe.skipIf(accountArtifact === undefined)('MindAccount ABI equivalence with abi/MindAccount.json', () => {
+  it('functions and events are set-equal; every compiled error is declared', () => {
+    const ours = selectorsOf(mindAccountAbi);
+    const theirs = selectorsOf(accountArtifact ?? []);
+    expect(missing(ours.functions, theirs.functions)).toEqual([]);
+    expect(missing(theirs.functions, ours.functions)).toEqual([]);
+    expect(missing(theirs.events, ours.events)).toEqual([]);
+    expect(missing(theirs.errors, ours.errors)).toEqual([]);
+  });
+});
+
+for (const [name, abi] of [['MindLaunchpad', launchpadArtifact], ['MindToken', tokenArtifact], ['PonsMindRegistry', registryArtifact], ['MindAccount', accountArtifact]] as const) {
   if (abi === undefined) {
     // eslint-disable-next-line no-console
     console.info(`[abi.test] packages/shared/abi/${name}.json not found — equivalence skipped (run \`forge build && pnpm abi:sync\`).`);

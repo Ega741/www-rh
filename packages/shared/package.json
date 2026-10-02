@@ -28,6 +28,11 @@
       "import": "./dist/curve.js",
       "default": "./dist/curve.js"
     },
+    "./ponsCurve": {
+      "types": "./dist/ponsCurve.d.ts",
+      "import": "./dist/ponsCurve.js",
+      "default": "./dist/ponsCurve.js"
+    },
     "./models": {
       "types": "./dist/models.d.ts",
       "import": "./dist/models.js",

@@ -10,6 +10,17 @@ optimizer = true
 optimizer_runs = 200
 via_ir = false
 ignored_warnings_from = ["lib/"]
+# Defaults plus 6335 ("leave" will be promoted to a keyword): SPEC §9.2 names PonsMindRegistry.leave(address,address)
+# normatively (shared TypeScript ABI); harmless with the pinned solc 0.8.37.
+ignored_error_codes = [
+    "license",
+    "code-size",
+    "init-code-size",
+    "transient-storage",
+    "transfer-deprecated",
+    "natspec-memory-safe-assembly-deprecated",
+    6335,
+]
 bytecode_hash = "none"
 cbor_metadata = false
 fs_permissions = [

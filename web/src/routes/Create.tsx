@@ -1,5 +1,6 @@
 /**
- * `/create` — launch a coin with a mind (directive W2):
+ * `/create` — launch a coin with a mind. Pons mode (SPEC §9.5, default) renders {@link PonsCreate}
+ * (Pons launch form + "Adopt an existing Pons coin"); curve mode keeps the §7 flow (directive W2):
  * metadata → `POST /api/metadata` (data: URI fallback) → `createMind(name, symbol, uri, modelId,
  * personaHash, minTokensOut)` with `value = creationFee + initialBuy` → decode `MindCreated` →
  * optional vault seed via `fundMind` → navigate to `/mind/<token>`.
@@ -8,22 +9,24 @@
  */
 import { DEFAULT_MODEL, DEFAULT_TRADE_FEE_BPS, mindLaunchpadAbi as launchpadAbi, TOTAL_SUPPLY } from '@www-rh/shared';
 import { useQueryClient } from '@tanstack/react-query';
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { zeroAddress, type Address, type Hex, type TransactionReceipt } from 'viem';
 import { useReadContract, useWriteContract } from 'wagmi';
 import { ChainGuard } from '../components/ChainGuard';
+import { Field } from '../components/FormField';
 import { ModelSelect } from '../components/ModelSelect';
 import { MindAvatar, TxLink } from '../components/common';
-import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
+import { LAUNCHPAD_ADDRESS, TARGET_CHAIN, VENUE } from '../config';
 import { formatBps, formatEth, formatTokens, parseAmount } from '../format';
 import { useTxFlow } from '../hooks/useTxFlow';
 import { describeError } from '../lib/errors';
 import { mindCreatedToken } from '../lib/events';
-import { METADATA_LIMITS, buildMetadata, dataUriFits, metadataJson, modelHashOf, validateDraft, type DraftErrors, type MetadataDraft } from '../lib/metadata';
+import { METADATA_LIMITS, PERSONA_PLACEHOLDER, buildMetadata, dataUriFits, metadataJson, modelHashOf, validateDraft, type DraftErrors, type MetadataDraft } from '../lib/metadata';
 import { publishMetadata, type PublishedMetadata } from '../lib/publish';
 import { DEFAULT_SLIPPAGE_BPS, planInitialBuy, slippagePercentToBps } from '../lib/quote';
 import { useHealth, useModels } from '../queries';
+import { PonsCreate } from './PonsCreate';
 
 type Step = 'form' | 'publishing' | 'creating' | 'seeding' | 'done';
 
@@ -37,21 +40,13 @@ const EMPTY_DRAFT: MetadataDraft = {
   links: { x: '', website: '', telegram: '' },
 };
 
-const PERSONA_PLACEHOLDER =
-  'You are an amateur astronomer who never sleeps. Every day you read new exoplanet papers on arXiv, check NASA APOD and the Minor Planet Center, and explain what you found in plain words. You distrust hype, you always link your sources, and you keep a running list of open questions you want to answer next.';
-
-function Field({ label, error, hint, children }: { label: string; error?: string | undefined; hint?: ReactNode; children: ReactNode }) {
-  return (
-    <div>
-      <span className="label">{label}</span>
-      {children}
-      {error !== undefined ? <p className="mt-1 text-[12px] text-danger">{error}</p> : hint !== undefined ? <p className="mt-1 text-[11px] text-mute">{hint}</p> : null}
-    </div>
-  );
+/** Create route: the Pons launch / adopt page in Pons mode, the launchpad form in curve mode. */
+export function Create() {
+  return VENUE === 'pons' ? <PonsCreate /> : <CurveCreate />;
 }
 
-/** Create route. */
-export function Create() {
+/** Curve-mode create form (SPEC §7). */
+function CurveCreate() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const models = useModels();

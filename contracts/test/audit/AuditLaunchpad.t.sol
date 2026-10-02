@@ -5,6 +5,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 import {MindToken} from "../../src/MindToken.sol";
 import {IGraduator} from "../../src/interfaces/IGraduator.sol";
+import {IMindCore} from "../../src/interfaces/IMindCore.sol";
 import {IMindLaunchpad} from "../../src/interfaces/IMindLaunchpad.sol";
 import {BaseTest} from "../utils/BaseTest.sol";
 
@@ -105,11 +106,11 @@ contract AuditLaunchpadTest is BaseTest {
         launchpad.setOperator(owner);
         launchpad.setComputeTreasury(owner);
         // [fix] the cap has a hard ceiling (MAX_DRAW_PER_EPOCH = 2 ether): an unbounded limit is rejected...
-        vm.expectRevert(IMindLaunchpad.InvalidDrawLimit.selector);
+        vm.expectRevert(IMindCore.InvalidDrawLimit.selector);
         launchpad.setDrawLimit(type(uint256).max, 3600);
         launchpad.setDrawLimit(2 ether, 3600);
         // ...so the whole vault cannot be drawn in one block.
-        vm.expectRevert(IMindLaunchpad.DrawLimitExceeded.selector);
+        vm.expectRevert(IMindCore.DrawLimitExceeded.selector);
         launchpad.drawCompute(token, vault, bytes32(0));
         launchpad.drawCompute(token, 2 ether, bytes32(0));
         vm.stopPrank();

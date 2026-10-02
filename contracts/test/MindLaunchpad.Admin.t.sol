@@ -7,6 +7,7 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {MindLaunchpad} from "../src/MindLaunchpad.sol";
 import {MindToken} from "../src/MindToken.sol";
 import {MockGraduator} from "../src/MockGraduator.sol";
+import {IMindCore} from "../src/interfaces/IMindCore.sol";
 import {IMindLaunchpad} from "../src/interfaces/IMindLaunchpad.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
 
@@ -42,15 +43,15 @@ contract MindLaunchpadAdminTest is BaseTest {
 
     function test_constructor_emitsAndValidates() public {
         vm.expectEmit(false, false, false, true);
-        emit IMindLaunchpad.TreasuryUpdated(treasury);
+        emit IMindCore.TreasuryUpdated(treasury);
         vm.expectEmit(false, false, false, true);
-        emit IMindLaunchpad.ComputeTreasuryUpdated(computeTreasury);
+        emit IMindCore.ComputeTreasuryUpdated(computeTreasury);
         vm.expectEmit(false, false, false, true);
-        emit IMindLaunchpad.OperatorUpdated(operator);
+        emit IMindCore.OperatorUpdated(operator);
         vm.expectEmit(false, false, false, true);
         emit IMindLaunchpad.FeeParamsUpdated(100, 7000, 250);
         vm.expectEmit(false, false, false, true);
-        emit IMindLaunchpad.DrawLimitUpdated(0.25 ether, 1 days);
+        emit IMindCore.DrawLimitUpdated(0.25 ether, 1 days);
         vm.expectEmit(false, false, false, true);
         emit IMindLaunchpad.GraduationGraceUpdated(1 days);
         MindLaunchpad fresh = new MindLaunchpad(owner, treasury, computeTreasury, operator);
@@ -58,11 +59,11 @@ contract MindLaunchpadAdminTest is BaseTest {
 
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
         new MindLaunchpad(address(0), treasury, computeTreasury, operator);
-        vm.expectRevert(IMindLaunchpad.ZeroAddress.selector);
+        vm.expectRevert(IMindCore.ZeroAddress.selector);
         new MindLaunchpad(owner, address(0), computeTreasury, operator);
-        vm.expectRevert(IMindLaunchpad.ZeroAddress.selector);
+        vm.expectRevert(IMindCore.ZeroAddress.selector);
         new MindLaunchpad(owner, treasury, address(0), operator);
-        vm.expectRevert(IMindLaunchpad.ZeroAddress.selector);
+        vm.expectRevert(IMindCore.ZeroAddress.selector);
         new MindLaunchpad(owner, treasury, computeTreasury, address(0));
     }
 
@@ -80,17 +81,17 @@ contract MindLaunchpadAdminTest is BaseTest {
         vm.startPrank(owner);
 
         vm.expectEmit(false, false, false, true, address(launchpad));
-        emit IMindLaunchpad.OperatorUpdated(a);
+        emit IMindCore.OperatorUpdated(a);
         launchpad.setOperator(a);
         assertEq(launchpad.operator(), a);
 
         vm.expectEmit(false, false, false, true, address(launchpad));
-        emit IMindLaunchpad.TreasuryUpdated(a);
+        emit IMindCore.TreasuryUpdated(a);
         launchpad.setTreasury(a);
         assertEq(launchpad.treasury(), a);
 
         vm.expectEmit(false, false, false, true, address(launchpad));
-        emit IMindLaunchpad.ComputeTreasuryUpdated(a);
+        emit IMindCore.ComputeTreasuryUpdated(a);
         launchpad.setComputeTreasury(a);
         assertEq(launchpad.computeTreasury(), a);
 
@@ -100,31 +101,31 @@ contract MindLaunchpadAdminTest is BaseTest {
         assertEq(launchpad.feeParams().tradeFeeBps, 500);
 
         vm.expectEmit(false, false, false, true, address(launchpad));
-        emit IMindLaunchpad.CreationFeeUpdated(1 ether);
+        emit IMindCore.CreationFeeUpdated(1 ether);
         launchpad.setCreationFee(1 ether);
         assertEq(launchpad.creationFee(), 1 ether);
 
-        vm.expectRevert(IMindLaunchpad.ZeroAddress.selector);
+        vm.expectRevert(IMindCore.ZeroAddress.selector);
         launchpad.setOperator(address(0));
-        vm.expectRevert(IMindLaunchpad.ZeroAddress.selector);
+        vm.expectRevert(IMindCore.ZeroAddress.selector);
         launchpad.setTreasury(address(0));
-        vm.expectRevert(IMindLaunchpad.ZeroAddress.selector);
+        vm.expectRevert(IMindCore.ZeroAddress.selector);
         launchpad.setComputeTreasury(address(0));
-        vm.expectRevert(IMindLaunchpad.FeeTooHigh.selector);
+        vm.expectRevert(IMindCore.FeeTooHigh.selector);
         launchpad.setFeeParams(IMindLaunchpad.FeeParams(501, 7000, 250));
-        vm.expectRevert(IMindLaunchpad.FeeTooHigh.selector);
+        vm.expectRevert(IMindCore.FeeTooHigh.selector);
         launchpad.setFeeParams(IMindLaunchpad.FeeParams(100, 10_001, 250));
-        vm.expectRevert(IMindLaunchpad.FeeTooHigh.selector);
+        vm.expectRevert(IMindCore.FeeTooHigh.selector);
         launchpad.setFeeParams(IMindLaunchpad.FeeParams(100, 7000, 1001));
         vm.stopPrank();
     }
 
     function test_renounceOwnership_disabled() public {
         vm.prank(owner);
-        vm.expectRevert(IMindLaunchpad.RenounceDisabled.selector);
+        vm.expectRevert(IMindCore.RenounceDisabled.selector);
         launchpad.renounceOwnership();
         vm.prank(stranger);
-        vm.expectRevert(IMindLaunchpad.RenounceDisabled.selector);
+        vm.expectRevert(IMindCore.RenounceDisabled.selector);
         launchpad.renounceOwnership();
         assertEq(launchpad.owner(), owner);
         // Transfers still work.
@@ -133,7 +134,7 @@ contract MindLaunchpadAdminTest is BaseTest {
         vm.prank(alice);
         launchpad.acceptOwnership();
         vm.prank(alice);
-        vm.expectRevert(IMindLaunchpad.RenounceDisabled.selector);
+        vm.expectRevert(IMindCore.RenounceDisabled.selector);
         launchpad.renounceOwnership();
         assertEq(launchpad.owner(), alice);
     }
@@ -141,11 +142,11 @@ contract MindLaunchpadAdminTest is BaseTest {
     function test_setDrawLimit_hardCeiling() public {
         vm.startPrank(owner);
         vm.expectEmit(false, false, false, true, address(launchpad));
-        emit IMindLaunchpad.DrawLimitUpdated(2 ether, 3600);
+        emit IMindCore.DrawLimitUpdated(2 ether, 3600);
         launchpad.setDrawLimit(2 ether, 3600); // MAX_DRAW_PER_EPOCH
-        vm.expectRevert(IMindLaunchpad.InvalidDrawLimit.selector);
+        vm.expectRevert(IMindCore.InvalidDrawLimit.selector);
         launchpad.setDrawLimit(2 ether + 1, 3600);
-        vm.expectRevert(IMindLaunchpad.InvalidDrawLimit.selector);
+        vm.expectRevert(IMindCore.InvalidDrawLimit.selector);
         launchpad.setDrawLimit(type(uint256).max, 1 days);
         vm.stopPrank();
         (uint256 maxPerEpoch, uint32 epochSeconds) = launchpad.drawLimit();
@@ -166,11 +167,11 @@ contract MindLaunchpadAdminTest is BaseTest {
         (, uint64 start) = launchpad.drawnInEpoch(token);
         vm.warp(uint256(start) + 3599);
         launchpad.drawCompute(token, 2 ether - 1, bytes32(0));
-        vm.expectRevert(IMindLaunchpad.DrawLimitExceeded.selector);
+        vm.expectRevert(IMindCore.DrawLimitExceeded.selector);
         launchpad.drawCompute(token, 1, bytes32(0));
         vm.warp(uint256(start) + 3600);
         launchpad.drawCompute(token, 2 ether, bytes32(0));
-        vm.expectRevert(IMindLaunchpad.DrawLimitExceeded.selector);
+        vm.expectRevert(IMindCore.DrawLimitExceeded.selector);
         launchpad.drawCompute(token, 1, bytes32(0));
         vm.stopPrank();
         assertEq(computeTreasury.balance, 4 ether, "2 x MAX_DRAW_PER_EPOCH within two seconds, no more");
@@ -230,12 +231,12 @@ contract MindLaunchpadAdminTest is BaseTest {
         address[4] memory callers = [stranger, owner, treasury, creator];
         for (uint256 i; i < callers.length; ++i) {
             vm.startPrank(callers[i]);
-            vm.expectRevert(IMindLaunchpad.NotOperator.selector);
+            vm.expectRevert(IMindCore.NotOperator.selector);
             launchpad.drawCompute(token, 1, bytes32(0));
-            vm.expectRevert(IMindLaunchpad.NotOperator.selector);
+            vm.expectRevert(IMindCore.NotOperator.selector);
             launchpad.anchorMemory(token, 1, bytes32(0), "");
-            vm.expectRevert(IMindLaunchpad.NotOperator.selector);
-            launchpad.setMindStatus(token, IMindLaunchpad.MindStatus.Dormant);
+            vm.expectRevert(IMindCore.NotOperator.selector);
+            launchpad.setMindStatus(token, IMindCore.MindStatus.Dormant);
             vm.stopPrank();
         }
     }
@@ -245,9 +246,9 @@ contract MindLaunchpadAdminTest is BaseTest {
         address[4] memory callers = [stranger, owner, operator, treasury];
         for (uint256 i; i < callers.length; ++i) {
             vm.startPrank(callers[i]);
-            vm.expectRevert(IMindLaunchpad.NotCreator.selector);
+            vm.expectRevert(IMindCore.NotCreator.selector);
             launchpad.setMindConfig(token, MODEL_ID, PERSONA_HASH, "");
-            vm.expectRevert(IMindLaunchpad.NotCreator.selector);
+            vm.expectRevert(IMindCore.NotCreator.selector);
             launchpad.setCreatorPaused(token, true);
             vm.stopPrank();
         }
@@ -283,18 +284,18 @@ contract MindLaunchpadAdminTest is BaseTest {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, operator));
         launchpad.withdrawProtocolFees(operator);
         vm.prank(owner);
-        vm.expectRevert(IMindLaunchpad.ZeroAddress.selector);
+        vm.expectRevert(IMindCore.ZeroAddress.selector);
         launchpad.withdrawProtocolFees(address(0));
 
         vm.expectEmit(true, false, false, true, address(launchpad));
-        emit IMindLaunchpad.ProtocolFeesWithdrawn(treasury, protocol);
+        emit IMindCore.ProtocolFeesWithdrawn(treasury, protocol);
         vm.prank(treasury);
         launchpad.withdrawProtocolFees(treasury);
         assertEq(treasury.balance, protocol);
         assertEq(launchpad.protocolBalance(), 0);
 
         vm.prank(owner);
-        vm.expectRevert(IMindLaunchpad.ZeroAmount.selector);
+        vm.expectRevert(IMindCore.ZeroAmount.selector);
         launchpad.withdrawProtocolFees(owner);
 
         _buy(alice, token, 1 ether);
@@ -340,7 +341,7 @@ contract MindLaunchpadAdminTest is BaseTest {
         vm.prank(operator);
         launchpad.drawCompute(token, 0.1 ether, bytes32(0));
         vm.prank(operator);
-        launchpad.setMindStatus(token, IMindLaunchpad.MindStatus.Dormant);
+        launchpad.setMindStatus(token, IMindCore.MindStatus.Dormant);
         vm.prank(creator);
         launchpad.setCreatorPaused(token, true);
         vm.prank(owner);

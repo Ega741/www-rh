@@ -1,7 +1,8 @@
 /**
  * `/mind/:token` — three columns: (1) stream: live frame, URL, thoughts, actions; (2) trade:
- * curve stats, buy / sell, graduation; (3) mind: model & persona, compute meter + feed,
- * creator tools, memories, receipts. Recent trades below.
+ * curve stats, buy / sell, graduation (the Pons curve in Pons mode, SPEC §9.5); (3) mind: model &
+ * persona, compute meter + feed (+ claimable / Harvest in Pons mode), creator tools, memories,
+ * receipts. Recent trades below.
  *
  * @module routes/Mind
  */
@@ -20,10 +21,11 @@ import { ReceiptsList } from '../components/ReceiptsList';
 import { StreamPanel } from '../components/StreamPanel';
 import { ThoughtsTicker } from '../components/ThoughtsTicker';
 import { TradePanel } from '../components/TradePanel';
+import { PonsTradePanel } from '../components/pons/PonsTradePanel';
 import { TradesTable, mergeTrades } from '../components/TradesTable';
-import { AddressLink, CopyButton, ExternalLink, MindAvatar, PhaseBadge, StatusBadge } from '../components/common';
+import { AddressLink, CopyButton, ExternalLink, MindAvatar, PhaseBadge, StatusBadge, VenueBadge } from '../components/common';
 import { modelLabel } from '../components/MindCard';
-import { RUNNER_LABEL, TARGET_CHAIN } from '../config';
+import { CORE_LABEL, RUNNER_LABEL, TARGET_CHAIN, VENUE } from '../config';
 import { formatEth, shortAddress, timeAgo } from '../format';
 import { useMindData, type ChainLookup } from '../hooks/useMindData';
 import { useMindStream } from '../hooks/useMindStream';
@@ -117,12 +119,19 @@ function MindPage({ token }: { token: Address }) {
           <ActionLog actions={stream.actions} />
         </div>
         <div className="min-w-0 space-y-4">
-          <TradePanel mind={live} onTx={data.refetchChain} />
+          {VENUE === 'pons' ? <PonsTradePanel mind={live} live={data.ponsLive} onTx={data.refetchChain} /> : <TradePanel mind={live} onTx={data.refetchChain} />}
         </div>
         <div className="min-w-0 space-y-4">
           <MindInfoPanel mind={live} />
-          <ComputeMeter mind={live} compute={computeData} computeError={computeError !== null} budget={stream.budget} onFunded={data.refetchChain} />
-          {isCreator && <CreatorTools mind={live} currentModel={currentModel} onChanged={data.refetchChain} />}
+          <ComputeMeter
+            mind={live}
+            compute={computeData}
+            computeError={computeError !== null}
+            budget={stream.budget}
+            onFunded={data.refetchChain}
+            claimableWei={data.ponsLive?.claimableWei ?? null}
+          />
+          {isCreator && <CreatorTools mind={live} currentModel={currentModel} onChanged={data.refetchChain} ponsLive={data.ponsLive} />}
           <MemoryList token={token} live={stream.memories} />
           <ReceiptsList compute={computeData} error={computeError !== null} />
         </div>
@@ -138,7 +147,7 @@ function MindUnavailable({ token, apiError, chain }: { token: Address; apiError:
   let body: string;
   if (chain === 'not-a-mind') {
     title = `No mind lives at ${shortAddress(token)}.`;
-    body = 'This address is not a coin of this launchpad. Check the link, or browse the minds that exist.';
+    body = `This address is not a ${VENUE === 'pons' ? 'mind of this registry' : 'coin of this launchpad'}. Check the link, or browse the minds that exist.`;
   } else if (chain === 'pending') {
     title = 'Looking for this coin…';
     body = unavailable ? `${RUNNER_LABEL} is unreachable; checking ${TARGET_CHAIN.name} directly.` : `The runner has not indexed ${shortAddress(token)}; checking ${TARGET_CHAIN.name} directly.`;
@@ -149,7 +158,7 @@ function MindUnavailable({ token, apiError, chain }: { token: Address; apiError:
     title = `indexing… ${shortAddress(token)} is not known to the runner yet.`;
     body =
       chain === 'disabled'
-        ? 'No launchpad is configured, so the chain cannot be checked. If the coin was just created it appears within a few blocks.'
+        ? `No ${CORE_LABEL} is configured, so the chain cannot be checked. If the coin was just created it appears within a few blocks.`
         : `${TARGET_CHAIN.name} could not be reached to check it. If the coin was just created it appears within a few blocks; this page keeps checking.`;
   }
   return (
@@ -179,7 +188,8 @@ function MindHeader({ mind }: { mind: MindDetail }) {
           </h1>
           <div className="flex flex-wrap items-center gap-2">
             <StatusBadge status={mind.status} />
-            <PhaseBadge phase={mind.phase} />
+            <VenueBadge venue={mind.venue} />
+            <PhaseBadge phase={mind.phase} venue={mind.venue} />
             <span className="chip">{modelLabel(mind)}</span>
             {mind.lastTickAt !== null && <span className="text-[11px] text-mute">last thought {timeAgo(mind.lastTickAt, now)}</span>}
           </div>
@@ -203,6 +213,14 @@ function MindHeader({ mind }: { mind: MindDetail }) {
         <dd>
           <AddressLink address={mind.creator} />
         </dd>
+        {mind.pons !== null && (
+          <>
+            <dt className="text-mute">{mind.pons.launchedHere ? 'launched here' : mind.pons.adopted ? 'adopted' : 'adoption pending'}</dt>
+            <dd>
+              account <AddressLink address={mind.pons.account} />
+            </dd>
+          </>
+        )}
         <dt className="text-mute">vault</dt>
         <dd className="tabular-nums">{formatEth(mind.mindBalanceWei)}</dd>
         <dt className="text-mute">born</dt>

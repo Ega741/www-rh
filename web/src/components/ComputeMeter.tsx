@@ -2,15 +2,17 @@
  * Compute meter: vault balance in ETH / USD, burn per hour and runway (vs. the runner's target
  * runway), plus "feed the mind". The on-chain `mindBalance` is authoritative for the balance;
  * USD values use the ETH/USD price implied by the runner's compute endpoint / budget messages.
+ * Pons mode (SPEC §9.5) adds the creator fees claimable from the Pons FeeEscrow and "Harvest".
  *
  * @module components/ComputeMeter
  */
-import { TARGET_RUNWAY_DAYS } from '../config';
+import { TARGET_RUNWAY_DAYS, VENUE } from '../config';
 import { formatDuration, formatEth, formatRunway, formatUsd, impliedEthUsd, runwayHours, weiToEth } from '../format';
 import type { StreamState } from '../lib/stream';
 import type { ComputeInfo, MindDetail } from '../lib/types';
 import { FeedMind } from './FeedMind';
 import { Panel, ProgressBar } from './common';
+import { HarvestButton } from './pons/HarvestButton';
 
 /** Derived numbers shown by the meter. */
 export interface ComputeFigures {
@@ -55,16 +57,20 @@ export interface ComputeMeterProps {
   computeError: boolean;
   budget: StreamState['budget'];
   onFunded: () => void;
+  /** Pons mode: creator fees claimable from the escrow (`registry.claimable`), live from chain. */
+  claimableWei?: bigint | null;
 }
 
 /** See module docs. */
-export function ComputeMeter({ mind, compute, computeError, budget, onFunded }: ComputeMeterProps) {
+export function ComputeMeter({ mind, compute, computeError, budget, onFunded, claimableWei = null }: ComputeMeterProps) {
   const f = computeFigures(mind, compute, budget);
+  const pons = VENUE === 'pons' && mind.pons !== null;
+  const claimable = claimableWei ?? mind.pons?.claimableWei ?? null;
   const targetHours = TARGET_RUNWAY_DAYS * 24;
   const runwayPct = f.runwayHours === null ? (f.balanceWei > 0n ? 100 : 0) : Math.min(100, (f.runwayHours / targetHours) * 100);
   const tone = f.runwayHours !== null && f.runwayHours < 24 ? 'amber' : 'acid';
   return (
-    <Panel title="compute" right={<span className="normal-case tracking-normal text-mute">paid by trading fees</span>}>
+    <Panel title="compute" right={<span className="normal-case tracking-normal text-mute">{pons ? 'paid by Pons creator fees' : 'paid by trading fees'}</span>}>
       <div className="space-y-3 p-3">
         <div className="flex items-end justify-between gap-3">
           <div>
@@ -78,13 +84,34 @@ export function ComputeMeter({ mind, compute, computeError, budget, onFunded }: 
             <p className="text-[12px] text-dim">{f.burnUsdPerHour !== null ? `burn ${formatUsd(f.burnUsdPerHour)}/h` : 'burn unknown'}</p>
           </div>
         </div>
+        {pons && (
+          <div className="space-y-2 rounded border border-line p-2">
+            <div className="flex items-end justify-between gap-3">
+              <div>
+                <p className="text-[11px] text-mute">claimable (Pons escrow)</p>
+                <p className="text-fg tabular-nums">{claimable !== null ? formatEth(claimable) : '—'}</p>
+                <p className="text-[11px] text-dim">
+                  {claimable !== null && f.ethUsd !== null ? `≈ ${formatUsd(weiToEth(claimable) * f.ethUsd)} · ` : ''}
+                  not in the vault until harvested
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="text-[11px] text-mute">vault + claimable</p>
+                <p className="text-fg tabular-nums">{formatEth(f.balanceWei + (claimable ?? 0n))}</p>
+              </div>
+            </div>
+            <HarvestButton token={mind.token} claimableWei={claimable} onHarvested={onFunded} />
+          </div>
+        )}
         <div>
           <ProgressBar percent={runwayPct} tone={tone} />
           <p className="mt-1 text-[11px] text-mute">
             {f.runwayHours === null
               ? f.balanceWei > 0n
                 ? 'Not burning right now: the vault is untouched until the mind thinks again.'
-                : 'Empty vault: the mind sleeps until someone feeds it or trades its coin.'
+                : pons
+                  ? 'Empty vault: the mind sleeps until someone feeds it or creator fees are harvested.'
+                  : 'Empty vault: the mind sleeps until someone feeds it or trades its coin.'
               : `${formatRunway(f.runwayHours)} of thinking left at the current pace (the runner paces minds toward ${TARGET_RUNWAY_DAYS} days).`}
           </p>
         </div>

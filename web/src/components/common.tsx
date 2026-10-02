@@ -4,9 +4,11 @@
  * @module components/common
  */
 import { useState, type ReactNode } from 'react';
+import { VENUE } from '../config';
 import { shortAddress, shortHash } from '../format';
 import { addressUrl, txUrl } from '../lib/chain';
-import type { CurvePhaseName, MindStatusName } from '../lib/types';
+import { ponsPhaseLabel } from '../lib/pons/phase';
+import type { CurvePhaseName, MindStatusName, VenueName } from '../lib/types';
 import type { TxFlow } from '../hooks/useTxFlow';
 
 /** Status dot + label (W3: paused is shown as "paused by creator"). */
@@ -32,11 +34,21 @@ export function StatusBadge({ status, compact = false }: { status: MindStatusNam
   );
 }
 
-/** Curve phase chip. */
-export function PhaseBadge({ phase }: { phase: CurvePhaseName }) {
+/** Curve phase chip. Pons minds label `complete` as "graduating" (SPEC §9.5). */
+export function PhaseBadge({ phase, venue }: { phase: CurvePhaseName; venue?: VenueName | null }) {
   const cls = phase === 'graduated' ? 'text-violet border-violet/40' : phase === 'complete' ? 'text-amber border-amber/40' : 'text-dim';
-  const label = phase === 'graduated' ? 'graduated' : phase === 'complete' ? 'curve complete' : 'bonding';
+  const label = (venue ?? VENUE) === 'pons' ? ponsPhaseLabel(phase) : phase === 'graduated' ? 'graduated' : phase === 'complete' ? 'curve complete' : 'bonding';
   return <span className={`chip ${cls}`}>{label}</span>;
+}
+
+/** Venue chip (SPEC §9.5 Home cards): "pons" or "curve". */
+export function VenueBadge({ venue }: { venue: VenueName | null }) {
+  const v = venue ?? VENUE;
+  return (
+    <span className={`chip ${v === 'pons' ? 'border-info/40 text-info' : 'text-dim'}`} title={v === 'pons' ? 'Trades on Pons V2 (ponsfamily.com)' : 'Trades on the www/rh bonding curve'}>
+      {v}
+    </span>
+  );
 }
 
 /** Progress bar (0..100). */

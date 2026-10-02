@@ -8,6 +8,8 @@ interface ImportMetaEnv {
   readonly VITE_RUNNER_WS?: string;
   readonly VITE_WALLETCONNECT_PROJECT_ID?: string;
   readonly VITE_MULTICALL?: string;
+  readonly VITE_VENUE?: string;
+  readonly VITE_REGISTRY_ADDRESS?: string;
 }
 
 interface ImportMeta {

@@ -17,6 +17,8 @@ export type { MindMetadata } from '@www-rh/shared';
 export type MindStatusName = 'alive' | 'dormant' | 'paused';
 /** Curve phase names (R11). */
 export type CurvePhaseName = 'bonding' | 'complete' | 'graduated';
+/** Venue a mind trades on (SPEC §9.3). */
+export type VenueName = 'pons' | 'curve';
 /** Sort keys accepted by `GET /api/minds`. */
 export type MindsSort = 'created' | 'mcap' | 'activity';
 
@@ -54,6 +56,52 @@ export interface MindSummary {
   createdAt: number;
   trades24h: number;
   volume24hWei: bigint;
+  /** Venue reported by the runner (SPEC §9.3); `null` from pre-Pons runners. */
+  venue: VenueName | null;
+}
+
+/** `MindDetail.pons` (SPEC §9.3): the Pons side of a mind, `null` for curve minds. */
+export interface PonsInfo {
+  curve: Address;
+  /** The mind's `MindAccount` (the Pons `creatorFeeRecipient` while it receives fees). */
+  account: Address;
+  /** Pons launch `deployer` (the registry for minds launched here). */
+  deployer: Address | null;
+  launchConfigId: bigint | null;
+  feeBps: number | null;
+  creatorTaxBps: number | null;
+  /** Creator fees credited to the account in the Pons FeeEscrow, not yet harvested. */
+  claimableWei: bigint;
+  launchedHere: boolean;
+  adopted: boolean;
+  /** Uniswap v4 pool id after graduation (recorded by the operator), when known. */
+  poolId: Hex | null;
+}
+
+/** Live Pons curve / launch state read from the chain for the mind page (Pons mode). */
+export interface PonsLive {
+  curve: Address;
+  /** Mind account (`registry.ponsMind(token).account`). */
+  account: Address | null;
+  /** `getReserves()`: quote reserve incl. the phantom reserve, excl. pending fees. */
+  quoteReserve: bigint | null;
+  tokenReserve: bigint | null;
+  /** `sellableTokens()`. */
+  sellable: bigint | null;
+  realQuoteReserve: bigint | null;
+  graduationThreshold: bigint | null;
+  feeBps: number | null;
+  creatorTaxBps: number | null;
+  graduated: boolean | null;
+  readyToGraduate: boolean | null;
+  /** `factory.getLaunchedToken(token).phase` (`GraduationPhase`). */
+  factoryPhase: number | null;
+  creatorFeeRecipient: Address | null;
+  deployer: Address | null;
+  /** Launch time in unix seconds (curve `launchedAt()`; else the mind's `createdAt` for minds launched here). */
+  launchedAt: number | null;
+  totalSupply: bigint | null;
+  claimableWei: bigint | null;
 }
 
 /** `MindDetail` = summary + resolved metadata and graduation info. */
@@ -67,6 +115,8 @@ export interface MindDetail extends MindSummary {
   persona: string | null;
   links: MindLinks | null;
   lastFrameAt: number | null;
+  /** Pons details (SPEC §9.3); `null` for curve minds and pre-Pons runners. */
+  pons: PonsInfo | null;
 }
 
 /** One curve trade (`Trade` event). */
@@ -181,6 +231,10 @@ export interface Health {
   headBlock: number | null;
   activeMinds: number | null;
   dryRun: boolean | null;
+  /** Venue the runner indexes (SPEC §9.4), `null` from pre-Pons runners. */
+  venue: VenueName | null;
+  /** `PonsMindRegistry` the runner indexes (Pons mode). */
+  registry: Address | null;
 }
 
 /** `GET /api/models` item (public fields). */

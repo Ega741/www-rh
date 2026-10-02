@@ -8,6 +8,7 @@ import {Vm} from "forge-std/Vm.sol";
 
 import {MindToken} from "../src/MindToken.sol";
 import {UniswapV3Graduator} from "../src/UniswapV3Graduator.sol";
+import {IMindCore} from "../src/interfaces/IMindCore.sol";
 import {IMindLaunchpad} from "../src/interfaces/IMindLaunchpad.sol";
 import {INonfungiblePositionManager} from "../src/interfaces/uniswap/INonfungiblePositionManager.sol";
 import {IUniswapV3Pool} from "../src/interfaces/uniswap/IUniswapV3Pool.sol";
@@ -450,7 +451,7 @@ contract UniswapV3GraduatorTest is BaseTest {
         assertGt(ethReturned, 0);
         uint256 found;
         for (uint256 i; i < logs.length; ++i) {
-            if (logs[i].emitter == address(launchpad) && logs[i].topics[0] == IMindLaunchpad.MindFunded.selector) {
+            if (logs[i].emitter == address(launchpad) && logs[i].topics[0] == IMindCore.MindFunded.selector) {
                 assertEq(logs[i].topics[1], bytes32(uint256(uint160(e.token))));
                 assertEq(logs[i].topics[2], bytes32(uint256(uint160(address(graduator)))));
                 assertEq(abi.decode(logs[i].data, (uint256)), ethReturned);
@@ -670,9 +671,9 @@ contract UniswapV3GraduatorTest is BaseTest {
         uint256 mindBefore = launchpad.mindBalance(e.token);
         uint256 burnBefore = MindToken(e.token).balanceOf(BURN);
         vm.expectEmit(true, true, false, true, address(launchpad));
-        emit IMindLaunchpad.MindFunded(e.token, address(graduator), ethFee);
+        emit IMindCore.MindFunded(e.token, address(graduator), ethFee);
         vm.expectEmit(true, false, false, true, address(launchpad));
-        emit IMindLaunchpad.Harvested(e.token, ethFee, tokenFee);
+        emit IMindCore.Harvested(e.token, ethFee, tokenFee);
         vm.prank(stranger);
         launchpad.harvest(e.token);
 
@@ -683,7 +684,7 @@ contract UniswapV3GraduatorTest is BaseTest {
 
         // Nothing left to collect.
         vm.expectEmit(true, false, false, true, address(launchpad));
-        emit IMindLaunchpad.Harvested(e.token, 0, 0);
+        emit IMindCore.Harvested(e.token, 0, 0);
         launchpad.harvest(e.token);
     }
 
@@ -712,7 +713,7 @@ contract UniswapV3GraduatorTest is BaseTest {
         uint256 mindBefore = launchpad.mindBalance(e.token);
         uint256 burnBefore = MindToken(e.token).balanceOf(BURN);
         vm.expectEmit(true, false, false, true, address(launchpad));
-        emit IMindLaunchpad.Harvested(e.token, wethFees, coinFees);
+        emit IMindCore.Harvested(e.token, wethFees, coinFees);
         launchpad.harvest(e.token);
         assertEq(launchpad.mindBalance(e.token), mindBefore + wethFees);
         assertEq(MindToken(e.token).balanceOf(BURN) - burnBefore, coinFees);

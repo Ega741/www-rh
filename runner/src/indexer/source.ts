@@ -4,7 +4,7 @@
  *
  * @module indexer/source
  */
-import type { Address, Hex } from 'viem';
+import { hexToBigInt, hexToNumber, toHex, type Address, type Hex } from 'viem';
 import type { RunnerPublicClient } from '../chain/clients.js';
 
 /** A raw (undecoded) mined log. */
@@ -25,11 +25,21 @@ export interface BlockHeader {
   parentHash: Hex;
 }
 
+/** An `eth_getLogs` filter: one or several addresses, optional topic filters (`null` = any, array = OR). */
+export interface LogFilter {
+  address: Address | readonly Address[];
+  topics?: readonly (Hex | readonly Hex[] | null)[];
+  fromBlock: bigint;
+  toBlock: bigint;
+}
+
 /** What the indexer needs from the chain. */
 export interface LogSource {
   getBlockNumber(): Promise<bigint>;
   /** Logs emitted by `address` in `[fromBlock, toBlock]`, in chain order. */
   getLogs(address: Address, fromBlock: bigint, toBlock: bigint): Promise<RawLog[]>;
+  /** Logs matching `filter` (Pons mode: address sets and indexed-topic filters). */
+  getLogsFiltered(filter: LogFilter): Promise<RawLog[]>;
   /** Timestamp (seconds) of a block. */
   getBlockTimestamp(blockNumber: bigint): Promise<bigint>;
   /** Hash and parent hash of a block (never cached: used for reorg detection). Rejects when the node does not have the block. */
@@ -67,6 +77,29 @@ export class ViemLogSource implements LogSource {
         transactionHash: log.transactionHash,
         logIndex: log.logIndex,
       };
+      if (ts !== undefined) raw.blockTimestamp = ts;
+      out.push(raw);
+    }
+    return out;
+  }
+
+  async getLogsFiltered(filter: LogFilter): Promise<RawLog[]> {
+    const rpc = (await this.client.request({
+      method: 'eth_getLogs',
+      params: [
+        {
+          address: (Array.isArray(filter.address) ? [...filter.address] : filter.address) as Address,
+          topics: (filter.topics ?? []).map((t) => (t === null ? null : Array.isArray(t) ? [...t] : t)) as never,
+          fromBlock: toHex(filter.fromBlock),
+          toBlock: toHex(filter.toBlock),
+        },
+      ],
+    })) as readonly { address: Hex; topics: Hex[]; data: Hex; blockNumber: Hex | null; transactionHash: Hex | null; logIndex: Hex | null; blockTimestamp?: unknown }[];
+    const out: RawLog[] = [];
+    for (const log of rpc) {
+      if (log.blockNumber === null || log.transactionHash === null || log.logIndex === null) continue;
+      const raw: RawLog = { address: log.address, topics: log.topics, data: log.data, blockNumber: hexToBigInt(log.blockNumber), transactionHash: log.transactionHash, logIndex: hexToNumber(log.logIndex) };
+      const ts = toBigint(log.blockTimestamp);
       if (ts !== undefined) raw.blockTimestamp = ts;
       out.push(raw);
     }
