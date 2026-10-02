@@ -1,9 +1,9 @@
 /**
  * Hash helpers on top of the shared canonical JSON (SPEC §3.2).
  *
- * `canonicalJson` comes from `@www-rh/shared`. LOCAL FALLBACKS (to be replaced by the SPEC-named
- * shared exports once published): `keccakCanonical` (≙ `drawReceiptHash` / `anchorBatchHash`)
- * and `utf8ByteLength`.
+ * `canonicalJson` comes from `@www-rh/shared`. `keccakCanonical` hashes an arbitrary served JSON
+ * object (used when a receipt does not match the shared schema, so the typed `drawReceiptHash`
+ * cannot be applied); `utf8ByteLength` sizes the `data:` URI fallback.
  *
  * @module lib/canonical
  */

@@ -5,8 +5,16 @@
  *
  * @module lib/metadata
  */
-import { isModelId, metadataDataUri, mindMetadataSchema, modelIdToHash } from '@www-rh/shared';
-import { keccak256, toBytes, type Hex } from 'viem';
+import {
+  MAX_METADATA_JSON_BYTES,
+  MAX_METADATA_URI_BYTES,
+  isModelId,
+  metadataDataUri,
+  mindMetadataSchema,
+  modelIdToHash,
+  personaHash,
+} from '@www-rh/shared';
+import type { Hex } from 'viem';
 import { canonicalJson, utf8ByteLength } from './canonical';
 import type { MindLinks, MindMetadata } from './types';
 
@@ -18,10 +26,10 @@ export const METADATA_LIMITS = {
   imageChars: 512,
   personaChars: 8000,
   linkChars: 256,
-  /** `POST /api/metadata` body limit. */
-  metadataJsonBytes: 32_768,
+  /** `POST /api/metadata` body limit (`MAX_METADATA_JSON_BYTES`). */
+  metadataJsonBytes: MAX_METADATA_JSON_BYTES,
   /** On-chain `metadataURI` limit — bounds the `data:` URI fallback (`MAX_METADATA_URI_BYTES`). */
-  metadataUriBytes: 2048,
+  metadataUriBytes: MAX_METADATA_URI_BYTES,
 } as const;
 
 /** Form state of the create / reconfigure flows. */
@@ -80,12 +88,9 @@ export function metadataJson(meta: MindMetadata): string {
   return canonicalJson({ ...meta, links: meta.links === undefined ? undefined : { ...meta.links } });
 }
 
-/**
- * `keccak256(utf8(persona))` — the on-chain `personaHash`.
- * LOCAL FALLBACK for the SPEC §3.2 shared `personaHash(persona)`.
- */
+/** `keccak256(utf8(persona))` — the on-chain `personaHash` (shared `personaHash`, SPEC §3.2). */
 export function personaHashOf(persona: string): Hex {
-  return keccak256(toBytes(persona));
+  return personaHash(persona);
 }
 
 /** `keccak256(utf8(modelId))` — the on-chain `modelId` (`modelIdToHash` from shared). */

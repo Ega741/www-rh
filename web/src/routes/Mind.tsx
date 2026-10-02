@@ -7,7 +7,7 @@
  */
 import { modelById } from '@www-rh/shared';
 import { useMemo } from 'react';
-import { Link, useParams } from 'react-router';
+import { Link, useLocation, useParams } from 'react-router';
 import { isAddress, type Address } from 'viem';
 import { useConnection } from 'wagmi';
 import { ApiError } from '../api';
@@ -59,6 +59,8 @@ function MindPage({ token }: { token: Address }) {
   const thoughts = useThoughts(token);
   const compute = useCompute(token);
   const { address } = useConnection();
+  const location = useLocation();
+  const seedError = isObjectState(location.state) && typeof location.state['seedError'] === 'string' ? location.state['seedError'] : null;
   const mergedTrades = useMemo(() => mergeTrades(stream.trades, trades.data ?? []), [stream.trades, trades.data]);
 
   if (data.mind === null) {
@@ -98,6 +100,11 @@ function MindPage({ token }: { token: Address }) {
   return (
     <div className="space-y-4">
       <MindHeader mind={live} />
+      {seedError !== null && (
+        <p className="rounded border border-amber/40 bg-amber/5 px-3 py-2 text-[12px] text-amber">
+          Your coin is live, but seeding its vault did not go through ({seedError}). You can feed the mind from the compute panel.
+        </p>
+      )}
       {isNotFound(data.apiError) ? (
         <p className="rounded border border-info/40 bg-info/5 px-3 py-2 text-[12px] text-info">
           indexing… The runner has not picked this coin up yet (it appears within a few blocks of creation). Curve and trading already work from the
@@ -132,6 +139,10 @@ function MindPage({ token }: { token: Address }) {
       <TradesTable trades={mergedTrades} symbol={live.symbol} loading={trades.isPending} error={trades.isError} />
     </div>
   );
+}
+
+function isObjectState(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
 }
 
 function MindHeader({ mind }: { mind: MindDetail }) {

@@ -39,36 +39,35 @@ export function resolveApiBase(env: WebEnv): string {
 }
 
 /**
- * WebSocket endpoint (directive W1). Dev: same-origin `/ws` through the Vite proxy. Prod:
- * `VITE_RUNNER_WS`, else `VITE_RUNNER_URL` with http→ws and `/ws`, else same-origin `/ws`.
+ * WebSocket endpoint (directive W1 / SPEC §7). Dev: same-origin `/ws` through the Vite proxy.
+ * Prod: `VITE_RUNNER_WS` when set, else the same-origin `/ws` URL.
  */
 export function resolveWsBase(env: WebEnv, location: { protocol: string; host: string }): string {
   const sameOrigin = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
   if (env.DEV) return sameOrigin;
   const explicit = clean(env.VITE_RUNNER_WS);
-  if (explicit !== '') return stripSlash(explicit);
-  const http = clean(env.VITE_RUNNER_URL);
-  if (http !== '') return `${stripSlash(http).replace(/^http/i, 'ws')}/ws`;
-  return sameOrigin;
+  return explicit !== '' ? stripSlash(explicit) : sameOrigin;
+}
+
+/** Optional RPC override for the wagmi transport (`VITE_RPC_URL`); `undefined` = the chain's rpc url. */
+export function resolveRpcUrl(env: WebEnv): string | undefined {
+  const rpc = clean(env.VITE_RPC_URL);
+  return rpc === '' ? undefined : rpc;
 }
 
 /**
  * The chain the app targets: `VITE_CHAIN_ID` resolved through `@www-rh/shared` chains
- * (default: Robinhood Chain Testnet), with an optional `VITE_RPC_URL` override. Multicall3 is
- * declared only when `VITE_MULTICALL=1` (`withMulticall3`, SPEC §7 / W5); any multicall3 entry of
- * the base definition is removed otherwise.
+ * (default: Robinhood Chain Testnet). Multicall3 is declared only when `VITE_MULTICALL=1`
+ * (`withMulticall3`, SPEC §7 / W5); any multicall3 entry of the base definition is removed
+ * otherwise. The chain's public rpc urls are kept as-is (they are what "Add Robinhood Chain"
+ * hands to the wallet); `VITE_RPC_URL` only affects the app's own transport.
  */
 export function resolveChain(env: WebEnv): Chain {
   const id = Number(clean(env.VITE_CHAIN_ID) || robinhoodChainTestnet.id);
   const base = chainById(id) ?? robinhoodChainTestnet;
-  const rpc = clean(env.VITE_RPC_URL);
   const { contracts, ...rest } = base;
   const { multicall3: _unverified, ...otherContracts } = contracts ?? {};
-  const chain: Chain = {
-    ...rest,
-    ...(Object.keys(otherContracts).length > 0 ? { contracts: otherContracts } : {}),
-    rpcUrls: rpc === '' ? base.rpcUrls : { ...base.rpcUrls, default: { http: [rpc] } },
-  };
+  const chain: Chain = { ...rest, ...(Object.keys(otherContracts).length > 0 ? { contracts: otherContracts } : {}) };
   return clean(env.VITE_MULTICALL) === '1' ? withMulticall3(chain) : chain;
 }
 
@@ -102,6 +101,8 @@ export const WS_BASE: string = resolveWsBase(
   env,
   typeof window === 'undefined' ? { protocol: 'http:', host: 'localhost' } : window.location,
 );
+/** RPC override for the wagmi transport (`undefined` = chain default). */
+export const RPC_URL: string | undefined = resolveRpcUrl(env);
 /** WalletConnect project id ('' = WalletConnect disabled). */
 export const WALLETCONNECT_PROJECT_ID: string = clean(env.VITE_WALLETCONNECT_PROJECT_ID);
 /** Whether viem may batch reads through Multicall3. */

@@ -5,6 +5,7 @@
  *
  * @module components/MemoryList
  */
+import { memoryContentHash } from '@www-rh/shared';
 import { useMemo } from 'react';
 import type { Address } from 'viem';
 import { memoryBatchUrl, parseMemoryBatchUri } from '../api';
@@ -23,6 +24,20 @@ export function mergeMemories(live: readonly Memory[], fetched: readonly Memory[
     bySeq.set(m.seq, prev !== undefined && prev.anchorTx !== null && m.anchorTx === null ? prev : m);
   }
   return [...bySeq.values()].sort((a, b) => b.seq - a.seq);
+}
+
+/**
+ * Re-computes `Memory.contentHash` (SPEC §3.2 `memoryContentHash`) from the served fields.
+ * `createdAt` is re-serialised with `toISOString()`, the wire format of SPEC §0.1.
+ */
+export function memoryHashMatches(m: Memory): boolean {
+  if (m.contentHash === null || m.createdAt <= 0) return false;
+  try {
+    const hash = memoryContentHash({ seq: m.seq, kind: m.kind, content: m.content, url: m.url, createdAt: new Date(m.createdAt).toISOString() });
+    return hash.toLowerCase() === m.contentHash.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 /** See module docs. */
@@ -52,6 +67,15 @@ export function MemoryList({ token, live }: { token: Address; live: readonly Mem
                 <span className="tabular-nums">#{m.seq}</span>
                 <span className={`chip ${m.kind === 'finding' ? 'border-acid/40 text-acid' : ''}`}>{m.kind}</span>
                 <span>{m.createdAt > 0 ? timeAgo(m.createdAt, now) : ''}</span>
+                {memoryHashMatches(m) ? (
+                  <span className="ml-auto text-acid-dim" title={`contentHash ${m.contentHash ?? ''} recomputed in your browser`}>
+                    hash ✓
+                  </span>
+                ) : (
+                  <span className="ml-auto" title="The served fields do not reproduce contentHash (or it is missing)">
+                    hash unverified
+                  </span>
+                )}
               </div>
               <p className="mt-1 whitespace-pre-wrap text-fg">{m.content}</p>
               {m.url !== null && (

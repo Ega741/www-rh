@@ -1,5 +1,6 @@
 /**
- * wagmi configuration (directive W5): the target chain from `@www-rh/shared`, the injected
+ * wagmi configuration (directive W5 / SPEC §7): the target chain from `@www-rh/shared` (transport
+ * on `VITE_RPC_URL` when set), the injected
  * connector always (EIP-6963 discovery included), WalletConnect only when
  * `VITE_WALLETCONNECT_PROJECT_ID` is set, no Multicall3 batching unless `VITE_MULTICALL=1`,
  * and a 2 s polling interval (receipts, block watching) suited to Robinhood Chain's ~100 ms blocks.
@@ -8,7 +9,7 @@
  */
 import { http, createConfig, injected, type CreateConnectorFn } from 'wagmi';
 import { walletConnect } from 'wagmi/connectors/walletConnect';
-import { MULTICALL_ENABLED, TARGET_CHAIN, WALLETCONNECT_PROJECT_ID } from './config';
+import { MULTICALL_ENABLED, RPC_URL, TARGET_CHAIN, WALLETCONNECT_PROJECT_ID } from './config';
 
 function connectors(): CreateConnectorFn[] {
   const list: CreateConnectorFn[] = [injected({ shimDisconnect: true })];
@@ -33,7 +34,7 @@ function connectors(): CreateConnectorFn[] {
 export const wagmiConfig = createConfig({
   chains: [TARGET_CHAIN],
   connectors: connectors(),
-  transports: { [TARGET_CHAIN.id]: http() },
+  transports: { [TARGET_CHAIN.id]: http(RPC_URL) },
   batch: { multicall: MULTICALL_ENABLED },
   pollingInterval: 2_000,
 });
