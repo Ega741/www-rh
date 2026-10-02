@@ -1478,8 +1478,10 @@ function launchMind(LaunchParams calldata p, uint256 quoteIn, uint256 minTokensO
 function prepareAdoption(address token, bytes32 modelId, bytes32 personaHash, string calldata metadataURI)
     external returns (address account);
     // token must exist in the factory (getLaunchedToken(token).exists); msg.sender must be the launch's
-    // current creatorFeeRecipient or its deployer; account = clone with salt keccak256(abi.encode(token));
+    // current creatorFeeRecipient (else NotRecipientOrDeployer); account = clone with salt keccak256(abi.encode(token));
     // registers the mind with status Dormant and PonsMind{adopted: false}; emits AdoptionPrepared(token, account, creator).
+    // While pending (not activated) the current recipient may call it again to replace the preparation (creator and
+    // config overwritten, account reused, status Dormant, AdoptionPrepared again); once activated → AlreadyAdopted.
 function activateAdoption(address token) external;
     // anyone; requires factory.getLaunchedToken(token).creatorFeeRecipient == account; sets adopted = true,
     // status Alive unless creator-paused; emits MindAdopted(token, account).

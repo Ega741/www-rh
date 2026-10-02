@@ -111,6 +111,8 @@ contract PonsRegistryHandler is Test {
         vm.startPrank(a);
         (address token,) = factory.launchToken{value: fee}(tp, 0, address(0), new address[](0));
         address account = registry.prepareAdoption(token, keccak256("m"), bytes32(0), "");
+        // Re-preparing a pending adoption replaces it (same account, no second registration).
+        require(registry.prepareAdoption(token, keccak256("m2"), bytes32(0), "") == account, "account reused");
         factory.transferCreatorFeeRecipient(token, account);
         vm.stopPrank();
         registry.activateAdoption(token);

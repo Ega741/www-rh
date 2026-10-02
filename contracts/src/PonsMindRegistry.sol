@@ -106,6 +106,10 @@ contract PonsMindRegistry is IPonsMindRegistry, MindCore {
     }
 
     /// @inheritdoc IPonsMindRegistry
+    /// @dev Only the launch's current creator fee recipient may prepare, so nobody can occupy a token's single
+    ///      adoption slot (the account salt is the token) ahead of the party whose hand-off activates it. A pending
+    ///      preparation can be replaced by whoever is the recipient now (e.g. after the role changed hands): creator
+    ///      and config are overwritten, the account is reused and the status is reset to Dormant.
     function prepareAdoption(address token, bytes32 modelId, bytes32 personaHash, string calldata metadataURI)
         external
         whenNotPaused
@@ -115,8 +119,17 @@ contract PonsMindRegistry is IPonsMindRegistry, MindCore {
         _checkConfig(modelId, metadataURI);
         IPonsV2LaunchFactory.LaunchedToken memory launch = factory.getLaunchedToken(token);
         if (!launch.exists || launch.pairToken != address(0)) revert NotPonsLaunch();
-        if (msg.sender != launch.creatorFeeRecipient && msg.sender != launch.deployer) revert NotRecipientOrDeployer();
-        if (_ponsMinds[token].account != address(0)) revert AccountExists();
+        if (msg.sender != launch.creatorFeeRecipient) revert NotRecipientOrDeployer();
+
+        PonsMind storage m = _ponsMinds[token];
+        account = m.account;
+        if (account != address(0)) {
+            if (m.launchedHere) revert AccountExists();
+            if (m.adopted) revert AlreadyAdopted();
+            _replacePreparation(token, modelId, personaHash, metadataURI);
+            emit AdoptionPrepared(token, account, msg.sender);
+            return account;
+        }
 
         account = _deployAccount(keccak256(abi.encode(token)));
         _tokenOf[account] = token;
@@ -284,6 +297,22 @@ contract PonsMindRegistry is IPonsMindRegistry, MindCore {
         if (Clones.predictDeterministicAddress(implementation, salt).code.length != 0) revert AccountExists();
         account = Clones.cloneDeterministic(implementation, salt);
         MindAccount(payable(account)).initialize(address(this));
+    }
+
+    /// @dev Re-preparation of a pending adoption by the current recipient: overwrites the creator and config (keeps
+    ///      `createdAt`) and resets the status to Dormant.
+    function _replacePreparation(address token, bytes32 modelId, bytes32 personaHash, string calldata metadataURI)
+        private
+    {
+        MindInfo storage info = _mindInfo[token];
+        info.creator = msg.sender;
+        info.modelId = modelId;
+        info.personaHash = personaHash;
+        info.metadataURI = metadataURI;
+        if (info.status != MindStatus.Dormant) {
+            info.status = MindStatus.Dormant;
+            emit MindStatusChanged(token, MindStatus.Dormant);
+        }
     }
 
     /// @dev `factory.launchToken` with the mind account as creator fee recipient, native quote, buyback disabled and

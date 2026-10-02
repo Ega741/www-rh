@@ -46,9 +46,10 @@ interface IPonsMindRegistry is IMindCore {
     event MindLaunched(
         address indexed token, address indexed curve, address indexed account, address creator, uint256 launchConfigId
     );
-    /// @notice An existing Pons token was registered for adoption (status Dormant). The current creator fee recipient
-    ///         must now call `factory.transferCreatorFeeRecipient(token, account)`, then anyone {activateAdoption}.
-    ///         No {IMindCore-MindCreated} is emitted for adoptions; read {getMind} and the token's ERC20 metadata.
+    /// @notice An existing Pons token was registered (or its pending registration replaced) for adoption, status
+    ///         Dormant. The creator fee recipient must now call `factory.transferCreatorFeeRecipient(token, account)`,
+    ///         then anyone {activateAdoption}. No {IMindCore-MindCreated} is emitted for adoptions; read {getMind} and the
+    ///         token's ERC20 metadata.
     event AdoptionPrepared(address indexed token, address indexed account, address indexed creator);
     /// @notice The adoption completed: the mind account is the creator fee recipient.
     event MindAdopted(address indexed token, address indexed account);
@@ -65,15 +66,15 @@ interface IPonsMindRegistry is IMindCore {
     // Errors
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice The mind account for this salt/token is already deployed, or the token already has a mind.
+    /// @notice The mind account for this salt is already deployed, or the token was launched through this registry.
     error AccountExists();
     /// @notice The token is not a native-quote Pons V2 launch of the configured factory.
     error NotPonsLaunch();
-    /// @notice The caller is neither the launch's current creator fee recipient nor its deployer.
+    /// @notice The caller is not the launch's current creator fee recipient (name kept for ABI stability).
     error NotRecipientOrDeployer();
     /// @notice The mind account is not (yet) the launch's creator fee recipient.
     error AdoptionNotReady();
-    /// @notice The mind was launched here or its adoption is already active.
+    /// @notice The mind was launched here or its adoption is already active (also from {prepareAdoption}).
     error AlreadyAdopted();
     /// @notice `msg.value != factory.launchFee() + quoteIn + creationFee()`.
     error WrongValue();
@@ -105,9 +106,12 @@ interface IPonsMindRegistry is IMindCore {
         string calldata metadataURI
     ) external payable returns (address token, address curve, address account);
 
-    /// @notice Registers an existing native-quote Pons token for adoption by its current creator fee recipient or
-    ///         its deployer (who becomes the mind's creator). Deploys the account (salt `keccak256(abi.encode(token))`)
-    ///         and registers the mind with status Dormant. `whenNotPaused`.
+    /// @notice Registers an existing native-quote Pons token for adoption; callable only by the launch's current
+    ///         creator fee recipient, who becomes the mind's creator. Deploys the account (salt
+    ///         `keccak256(abi.encode(token))`) and registers the mind with status Dormant. While the adoption is pending
+    ///         (not yet activated), the current recipient may call it again to replace the preparation (creator and
+    ///         config overwritten, account reused, status reset to Dormant, {AdoptionPrepared} emitted again); once
+    ///         activated it reverts `AlreadyAdopted()`, and for tokens launched here `AccountExists()`. `whenNotPaused`.
     function prepareAdoption(address token, bytes32 modelId, bytes32 personaHash, string calldata metadataURI)
         external
         returns (address account);

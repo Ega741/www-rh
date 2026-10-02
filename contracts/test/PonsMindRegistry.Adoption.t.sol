@@ -63,10 +63,17 @@ contract PonsMindRegistryAdoptionTest is PonsBaseTest {
         assertEq(factory.getLaunchedToken(wild).creatorFeeRecipient, bob);
     }
 
-    function test_prepareAdoption_byDeployer() public {
-        address account = _prepare(alice);
-        assertEq(registry.getMind(wild).creator, alice);
-        assertEq(registry.accountOf(wild), account);
+    function test_prepareAdoption_deployerCannotSquat() public {
+        // Alice launched the coin but Bob receives its fees: Alice cannot occupy the token's adoption slot.
+        vm.prank(alice);
+        vm.expectRevert(IPonsMindRegistry.NotRecipientOrDeployer.selector);
+        registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        assertFalse(registry.isMind(wild));
+        assertEq(registry.mindsLength(), 0);
+        // Bob still can.
+        address account = _prepare(bob);
+        assertEq(registry.getMind(wild).creator, bob);
+        assertEq(account, registry.predictAdoptionAccount(wild));
     }
 
     function test_prepareAdoption_wrongCaller() public {
@@ -90,23 +97,90 @@ contract PonsMindRegistryAdoptionTest is PonsBaseTest {
         registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
     }
 
-    function test_prepareAdoption_alreadyAMind() public {
-        _prepare(bob);
+    function test_prepareAdoption_recipientReplacesPendingPreparation() public {
+        address account = _prepare(bob);
         vm.prank(bob);
-        vm.expectRevert(IPonsMindRegistry.AccountExists.selector);
-        registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
-        vm.prank(alice);
-        vm.expectRevert(IPonsMindRegistry.AccountExists.selector);
+        registry.setCreatorPaused(wild, true);
+        uint64 createdAt = registry.getMind(wild).createdAt;
+
+        // Bob hands the fee recipient role to Carol without completing the adoption; Carol takes over the stale
+        // preparation: creator and config are overwritten, the account is reused, the status is reset to Dormant.
+        address carol = makeAddr("carol");
+        vm.prank(bob);
+        factory.transferCreatorFeeRecipient(wild, carol);
+        vm.prank(bob);
+        vm.expectRevert(IPonsMindRegistry.NotRecipientOrDeployer.selector);
         registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
 
-        // A token launched through the registry already has its account. Its Pons deployer is the registry and its
-        // recipient the account, so no external caller passes the role check either.
+        bytes32 model = keccak256("claude-sonnet-5");
+        vm.warp(block.timestamp + 1 hours);
+        vm.expectEmit(true, false, false, true, address(registry));
+        emit IMindCore.MindStatusChanged(wild, IMindCore.MindStatus.Dormant);
+        vm.expectEmit(true, true, true, true, address(registry));
+        emit IPonsMindRegistry.AdoptionPrepared(wild, account, carol);
+        vm.prank(carol);
+        address again = registry.prepareAdoption(wild, model, bytes32(uint256(7)), "ipfs://carol");
+
+        assertEq(again, account, "account reused");
+        assertEq(registry.mindsLength(), 1, "not registered twice");
+        IMindCore.MindInfo memory info = registry.getMind(wild);
+        assertEq(info.creator, carol);
+        assertEq(info.modelId, model);
+        assertEq(info.personaHash, bytes32(uint256(7)));
+        assertEq(info.metadataURI, "ipfs://carol");
+        assertEq(info.createdAt, createdAt, "registration time kept");
+        assertEq(uint8(info.status), uint8(IMindCore.MindStatus.Dormant));
+        assertFalse(registry.ponsMind(wild).adopted);
+
+        // Bob lost every creator right.
+        vm.prank(bob);
+        vm.expectRevert(IMindCore.NotCreator.selector);
+        registry.setMindConfig(wild, model, bytes32(0), "");
+
+        // Carol can re-prepare her own pending adoption too (config update), then activate it.
+        vm.prank(carol);
+        registry.prepareAdoption(wild, model, bytes32(uint256(8)), "ipfs://carol2");
+        assertEq(registry.getMind(wild).personaHash, bytes32(uint256(8)));
+        vm.prank(carol);
+        factory.transferCreatorFeeRecipient(wild, account);
+        registry.activateAdoption(wild);
+        assertTrue(registry.ponsMind(wild).adopted);
+        assertEq(uint8(_status(wild)), uint8(IMindCore.MindStatus.Alive));
+        assertEq(registry.getMind(wild).creator, carol);
+    }
+
+    function test_prepareAdoption_afterActivation_reverts() public {
+        address account = _prepare(bob);
+        _handOver(account);
+        registry.activateAdoption(wild);
+        // The recipient is now the account itself.
+        vm.prank(account);
+        vm.expectRevert(IPonsMindRegistry.AlreadyAdopted.selector);
+        registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        // Even after leaving, the new recipient cannot re-prepare an adoption that was activated.
+        vm.prank(bob);
+        registry.leave(wild, stranger);
+        vm.prank(stranger);
+        vm.expectRevert(IPonsMindRegistry.AlreadyAdopted.selector);
+        registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        assertEq(registry.getMind(wild).creator, bob);
+    }
+
+    function test_prepareAdoption_launchedHereToken() public {
+        // A token launched through the registry: its recipient is the account (AccountExists if it could call), and
+        // no external caller passes the recipient check, not even its creator.
         (address token,, address account) = _launch(creator, 0);
         vm.prank(account);
         vm.expectRevert(IPonsMindRegistry.AccountExists.selector);
         registry.prepareAdoption(token, MODEL_ID, PERSONA_HASH, METADATA_URI);
         vm.prank(creator);
         vm.expectRevert(IPonsMindRegistry.NotRecipientOrDeployer.selector);
+        registry.prepareAdoption(token, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        // After leaving, the new recipient (the creator) still cannot turn it into an adoption.
+        vm.prank(creator);
+        registry.leave(token, creator);
+        vm.prank(creator);
+        vm.expectRevert(IPonsMindRegistry.AccountExists.selector);
         registry.prepareAdoption(token, MODEL_ID, PERSONA_HASH, METADATA_URI);
     }
 
