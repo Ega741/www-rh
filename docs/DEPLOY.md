@@ -111,9 +111,40 @@ node scripts/sync-abi.mjs            # contracts/out -> packages/shared/abi/*.js
 pnpm -r build
 ```
 
+## 1a. Режим Pons (mainnet, основной)
+
+На mainnet монеты запускаются на Pons, а наш контракт `PonsMindRegistry` только получает creator
+fees и ведёт vault'ы разумов. Деплой:
+
+```bash
+cd contracts
+VENUE=pons OWNER=... TREASURY=... COMPUTE_TREASURY=... OPERATOR=... \
+forge script script/DeployPons.s.sol \
+  --rpc-url "$ROBINHOOD_RPC_URL" --private-key "$DEPLOYER_PRIVATE_KEY" \
+  --broadcast --verify --verifier blockscout \
+  --verifier-url https://robinhoodchain.blockscout.com/api -vvvv
+cat deployments/4663.json      # { registry, venue: "pons", ... }
+```
+
+Адреса Pons (`PONS_FACTORY`, `PONS_FEE_ESCROW`, `PONS_MEME_HOOK`) подставляются из
+`docs/ROBINHOOD_CHAIN.md`; на других сетях их нужно задать явно. После деплоя:
+
+1. `acceptOwnership()` с адреса `OWNER` (Ownable2Step).
+2. Проверьте `factory.canLaunch(<REGISTRY>)` на фабрике Pons: публичные запуски должны быть включены
+   (`launchEnabled`) либо реестр добавлен в whitelist Pons. Иначе `launchMind` будет откатываться,
+   а работать будет только «усыновление» (`prepareAdoption` → `transferCreatorFeeRecipient` → `activateAdoption`).
+3. Раннер: `VENUE=pons`, `REGISTRY_ADDRESS=<registry>`, `START_BLOCK` из broadcast-файла.
+4. Веб: `VITE_VENUE=pons`, `VITE_REGISTRY_ADDRESS=<registry>`.
+
+Как попадают деньги в vault: Pons начисляет creator share в эскроу при свипе комиссий (оператор
+Pons; на кривой также `deployer`, то есть наш реестр для монет, запущенных через `launchMind`).
+`harvest(token)` (permissionless, раннер вызывает при `claimable ≥ HARVEST_MIN_WEI`) делает
+best-effort свип и `claim()` через `MindAccount`, после чего ETH зачисляется в vault монеты.
+
 ## 2. Раннер (разум монет)
 
-Заполните в `.env`: `CHAIN_ID`, `RPC_URL`, `LAUNCHPAD_ADDRESS`, `START_BLOCK` (блок деплоя),
+Заполните в `.env`: `VENUE` (`pons` на mainnet, `curve` на testnet), `CHAIN_ID`, `RPC_URL`,
+`REGISTRY_ADDRESS` или `LAUNCHPAD_ADDRESS`, `START_BLOCK` (блок деплоя),
 `OPERATOR_PRIVATE_KEY`, `ANTHROPIC_API_KEY`, `ETH_USD_PRICE` (или `ETH_USD_FEED` — адрес
 Chainlink ETH/USD на Robinhood Chain), `PUBLIC_WEB_ORIGIN`. Для проверки без транзакций и без
 модели оставьте `DRY_RUN=true` и пустой `ANTHROPIC_API_KEY`: индексатор и API будут работать,
