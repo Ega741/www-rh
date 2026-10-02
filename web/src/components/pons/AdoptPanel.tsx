@@ -104,6 +104,12 @@ function AdoptToken({ token }: { token: Address }) {
             The Pons V2 factory has no launch for this address. Only coins launched on Pons V2 can be adopted.
           </p>
         )}
+        {step.kind === 'unsupported-quote' && (
+          <p className="rounded border border-amber/40 bg-amber/5 p-3 text-[12px] text-amber">
+            This Pons launch trades against an ERC-20 (<AddressLink address={step.pairToken} />), not native ETH. Minds can only be attached to native-ETH
+            launches.
+          </p>
+        )}
         {(step.kind === 'launched-here' || step.kind === 'adopted') && (
           <section className="panel space-y-2 p-4">
             <p className="text-fg">{step.kind === 'launched-here' ? 'This coin was launched with a mind here.' : 'This coin has a mind.'}</p>
@@ -177,9 +183,6 @@ function AdoptToken({ token }: { token: Address }) {
                 <dt>phase</dt>
                 <dd>{factoryPhaseName(launch.data.phase)}</dd>
               </div>
-              {launch.data.pairToken !== zeroAddress && (
-                <p className="mt-1 text-amber">This launch trades against an ERC-20, not native ETH; minds are only supported on native-ETH launches.</p>
-              )}
             </dl>
           ) : (
             <p className="text-mute">{launch.isPending ? 'reading…' : '—'}</p>

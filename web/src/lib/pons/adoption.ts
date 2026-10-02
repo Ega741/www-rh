@@ -20,6 +20,8 @@ export interface LaunchRecord {
   curve: Address;
   deployer: Address;
   creatorFeeRecipient: Address;
+  /** Quote asset of the launch; minds need native ETH (`0x0`), else `prepareAdoption` reverts `NotPonsLaunch`. */
+  pairToken: Address;
 }
 
 /** `registry.ponsMind(token)`; `account == 0` means the token is not registered. */
@@ -46,6 +48,8 @@ export type AdoptionStep =
   | { kind: 'error' }
   /** The factory has no launch for this address. */
   | { kind: 'not-pons' }
+  /** A Pons launch quoted in an ERC-20: not supported by the registry (native quote only). */
+  | { kind: 'unsupported-quote'; pairToken: Address }
   /** Already a mind launched through the registry. */
   | { kind: 'launched-here'; account: Address }
   /** Adoption complete; `receivingFees` is false after the creator left. */
@@ -80,6 +84,7 @@ export function adoptionStep(input: AdoptionInput): AdoptionStep {
     if (receivingFees) return { kind: 'activate', account: mind.account };
     return { kind: 'transfer', account: mind.account, recipient: launch.creatorFeeRecipient, walletIsRecipient: same(wallet, launch.creatorFeeRecipient) };
   }
+  if (launch.pairToken.toLowerCase() !== zeroAddress) return { kind: 'unsupported-quote', pairToken: launch.pairToken };
   if (wallet === undefined) return { kind: 'connect' };
   const walletIsRecipient = same(wallet, launch.creatorFeeRecipient);
   if (walletIsRecipient || same(wallet, launch.deployer)) {

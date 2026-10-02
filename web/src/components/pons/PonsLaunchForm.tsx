@@ -238,7 +238,7 @@ export function PonsLaunchForm() {
       case 'done':
         return 'Opening the mind…';
       default:
-        return `Launch $${draft.symbol.trim() || 'COIN'} on Pons${plan !== null ? ` for ${formatEth(plan.value)}` : ''}`;
+        return `Launch $${draft.symbol.trim() || 'COIN'} on Pons${plan !== null && creationFee.data !== undefined ? ` for ${formatEth(plan.value)}` : ''}`;
     }
   }
 
@@ -436,7 +436,7 @@ export function PonsLaunchForm() {
             )}
             <div className="kv border-t border-line pt-2 text-fg">
               <dt className="text-fg">value sent</dt>
-              <dd>{plan !== null ? formatEth(plan.value) : '—'}</dd>
+              <dd>{plan !== null && creationFee.data !== undefined ? formatEth(plan.value) : '—'}</dd>
             </div>
           </dl>
           <p className="mt-2 text-[11px] text-mute">

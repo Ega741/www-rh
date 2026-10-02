@@ -6,9 +6,13 @@
 пополняется торговыми комиссиями.
 
 *EN summary: Vite + React 19 + wagmi 3 front-end. Home grid with live thumbnails, a create flow
-(metadata → `createMind` → optional vault seed), and a three-column mind page (live stream, bonding
-curve trading, compute meter / memories / receipts / creator tools). Talks to the runner over HTTP
-(`/api`) and WebSocket (`/ws`), and to `MindLaunchpad` on Robinhood Chain through wagmi.*
+and a three-column mind page (live stream, trading, compute meter / memories / receipts / creator
+tools). Two venues (SPEC §9): **Pons mode** (`VITE_VENUE=pons`, the default and the mainnet path) —
+coins launch and trade on Pons V2, the mind lives in `PonsMindRegistry` (launch via
+`registry.launchMind`, or adopt an existing Pons coin in three steps), the trade column talks to the
+Pons curve directly and the compute meter shows Pons creator fees claimable + "Harvest"; **curve
+mode** (`VITE_VENUE=curve`) — the in-house `MindLaunchpad` bonding curve of §7, unchanged. Talks to
+the runner over HTTP (`/api`) and WebSocket (`/ws`), and to the contracts through wagmi.*
 
 ## Стек
 
@@ -21,7 +25,7 @@ Tailwind CSS v4 (`@tailwindcss/vite`). Сети, ABI, математика кр�
 
 ```sh
 pnpm install                         # в корне репозитория
-cp web/.env.example web/.env.local   # и заполнить VITE_LAUNCHPAD_ADDRESS
+cp web/.env.example web/.env.local   # VITE_VENUE + VITE_REGISTRY_ADDRESS (pons) или VITE_LAUNCHPAD_ADDRESS (curve)
 pnpm --filter @www-rh/runner dev     # раннер на :8787 (API + WS)
 pnpm --filter @www-rh/web dev        # http://localhost:5173
 ```
@@ -35,7 +39,8 @@ API-база — `VITE_RUNNER_URL` (пусто = тот же origin), WebSocket 
 pnpm --filter @www-rh/web build      # tsc --noEmit + vite build → web/dist
 pnpm --filter @www-rh/web preview    # отдать dist на :4173
 pnpm --filter @www-rh/web typecheck
-pnpm --filter @www-rh/web test       # vitest: форматирование, котировки, WS-парсер, нормализация, хэши, окно выпуска, ошибки
+pnpm --filter @www-rh/web test       # vitest: форматирование, котировки, WS-парсер, нормализация, хэши, окно выпуска, ошибки, Pons (котировки, запуск, усыновление, фазы, события)
+pnpm --filter @www-rh/web lint       # tsc с --noUnusedLocals/--noUnusedParameters
 ```
 
 ## Переменные окружения
@@ -43,7 +48,9 @@ pnpm --filter @www-rh/web test       # vitest: форматирование, к�
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
 | `VITE_CHAIN_ID` | `46630` | сеть: 4663 mainnet, 46630 testnet, 31337 anvil |
-| `VITE_LAUNCHPAD_ADDRESS` | — | адрес `MindLaunchpad`; пусто/нулевой адрес → `launchpadAddress(chainId)` из shared; если адреса нет, запись в контракт отключена и показывается предупреждение |
+| `VITE_VENUE` | `pons` | площадка (SPEC §9.5): `pons` — Pons V2 + `PonsMindRegistry`; `curve` — собственная кривая `MindLaunchpad` (§7). Любое значение, кроме `curve`, означает Pons. Pons V2 есть только в mainnet (4663): для testnet/anvil обычно `VITE_VENUE=curve` |
+| `VITE_REGISTRY_ADDRESS` | — | Pons-режим: адрес `PonsMindRegistry`; пусто/нулевой адрес → `registryAddress(chainId)` из shared; без адреса запись отключена. Адрес фабрики Pons читается из `registry.factory()` (запасной вариант — mainnet-фабрика из `PONS` в shared) |
+| `VITE_LAUNCHPAD_ADDRESS` | — | curve-режим: адрес `MindLaunchpad`; пусто/нулевой адрес → `launchpadAddress(chainId)` из shared; если адреса нет, запись в контракт отключена и показывается предупреждение |
 | `VITE_RUNNER_URL` | — | origin раннера: цель dev-прокси и API-база в production |
 | `VITE_RUNNER_WS` | — | WebSocket раннера в production (`wss://host/ws`) |
 | `VITE_RPC_URL` | — | свой RPC для транспорта wagmi (в кошелёк не передаётся) |
@@ -51,6 +58,8 @@ pnpm --filter @www-rh/web test       # vitest: форматирование, к�
 | `VITE_MULTICALL` | — | `1` — объявить Multicall3 (`withMulticall3`) и батчить чтения |
 
 ## Страницы
+
+Ниже — curve-режим (§7). Отличия Pons-режима — в разделе «Pons-режим».
 
 - **`/`** — сетка разумов (`GET /api/minds`, вкладки new / mcap / active, «load more» по курсору),
   живые миниатюры (`frame.jpg` каждые 5 с, пока карточка видна и разум жив), статус (alive /
@@ -92,12 +101,78 @@ pnpm --filter @www-rh/web test       # vitest: форматирование, к�
   «curve reopened after the graduation window expired». Математика окна — чистые функции
   `lib/grace.ts` (с тестами).
 
+## Pons-режим (SPEC §9.5, `VITE_VENUE=pons`)
+
+Общий контур MindCore (`getMind`, `mindBalance`, `fundMind`, `setMindConfig`, `setCreatorPaused`,
+`creationFee`, `paused`) одинаков у лаунчпада и реестра (те же селекторы), поэтому «feed the mind»,
+смена модели/персоны и пауза работают так же, только адресом служит `PonsMindRegistry`.
+
+- **`/create`** — две вкладки (`?tab=adopt&token=0x…` открывает вторую сразу):
+  1. **launch on Pons**: имя, тикер, логотип (https/ipfs URL), описание, соцсети (x, telegram,
+     website, discord, farcaster — полные http(s) URL; первые три также попадают в метаданные),
+     ползунок creator tax 0..`maxCreatorTaxBps` из `GET /api/launch-config` (по умолчанию 1 %; налог
+     целиком идёт на аккаунт разума), выбор launch config, первая покупка с превью `ponsQuoteBuy` на
+     свежей кривой конфига (phantom reserve против всего supply, sellable = supply − reserved) и
+     проскальзыванием, модель, персона. Поток: метаданные (как раньше: `POST /api/metadata`, иначе
+     `data:`-URI ≤ 2048 байт) → свежие чтения прямо перед отправкой (`creationFee` реестра,
+     `launchFee`, `getLaunchConfig(id)` и `previewLaunchEconomics(id, 0x0)` фабрики) →
+     `registry.launchMind(params, quoteIn, minTokensOut, modelId, personaHash, uri)` с
+     `value = launchFee + quoteIn + creationFee`, `expectedEconomics` = превью,
+     `salt = keccak256(utf8(name + ' ' + symbol + ' ' + nonce))` (новый nonce на каждую попытку) →
+     из чека декодируется `MindLaunched` → переход на `/mind/<token>`. Если раннер недоступен,
+     launch config читается из фабрики. Показываются предупреждения `paused()` реестра и
+     `factory.canLaunch(registry) == false`.
+  2. **adopt an existing Pons coin**: вставить адрес токена → запись запуска
+     (`factory.getLaunchedToken`: кривая, deployer, получатель комиссий, creator tax, фаза) → шаг 1
+     `registry.prepareAdoption(token, modelId, personaHash, uri)` (получатель комиссий или deployer;
+     модель и персона, метаданные публикуются как при создании) → шаг 2 кнопка
+     `factory.transferCreatorFeeRecipient(token, account)` (только текущий получатель; иначе
+     подсказка, кто и что должен вызвать) → шаг 3 `registry.activateAdoption(token)` (кто угодно).
+     Текущий шаг выводится из состояния сети чистой функцией `adoptionStep` (`lib/pons/adoption.ts`),
+     поэтому поток продолжается после перезагрузки и из разных кошельков; запуски с ERC-20 в качестве
+     котируемого актива не поддерживаются.
+- **`/mind/:token`** — данные: `registry.getMind/ponsMind/mindBalance/claimable`,
+  `factory.getLaunchedToken` (фаза, получатель комиссий), кривая Pons (`getReserves`,
+  `sellableTokens`, `realQuoteReserve`, `graduationThreshold`, `feeBps`, `creatorTaxBps`, `graduated`,
+  `readyToGraduate`; best-effort `launchedAt`). Цена = `quoteReserve·1e18/tokenReserve`, прогресс =
+  `realQuoteReserve/graduationThreshold`. Фазы: bonding / graduating (`Swept`, или кривая распродана)
+  / graduated (`PoolCreated`/`Rescued`).
+  - торговля напрямую с кривой: buy — `curve.buy{value: quoteIn}(quoteIn, minOut, account)`, sell —
+    approve ровно на сумму кривой, затем `curve.sell(tokensIn, minOut, account)`; котировки локальные
+    (`ponsQuoteBuy`/`ponsQuoteSell` из shared по живым резервам — у Pons нет view-котировки), дедлайна
+    у кривой нет, только minOut. Первые `snipeTaxSeconds` (15 с) после запуска — красное
+    предупреждение о snipe tax (до 99 %, убывает; создатель освобождён) с обратным отсчётом и, если
+    кошелёк подключён, текущей ставкой `currentSnipeTaxBps`; котировка налог не учитывает, так что
+    облагаемая покупка откатится по проскальзыванию, а не заплатит его.
+  - graduating: кнопка «Seed the Uniswap pool» (`registry.createGraduatedPool`, кто угодно;
+    `WrongGraduationPhase` = уже сделано, просто обновляем) или «Settle the launch»
+    (`factory.graduate`, если автоматический выпуск не прошёл); после выпуска — вместо формы
+    «Trade on Pons» (https://www.ponsfamily.com), Uniswap (только mainnet) и Blockscout.
+  - счётчик вычислений: vault + claimable (кредит в FeeEscrow Pons) и кнопка «Harvest»
+    (`registry.harvest(token)`, кто угодно).
+  - инструменты создателя: «Leave» — `registry.leave(token, newRecipient)` с подтверждением
+    (галочка); разум засыпает, vault остаётся только для вычислений. Если получатель комиссий уже не
+    аккаунт разума, вместо кнопки показывается, кому идут комиссии.
+- **`/`** — на карточках бейдж площадки (`pons`/`curve`, из `MindSummary.venue`), фаза «graduating»
+  для Pons; в подвале — адрес реестра и предупреждение, если `venue` раннера (`/api/health`) не
+  совпадает со сборкой.
+- Ошибки реестра (`AccountExists`, `NotPonsLaunch`, `NotRecipientOrDeployer`, `AdoptionNotReady`,
+  `AlreadyAdopted`, `WrongValue`, `LaunchFailed`) и всплывающие ошибки кривой/фабрики Pons
+  (`SlippageExceeded`, `CurveGraduated`, `LaunchEconomicsMismatch`, `NotCreatorFeeRecipient`, …)
+  декодируются по ABI вызова, затем по ABI лаунчпада/реестра/кривой/фабрики, затем по селектору.
+
+ABI, адреса Pons и математика котировок берутся из `@www-rh/shared` (§9.3). Локально (в
+`src/lib/pons/`) остаются только недостающие части: ошибки кривой и фабрики Pons,
+`factory.graduate(address)`, `curve.token()`, `FailedDeployment()` реестра, view-функции кривой
+`launchedAt`/`snipeTaxSeconds`/`currentSnipeTaxBps`, свежие резервы конфига
+(`ponsReservedTokens`/`ponsInitialReserves`) и URL приложения Pons.
+
 ## Устройство
 
 ```
 src/
   main.tsx, App.tsx        провайдеры (wagmi, TanStack Query) и роутер
-  config.ts                VITE_* → сеть, адрес лаунчпада, URL раннера (чистые функции + тесты)
+  config.ts                VITE_* → сеть, площадка, адреса лаунчпада/реестра, URL раннера (чистые функции + тесты)
   wagmi.ts                 createConfig: injected + WalletConnect по env, batch.multicall, polling 2 с
   api.ts                   типизированный клиент HTTP API (§5)
   ws.ts                    парсер сообщений и переподключающийся WebSocket (§6)
@@ -105,9 +180,13 @@ src/
   queries.ts               хуки TanStack Query
   lib/                     нормализация ответов (с проверкой zod-схемами shared), котировки,
                            метаданные, публикация, хэши, редьюсер стрима, ошибки, события
-  hooks/                   поток разума, данные разума (API + сеть), транзакции, смена сети, тики
-  routes/                  Home, Create, Mind, NotFound
+  lib/pons/                Pons-режим: ABI (shared + локальные дополнения), математика запуска,
+                           машина состояний усыновления, фазы, snipe-окно, события, ссылки (+ тесты)
+  hooks/                   поток разума, данные разума (API + сеть; usePonsMindData в Pons-режиме),
+                           usePons (фабрика, launch config), транзакции, смена сети, тики
+  routes/                  Home, Create (curve) / PonsCreate (launch + adopt), Mind, NotFound
   components/              карточки, панели, кошелёк, ChainGuard, ...
+  components/pons/         PonsLaunchForm, AdoptPanel, PonsTradePanel, HarvestButton, LeaveMind
 ```
 
 Все ответы API и сообщения WS сначала проверяются zod-схемами из `@www-rh/shared`; при

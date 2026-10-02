@@ -6,7 +6,7 @@
  *
  * @module lib/pons
  */
-export { PONS, ponsAddressesFor } from '@www-rh/shared';
+export { ponsAddressesFor } from '@www-rh/shared';
 export type { PonsAddresses } from '@www-rh/shared';
 export * from './abi';
 export * from './curve';
@@ -16,3 +16,4 @@ export * from './phase';
 export * from './events';
 export * from './links';
 export * from './snipe';
+export * from './leave';

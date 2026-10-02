@@ -65,8 +65,14 @@ const REVERT_MESSAGES: Record<string, { signature: string; message: string }> = 
 /** Copy for the `PonsMindRegistry` errors (SPEC §9.2) and the Pons curve / factory errors that bubble up. */
 const PONS_REVERT_MESSAGES: Record<string, { signature: string; message: string }> = {
   // PonsMindRegistry
-  AccountExists: { signature: 'AccountExists()', message: 'A mind account already exists for this launch salt. Submit again: every attempt uses a fresh salt.' },
-  NotPonsLaunch: { signature: 'NotPonsLaunch()', message: 'That token was not launched by the Pons factory, so it cannot get a mind here.' },
+  AccountExists: {
+    signature: 'AccountExists()',
+    message: 'A mind account already exists here: this coin may already have a mind, or (for a new launch) the salt was reused. Submit again; every launch attempt uses a fresh salt.',
+  },
+  NotPonsLaunch: {
+    signature: 'NotPonsLaunch()',
+    message: 'That token is not a native-ETH Pons V2 launch (unknown to the factory, or quoted in an ERC-20), so it cannot get a mind here.',
+  },
   NotRecipientOrDeployer: {
     signature: 'NotRecipientOrDeployer()',
     message: "Only the Pons launch's current creator-fee recipient or its deployer can adopt this coin.",

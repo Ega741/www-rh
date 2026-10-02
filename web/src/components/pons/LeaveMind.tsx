@@ -6,24 +6,14 @@
  * @module components/pons/LeaveMind
  */
 import { useState } from 'react';
-import { isAddress, zeroAddress, type Address } from 'viem';
+import type { Address } from 'viem';
 import { useConnection, useWriteContract } from 'wagmi';
 import { REGISTRY_ADDRESS, TARGET_CHAIN } from '../../config';
 import { useTxFlow } from '../../hooks/useTxFlow';
-import { ponsMindRegistryAbi } from '../../lib/pons';
+import { leaveRecipientError, ponsMindRegistryAbi } from '../../lib/pons';
 import type { MindDetail, PonsLive } from '../../lib/types';
 import { ChainGuard } from '../ChainGuard';
 import { AddressLink, TxStatus } from '../common';
-
-/** Validation message for the new recipient, or `null` when it is acceptable. */
-export function leaveRecipientError(input: string, account: Address | null): string | null {
-  const text = input.trim();
-  if (text === '') return 'Enter the address that should receive the creator fees from now on.';
-  if (!isAddress(text, { strict: false })) return 'Not an address.';
-  if (text.toLowerCase() === zeroAddress) return 'The zero address cannot receive fees.';
-  if (account !== null && text.toLowerCase() === account.toLowerCase()) return 'That is the mind account itself.';
-  return null;
-}
 
 /** See module docs. */
 export function LeaveMind({ mind, live, onChanged }: { mind: MindDetail; live: PonsLive | null; onChanged: () => void }) {

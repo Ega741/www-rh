@@ -76,7 +76,7 @@ export function PonsTradePanel({ mind, live, onTx }: PonsTradePanelProps) {
           <div className="kv">
             <dt>real reserve</dt>
             <dd>
-              {live?.realQuoteReserve != null ? formatEth(live.realQuoteReserve, { maxFraction: 3, symbol: false }) : '—'} /{' '}
+              {formatEth(live?.realQuoteReserve ?? mind.realEthReserveWei, { maxFraction: 3, symbol: false })} /{' '}
               {live?.graduationThreshold != null ? formatEth(live.graduationThreshold, { maxFraction: 3 }) : '—'}
             </dd>
           </div>
@@ -297,7 +297,7 @@ function PonsTradeForm({ mind, live, onTx }: { mind: MindDetail; live: PonsLive;
     query: { enabled: address !== undefined && side === 'sell' },
   });
 
-  const ready = live.quoteReserve !== null && live.tokenReserve !== null && live.feeBps !== null && live.creatorTaxBps !== null;
+  const ready = live.quoteReserve !== null && live.tokenReserve !== null && live.feeBps !== null && live.creatorTaxBps !== null && (side === 'sell' || live.sellable !== null);
   const reserves = { quoteReserve: live.quoteReserve ?? 0n, tokenReserve: live.tokenReserve ?? 0n };
   const fees = { feeBps: BigInt(live.feeBps ?? 0), taxBps: BigInt(live.creatorTaxBps ?? 0) };
   const amountOk = parsed !== null && parsed > 0n;

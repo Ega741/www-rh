@@ -8,7 +8,7 @@ const RECIPIENT = '0x3333333333333333333333333333333333333333' as Address;
 const ACCOUNT = '0x4444444444444444444444444444444444444444' as Address;
 const STRANGER = '0x5555555555555555555555555555555555555555' as Address;
 
-const launch: LaunchRecord = { exists: true, curve: CURVE, deployer: DEPLOYER, creatorFeeRecipient: RECIPIENT };
+const launch: LaunchRecord = { exists: true, curve: CURVE, deployer: DEPLOYER, creatorFeeRecipient: RECIPIENT, pairToken: zeroAddress };
 const unregistered: RegistryMindRecord = { curve: zeroAddress, account: zeroAddress, launchedHere: false, adopted: false };
 const prepared: RegistryMindRecord = { curve: CURVE, account: ACCOUNT, launchedHere: false, adopted: false };
 
@@ -29,6 +29,10 @@ describe('adoption state machine (SPEC §9.2/§9.5)', () => {
       walletIsRecipient: false,
     });
     expect(adoptionStep({ wallet: STRANGER, launch, mind: unregistered })).toEqual({ kind: 'not-authorized', recipient: RECIPIENT, deployer: DEPLOYER });
+  });
+
+  it('refuses launches quoted in an ERC-20 (native quote only)', () => {
+    expect(adoptionStep({ wallet: RECIPIENT, launch: { ...launch, pairToken: STRANGER }, mind: unregistered })).toEqual({ kind: 'unsupported-quote', pairToken: STRANGER });
   });
 
   it('step 2: after prepareAdoption the current recipient must transfer to the account', () => {

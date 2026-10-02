@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { PonsGraduationPhase } from './abi';
 import { factoryPhaseName, ponsPhase, ponsPhaseLabel } from './phase';
 import { snipeWindow } from './snipe';
+import { leaveRecipientError } from './leave';
 
 describe('Pons phases (SPEC §9.3/§9.5)', () => {
   it('maps the factory phase and curve flags onto bonding / complete / graduated', () => {
@@ -34,5 +35,16 @@ describe('snipe-tax window', () => {
   it('is closed when the launch time is unknown or the window is zero', () => {
     expect(snipeWindow(null, 15, 0)).toEqual({ active: false, remainingSeconds: 0, endsAt: null });
     expect(snipeWindow(launchedAt, 0, launchedAt * 1000).active).toBe(false);
+  });
+});
+
+describe('leave recipient validation', () => {
+  const account = '0x5555555555555555555555555555555555555555' as const;
+  it('accepts a fresh address and rejects empty, malformed, zero and the account itself', () => {
+    expect(leaveRecipientError('0x3333333333333333333333333333333333333333', account)).toBeNull();
+    expect(leaveRecipientError('  ', account)).toMatch(/Enter/);
+    expect(leaveRecipientError('0x123', account)).toMatch(/Not an address/);
+    expect(leaveRecipientError('0x0000000000000000000000000000000000000000', account)).toMatch(/zero address/);
+    expect(leaveRecipientError(account.toUpperCase().replace('0X', '0x'), account)).toMatch(/mind account/);
   });
 });
