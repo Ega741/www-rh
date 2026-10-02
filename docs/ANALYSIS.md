@@ -71,7 +71,7 @@ fees, что и у оригинала, а собственная кривая и
 | Элемент | Режим Pons (mainnet) |
 |---|---|
 | Запуск монеты | `PonsMindRegistry.launchMind` одной транзакцией: клон `MindAccount` → `factory.launchToken` с `creatorFeeRecipient = account` → регистрация разума → первая покупка создателя (освобождена от snipe tax) |
-| Существующая монета Pons | «усыновление»: `prepareAdoption` → создатель переводит получателя комиссий на `MindAccount` → `activateAdoption` |
+| Существующая монета Pons | «усыновление»: заявитель создаёт свой `MindAccount` (`prepareAdoption`), текущий получатель комиссий переводит поток на этот аккаунт (`transferCreatorFeeRecipient`), затем `activateAdoption(token, preparer)` регистрирует разум; тот, чей аккаунт получил поток, и становится создателем разума |
 | Доход разума | creator share (70 % от 1 %) + опциональный creator tax, из эскроу Pons через `harvest()`; после выпуска — комиссии хука Uniswap v4 |
 | Торговля | напрямую на кривой Pons (`buy`/`sell`), после выпуска на Pons/Uniswap v4 |
 | Compute, память, статусы | без изменений: `drawCompute` с квитанциями, `anchorMemory`, пауза создателя |

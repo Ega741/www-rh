@@ -132,7 +132,9 @@ cat deployments/4663.json      # { registry, venue: "pons", ... }
 1. `acceptOwnership()` с адреса `OWNER` (Ownable2Step).
 2. Проверьте `factory.canLaunch(<REGISTRY>)` на фабрике Pons: публичные запуски должны быть включены
    (`launchEnabled`) либо реестр добавлен в whitelist Pons. Иначе `launchMind` будет откатываться,
-   а работать будет только «усыновление» (`prepareAdoption` → `transferCreatorFeeRecipient` → `activateAdoption`).
+   а работать будет только «усыновление»: заявитель вызывает `prepareAdoption` (создаётся его
+   личный `MindAccount`), текущий получатель комиссий Pons переводит поток на этот аккаунт
+   (`transferCreatorFeeRecipient`), затем любой вызывает `activateAdoption(token, preparer)`.
 3. Раннер: `VENUE=pons`, `REGISTRY_ADDRESS=<registry>`, `START_BLOCK` из broadcast-файла.
 4. Веб: `VITE_VENUE=pons`, `VITE_REGISTRY_ADDRESS=<registry>`.
 
@@ -140,6 +142,11 @@ cat deployments/4663.json      # { registry, venue: "pons", ... }
 Pons; на кривой также `deployer`, то есть наш реестр для монет, запущенных через `launchMind`).
 `harvest(token)` (permissionless, раннер вызывает при `claimable ≥ HARVEST_MIN_WEI`) делает
 best-effort свип и `claim()` через `MindAccount`, после чего ETH зачисляется в vault монеты.
+Свип кривой выполняет сам `MindAccount` (у Pons право свипа есть у текущего получателя комиссий),
+свип комиссий пула после выпуска чаще всего доступен только оператору Pons — доход после выпуска
+зависит от частоты их свипов. Создатель может уйти (`leave`): заработанные комиссии сначала
+собираются в vault, затем поток переводится на указанный адрес; vault остаётся у разума, а новый
+владелец потока может «перехватить» разум через усыновление.
 
 ## 2. Раннер (разум монет)
 
