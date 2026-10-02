@@ -1,5 +1,5 @@
 /**
- * Pons-mode operator transactions of the scheduler (`docs/SPEC.md` §9.4):
+ * Pons-mode operator transactions of the scheduler (`docs/SPEC.md` §9.4, §9.7):
  *
  * - **harvest** (`registry.harvest(token)`) per {@link harvestDecision}: after ticks and on vault /
  *   escrow events (`threshold`, `runway`), and in the hourly sweep (`hourly`, `pool`); at most one
@@ -8,8 +8,12 @@
  *   been `Swept` for more than {@link SWEPT_POOL_DELAY_MS} (Pons auto-graduates the curve; seeding
  *   the v4 pool is permissionless); the on-chain phase is re-read first (`Rescued` is mapped to
  *   `graduated` locally, it emits nothing we index);
- * - **setPoolId** (`registry.setPoolId(token, poolId)`) from the hook's `PoolRegistered` (live
- *   event, and the 10-min sweep for any recorded pool id the registry does not have yet).
+ * - **pool id** (§9.7): `harvest` uses `poolIdOf(token)` when set, else `derivedPoolId(token)`. After
+ *   graduation the derived id is read through once (`registry.derivedPoolId`, stored in
+ *   `pons_minds.derived_pool_id`), so no transaction is needed when `PoolRegistered` is not observed;
+ *   **setPoolId** (`registry.setPoolId(token, poolId)`) is sent only as an override, for an observed
+ *   `PoolRegistered` id (live event, and the 10-min sweep) that differs from the derived one (or when
+ *   the derived id cannot be read).
  *
  * Nothing here calls the in-house curve's `graduate` / `harvest`. Every transaction goes through the
  * DRY_RUN-aware queue.
@@ -39,7 +43,7 @@ export const POOL_TX_SPACING_MS = 10 * 60_000;
 export interface PonsOpsDeps {
   repos: Repos;
   queue: Pick<TxQueue, 'enqueue'>;
-  reader: Pick<PonsReader, 'launchedToken'> | null;
+  reader: Pick<PonsReader, 'launchedToken' | 'derivedPoolId'> | null;
   economics: { snapshot(token: string): Promise<MindEconomics> };
   log: Logger;
   config: { harvestMinWei: bigint; harvestIntervalMs: number };
@@ -112,14 +116,39 @@ export class PonsOps {
     }
   }
 
-  /** Records the hook's pool id on the registry (DRY_RUN-aware, rate limited). */
+  /**
+   * `registry.derivedPoolId(token)`, read through once and stored (the pool key is fixed per launch); `null`
+   * when it cannot be read (no reader, RPC failure, a registry without the view) or is zero.
+   */
+  async resolvePoolId(token: string): Promise<string | null> {
+    const row = this.deps.repos.pons.get(token);
+    if (row === undefined) return null;
+    if (row.derived_pool_id !== null) return row.derived_pool_id;
+    if (this.deps.reader === null) return null;
+    try {
+      const id = (await this.deps.reader.derivedPoolId(token as Address)).toLowerCase();
+      if (/^0x0{64}$/.test(id)) return null;
+      this.deps.repos.pons.patch(token, { derived_pool_id: id });
+      return id;
+    } catch (err) {
+      this.deps.log.debug('derivedPoolId unavailable', { token, error: errorMessage(err) });
+      return null;
+    }
+  }
+
+  /**
+   * An observed `PoolRegistered` id: nothing to send when the registry already has it or derives the same id
+   * (§9.7); otherwise `setPoolId` as an override (DRY_RUN-aware, rate limited).
+   */
   async setPoolId(token: string, poolId: string): Promise<void> {
     if (this.#stopped) return;
     const row = this.deps.repos.pons.get(token);
-    if (row === undefined || row.registry_pool_id === poolId.toLowerCase()) return;
+    const id = poolId.toLowerCase();
+    if (row === undefined || row.registry_pool_id === id) return;
+    if ((await this.resolvePoolId(token)) === id) return; // harvest falls back to derivedPoolId: no transaction needed
     if (!this.#slot('setPoolId', token, POOL_TX_SPACING_MS)) return;
     try {
-      this.deps.log.info('recording the graduated pool id', { token, poolId });
+      this.deps.log.info('recording the graduated pool id (override of derivedPoolId)', { token, poolId });
       await this.deps.queue.enqueue({ functionName: 'setPoolId', args: [token as Address, poolId as Hex] }, `setPoolId ${token}`);
     } catch (err) {
       this.deps.log.warn('setPoolId failed', { token, error: errorMessage(err) });
@@ -149,7 +178,10 @@ export class PonsOps {
     }
   }
 
-  /** Every 10 min (and once when the indexer is live): pools of launches swept > 10 min ago, pending pool ids. */
+  /**
+   * Every 10 min (and once when the indexer is live): pools of launches swept > 10 min ago, the derived pool id
+   * of graduated pools (read through), observed pool ids that need a `setPoolId` override.
+   */
   async poolSweep(): Promise<void> {
     const now = this.#now();
     for (const row of this.deps.repos.pons.all()) {
@@ -157,6 +189,7 @@ export class PonsOps {
       const mind = this.deps.repos.minds.get(row.token);
       if (mind === undefined) continue;
       if (mind.phase === 1 && row.swept_at !== null && now - row.swept_at > SWEPT_POOL_DELAY_MS) await this.#createPool(row.token);
+      if (row.launch_phase === 2 && row.derived_pool_id === null) await this.resolvePoolId(row.token);
       if (row.pool_id !== null && row.registry_pool_id !== row.pool_id) await this.setPoolId(row.token, row.pool_id);
     }
   }

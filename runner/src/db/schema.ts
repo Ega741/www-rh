@@ -261,6 +261,36 @@ CREATE INDEX pons_minds_by_curve ON pons_minds (curve);
 CREATE INDEX pons_minds_by_account ON pons_minds (account);
 `;
 
+/**
+ * v4 — Pons adoption v2 and lifecycle hardening (`docs/SPEC.md` §9.7).
+ *
+ * - `pons_minds.has_left`: the creator called `leave` (`MindLeft`); cleared by a takeover (`MindAdopted`);
+ * - `pons_minds.derived_pool_id`: `registry.derivedPoolId(token)` read through once after graduation (the pool
+ *   key is fixed per launch), used when no `PoolRegistered` / `PoolIdSet` was observed;
+ * - `pons_adoptions`: pending preparations from `AdoptionPrepared` (config re-read from
+ *   `pendingAdoption(token, preparer)`; `NULL` config = the preparation was no longer pending when read). Their
+ *   accounts join the escrow log filter so a fee hand-off before activation is observed: `claimable` is the
+ *   account's escrow balance (Σ `Credited` − Σ `Claimed`), carried into `pons_minds` by `MindAdopted`, which
+ *   deletes the row (the registry deletes the pending record on activation).
+ */
+const SCHEMA_V4 = `
+ALTER TABLE pons_minds ADD COLUMN has_left INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE pons_minds ADD COLUMN derived_pool_id TEXT;
+
+CREATE TABLE pons_adoptions (
+  token TEXT NOT NULL,
+  preparer TEXT NOT NULL,
+  account TEXT NOT NULL,
+  model_id TEXT,
+  persona_hash TEXT,
+  metadata_uri TEXT,
+  claimable TEXT NOT NULL DEFAULT '0',
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (token, preparer)
+);
+CREATE INDEX pons_adoptions_by_account ON pons_adoptions (account);
+`;
+
 /** Ordered migrations; index + 1 is the resulting `user_version`. */
 const MIGRATIONS: readonly ((db: Db) => void)[] = [
   (db) => {
@@ -273,6 +303,7 @@ const MIGRATIONS: readonly ((db: Db) => void)[] = [
   },
   (db) => db.exec(SCHEMA_V2),
   (db) => db.exec(SCHEMA_V3),
+  (db) => db.exec(SCHEMA_V4),
 ];
 
 /** Latest schema version. */

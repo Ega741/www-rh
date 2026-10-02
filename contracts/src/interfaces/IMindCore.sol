@@ -174,7 +174,8 @@ interface IMindCore {
     function setMindConfig(address token, bytes32 modelId, bytes32 personaHash, string calldata metadataURI) external;
 
     /// @notice Creator-only: `paused = true` sets the status to `Paused` (from Alive or Dormant);
-    ///         `paused = false` restores `Alive` from `Paused`. A no-op (no event) when nothing changes.
+    ///         `paused = false` restores `Alive` from `Paused` (`Dormant` instead where the venue does not allow the mind
+    ///         to be Alive, e.g. a Pons mind whose creator left). A no-op (no event) when nothing changes.
     function setCreatorPaused(address token, bool paused) external;
 
     // ---------------------------------------------------------------------------------------------
@@ -190,7 +191,8 @@ interface IMindCore {
     function anchorMemory(address token, uint64 seq, bytes32 contentHash, string calldata uri) external;
 
     /// @notice Operator-only: sets `Alive` or `Dormant` (no event when unchanged). Reverts `InvalidStatus()` when
-    ///         `status == Paused` or the mind is currently `Paused` (only the creator can change that).
+    ///         `status == Paused` or the mind is currently `Paused` (only the creator can change that), and for `Alive`
+    ///         where the venue does not allow the mind to be Alive (a Pons mind whose creator left).
     function setMindStatus(address token, MindStatus status) external;
 
     // ---------------------------------------------------------------------------------------------

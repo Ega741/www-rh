@@ -16,11 +16,12 @@ import {
   type LedgerEntry,
   type MindDetail,
   type MindSummary,
+  type PonsAdoption,
   type PonsMindInfo,
   type Thought,
   type Trade,
 } from '@www-rh/shared';
-import type { DrawRow, MindRow, PonsMindRow, ReceiptRow, ThoughtRow, TickRow, TradeRow } from '../db/repos.js';
+import type { DrawRow, MindRow, PonsAdoptionRow, PonsMindRow, ReceiptRow, ThoughtRow, TickRow, TradeRow } from '../db/repos.js';
 import { microToUsd } from '../economics/budget.js';
 
 type Hex = `0x${string}`;
@@ -80,7 +81,20 @@ export function ponsInfoDto(p: PonsMindRow): PonsMindInfo {
     claimableWei: p.claimable,
     launchedHere: p.launched_here === 1,
     adopted: p.adopted === 1,
-    poolId: (p.pool_id ?? p.registry_pool_id) as Hex | null,
+    left: p.has_left === 1,
+    // the hook's PoolRegistered, else the registry's PoolIdSet override, else registry.derivedPoolId (§9.7)
+    poolId: (p.pool_id ?? p.registry_pool_id ?? p.derived_pool_id) as Hex | null,
+  };
+}
+
+/** `GET /api/minds/:token/adoptions` item of a `pons_adoptions` row whose pending config is known (§9.7). */
+export function ponsAdoptionDto(r: PonsAdoptionRow): PonsAdoption {
+  return {
+    preparer: r.preparer as Hex,
+    account: r.account as Hex,
+    modelId: (r.model_id ?? `0x${'00'.repeat(32)}`) as Hex,
+    personaHash: (r.persona_hash ?? `0x${'00'.repeat(32)}`) as Hex,
+    metadataURI: r.metadata_uri ?? '',
   };
 }
 

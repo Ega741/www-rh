@@ -306,12 +306,13 @@ const CURVE_ONLY = [
   'WrongPhase', 'Slippage', 'Expired', 'ExceedsTokensSold', 'GraduatorNotSet', 'InvalidGraduationGrace', 'InvalidGraduator', 'PoolPriceSkewed',
 ];
 
-describe('PonsMindRegistry / MindAccount ABIs (§9.2)', () => {
+describe('PonsMindRegistry / MindAccount ABIs (§9.2, §9.7)', () => {
   it('registry = MindCore surface + Pons integration, without MindLaunchpad-only members', () => {
     const fns = names(ponsMindRegistryAbi, 'function');
     for (const name of [
       'launchMind', 'prepareAdoption', 'activateAdoption', 'leave', 'harvest', 'createGraduatedPool', 'setPoolId', 'ponsMind', 'accountOf', 'tokenOf',
       'predictAccount', 'predictAdoptionAccount', 'claimable', 'poolIdOf', 'launchQuote', 'factory', 'feeEscrow', 'memeHook', 'accountImplementation', 'mindFeeBps', 'setMindFeeBps',
+      'pendingAdoption', 'hasLeft', 'derivedPoolId', 'recoverAccountTokens',
       'fundMind', 'drawCompute', 'anchorMemory', 'setMindStatus', 'setMindConfig', 'setCreatorPaused', 'getMind', 'mindBalance', 'protocolBalance', 'mindsLength',
       'mindAt', 'isMind', 'creationFee', 'setCreationFee', 'drawLimit', 'setDrawLimit', 'drawnInEpoch', 'operator', 'treasury', 'computeTreasury', 'setOperator',
       'setTreasury', 'setComputeTreasury', 'pause', 'unpause', 'paused', 'withdrawProtocolFees', 'owner', 'pendingOwner', 'transferOwnership', 'acceptOwnership',
@@ -324,7 +325,7 @@ describe('PonsMindRegistry / MindAccount ABIs (§9.2)', () => {
       expect(events.has(name), `event ${name}`).toBe(true);
     }
     const errors = names(ponsMindRegistryAbi, 'error');
-    for (const name of ['AccountExists', 'NotPonsLaunch', 'NotRecipientOrDeployer', 'AdoptionNotReady', 'AlreadyAdopted', 'WrongValue', 'LaunchFailed', 'NotAMind', 'EthReturnMismatch', 'DirectEthNotAccepted']) {
+    for (const name of ['AccountExists', 'NotPonsLaunch', 'NotRecipientOrDeployer', 'AdoptionNotReady', 'AlreadyAdopted', 'WrongValue', 'LaunchFailed', 'NotAMind', 'EthReturnMismatch', 'DirectEthNotAccepted', 'BuybackEnabledLaunch', 'InvalidRecipient']) {
       expect(errors.has(name), `error ${name}`).toBe(true);
     }
     for (const name of CURVE_ONLY) expect(fns.has(name) || events.has(name) || errors.has(name), name).toBe(false);
@@ -347,8 +348,38 @@ describe('PonsMindRegistry / MindAccount ABIs (§9.2)', () => {
     for (const [topic, sig] of lp.events) if (names(ponsMindRegistryAbi, 'event').has(sig.slice(0, sig.indexOf('(')))) expect(reg.events.get(topic), sig).toBe(sig);
   });
 
-  it('MindAccount has the §9.2 functions plus sweepCurve', () => {
-    expect(sorted(mindAccountAbi, 'function')).toEqual(['claim', 'initialize', 'registry', 'sweepCurve', 'sweepPool', 'transferFeeRecipient']);
+  it('adoption v2 / lifecycle members (§9.7): signatures, selectors, topics and decoded names', () => {
+    const reg = selectorsOf(ponsMindRegistryAbi);
+    for (const sig of [
+      'activateAdoption(address,address)', 'predictAdoptionAccount(address,address)', 'pendingAdoption(address,address)', 'hasLeft(address)', 'derivedPoolId(address)',
+      'recoverAccountTokens(address,address)', 'prepareAdoption(address,bytes32,bytes32,string)', 'leave(address,address)',
+    ]) {
+      expect(reg.functions.get(toFunctionSelector(sig)), sig).toBe(sig);
+    }
+    // the §9.2 one-argument forms are gone
+    for (const sig of ['activateAdoption(address)', 'predictAdoptionAccount(address)']) expect(reg.functions.has(toFunctionSelector(sig)), sig).toBe(false);
+    expect(reg.events.get(toEventSelector('MindAdopted(address,address,address)'))).toBe('MindAdopted(address,address,address)');
+    expect(reg.events.has(toEventSelector('MindAdopted(address,address)'))).toBe(false);
+    expect(reg.errors.get(toFunctionSelector('BuybackEnabledLaunch()'))).toBe('BuybackEnabledLaunch()');
+    expect(reg.errors.get(toFunctionSelector('InvalidRecipient()'))).toBe('InvalidRecipient()');
+    const ev = (name: string): string[] =>
+      (ponsMindRegistryAbi.find((i) => i.type === 'event' && i.name === name) as AbiEvent).inputs.map((i) => `${i.name}${i.indexed === true ? '*' : ''}`);
+    expect(ev('AdoptionPrepared')).toEqual(['token*', 'account*', 'preparer*']);
+    expect(ev('MindAdopted')).toEqual(['token*', 'account*', 'creator*']);
+    expect(ev('MindLeft')).toEqual(['token*', 'newRecipient']);
+    const fn = (name: string): AbiFunction => ponsMindRegistryAbi.find((i) => i.type === 'function' && i.name === name) as AbiFunction;
+    expect(fn('pendingAdoption').outputs.map((o) => `${o.type} ${o.name}`)).toEqual(['address account', 'bytes32 modelId', 'bytes32 personaHash', 'string metadataURI']);
+    expect(fn('pendingAdoption').stateMutability).toBe('view');
+    expect(fn('activateAdoption').inputs.map((i) => i.name)).toEqual(['token', 'preparer']);
+    expect(fn('predictAdoptionAccount').inputs.map((i) => i.name)).toEqual(['token', 'preparer']);
+    expect([fn('hasLeft').outputs[0]?.type, fn('derivedPoolId').outputs[0]?.type]).toEqual(['bool', 'bytes32']);
+    expect(fn('recoverAccountTokens').stateMutability).toBe('nonpayable');
+  });
+
+  it('MindAccount has the §9.2 functions plus sweepCurve and sweepTokens (§9.7)', () => {
+    expect(sorted(mindAccountAbi, 'function')).toEqual(['claim', 'initialize', 'registry', 'sweepCurve', 'sweepPool', 'sweepTokens', 'transferFeeRecipient']);
+    expect(selectorsOf(mindAccountAbi).functions.get(toFunctionSelector('sweepTokens(address,address)'))).toBe('sweepTokens(address,address)');
+    expect(selectorsOf(mindAccountAbi).errors.get(toFunctionSelector('SafeERC20FailedOperation(address)'))).toBe('SafeERC20FailedOperation(address)');
     expect(mindAccountAbi.some((i) => i.type === 'receive')).toBe(true);
   });
 });
@@ -359,7 +390,8 @@ const accountArtifact = loadSyncedAbi('MindAccount');
 describe.skipIf(registryArtifact === undefined)('PonsMindRegistry ABI equivalence with abi/PonsMindRegistry.json', () => {
   const ours = selectorsOf(ponsMindRegistryAbi);
   const theirs = selectorsOf(registryArtifact ?? []);
-  it('functions and events are set-equal; every compiled error is declared', () => {
+  it('functions and events are set-equal; every compiled error is declared (§9.7 artifact)', () => {
+    expect(theirs.functions.get(toFunctionSelector('hasLeft(address)'))).toBe('hasLeft(address)');
     expect(missing(ours.functions, theirs.functions)).toEqual([]);
     expect(missing(theirs.functions, ours.functions)).toEqual([]);
     expect(missing(ours.events, theirs.events)).toEqual([]);

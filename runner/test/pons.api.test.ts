@@ -5,6 +5,8 @@ import {
   launchConfigResponseSchema,
   mindDetailSchema,
   mindsResponseSchema,
+  modelIdToHash,
+  ponsAdoptionsResponseSchema,
   ponsCurveAbi,
   ponsFeeEscrowAbi,
   ponsMindRegistryAbi,
@@ -22,7 +24,7 @@ import { Indexer } from '../src/indexer/indexer.js';
 import { PonsIndexerVenue } from '../src/indexer/pons.js';
 import { StreamBus } from '../src/stream/bus.js';
 import { CREATOR, FakeClock, FakeLogSource, memoryRepos, mindCreatedLog, silentLogger, TOKEN } from './helpers.js';
-import { E, encodePonsLog, ESCROW, FakePonsReader, launchedToken, mindCreatedArgs, PACCOUNT, PCURVE, PHANTOM, PTOKEN, REGISTRY, SUPPLY } from './ponsHelpers.js';
+import { AACCOUNT, AACCOUNT2, ACURVE, ATOKEN, E, encodePonsLog, ESCROW, FakePonsReader, launchedToken, mindCreatedArgs, PACCOUNT, PCURVE, PHANTOM, PREPARER2, PTOKEN, REGISTRY, SUPPLY } from './ponsHelpers.js';
 
 const policy = { tickIntervalMs: 20_000, targetRunwayDays: 14, minDailySpendUsd: 0.5, maxTickCostUsd: 0.25, minTickBudgetUsd: 0.05 };
 const NOW = 1_800_000_000_000;
@@ -119,7 +121,7 @@ describe('Pons-mode API DTOs (SPEC §9.3, §9.4)', () => {
     const pons = list.items[1]!;
     expect(pons).toMatchObject({ trades24h: 1, volume24hWei: E.toString(), progressBps: Number((99n * 10n ** 16n * 10_000n) / 4_200_000_000_000_000_000n) });
     const detail = mindDetailSchema.parse((await json(w.app, `/api/minds/${PTOKEN}`)).body);
-    expect(detail.pons).toEqual({ curve: PCURVE, account: PACCOUNT, deployer: REGISTRY, launchConfigId: 0, feeBps: 100, creatorTaxBps: 0, claimableWei: '120', launchedHere: true, adopted: false, poolId: null });
+    expect(detail.pons).toEqual({ curve: PCURVE, account: PACCOUNT, deployer: REGISTRY, launchConfigId: 0, feeBps: 100, creatorTaxBps: 0, claimableWei: '120', launchedHere: true, adopted: false, left: false, poolId: null });
     expect(mindDetailSchema.parse((await json(w.app, `/api/minds/${TOKEN}`)).body).pons).toBeNull();
     const [trade] = tradeSchema.array().parse((await json(w.app, `/api/minds/${PTOKEN}/trades`)).body);
     expect(trade).toMatchObject({ isBuy: true, trader: CREATOR.toLowerCase(), ethAmountWei: E.toString(), feeWei: (E / 100n).toString(), realEthReserveWei: (99n * 10n ** 16n).toString() });
@@ -128,6 +130,55 @@ describe('Pons-mode API DTOs (SPEC §9.3, §9.4)', () => {
     const econ = await w.economics.snapshot(PTOKEN);
     expect([econ.budget.balanceWei, econ.claimableWei]).toEqual([0n, 123n]);
     expect((await w.economics.snapshot(TOKEN)).claimableWei).toBeNull();
+  });
+});
+
+describe('GET /api/minds/:token/adoptions (SPEC §9.7)', () => {
+  it('serves the pending preparations of a Pons token that is not a mind yet (indexed from AdoptionPrepared), most recent first', async () => {
+    const w = ponsWorld();
+    const source = new FakeLogSource();
+    source.byAddress = true;
+    const opus = modelIdToHash('claude-opus-5-5');
+    const haiku = modelIdToHash('claude-haiku-4-5');
+    w.reader.pending.set(`${ATOKEN}:${CREATOR.toLowerCase()}`, { account: AACCOUNT, modelId: opus, personaHash: `0x${'aa'.repeat(32)}`, metadataURI: 'runner://metadata/' + 'ab'.repeat(32) });
+    w.reader.pending.set(`${ATOKEN}:${PREPARER2.toLowerCase()}`, { account: AACCOUNT2, modelId: haiku, personaHash: `0x${'bb'.repeat(32)}`, metadataURI: 'ipfs://second' });
+    source.logs = [
+      encodePonsLog(ponsMindRegistryAbi, 'AdoptionPrepared', { token: ATOKEN, account: AACCOUNT, preparer: CREATOR }, { address: REGISTRY, block: 5n, logIndex: 0 }),
+      encodePonsLog(ponsMindRegistryAbi, 'AdoptionPrepared', { token: ATOKEN, account: AACCOUNT2, preparer: PREPARER2 }, { address: REGISTRY, block: 6n, logIndex: 0 }),
+    ];
+    source.head = 6n;
+    const indexer = new Indexer(w.repos, source, new IndexerEvents(), { address: REGISTRY, venue: new PonsIndexerVenue(REGISTRY, w.reader, silentLogger), startBlock: 0n, confirmations: 0 }, silentLogger);
+    await indexer.syncOnce();
+    expect(w.repos.minds.get(ATOKEN)).toBeUndefined();
+    // mixed-case address accepted
+    const res = await json(w.app, `/api/minds/${ATOKEN.toUpperCase().replace('0X', '0x')}/adoptions`);
+    expect(res.status).toBe(200);
+    expect(ponsAdoptionsResponseSchema.parse(res.body)).toEqual([
+      { preparer: PREPARER2.toLowerCase(), account: AACCOUNT2, modelId: haiku, personaHash: `0x${'bb'.repeat(32)}`, metadataURI: 'ipfs://second' },
+      { preparer: CREATOR.toLowerCase(), account: AACCOUNT, modelId: opus, personaHash: `0x${'aa'.repeat(32)}`, metadataURI: 'runner://metadata/' + 'ab'.repeat(32) },
+    ]);
+    // the mind routes still 404 for a token that is not a mind
+    expect((await json(w.app, `/api/minds/${ATOKEN}`)).status).toBe(404);
+
+    // activation by CREATOR removes its preparation; PREPARER2's stays pending (served for the registered mind too)
+    w.reader.launched.set(ATOKEN, launchedToken(ACURVE, { creatorFeeRecipient: AACCOUNT }));
+    w.reader.states.set(`${ACURVE}@7`, { quoteReserve: PHANTOM, tokenReserve: SUPPLY, realQuoteReserve: 0n });
+    source.logs.push(
+      encodePonsLog(ponsMindRegistryAbi, 'MindCreated', { ...mindCreatedArgs(ATOKEN), creator: CREATOR }, { address: REGISTRY, block: 7n, logIndex: 0 }),
+      encodePonsLog(ponsMindRegistryAbi, 'MindAdopted', { token: ATOKEN, account: AACCOUNT, creator: CREATOR }, { address: REGISTRY, block: 7n, logIndex: 1 }),
+    );
+    source.head = 7n;
+    await indexer.syncOnce();
+    expect(ponsAdoptionsResponseSchema.parse((await json(w.app, `/api/minds/${ATOKEN}/adoptions`)).body).map((a) => a.preparer)).toEqual([PREPARER2.toLowerCase()]);
+    expect(mindDetailSchema.parse((await json(w.app, `/api/minds/${ATOKEN}`)).body).pons).toMatchObject({ account: AACCOUNT, adopted: true, left: false, launchedHere: false });
+  });
+
+  it('[] for an address without preparations; 400 for a malformed address; preparations no longer pending are not served', async () => {
+    const w = ponsWorld();
+    expect(await json(w.app, `/api/minds/${PTOKEN}/adoptions`)).toEqual({ status: 200, body: [] });
+    expect(await json(w.app, '/api/minds/0x1234/adoptions')).toEqual({ status: 400, body: { error: 'invalid token address' } });
+    w.repos.ponsAdoptions.upsert({ token: PTOKEN, preparer: CREATOR, account: PACCOUNT, modelId: null, personaHash: null, metadataUri: null, updatedAt: 1 });
+    expect(await json(w.app, `/api/minds/${PTOKEN}/adoptions`)).toEqual({ status: 200, body: [] });
   });
 });
 

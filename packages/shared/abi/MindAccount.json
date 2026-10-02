@@ -101,6 +101,24 @@
   },
   {
     "type": "function",
+    "name": "sweepTokens",
+    "inputs": [
+      {
+        "name": "erc20",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "to",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "transferFeeRecipient",
     "inputs": [
       {
@@ -136,6 +154,17 @@
     "type": "error",
     "name": "NotRegistry",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "SafeERC20FailedOperation",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
   },
   {
     "type": "error",

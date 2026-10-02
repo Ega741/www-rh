@@ -5,6 +5,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {MindAccount} from "../src/MindAccount.sol";
+import {PonsMindRegistry} from "../src/PonsMindRegistry.sol";
 import {IMindCore} from "../src/interfaces/IMindCore.sol";
 import {IPonsMindRegistry} from "../src/interfaces/IPonsMindRegistry.sol";
 import {IPonsV2FeeEscrow} from "../src/interfaces/pons/IPonsV2FeeEscrow.sol";
@@ -89,9 +90,10 @@ contract EthPusher {
     }
 }
 
-/// @notice SPEC §9.2 harvest: best-effort sweeps (curve via the account, direct fallback, graduated pool), claim
-///         through the account with the return counter, mindFeeBps split, EthReturnMismatch and the receive() gate,
-///         setPoolId, createGraduatedPool, claimable.
+/// @notice SPEC §9.2/§9.7 harvest: best-effort sweeps (curve via the account, direct fallback, graduated pool on the
+///         derived v4 pool id or the operator override), claim through the account with the return counter, mindFeeBps
+///         split, EthReturnMismatch and the receive() gate, setPoolId, derivedPoolId vectors, createGraduatedPool,
+///         claimable (escrow balance + account ETH).
 contract PonsMindRegistryHarvestTest is PonsBaseTest {
     address internal token;
     address internal curve;
@@ -204,14 +206,17 @@ contract PonsMindRegistryHarvestTest is PonsBaseTest {
     }
 
     function test_harvest_buybackPending_sweepSkipped() public {
-        // An adopted coin whose original creator enabled buyback: the account may not sweep (internal swap needs
-        // Pons' operator); harvest records the failure and still claims what the escrow holds.
-        (address wild, address wildCurve) = _launchDirect(alice, alice, keccak256("bb"), true);
+        // Buyback launches cannot be prepared, but the recipient may enable buyback after preparing: activation does
+        // not re-check (refusing would strand the handed-over stream). The account may not sweep (the internal swap
+        // needs Pons' operator); harvest records the failure and still claims what the escrow holds.
+        (address wild, address wildCurve) = _launchDirect(alice, alice, keccak256("bb"), false);
+        address wildAccount = _prepareAdoption(wild, alice);
         vm.prank(alice);
-        address wildAccount = registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        factory.setBuybackEnabled(wild, true);
         vm.prank(alice);
         factory.transferCreatorFeeRecipient(wild, wildAccount);
-        registry.activateAdoption(wild);
+        registry.activateAdoption(wild, alice);
+        assertTrue(factory.getLaunchedToken(wild).buybackEnabled);
         vm.warp(block.timestamp + 1 minutes);
         _buy(stranger, wildCurve, 1 ether);
         assertGt(MockPonsCurve(wildCurve).buybackQuoteBalance(), 0);
@@ -326,40 +331,150 @@ contract PonsMindRegistryHarvestTest is PonsBaseTest {
         assertEq(uint8(_phase(token)), uint8(IPonsV2LaunchFactory.GraduationPhase.PoolCreated));
     }
 
-    function test_harvest_poolPhase_needsPoolId() public {
+    function test_harvest_poolPhase_derivedPoolId_andOperatorOverride() public {
         _graduate(stranger, curve);
         registry.createGraduatedPool(token);
         bytes32 poolId = factory.poolIdFor(token);
+        assertEq(registry.derivedPoolId(token), poolId);
+        assertEq(registry.poolIdOf(token), bytes32(0));
         _harvest(token); // claims the graduation sweep
         uint256 vault = registry.mindBalance(token);
-
-        hook.simulateSwapFees{value: 1 ether}(poolId, 0.05 ether);
         uint256 share = 0.95 ether - 0.95 ether * PROTOCOL_SHARE_BPS / 10_000 + 0.05 ether;
 
-        // Unknown pool id: no pool sweep.
+        // No override: the derived pool id is swept.
+        hook.simulateSwapFees{value: 1 ether}(poolId, 0.05 ether);
         vm.expectEmit(true, false, false, true, address(registry));
-        emit IPonsMindRegistry.SweepAttempted(token, false, false);
+        emit IPonsMindRegistry.SweepAttempted(token, false, true);
         _harvest(token);
-        assertEq(registry.mindBalance(token), vault);
+        assertEq(registry.mindBalance(token), vault + share);
+        vault += share;
 
+        // An operator override takes precedence (a wrong one makes the sweep fail, nothing is lost).
         vm.prank(stranger);
         vm.expectRevert(IMindCore.NotOperator.selector);
         registry.setPoolId(token, poolId);
         vm.prank(operator);
         vm.expectRevert(IMindCore.NotAMind.selector);
         registry.setPoolId(makeAddr("random"), poolId);
+        bytes32 wrong = keccak256("wrong");
         vm.expectEmit(true, false, false, true, address(registry));
-        emit IPonsMindRegistry.PoolIdSet(token, poolId);
+        emit IPonsMindRegistry.PoolIdSet(token, wrong);
+        vm.prank(operator);
+        registry.setPoolId(token, wrong);
+        assertEq(registry.poolIdOf(token), wrong);
+        hook.simulateSwapFees{value: 1 ether}(poolId, 0.05 ether);
+        vm.expectEmit(true, false, false, true, address(registry));
+        emit IPonsMindRegistry.SweepAttempted(token, false, false);
+        _harvest(token);
+        assertEq(registry.mindBalance(token), vault);
+
+        // Correct override, then cleared (zero): both sweep the right pool.
         vm.prank(operator);
         registry.setPoolId(token, poolId);
-        assertEq(registry.poolIdOf(token), poolId);
-
         vm.expectEmit(true, false, false, true, address(registry));
         emit IPonsMindRegistry.SweepAttempted(token, false, true);
         _harvest(token);
         assertEq(registry.mindBalance(token), vault + share);
-        assertEq(escrow.balanceOf(ponsProtocol) > 0, true);
+        vm.prank(operator);
+        registry.setPoolId(token, bytes32(0));
+        hook.simulateSwapFees{value: 1 ether}(poolId, 0.05 ether);
+        _harvest(token);
+        assertEq(registry.mindBalance(token), vault + 2 * share);
+        assertGt(escrow.balanceOf(ponsProtocol), 0);
         _assertSolvent();
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // derivedPoolId: Uniswap v4 PoolId = keccak256(abi.encode(PoolKey))
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev Verbatim copy of Uniswap v4-core `PoolIdLibrary.toId`: hashes the 5-word in-memory `PoolKey`.
+    function _v4ToId(IPonsV2MemeHook.PoolKey memory key) internal pure returns (bytes32 poolId) {
+        assembly ("memory-safe") {
+            poolId := keccak256(key, 0xa0)
+        }
+    }
+
+    function test_derivedPoolId_matchesPonsHookAndV4() public {
+        _graduate(stranger, curve);
+        vm.recordLogs();
+        registry.createGraduatedPool(token);
+        bytes32 registered;
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter == address(hook) && logs[i].topics[0] == IPonsV2MemeHook.PoolRegistered.selector) {
+                registered = logs[i].topics[1];
+            }
+        }
+        IPonsV2MemeHook.PoolKey memory key = IPonsV2MemeHook.PoolKey({
+            currency0: address(0), currency1: token, fee: POOL_FEE, tickSpacing: TICK_SPACING, hooks: address(hook)
+        });
+        assertTrue(registered != bytes32(0));
+        assertEq(registry.derivedPoolId(token), registered, "== hook PoolRegistered id");
+        assertEq(registry.derivedPoolId(token), _v4ToId(key), "== v4 PoolIdLibrary.toId");
+        assertEq(registry.derivedPoolId(token), keccak256(abi.encode(key)));
+        // Zero for tokens that are not native-quote Pons launches.
+        assertEq(registry.derivedPoolId(makeAddr("random")), bytes32(0));
+    }
+
+    /// @dev Known vectors computed off-chain from the raw ABI encoding of the 5-tuple
+    ///      (`cast keccak $(cast abi-encode "f((address,address,uint24,int24,address))" "(0x0…0,0x1111…1111,10000,200,
+    ///      0xE5e7…e044)")`), checked against a registry wired to the mainnet hook address.
+    function test_derivedPoolId_knownVectors() public {
+        address mainnetHook = 0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044;
+        address coin = 0x1111111111111111111111111111111111111111;
+        PonsMindRegistry r = new PonsMindRegistry(
+            owner, treasury, computeTreasury, operator, address(factory), address(escrow), mainnetHook
+        );
+        IPonsV2LaunchFactory.LaunchedToken memory lt;
+        lt.token = coin;
+        lt.exists = true;
+        lt.poolFee = 10_000;
+        lt.tickSpacing = 200;
+        vm.mockCall(address(factory), abi.encodeCall(IPonsV2LaunchFactory.getLaunchedToken, (coin)), abi.encode(lt));
+        bytes32 expected = 0x51a32dcddaf6614976a48d3001e0ccffe7efda9be089f31410d0975777ee00eb;
+        assertEq(r.derivedPoolId(coin), expected);
+        assertEq(
+            _v4ToId(
+                IPonsV2MemeHook.PoolKey({
+                    currency0: address(0), currency1: coin, fee: 10_000, tickSpacing: 200, hooks: mainnetHook
+                })
+            ),
+            expected
+        );
+        // A negative tick spacing (sign extension of int24) encodes identically in memory and in abi.encode.
+        lt.poolFee = 3000;
+        lt.tickSpacing = -60;
+        vm.mockCall(address(factory), abi.encodeCall(IPonsV2LaunchFactory.getLaunchedToken, (coin)), abi.encode(lt));
+        assertEq(r.derivedPoolId(coin), 0x39db912e2807e24c8642609d46d7c5d76a5e70f4f89cf1a33a85d2a47b15e4c6);
+        // A non-native pair is not derivable.
+        lt.pairToken = makeAddr("usdc");
+        vm.mockCall(address(factory), abi.encodeCall(IPonsV2LaunchFactory.getLaunchedToken, (coin)), abi.encode(lt));
+        assertEq(r.derivedPoolId(coin), bytes32(0));
+    }
+
+    function testFuzz_poolKeyAbiEncoding_equalsV4MemoryHash(address coin, uint24 fee, int24 tickSpacing, address hk)
+        public
+        pure
+    {
+        IPonsV2MemeHook.PoolKey memory key =
+            IPonsV2MemeHook.PoolKey({currency0: address(0), currency1: coin, fee: fee, tickSpacing: tickSpacing, hooks: hk});
+        assertEq(keccak256(abi.encode(key)), _v4ToId(key));
+        assertEq(keccak256(abi.encode(address(0), coin, fee, tickSpacing, hk)), _v4ToId(key));
+    }
+
+    function test_claimable_includesAccountEth() public {
+        uint256 share = _pendingCreatorShare(curve);
+        vm.prank(ponsOperator);
+        MockPonsCurve(curve).sweepFees(0);
+        assertEq(registry.claimable(token), share);
+        vm.prank(stranger);
+        (bool ok,) = account.call{value: 0.25 ether}("");
+        assertTrue(ok);
+        assertEq(registry.claimable(token), share + 0.25 ether);
+        _harvest(token);
+        assertEq(registry.mindBalance(token), share + 0.25 ether);
+        assertEq(registry.claimable(token), 0);
     }
 
     function test_harvest_poolSweep_memecoinFeesNeedOperator() public {
@@ -485,6 +600,9 @@ contract PonsMindRegistryHarvestTest is PonsBaseTest {
         (ok, err) = account.call(
             abi.encodeWithSignature("transferFeeRecipient(address,address,address)", address(factory), token, stranger)
         );
+        assertFalse(ok);
+        assertEq(err, notRegistry);
+        (ok, err) = account.call(abi.encodeWithSignature("sweepTokens(address,address)", token, stranger));
         assertFalse(ok);
         assertEq(err, notRegistry);
         (ok, err) = account.call(abi.encodeWithSignature("initialize(address)", stranger));

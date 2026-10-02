@@ -2,6 +2,8 @@
 pragma solidity ^0.8.24;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {IPonsV2FeeEscrow} from "../../../src/interfaces/pons/IPonsV2FeeEscrow.sol";
@@ -17,9 +19,15 @@ import {MockPonsMemeHook} from "./MockPonsMemeHook.sol";
 ///         snipe-tax exemptions (launching account, creator fee recipient, plus up to 32 declared ones), the launch
 ///         record, the launch fee forwarded to the hook's protocol fee recipient, permissionless two-phase graduation
 ///         (`graduate` drains a ready curve -> `Swept`; `createGraduatedPool` registers the pool with the hook ->
-///         `PoolCreated`; the reserves stay in this contract in place of the V4 position), and the creator fee
-///         recipient hand-off by the current recipient (forwarded to the curve, or to the hook once the pool exists).
+///         `PoolCreated`; the reserves stay in this contract in place of the V4 position), the creator fee
+///         recipient hand-off by the current recipient (forwarded to the curve, or to the hook once the pool exists),
+///         the protocol owner's timelocked recipient override (`setCreatorFeeRecipient` -> 3 days ->
+///         `executeCreatorFeeRecipientChange` within 3 days, cancellable; a creator transfer does not cancel it), and
+///         the owner's rescue of a `Swept` launch whose pool cannot be seeded (`rescueSweptGraduation` after 7 days ->
+///         `Rescued`, reserves paid to a single recipient).
 contract MockPonsFactory is IPonsV2LaunchFactory, Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
     uint256 private constant BPS = 10_000;
     uint256 private constant MAX_CURVE_FEE_BPS = 1000;
     uint256 private constant MAX_CREATOR_TAX_CEILING_BPS = 1000;
@@ -28,6 +36,16 @@ contract MockPonsFactory is IPonsV2LaunchFactory, Ownable, ReentrancyGuard {
     uint256 private constant MAX_SNIPE_TAX_SECONDS = 60;
     uint256 private constant MAX_SNIPE_TAX_EXEMPTIONS = 32;
     uint256 private constant MIN_LAUNCH_SUPPLY = 1 ether;
+    uint256 public constant CREATOR_FEE_RECIPIENT_TIMELOCK = 3 days;
+    uint256 public constant CREATOR_FEE_RECIPIENT_EXECUTION_WINDOW = 3 days;
+    uint256 public constant GRADUATION_RESCUE_DELAY = 7 days;
+
+    /// @notice A protocol-owner override of a launch's creator fee recipient awaiting its timelock.
+    struct PendingCreatorFeeRecipient {
+        address newRecipient;
+        uint256 effectiveAt;
+        uint256 expiresAt;
+    }
 
     MockPonsMemeHook public immutable memeHook;
     IPonsV2FeeEscrow public immutable feeEscrow;
@@ -44,6 +62,7 @@ contract MockPonsFactory is IPonsV2LaunchFactory, Ownable, ReentrancyGuard {
     mapping(address launcher => bool) public whitelistedLaunchers;
     mapping(address token => LaunchedToken) private _launchedTokens;
     mapping(address token => IPonsV2MemeHook.FeePolicySnapshot) private _launchFeePolicies;
+    mapping(address token => PendingCreatorFeeRecipient) public pendingCreatorFeeRecipient;
     LaunchConfig[] private _launchConfigs;
 
     error InvalidLaunchConfigId();
@@ -71,6 +90,10 @@ contract MockPonsFactory is IPonsV2LaunchFactory, Ownable, ReentrancyGuard {
     error InvalidGraduationThreshold();
     error InvalidPhantomQuote();
     error LaunchEconomicsMismatch(bytes32 expected, bytes32 actual);
+    error NoPendingChange();
+    error TimelockNotElapsed(uint256 effectiveAt);
+    error TimelockExpired(uint256 expiresAt);
+    error GraduationRescueTooEarly(uint256 availableAt);
 
     event LaunchConfigAdded(uint256 indexed id);
     event LaunchConfigUpdated(uint256 indexed id);
@@ -82,6 +105,17 @@ contract MockPonsFactory is IPonsV2LaunchFactory, Ownable, ReentrancyGuard {
     event SnipeTaxSecondsUpdated(uint256 secondsWindow);
     event LaunchForwarderSet(address forwarder);
     event BuybackEnabledUpdated(address indexed token, bool enabled, address indexed controller);
+    event CreatorFeeRecipientChangeProposed(
+        address indexed token,
+        address indexed currentRecipient,
+        address indexed proposedRecipient,
+        uint256 effectiveAt,
+        uint256 expiresAt
+    );
+    event CreatorFeeRecipientChangeCancelled(address indexed token, address indexed proposedRecipient);
+    event LaunchGraduationRescued(
+        address indexed token, address indexed recipient, uint256 quoteAmount, uint256 tokenAmount
+    );
 
     constructor(address initialOwner, MockPonsMemeHook memeHook_, IPonsV2FeeEscrow feeEscrow_, uint256 launchFee_)
         Ownable(initialOwner)
@@ -224,15 +258,40 @@ contract MockPonsFactory is IPonsV2LaunchFactory, Ownable, ReentrancyGuard {
         LaunchedToken storage launch = _launchedTokens[token];
         if (!launch.exists) revert TokenNotFound();
         if (msg.sender != launch.creatorFeeRecipient) revert NotCreatorFeeRecipient();
+        _setCreatorFeeRecipient(token, launch, newRecipient);
+    }
+
+    /// @notice Owner: proposes an override of `token`'s creator fee recipient (any launch, executable by anyone
+    ///         between `effectiveAt` and `expiresAt`; a new proposal replaces the pending one).
+    function setCreatorFeeRecipient(address token, address newRecipient) external onlyOwner {
+        LaunchedToken storage launch = _launchedTokens[token];
+        if (!launch.exists) revert TokenNotFound();
         if (newRecipient == address(0)) revert ZeroAddress();
-        address previousRecipient = launch.creatorFeeRecipient;
-        launch.creatorFeeRecipient = newRecipient;
-        if (launch.phase == GraduationPhase.PoolCreated) {
-            memeHook.setCreatorFeeRecipient(poolIdFor(token), newRecipient);
-        } else {
-            MockPonsCurve(launch.curve).setCreatorFeeRecipient(newRecipient);
-        }
-        emit CreatorFeeRecipientUpdated(token, previousRecipient, newRecipient);
+        uint256 effectiveAt = block.timestamp + CREATOR_FEE_RECIPIENT_TIMELOCK;
+        uint256 expiresAt = effectiveAt + CREATOR_FEE_RECIPIENT_EXECUTION_WINDOW;
+        pendingCreatorFeeRecipient[token] =
+            PendingCreatorFeeRecipient({newRecipient: newRecipient, effectiveAt: effectiveAt, expiresAt: expiresAt});
+        emit CreatorFeeRecipientChangeProposed(token, launch.creatorFeeRecipient, newRecipient, effectiveAt, expiresAt);
+    }
+
+    /// @notice Anyone: applies a matured owner override.
+    function executeCreatorFeeRecipientChange(address token) external {
+        PendingCreatorFeeRecipient memory pending = pendingCreatorFeeRecipient[token];
+        if (pending.newRecipient == address(0)) revert NoPendingChange();
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp < pending.effectiveAt) revert TimelockNotElapsed(pending.effectiveAt);
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > pending.expiresAt) revert TimelockExpired(pending.expiresAt);
+        delete pendingCreatorFeeRecipient[token];
+        _setCreatorFeeRecipient(token, _launchedTokens[token], pending.newRecipient);
+    }
+
+    /// @notice Owner: cancels a pending override.
+    function cancelCreatorFeeRecipientChange(address token) external onlyOwner {
+        PendingCreatorFeeRecipient memory pending = pendingCreatorFeeRecipient[token];
+        if (pending.newRecipient == address(0)) revert NoPendingChange();
+        delete pendingCreatorFeeRecipient[token];
+        emit CreatorFeeRecipientChangeCancelled(token, pending.newRecipient);
     }
 
     function setBuybackEnabled(address token, bool enabled) external {
@@ -288,7 +347,43 @@ contract MockPonsFactory is IPonsV2LaunchFactory, Ownable, ReentrancyGuard {
         emit PoolGraduated(token, positionId, tokenAmount, sweptQuote);
     }
 
+    /// @notice Owner: releases a `Swept` launch's reserves (quote and tokens) to `recipient` once
+    ///         `GRADUATION_RESCUE_DELAY` passed without the pool being created; phase `Rescued` (terminal).
+    function rescueSweptGraduation(address token, address recipient) external onlyOwner nonReentrant {
+        LaunchedToken storage launch = _launchedTokens[token];
+        if (!launch.exists) revert TokenNotFound();
+        if (launch.phase != GraduationPhase.Swept) revert WrongGraduationPhase();
+        if (recipient == address(0)) revert ZeroAddress();
+        uint256 availableAt = launch.sweptAt + GRADUATION_RESCUE_DELAY;
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp < availableAt) revert GraduationRescueTooEarly(availableAt);
+        uint256 quoteAmount = launch.sweptQuote;
+        uint256 tokenAmount = launch.sweptTokens;
+        launch.sweptQuote = 0;
+        launch.sweptTokens = 0;
+        launch.sweptAt = 0;
+        launch.phase = GraduationPhase.Rescued;
+        if (quoteAmount != 0) {
+            (bool sent,) = payable(recipient).call{value: quoteAmount}("");
+            if (!sent) revert FeeTransferFailed();
+        }
+        if (tokenAmount != 0) IERC20(token).safeTransfer(recipient, tokenAmount);
+        emit LaunchGraduationRescued(token, recipient, quoteAmount, tokenAmount);
+    }
+
     // ------------------------------------------------------------------ internals
+
+    function _setCreatorFeeRecipient(address token, LaunchedToken storage launch, address newRecipient) private {
+        if (newRecipient == address(0)) revert ZeroAddress();
+        address previousRecipient = launch.creatorFeeRecipient;
+        launch.creatorFeeRecipient = newRecipient;
+        if (launch.phase == GraduationPhase.PoolCreated) {
+            memeHook.setCreatorFeeRecipient(poolIdFor(token), newRecipient);
+        } else {
+            MockPonsCurve(launch.curve).setCreatorFeeRecipient(newRecipient);
+        }
+        emit CreatorFeeRecipientUpdated(token, previousRecipient, newRecipient);
+    }
 
     function _launchToken(
         TokenParams calldata params,

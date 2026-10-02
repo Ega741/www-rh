@@ -12,19 +12,30 @@ import {MockPonsFactory} from "../mocks/pons/MockPonsFactory.sol";
 import {MockPonsMemeHook} from "../mocks/pons/MockPonsMemeHook.sol";
 
 /// @notice Drives the Pons registry and the Pons mocks with random but valid actions: launches (with initial buys,
-///         some crossing the threshold), adoptions, curve trades, Pons operator sweeps, graduation and pool fees,
-///         harvests, funding, draws, withdrawals, fee changes, leaving, donations to accounts and time.
+///         some crossing the threshold), adoptions, pending-only preparations, takeovers (after a leave, a Pons
+///         recipient override, or a return to the same account), curve trades, Pons operator sweeps, Pons owner
+///         overrides, graduation and pool fees, harvests, funding, draws, withdrawals, fee changes, leaving to an heir,
+///         donations to accounts, token recovery from accounts and time.
 contract PonsRegistryHandler is Test {
+    /// @notice An account replaced by a takeover (it may become current again if its preparer re-adopts).
+    struct Superseded {
+        address account;
+        address token;
+    }
+
     PonsMindRegistry public immutable registry;
     MockPonsFactory public immutable factory;
     MockPonsMemeHook public immutable hook;
     address public immutable owner;
     address public immutable operator;
     address public immutable ponsOperator;
+    address public immutable ponsOwner;
 
     address[] public actors;
     address[] public tokens;
+    Superseded[] public superseded;
     mapping(address account => uint256) public undelivered; // ETH sent straight to an account, not yet harvested
+    mapping(address token => bool) public overridden; // Pons moved the recipient away from the mind account
     mapping(bytes32 action => uint256) public calls;
     uint256 internal _nonce;
 
@@ -36,7 +47,8 @@ contract PonsRegistryHandler is Test {
         MockPonsMemeHook hook_,
         address owner_,
         address operator_,
-        address ponsOperator_
+        address ponsOperator_,
+        address ponsOwner_
     ) {
         registry = registry_;
         factory = factory_;
@@ -44,6 +56,7 @@ contract PonsRegistryHandler is Test {
         owner = owner_;
         operator = operator_;
         ponsOperator = ponsOperator_;
+        ponsOwner = ponsOwner_;
         for (uint256 i; i < 4; ++i) {
             address a = makeAddr(string.concat("ponsActor", vm.toString(i)));
             actors.push(a);
@@ -56,6 +69,10 @@ contract PonsRegistryHandler is Test {
 
     function tokensLength() external view returns (uint256) {
         return tokens.length;
+    }
+
+    function supersededLength() external view returns (uint256) {
+        return superseded.length;
     }
 
     function _actor(uint256 seed) internal view returns (address) {
@@ -111,13 +128,63 @@ contract PonsRegistryHandler is Test {
         vm.startPrank(a);
         (address token,) = factory.launchToken{value: fee}(tp, 0, address(0), new address[](0));
         address account = registry.prepareAdoption(token, keccak256("m"), bytes32(0), "");
-        // Re-preparing a pending adoption replaces it (same account, no second registration).
+        // Re-preparing a pending adoption updates it (same account, nothing registered yet).
         require(registry.prepareAdoption(token, keccak256("m2"), bytes32(0), "") == account, "account reused");
+        require(!registry.isMind(token), "registered only at activation");
         factory.transferCreatorFeeRecipient(token, account);
         vm.stopPrank();
-        registry.activateAdoption(token);
+        registry.activateAdoption(token, a);
         tokens.push(token);
         calls["adopt"]++;
+    }
+
+    /// @dev A preparation that is never activated (or only later, by a takeover of the same preparer).
+    function prepareOnly(uint256 actorSeed, uint256 tokenSeed) external {
+        vm.prank(_actor(actorSeed));
+        registry.prepareAdoption(_token(tokenSeed), keccak256("pending"), bytes32(0), "");
+        calls["prepareOnly"]++;
+    }
+
+    /// @dev The heir takes the mind over: if the mind account still receives the fees, the creator first leaves to
+    ///      the heir; the heir prepares, the current recipient hands over to the heir's account, anyone activates.
+    function takeover(uint256 tokenSeed, uint256 heirSeed) external {
+        address token = _token(tokenSeed);
+        address heir = _actor(heirSeed);
+        address previous = registry.accountOf(token);
+        address recipient = factory.getLaunchedToken(token).creatorFeeRecipient;
+        if (recipient == previous) {
+            vm.prank(registry.getMind(token).creator);
+            registry.leave(token, heir);
+            undelivered[previous] = 0;
+            recipient = heir;
+        }
+        vm.prank(heir);
+        address account = registry.prepareAdoption(token, keccak256("heir"), bytes32(uint256(uint160(heir))), "");
+        // Same account without a leave (Pons override): handing back would just make the mind whole again.
+        if (account == previous && !registry.hasLeft(token)) return;
+        vm.prank(recipient);
+        factory.transferCreatorFeeRecipient(token, account);
+        registry.activateAdoption(token, heir);
+        require(registry.getMind(token).creator == heir && !registry.hasLeft(token), "taken over");
+        if (account != previous) {
+            undelivered[previous] = 0; // claimed into the vault during the takeover
+            superseded.push(Superseded({account: previous, token: token}));
+        }
+        overridden[token] = false;
+        calls["takeover"]++;
+    }
+
+    /// @dev Pons' owner moves the recipient (timelocked override) to an actor.
+    function ponsOverride(uint256 tokenSeed, uint256 actorSeed) external {
+        address token = _token(tokenSeed);
+        address to = _actor(actorSeed);
+        if (factory.getLaunchedToken(token).creatorFeeRecipient == to) return;
+        vm.prank(ponsOwner);
+        factory.setCreatorFeeRecipient(token, to);
+        vm.warp(block.timestamp + factory.CREATOR_FEE_RECIPIENT_TIMELOCK());
+        factory.executeCreatorFeeRecipientChange(token);
+        overridden[token] = true;
+        calls["ponsOverride"]++;
     }
 
     function buy(uint256 actorSeed, uint256 tokenSeed, uint256 amount) external {
@@ -161,13 +228,16 @@ contract PonsRegistryHandler is Test {
         calls["harvest"]++;
     }
 
-    function createPool(uint256 tokenSeed) external {
+    function createPool(uint256 tokenSeed, bool setOverride) external {
         address token = _token(tokenSeed);
         if (_phase(token) != IPonsV2LaunchFactory.GraduationPhase.Swept) return;
         registry.createGraduatedPool(token);
         bytes32 poolId = factory.poolIdFor(token);
-        vm.prank(operator);
-        registry.setPoolId(token, poolId);
+        require(registry.derivedPoolId(token) == poolId, "derived pool id");
+        if (setOverride) {
+            vm.prank(operator);
+            registry.setPoolId(token, poolId);
+        }
         calls["createPool"]++;
     }
 
@@ -224,14 +294,31 @@ contract PonsRegistryHandler is Test {
         calls["setCreationFee"]++;
     }
 
-    function leave(uint256 tokenSeed) external {
+    function leave(uint256 tokenSeed, uint256 heirSeed) external {
         address token = _token(tokenSeed);
-        address creator = registry.getMind(token).creator;
         address account = registry.accountOf(token);
         if (factory.getLaunchedToken(token).creatorFeeRecipient != account) return;
-        vm.prank(creator);
-        registry.leave(token, creator);
+        vm.prank(registry.getMind(token).creator);
+        registry.leave(token, _actor(heirSeed));
+        undelivered[account] = 0; // leave harvests first
         calls["leave"]++;
+    }
+
+    /// @dev Memecoin sent to a mind account is recovered by the creator.
+    function recoverTokens(uint256 actorSeed, uint256 tokenSeed, uint256 bps) external {
+        address token = _token(tokenSeed);
+        address a = _actor(actorSeed);
+        uint256 amount = IERC20(token).balanceOf(a) * bound(bps, 1, 10_000) / 10_000;
+        if (amount == 0) return;
+        address account = registry.accountOf(token);
+        vm.prank(a);
+        require(IERC20(token).transfer(account, amount), "transfer");
+        address creator = registry.getMind(token).creator;
+        uint256 before = IERC20(token).balanceOf(creator);
+        vm.prank(creator);
+        registry.recoverAccountTokens(token, token);
+        require(IERC20(token).balanceOf(creator) == before + amount, "recovered");
+        calls["recoverTokens"]++;
     }
 
     function donateToAccount(uint256 actorSeed, uint256 tokenSeed, uint256 amount) external {

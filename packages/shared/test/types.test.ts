@@ -20,6 +20,8 @@ import {
   mindStatusValue,
   mindSummarySchema,
   mindsResponseSchema,
+  ponsAdoptionSchema,
+  ponsAdoptionsResponseSchema,
   ponsMindInfoSchema,
   ponsPhaseName,
   redactActionInput,
@@ -84,6 +86,7 @@ const ponsInfo = {
   claimableWei: '2000000000000000',
   launchedHere: true,
   adopted: false,
+  left: false,
   poolId: null,
 };
 
@@ -140,12 +143,28 @@ describe('§5 DTOs', () => {
     const ponsDetail = { ...detail, venue: 'pons', pons: { ...ponsInfo, poolId: hash.toUpperCase().replace('0X', '0x') } };
     expect(mindDetailSchema.parse(ponsDetail).pons).toEqual({ ...ponsInfo, poolId: hash });
     expect(ponsMindInfoSchema.parse(ponsInfo)).toEqual(ponsInfo);
-    for (const key of ['deployer', 'launchConfigId', 'feeBps', 'creatorTaxBps', 'poolId'] as const) {
+    for (const key of ['deployer', 'launchConfigId', 'feeBps', 'creatorTaxBps', 'poolId', 'left'] as const) {
       expect(ponsMindInfoSchema.safeParse({ ...ponsInfo, [key]: undefined }).success, key).toBe(false);
     }
+    // §9.7: a mind whose creator left (Dormant until a takeover)
+    expect(ponsMindInfoSchema.parse({ ...ponsInfo, adopted: true, left: true }).left).toBe(true);
+    expect(ponsMindInfoSchema.safeParse({ ...ponsInfo, left: 'yes' }).success).toBe(false);
     expect(ponsMindInfoSchema.safeParse({ ...ponsInfo, claimableWei: '-1' }).success).toBe(false);
     expect(mindDetailSchema.safeParse({ ...detail, pons: undefined }).success).toBe(false);
     expect(mindSummarySchema.safeParse({ ...summary, venue: undefined }).success).toBe(false);
+  });
+
+  it('GET /api/minds/:token/adoptions (SPEC §9.7): pending preparations, lowercased, every field required', () => {
+    const item = { preparer: token.toUpperCase().replace('0X', '0x'), account: token, modelId: hash, personaHash: hash, metadataURI: 'runner://metadata/' + 'ab'.repeat(32) };
+    expect(ponsAdoptionSchema.parse(item)).toEqual({ ...item, preparer: token });
+    expect(ponsAdoptionsResponseSchema.parse([item, item])).toHaveLength(2);
+    expect(ponsAdoptionsResponseSchema.parse([])).toEqual([]);
+    for (const key of ['preparer', 'account', 'modelId', 'personaHash', 'metadataURI'] as const) {
+      expect(ponsAdoptionSchema.safeParse({ ...item, [key]: undefined }).success, key).toBe(false);
+    }
+    expect(ponsAdoptionSchema.safeParse({ ...item, modelId: null }).success).toBe(false);
+    expect(ponsAdoptionSchema.safeParse({ ...item, account: '0x1234' }).success).toBe(false);
+    expect(ponsAdoptionsResponseSchema.safeParse({ items: [item] }).success).toBe(false);
   });
 
   it('GET /api/launch-config (SPEC §9.4)', () => {

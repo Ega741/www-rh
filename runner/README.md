@@ -180,14 +180,29 @@ anchors, status, config — so settlement, anchoring and status management are u
 indexing, the budget's income and the venue transactions differ.
 
 **Indexing.** Per range: the registry's logs (MindCore events plus `MindLaunched`, `AdoptionPrepared`,
-`MindAdopted`, `MindLeft`, `PoolIdSet`, …); new registrations are resolved with chain reads before
-anything is applied (curve, `getLaunchedToken`, curve fee / creator tax / threshold, token supply,
-and — `prepareAdoption` emits no `MindCreated` — the mind from `getMind` + the token's name / symbol).
-Then, for every registered token: `CurveBuy` / `CurveSell` / `CurveBuyRefunded` / `FeesSwept` /
-`CurveCompleted` of the known curves (address-filtered `eth_getLogs`), the factory's `LaunchSwept` /
-`PoolGraduated` / `CreatorFeeRecipientUpdated` filtered by token, the escrow's `Credited` / `Claimed`
-filtered by mind account, and the hook's `PoolRegistered` filtered by memecoin. Everything is
-applied in `(blockNumber, logIndex)` order in the range's single transaction (idempotent).
+`MindAdopted`, `MindLeft`, `PoolIdSet`, …). A mind row is created by `MindCreated` (emitted by
+`launchMind` and by the first `activateAdoption`); the Pons state of a new registration (`MindLaunched`,
+or the `MindAdopted` of a token not registered yet) is resolved with chain reads before anything is
+applied (curve, `getLaunchedToken`, curve fee / creator tax / threshold, token supply). Then, for every
+registered token: `CurveBuy` / `CurveSell` / `CurveBuyRefunded` / `FeesSwept` / `CurveCompleted` of the
+known curves (address-filtered `eth_getLogs`), the factory's `LaunchSwept` / `PoolGraduated` /
+`CreatorFeeRecipientUpdated` filtered by token, the escrow's `Credited` / `Claimed` filtered by mind
+account and by the accounts of pending adoptions, and the hook's `PoolRegistered` filtered by memecoin.
+Everything is applied in `(blockNumber, logIndex)` order in the range's single transaction (idempotent).
+
+**Adoption v2** (`docs/SPEC.md` §9.7). Every preparation is bound to its preparer; nothing is
+registered until activation:
+
+| registry event | runner |
+|---|---|
+| `AdoptionPrepared(token, account, preparer)` | informational: `pendingAdoption(token, preparer)` is read (at `latest`) and stored in `pons_adoptions`; the account joins the escrow filter, so fees credited after the hand-off and before activation are counted on the preparation (bounded: only accounts seen in `AdoptionPrepared`). A failed read retries the range; a record already gone when read (activated later in a replay) is kept for escrow tracking but not served |
+| `MindCreated` + `MindAdopted(token, account, creator)` (first activation) | mind row from `MindCreated` (creator = preparer); Pons state resolved as for `MindLaunched` (`launchedHere = false`, `launchConfigId` unknown); `adopted`, not left, `Alive`; the preparation's escrow balance moves to the mind and its row is deleted |
+| `MindConfigUpdated` + `MindAdopted` (takeover of a registered mind) | config replaced (persona re-resolved), creator = preparer, account replaced (the old account leaves the escrow filter; its balance is no longer the mind's), `adopted`, `left` cleared, `Alive` |
+| `MindLeft(token, newRecipient)` | `left`, `Dormant` (also when it was paused); the scheduler never sets it `Alive` again (`setMindStatus(Alive)` reverts) until a takeover |
+
+`GET /api/minds/:token/adoptions` → `[{ preparer, account, modelId, personaHash, metadataURI }]`: the
+pending preparations of any Pons token address (minds or not), most recently prepared first, `[]` when
+there are none; `400` for a malformed address.
 
 | Pons | runner / API |
 |---|---|
@@ -195,7 +210,8 @@ applied in `(blockNumber, logIndex)` order in the range's single transaction (id
 | `LaunchSwept` / `CurveCompleted` (phase `Swept`) | phase `complete`, price frozen at the final curve state |
 | `PoolGraduated` (`PoolCreated`), `Rescued` (read by the pool sweep) | phase `graduated`, `positionId` |
 | escrow `Credited` − `Claimed` (mind account) | `MindDetail.pons.claimableWei` |
-| hook `PoolRegistered` | `MindDetail.pons.poolId`, then `setPoolId` |
+| hook `PoolRegistered` | `MindDetail.pons.poolId`; `setPoolId` only when it differs from `derivedPoolId` |
+| `MindLeft` / takeover `MindAdopted` | `MindDetail.pons.left` |
 | `Harvested` | vault income (`StatsResponse.totalFeesToMindsWei`) |
 
 Post-trade reserves are anchored to chain state: for every (curve, block) with trades the runner reads
@@ -206,8 +222,9 @@ supply; progress = `realQuoteReserve · 10000 / graduationThreshold` while bondi
 
 **Budget.** `availableUsd` counts the vault (`mindBalance`) only. Creator fees reach the mind in two
 steps: a sweep credits them to the mind account in the Pons escrow (Pons' operator, or `harvest`
-itself), then `harvest(token)` claims them into the vault. `claimableWei` (`registry.claimable(token)`,
-cached 60 s, the indexed escrow balance as fallback) is reported in `MindDetail.pons`.
+itself), then `harvest(token)` claims them into the vault. The economics snapshot uses
+`registry.claimable(token)` (escrow balance + ETH held by the account, cached 60 s, the indexed escrow
+balance as fallback); `MindDetail.pons.claimableWei` is the indexed escrow balance.
 
 **Harvest** (`registry.harvest(token)`, operator transaction, ≤ 1 per mind per 5 min):
 
@@ -216,24 +233,29 @@ cached 60 s, the indexed escrow balance as fallback) is reported in `MindDetail.
 | 1 | `claimable ≥ HARVEST_MIN_WEI` | `threshold` |
 | 2 | the vault cannot cover the next tick and vault + claimable + sweepable can | `runway` (the Dormant transition is skipped: the vault is about to be refilled) |
 | 3 | hourly sweep: `claimable + sweepable ≥ HARVEST_MIN_WEI` | `hourly` |
-| 4 | hourly sweep: graduated, pool id recorded, no harvest for `HARVEST_INTERVAL_MS` | `pool` |
+| 4 | hourly sweep: graduated, pool id known (`PoolRegistered`, `PoolIdSet` or `derivedPoolId`), no harvest for `HARVEST_INTERVAL_MS` | `pool` |
 
 `sweepable` is the creator share of the curve fees indexed since the last `FeesSwept`, counted while
-`harvest` can sweep the curve itself (still bonding; launched here or adopted). Rules 1–2 run after
-every tick and on vault / escrow events; the 60 s sweep also re-evaluates minds with an escrow balance.
+`harvest` can sweep the curve itself (still bonding; launched here or adopted; the creator has not
+left). Rules 1–2 run after every tick and on vault / escrow events; the 60 s sweep also re-evaluates
+minds with an escrow balance.
 
 **Graduation.** Pons graduates the curve itself (phase `Swept`); nothing is sent for the curve. A
 launch `Swept` for more than 10 min gets `createGraduatedPool(token)` (best effort, re-read first,
-retried every 10 min). The hook's pool id is recorded on the registry with `setPoolId` (on a live
-`PoolRegistered`, and by the 10-min sweep for any pool id the registry does not have yet). No
+retried every 10 min). `harvest` sweeps the pool by `poolIdOf(token)` or else `derivedPoolId(token)`
+(§9.7), so no transaction is needed for the pool id: after graduation (live `PoolGraduated`, and the
+10-min sweep) the runner reads `registry.derivedPoolId(token)` once and stores it (`MindDetail.pons.poolId`
+when no `PoolRegistered` was observed). `setPoolId` is sent only as an override, for an observed
+`PoolRegistered` id that differs from the derived one (or when the derived id cannot be read). No
 `MindLaunchpad.graduate` / curve harvest is ever sent in Pons mode. All of this runs in the scheduler
 (started once the indexer is live and `ANTHROPIC_API_KEY` is set) and goes through the DRY_RUN-aware
 transaction queue.
 
 **API.** `/api/health` adds `venue` and `registry`; `MindSummary.venue`; `MindDetail.pons`
 (`curve, account, deployer, launchConfigId, feeBps, creatorTaxBps, claimableWei, launchedHere, adopted,
-poolId`, `null` for curve minds); `GET /api/launch-config` (Pons only, 404 in curve mode) returns the
-factory's `{ launchFee, configs, maxCreatorTaxBps, snipeTaxSeconds }` through a 60 s read-through cache.
+left, poolId`, `null` for curve minds); `GET /api/minds/:token/adoptions` (pending preparations, see
+above); `GET /api/launch-config` (Pons only, 404 in curve mode) returns the factory's
+`{ launchFee, configs, maxCreatorTaxBps, snipeTaxSeconds }` through a 60 s read-through cache.
 
 Pons' own contracts (factory, curves, escrow, hook) are third-party and outside the www-rh audit.
 
@@ -318,6 +340,7 @@ All under `/api`; addresses lowercase, wei amounts decimal strings named `…Wei
 | `GET /api/minds/:token/thoughts?limit=1..500` | `Thought[]` newest first |
 | `GET /api/minds/:token/compute` | `ComputeResponse` (ledger, `receipts`, draws) |
 | `GET /api/minds/:token/frame.jpg` | last frame (`Cache-Control: no-store`) or 404 |
+| `GET /api/minds/:token/adoptions` | Pons mode (§9.7): `[{ preparer, account, modelId, personaHash, metadataURI }]` pending adoption preparations for any Pons token address (not only minds), most recent first; `[]` when none |
 | `GET /api/models` | public model catalog |
 | `GET /api/launch-config` | Pons mode: `{ launchFee, configs: [{ id, supply, curveFeeBps, phantomQuote, graduationThreshold, enabled }], maxCreatorTaxBps, snipeTaxSeconds }` (cached 60 s; 404 in curve mode, 500 when the factory cannot be read) |
 | `GET /api/stats` | `{ minds, alive, graduated, totalVolumeWei, totalFeesToMindsWei }` |

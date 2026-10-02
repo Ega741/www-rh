@@ -7,7 +7,9 @@ import {MockPonsCurve} from "../../mocks/pons/MockPonsCurve.sol";
 import {PonsBaseTest} from "../../utils/PonsBaseTest.sol";
 
 /// @notice AUDIT PoCs for PonsMindRegistry / MindAccount (Pons mode, SPEC §9.2). Tests named test_POC_* assert the
-///         SAFE behaviour and therefore FAIL on the current code; test_control_* pass and document the mechanics.
+///         SAFE behaviour (they failed on the first adoption design and pass since SPEC §9.7; adjusted only where §9.7
+///         changed the interface: per-preparer accounts, registration at activation, `activateAdoption(token,
+///         preparer)`); test_control_* pass and document the mechanics.
 contract AuditPonsRegistryTest is PonsBaseTest {
     address internal wild;
     address internal wildCurve;
@@ -35,22 +37,26 @@ contract AuditPonsRegistryTest is PonsBaseTest {
         vm.prank(bob);
         factory.transferCreatorFeeRecipient(wild, carol); // OTC sale of the fee stream
 
-        // Carol adopts "into" the advertised account; her prepare after the hand-off is impossible.
-        assertEq(registry.accountOf(wild), account);
+        // SPEC §9.7: nothing is registered at preparation, so there is no shared "advertised" account; Bob's
+        // preparation is bound to Bob's own account. Carol prepares after the hand-off (anyone may) and hands the
+        // stream to her own account.
+        assertEq(registry.accountOf(wild), address(0));
         vm.prank(carol);
-        factory.transferCreatorFeeRecipient(wild, account);
+        address carolAccount = registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        assertTrue(carolAccount != account);
         vm.prank(carol);
-        vm.expectRevert(IPonsMindRegistry.NotRecipientOrDeployer.selector);
-        registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        factory.transferCreatorFeeRecipient(wild, carolAccount);
 
-        registry.activateAdoption(wild); // permissionless
-        assertEq(registry.getMind(wild).creator, bob, "stale preparer is the creator");
+        vm.expectRevert(IPonsMindRegistry.AdoptionNotReady.selector);
+        registry.activateAdoption(wild, bob); // the stale preparation activates nothing
+        registry.activateAdoption(wild, carol); // permissionless
+        assertEq(registry.getMind(wild).creator, carol, "creator is whoever's account received the stream");
 
         // SAFE: Bob, who no longer owned the fee stream when it was handed over, must not be able to take it.
         vm.prank(bob);
         vm.expectRevert();
-        registry.leave(wild, bob); // current code: succeeds, Bob is now the recipient
-        assertEq(factory.getLaunchedToken(wild).creatorFeeRecipient, account, "Carol's stream stays with the mind");
+        registry.leave(wild, bob);
+        assertEq(factory.getLaunchedToken(wild).creatorFeeRecipient, carolAccount, "Carol's stream stays with the mind");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -62,13 +68,16 @@ contract AuditPonsRegistryTest is PonsBaseTest {
         address account = registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
         vm.prank(bob);
         factory.transferCreatorFeeRecipient(wild, account);
-        registry.activateAdoption(wild);
+        registry.activateAdoption(wild, bob);
         vm.prank(bob);
         registry.leave(wild, carol); // Bob sells the stream to Carol
 
-        // SAFE: Carol, the current recipient, can prepare a fresh adoption (she would replace the stale creator).
+        // SAFE: Carol, the current recipient, can prepare a fresh adoption and take over (replacing the stale creator).
         vm.prank(carol);
-        registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI); // current code: AlreadyAdopted()
+        address carolAccount = registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        vm.prank(carol);
+        factory.transferCreatorFeeRecipient(wild, carolAccount);
+        registry.activateAdoption(wild, carol); // takeover
         assertEq(registry.getMind(wild).creator, carol);
     }
 
@@ -111,12 +120,15 @@ contract AuditPonsRegistryTest is PonsBaseTest {
     function test_POC_I1_pendingAdoptionCanBeMadeAlive() public {
         vm.startPrank(bob);
         registry.prepareAdoption(wild, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        // SPEC §9.7: a pending adoption registers no mind, so its preparer has no status to toggle.
+        vm.expectRevert(IMindCore.NotCreator.selector);
         registry.setCreatorPaused(wild, true);
+        vm.expectRevert(IMindCore.NotCreator.selector);
         registry.setCreatorPaused(wild, false);
         vm.stopPrank();
         assertFalse(registry.ponsMind(wild).adopted);
-        // SAFE: Dormant until activateAdoption. Current code: Alive (Paused -> Alive per MindCore rule 9).
-        assertEq(uint8(registry.getMind(wild).status), uint8(IMindCore.MindStatus.Dormant));
+        // SAFE: nothing can be Alive before activateAdoption (there is no mind at all).
+        assertFalse(registry.isMind(wild));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -151,7 +163,8 @@ contract AuditPonsRegistryTest is PonsBaseTest {
         assertTrue(t1 != t2 && a1 != a2);
         assertEq(a1, registry.predictAccount(creator, SALT));
         assertEq(a2, registry.predictAccount(alice, SALT));
-        // a launch account can never collide with an adoption account (64- vs 32-byte salt preimages)
-        assertTrue(registry.predictAdoptionAccount(t1) != a1);
+        // a launch account never collides with an adoption account: the first word of an adoption salt preimage is a
+        // Pons token, which never calls launchMind (SPEC §9.7 salt keccak256(abi.encode(token, preparer)))
+        assertTrue(registry.predictAdoptionAccount(t1, creator) != a1);
     }
 }

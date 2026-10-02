@@ -49,6 +49,14 @@ export interface OnchainPonsMind {
   adopted: boolean;
 }
 
+/** `registry.pendingAdoption(token, preparer)` (§9.7); `account` is the zero address when nothing is pending. */
+export interface PonsPendingAdoption {
+  account: Address;
+  modelId: Hex;
+  personaHash: Hex;
+  metadataURI: string;
+}
+
 /** Curve reserves at one block (`getReserves()` + `realQuoteReserve()`). */
 export interface PonsCurveState {
   quoteReserve: bigint;
@@ -76,8 +84,12 @@ export interface PonsReader {
   contracts(): Promise<ResolvedPonsContracts>;
   launchedToken(token: Address): Promise<PonsLaunchedToken>;
   ponsMind(token: Address): Promise<OnchainPonsMind>;
-  /** `registry.claimable(token)` = `feeEscrow.balanceOf(accountOf(token))`. */
+  /** `registry.claimable(token)` = `feeEscrow.balanceOf(account) + account.balance` (§9.7). */
   claimable(token: Address): Promise<bigint>;
+  /** `registry.pendingAdoption(token, preparer)` at `latest` (§9.7). */
+  pendingAdoption(token: Address, preparer: Address): Promise<PonsPendingAdoption>;
+  /** `registry.derivedPoolId(token)`: the graduated v4 pool id the registry harvests when no `setPoolId` override exists (§9.7). */
+  derivedPoolId(token: Address): Promise<Hex>;
   /** Reserves at `blockNumber` (end-of-block state), or at `latest`. */
   curveState(curve: Address, blockNumber?: bigint): Promise<PonsCurveState>;
   curveParams(curve: Address): Promise<PonsCurveParams>;
@@ -138,6 +150,15 @@ export class ViemPonsReader implements PonsReader {
 
   claimable(token: Address): Promise<bigint> {
     return this.client.readContract({ address: this.registry, abi: ponsMindRegistryAbi, functionName: 'claimable', args: [token] });
+  }
+
+  async pendingAdoption(token: Address, preparer: Address): Promise<PonsPendingAdoption> {
+    const [account, modelId, personaHash, metadataURI] = await this.client.readContract({ address: this.registry, abi: ponsMindRegistryAbi, functionName: 'pendingAdoption', args: [token, preparer] });
+    return { account, modelId, personaHash, metadataURI };
+  }
+
+  derivedPoolId(token: Address): Promise<Hex> {
+    return this.client.readContract({ address: this.registry, abi: ponsMindRegistryAbi, functionName: 'derivedPoolId', args: [token] });
   }
 
   async curveState(curve: Address, blockNumber?: bigint): Promise<PonsCurveState> {

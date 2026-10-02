@@ -271,7 +271,7 @@ export type MindSummary = z.infer<typeof mindSummarySchema>;
 export const ponsMindInfoSchema = z.object({
   /** The launch's `PonsV2BondingCurve`. */
   curve: addressSchema,
-  /** The mind's `MindAccount` (creator fee recipient once adopted / launched here). */
+  /** The mind's current `MindAccount` (creator fee recipient once adopted / launched here; replaced by a takeover, §9.7). */
   account: addressSchema,
   /** The launch's deployer (the registry for minds launched here); `null` when unknown. */
   deployer: addressSchema.nullable(),
@@ -280,14 +280,49 @@ export const ponsMindInfoSchema = z.object({
   feeBps: z.number().int().min(0).max(10_000).nullable(),
   /** Creator tax of the curve (bps); `null` when unknown. */
   creatorTaxBps: z.number().int().min(0).max(10_000).nullable(),
-  /** `feeEscrow.balanceOf(account)`: creator fees credited and not yet harvested into the vault. */
+  /**
+   * Indexed escrow balance of the account (Σ `Credited` − Σ `Claimed`): creator fees credited and not yet
+   * harvested into the vault. (`registry.claimable(token)` additionally counts ETH held by the account, §9.7.)
+   */
   claimableWei: bigintStringSchema,
   launchedHere: z.boolean(),
+  /** Activated through `activateAdoption` (first adoption or takeover, §9.7). */
   adopted: z.boolean(),
-  /** Uniswap v4 pool id of the graduated pool (from the hook's `PoolRegistered`); `null` before. */
+  /**
+   * The creator called `leave` (`registry.hasLeft(token)`, §9.7): the fee recipient was handed away and the mind
+   * stays Dormant until someone takes it over with `prepareAdoption` + `activateAdoption`.
+   */
+  left: z.boolean(),
+  /**
+   * Uniswap v4 pool id of the graduated pool: the hook's `PoolRegistered`, else the registry's `PoolIdSet`, else
+   * `registry.derivedPoolId(token)` (§9.7); `null` before graduation / when unknown.
+   */
   poolId: hash32Schema.nullable(),
 });
 export type PonsMindInfo = z.infer<typeof ponsMindInfoSchema>;
+
+/**
+ * A pending adoption preparation (`GET /api/minds/:token/adoptions` item, §9.7): `prepareAdoption` by
+ * `preparer` stored `{ account, modelId, personaHash, metadataURI }` and `activateAdoption(token, preparer)`
+ * has not run yet. The adoption activates once the launch's creator fee recipient is `account`.
+ */
+export const ponsAdoptionSchema = z.object({
+  preparer: addressSchema,
+  /** The preparer's `MindAccount` for this token (`predictAdoptionAccount(token, preparer)`). */
+  account: addressSchema,
+  /** bytes32 model id of the pending config. */
+  modelId: hash32Schema,
+  personaHash: hash32Schema,
+  metadataURI: z.string(),
+});
+export type PonsAdoption = z.infer<typeof ponsAdoptionSchema>;
+
+/**
+ * `GET /api/minds/:token/adoptions` (Pons mode, §9.7): pending preparations for any Pons token address
+ * (also tokens that are not minds yet), most recently prepared first; `[]` when there are none.
+ */
+export const ponsAdoptionsResponseSchema = z.array(ponsAdoptionSchema);
+export type PonsAdoptionsResponse = z.infer<typeof ponsAdoptionsResponseSchema>;
 
 /** Full view of a mind. */
 export const mindDetailSchema = mindSummarySchema.extend({

@@ -1,9 +1,14 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Address } from 'viem';
 import {
   mindDetailSchema,
   mindLaunchpadAbi,
   mindSummarySchema,
+  modelIdToHash,
+  personaHash,
   ponsCurveAbi,
   ponsFactoryAbi,
   ponsFeeEscrowAbi,
@@ -17,14 +22,18 @@ import {
 } from '@www-rh/shared';
 import { mindDetailDto, mindSummaryDto } from '../src/api/dto.js';
 import { addressTopic, type PonsCurveState } from '../src/chain/pons.js';
+import { Repos } from '../src/db/repos.js';
+import { SCHEMA_VERSION } from '../src/db/schema.js';
+import { Db } from '../src/db/sqlite.js';
 import { STATE_TOTAL_FEES_TO_MINDS, STATE_TOTAL_VOLUME } from '../src/indexer/apply.js';
 import { IndexerEvents, type IndexedEvent } from '../src/indexer/events.js';
 import { Indexer } from '../src/indexer/indexer.js';
 import { PonsIndexerVenue, walkBackStates } from '../src/indexer/pons.js';
 import { CurveIndexerVenue } from '../src/indexer/venue.js';
-import { CREATOR, FakeLogSource, LAUNCHPAD, memoryRepos, mindCreatedLog, silentLogger, TOKEN } from './helpers.js';
+import { CREATOR, FakeLogSource, LAUNCHPAD, memoryRepos, mindCreatedLog, PERSONA, silentLogger, TOKEN } from './helpers.js';
 import {
   AACCOUNT,
+  AACCOUNT2,
   ACURVE,
   ATOKEN,
   BUYER,
@@ -39,6 +48,7 @@ import {
   PACCOUNT,
   PCURVE,
   PHANTOM,
+  PREPARER2,
   PTOKEN,
   REGISTRY,
   RESERVED,
@@ -69,7 +79,7 @@ function setup() {
 const state = (r: { quoteReserve: bigint; tokenReserve: bigint }): PonsCurveState => ({ ...r, realQuoteReserve: r.quoteReserve - PHANTOM });
 const params = { feeBps: 100n, taxBps: 0n };
 
-describe('Pons indexer (SPEC §9.4)', () => {
+describe('Pons indexer (SPEC §9.4, §9.7)', () => {
   it('indexes a mind launched here: registration, trades (§5 DTO), per-block reserve anchoring, escrow, sweep, graduation, pool id; idempotent', async () => {
     const { repos, source, reader, seen, indexer } = setup();
     // ---- block 10: launchMind = MindCreated + MindLaunched + the creator's initial buy (registry is the buyer)
@@ -200,72 +210,252 @@ describe('Pons indexer (SPEC §9.4)', () => {
     expect(JSON.stringify([repos.minds.get(PTOKEN), repos.pons.get(PTOKEN), repos.trades.listByToken(PTOKEN, 50), repos.state.bigint(STATE_TOTAL_VOLUME).toString(), repos.chain.eventCount()])).toBe(snapshot);
   });
 
-  it('adoption: AdoptionPrepared (Dormant, mind built from chain reads), recipient hand-off, MindAdopted (Alive), MindLeft (Dormant)', async () => {
+  it('adoption v2 (§9.7): AdoptionPrepared is informational, a hand-off before activation is observed, activation registers the mind, MindLeft', async () => {
     const { repos, source, reader, seen, indexer } = setup();
     const mid = { quoteReserve: PHANTOM + 2n * E, tokenReserve: SUPPLY / 2n };
-    reader.launched.set(ATOKEN, launchedToken(ACURVE, { deployer: BUYER, creatorFeeRecipient: CREATOR, creatorTaxBps: 200 }));
-    reader.minds.set(ATOKEN, { curve: ACURVE, account: AACCOUNT, launchConfigId: 0n, launchedHere: false, adopted: false });
-    reader.mindInfo.set(ATOKEN, { creator: CREATOR, modelId: mindCreatedArgs(ATOKEN)['modelId'] as `0x${string}`, personaHash: mindCreatedArgs(ATOKEN)['personaHash'] as `0x${string}`, metadataURI: 'ipfs://bafy-adopt', createdAt: 1n, status: 1 });
-    reader.states.set(`${ACURVE}@40`, state(mid));
-    source.logs.push(reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT, creator: CREATOR }, 40n, 0));
+    reader.launched.set(ATOKEN, launchedToken(ACURVE, { deployer: BUYER, creatorFeeRecipient: BUYER, creatorTaxBps: 200 }));
+    const model = modelIdToHash('claude-opus-5-5');
+    const ph = personaHash(PERSONA);
+    reader.pending.set(`${ATOKEN}:${CREATOR.toLowerCase()}`, { account: AACCOUNT, modelId: model, personaHash: ph, metadataURI: 'ipfs://bafy-adopt' });
+    // ---- block 40: CREATOR prepares; nothing is registered yet, the config comes from pendingAdoption(token, preparer)
+    source.logs.push(reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT, preparer: CREATOR }, 40n, 0));
     source.head = 40n;
     await indexer.syncOnce();
-    let m = repos.minds.get(ATOKEN)!;
-    expect([m.venue, m.name, m.symbol, m.status, m.metadata_uri, m.creator, m.price_wei]).toEqual(['pons', 'Adopted Coin', 'ADPT', 1, 'ipfs://bafy-adopt', CREATOR.toLowerCase(), ponsPrice(mid.quoteReserve, mid.tokenReserve).toString()]);
-    // the registry records launchConfigId 0 for adoptions as a placeholder: reported as unknown
-    expect(repos.pons.get(ATOKEN)).toMatchObject({ curve: ACURVE, account: AACCOUNT, launched_here: 0, adopted: 0, deployer: BUYER, fee_recipient: CREATOR.toLowerCase(), launch_config_id: null });
-    expect(seen.map((e) => e.type)).toEqual(['mind:created', 'mind:status']);
-    // the pending adoption is re-prepared by the current recipient: new creator and config (no MindConfigUpdated on chain)
-    const reModel = `0x${'ee'.repeat(32)}` as const;
-    reader.mindInfo.set(ATOKEN, { creator: BUYER, modelId: reModel, personaHash: `0x${'ef'.repeat(32)}`, metadataURI: 'ipfs://bafy-again', createdAt: 1n, status: 1 });
-    source.logs.push(reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT, creator: BUYER }, 40n, 1, `0x${'40'.repeat(32)}`));
-    source.head = 40n;
-    repos.state.setLastBlock(39n); // the second preparation lands in a later pass over block 40
-    repos.chain.deleteBlockHashesAbove(39);
-    await indexer.syncOnce();
-    m = repos.minds.get(ATOKEN)!;
-    expect([m.creator, m.model_id, m.metadata_uri, m.meta_status, m.status]).toEqual([BUYER, reModel, 'ipfs://bafy-again', 'pending', 1]);
-    expect(seen.map((e) => e.type)).toEqual(['mind:created', 'mind:status', 'mind:config']);
-    seen.length = 2;
+    expect(repos.minds.get(ATOKEN)).toBeUndefined();
+    expect(repos.pons.get(ATOKEN)).toBeUndefined();
+    expect(repos.ponsAdoptions.pending(ATOKEN)).toEqual([
+      { token: ATOKEN, preparer: CREATOR.toLowerCase(), account: AACCOUNT, model_id: model, persona_hash: ph, metadata_uri: 'ipfs://bafy-adopt', claimable: '0', updated_at: (1_790_000_000 + 40) * 1000 },
+    ]);
+    expect(seen).toEqual([]);
+    // the pending account joins the escrow filter (no mind yet: no curve / factory / hook queries)
+    expect(source.filtered.find((f) => f.address === ESCROW)?.topics?.[1]).toEqual([addressTopic(AACCOUNT)]);
+    expect(source.filtered.some((f) => f.address === FACTORY || f.address === HOOK)).toBe(false);
+
+    // ---- block 41: CREATOR re-prepares (config updated, same account); PREPARER2 prepares too
+    const reModel = modelIdToHash('claude-sonnet-5-5');
+    reader.pending.set(`${ATOKEN}:${CREATOR.toLowerCase()}`, { account: AACCOUNT, modelId: reModel, personaHash: ph, metadataURI: 'ipfs://bafy-again' });
+    reader.pending.set(`${ATOKEN}:${PREPARER2.toLowerCase()}`, { account: AACCOUNT2, modelId: model, personaHash: ph, metadataURI: 'ipfs://bafy-other' });
     source.logs.push(
-      factory('CreatorFeeRecipientUpdated', { token: ATOKEN, previousRecipient: CREATOR, newRecipient: AACCOUNT }, 41n, 0),
-      reg('MindAdopted', { token: ATOKEN, account: AACCOUNT }, 41n, 1),
+      reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT2, preparer: PREPARER2 }, 41n, 0),
+      reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT, preparer: CREATOR }, 41n, 1),
     );
     source.head = 41n;
     await indexer.syncOnce();
-    m = repos.minds.get(ATOKEN)!;
-    expect(m.status).toBe(0);
-    expect(repos.pons.get(ATOKEN)).toMatchObject({ adopted: 1, fee_recipient: AACCOUNT });
-    expect(seen.slice(2).map((e) => e.type)).toEqual(['pons:adopted', 'mind:status']);
-    source.logs.push(reg('MindLeft', { token: ATOKEN, newRecipient: CREATOR }, 42n, 0));
+    expect(repos.ponsAdoptions.pending(ATOKEN).map((r) => [r.preparer, r.account, r.model_id, r.metadata_uri])).toEqual([
+      [CREATOR.toLowerCase(), AACCOUNT, reModel, 'ipfs://bafy-again'], // same block: ties by preparer
+      [PREPARER2.toLowerCase(), AACCOUNT2, model, 'ipfs://bafy-other'],
+    ]);
+
+    // ---- block 42: the current recipient hands the fees to CREATOR's account; Pons sweeps → escrow credit before activation
+    source.logs.push(
+      factory('CreatorFeeRecipientUpdated', { token: ATOKEN, previousRecipient: BUYER, newRecipient: AACCOUNT }, 42n, 0),
+      escrow('Credited', { recipient: AACCOUNT, depositor: ACURVE, amount: 5n * 10n ** 15n }, 42n, 1),
+      escrow('Credited', { recipient: BUYER, depositor: ACURVE, amount: E }, 42n, 2), // not an account of ours
+    );
     source.head = 42n;
     await indexer.syncOnce();
-    expect(repos.minds.get(ATOKEN)?.status).toBe(1);
-    expect(seen.slice(4).map((e) => e.type)).toEqual(['pons:left', 'mind:status']);
-    const summary = mindSummarySchema.parse(mindSummaryDto(repos.minds.get(ATOKEN)!, undefined, repos.pons.get(ATOKEN)));
-    expect(summary).toMatchObject({ venue: 'pons', status: 'dormant', progressBps: Number(((mid.quoteReserve - PHANTOM) * 10_000n) / THRESHOLD) });
+    expect(repos.ponsAdoptions.get(ATOKEN, CREATOR)?.claimable).toBe((5n * 10n ** 15n).toString());
+    expect(seen).toEqual([]); // no domain events for tokens that are not minds
+
+    // ---- block 43: activateAdoption(token, CREATOR) = MindCreated + MindAdopted
+    reader.launched.set(ATOKEN, launchedToken(ACURVE, { deployer: BUYER, creatorFeeRecipient: AACCOUNT, creatorTaxBps: 200 }));
+    reader.states.set(`${ACURVE}@43`, state(mid));
+    const activation = `0x${'43'.repeat(32)}` as const;
+    source.logs.push(
+      reg('MindCreated', { ...mindCreatedArgs(ATOKEN, 'claude-sonnet-5-5'), name: 'Adopted Coin', symbol: 'ADPT', metadataURI: 'ipfs://bafy-again' }, 43n, 0, activation),
+      reg('MindAdopted', { token: ATOKEN, account: AACCOUNT, creator: CREATOR }, 43n, 1, activation),
+    );
+    source.head = 43n;
+    await indexer.syncOnce();
+    let m = repos.minds.get(ATOKEN)!;
+    expect([m.venue, m.name, m.symbol, m.status, m.creator, m.model_id, m.metadata_uri, m.price_wei]).toEqual([
+      'pons', 'Adopted Coin', 'ADPT', 0, CREATOR.toLowerCase(), reModel, 'ipfs://bafy-again', ponsPrice(mid.quoteReserve, mid.tokenReserve).toString(),
+    ]);
+    // the registry records launchConfigId 0 for adoptions as a placeholder: reported as unknown; the pre-activation credit moved over
+    expect(repos.pons.get(ATOKEN)).toMatchObject({
+      curve: ACURVE, account: AACCOUNT, launched_here: 0, adopted: 1, has_left: 0, deployer: BUYER, fee_recipient: AACCOUNT, launch_config_id: null, claimable: (5n * 10n ** 15n).toString(), creator_tax_bps: 0,
+    });
+    // CREATOR's pending record is gone (deleted on activation); PREPARER2's is still pending
+    expect(repos.ponsAdoptions.get(ATOKEN, CREATOR)).toBeUndefined();
+    expect(repos.ponsAdoptions.pending(ATOKEN).map((r) => r.preparer)).toEqual([PREPARER2.toLowerCase()]);
+    expect(seen.map((e) => e.type)).toEqual(['mind:created', 'pons:adopted']);
+
+    // ---- block 44: further credits to the mind account and the factory's recipient log of a registered mind
+    source.logs.push(escrow('Credited', { recipient: AACCOUNT, depositor: ACURVE, amount: 1n }, 44n, 0));
+    source.head = 44n;
+    await indexer.syncOnce();
+    expect(repos.pons.get(ATOKEN)?.claimable).toBe((5n * 10n ** 15n + 1n).toString());
+    expect(source.filtered.filter((f) => f.address === FACTORY).at(-1)?.topics?.[1]).toEqual([addressTopic(ATOKEN)]);
+
+    // ---- block 45: leave → left, Dormant (even if it had been paused)
+    repos.minds.setStatus(ATOKEN, 2);
+    source.logs.push(reg('MindLeft', { token: ATOKEN, newRecipient: BUYER }, 45n, 0));
+    source.head = 45n;
+    await indexer.syncOnce();
+    m = repos.minds.get(ATOKEN)!;
+    expect(m.status).toBe(1);
+    expect(repos.pons.get(ATOKEN)).toMatchObject({ has_left: 1, fee_recipient: BUYER, adopted: 1 });
+    expect(seen.slice(2).map((e) => e.type)).toEqual(['pons:credited', 'pons:left', 'mind:status']);
+    const detail = mindDetailSchema.parse(mindDetailDto(m, undefined, repos.pons.get(ATOKEN)));
+    expect(detail).toMatchObject({ venue: 'pons', status: 'dormant', progressBps: Number(((mid.quoteReserve - PHANTOM) * 10_000n) / THRESHOLD), pons: { adopted: true, left: true, launchedHere: false, account: AACCOUNT } });
+    const summary = mindSummarySchema.parse(mindSummaryDto(m, undefined, repos.pons.get(ATOKEN)));
+    expect(summary.creator).toBe(CREATOR.toLowerCase());
+  });
+
+  it('takeover (§9.7): after leave, a new preparer activates (MindConfigUpdated + MindAdopted): creator, config and account replaced, left cleared, Alive', async () => {
+    const { repos, source, reader, seen, indexer } = setup();
+    reader.launched.set(PTOKEN, launchedToken(PCURVE));
+    reader.states.set(`${PCURVE}@10`, state({ quoteReserve: PHANTOM, tokenReserve: SUPPLY }));
+    source.logs.push(
+      reg('MindCreated', mindCreatedArgs(PTOKEN), 10n, 0),
+      reg('MindLaunched', { token: PTOKEN, curve: PCURVE, account: PACCOUNT, creator: CREATOR, launchConfigId: 0n }, 10n, 1),
+      escrow('Credited', { recipient: PACCOUNT, depositor: PCURVE, amount: 3n }, 11n, 0),
+      reg('MindLeft', { token: PTOKEN, newRecipient: BUYER }, 12n, 0),
+    );
+    source.head = 12n;
+    await indexer.syncOnce();
+    expect(repos.pons.get(PTOKEN)).toMatchObject({ launched_here: 1, adopted: 0, has_left: 1, claimable: '3' });
+    expect(repos.minds.get(PTOKEN)?.status).toBe(1);
+
+    // PREPARER2 prepares, BUYER hands over, Pons sweeps to the new account before activation
+    const model = modelIdToHash('claude-haiku-4-5');
+    const ph = `0x${'7a'.repeat(32)}` as const;
+    reader.pending.set(`${PTOKEN}:${PREPARER2.toLowerCase()}`, { account: AACCOUNT2, modelId: model, personaHash: ph, metadataURI: 'ipfs://takeover' });
+    source.logs.push(
+      reg('AdoptionPrepared', { token: PTOKEN, account: AACCOUNT2, preparer: PREPARER2 }, 13n, 0),
+      factory('CreatorFeeRecipientUpdated', { token: PTOKEN, previousRecipient: BUYER, newRecipient: AACCOUNT2 }, 14n, 0),
+      escrow('Credited', { recipient: AACCOUNT2, depositor: PCURVE, amount: 7n }, 14n, 1),
+    );
+    source.head = 14n;
+    await indexer.syncOnce();
+    expect(repos.ponsAdoptions.get(PTOKEN, PREPARER2)?.claimable).toBe('7');
+    expect(repos.pons.get(PTOKEN)).toMatchObject({ claimable: '3', fee_recipient: AACCOUNT2, account: PACCOUNT }); // the mind keeps its account until activation
+    expect(source.filtered.filter((f) => f.address === ESCROW).at(-1)?.topics?.[1]).toEqual([addressTopic(PACCOUNT), addressTopic(AACCOUNT2)]);
+
+    // activateAdoption(token, PREPARER2): takeover
+    const takeover = `0x${'15'.repeat(32)}` as const;
+    seen.length = 0;
+    source.logs.push(
+      reg('MindConfigUpdated', { token: PTOKEN, modelId: model, personaHash: ph, metadataURI: 'ipfs://takeover' }, 15n, 0, takeover),
+      reg('MindAdopted', { token: PTOKEN, account: AACCOUNT2, creator: PREPARER2 }, 15n, 1, takeover),
+    );
+    source.head = 15n;
+    await indexer.syncOnce();
+    const m = repos.minds.get(PTOKEN)!;
+    expect([m.creator, m.model_id, m.persona_hash, m.metadata_uri, m.meta_status, m.status]).toEqual([PREPARER2.toLowerCase(), model, ph, 'ipfs://takeover', 'pending', 0]);
+    // the old account's balance is not claimable through the mind any more; the new account's pre-activation credit moved over
+    expect(repos.pons.get(PTOKEN)).toMatchObject({ account: AACCOUNT2, adopted: 1, has_left: 0, launched_here: 1, fee_recipient: AACCOUNT2, claimable: '7', curve: PCURVE });
+    expect(repos.ponsAdoptions.pending(PTOKEN)).toEqual([]);
+    expect(repos.pons.byAccount(PACCOUNT)).toBeUndefined();
+    expect(seen.map((e) => e.type)).toEqual(['mind:config', 'pons:adopted', 'mind:status']);
+
+    // later: the old account is out of the escrow filter; the new one counts
+    source.logs.push(
+      escrow('Credited', { recipient: PACCOUNT, depositor: PCURVE, amount: 50n }, 16n, 0),
+      escrow('Credited', { recipient: AACCOUNT2, depositor: PCURVE, amount: 5n }, 16n, 1),
+    );
+    source.head = 16n;
+    await indexer.syncOnce();
+    expect(source.filtered.filter((f) => f.address === ESCROW).at(-1)?.topics?.[1]).toEqual([addressTopic(AACCOUNT2)]);
+    expect(repos.pons.get(PTOKEN)?.claimable).toBe('12');
+    expect(mindDetailSchema.parse(mindDetailDto(repos.minds.get(PTOKEN)!, undefined, repos.pons.get(PTOKEN))).pons).toMatchObject({ launchedHere: true, adopted: true, left: false, account: AACCOUNT2 });
+  });
+
+  it('re-adoption by the creator who left (same account): escrow credits stay on the mind; nothing is carried twice', async () => {
+    const { repos, source, reader, indexer } = setup();
+    reader.launched.set(ATOKEN, launchedToken(ACURVE, { deployer: BUYER, creatorFeeRecipient: AACCOUNT }));
+    reader.states.set(`${ACURVE}@20`, state({ quoteReserve: PHANTOM + E, tokenReserve: SUPPLY - SUPPLY / 5n }));
+    const cfg = { account: AACCOUNT, modelId: modelIdToHash('claude-opus-5-5'), personaHash: personaHash(PERSONA), metadataURI: 'ipfs://a' };
+    reader.pending.set(`${ATOKEN}:${CREATOR.toLowerCase()}`, cfg);
+    source.logs.push(
+      reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT, preparer: CREATOR }, 20n, 0),
+      reg('MindCreated', { ...mindCreatedArgs(ATOKEN), metadataURI: 'ipfs://a' }, 20n, 1),
+      reg('MindAdopted', { token: ATOKEN, account: AACCOUNT, creator: CREATOR }, 20n, 2),
+      reg('MindLeft', { token: ATOKEN, newRecipient: BUYER }, 21n, 0),
+      reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT, preparer: CREATOR }, 22n, 0),
+      escrow('Credited', { recipient: AACCOUNT, depositor: ACURVE, amount: 4n }, 23n, 0),
+    );
+    source.head = 23n;
+    await indexer.syncOnce();
+    // the account is still the mind's: the credit is applied to the mind, not to the preparation
+    expect(repos.pons.get(ATOKEN)).toMatchObject({ claimable: '4', has_left: 1 });
+    expect(repos.ponsAdoptions.get(ATOKEN, CREATOR)?.claimable).toBe('0');
+    source.logs.push(reg('MindConfigUpdated', { token: ATOKEN, modelId: cfg.modelId, personaHash: cfg.personaHash, metadataURI: 'ipfs://a' }, 24n, 0), reg('MindAdopted', { token: ATOKEN, account: AACCOUNT, creator: CREATOR }, 24n, 1));
+    source.head = 24n;
+    await indexer.syncOnce();
+    expect(repos.pons.get(ATOKEN)).toMatchObject({ claimable: '4', has_left: 0, adopted: 1 });
+    expect(repos.minds.get(ATOKEN)?.status).toBe(0);
+    expect(repos.ponsAdoptions.get(ATOKEN, CREATOR)).toBeUndefined();
+  });
+
+  it('a preparation already activated when read: kept (unserved) for escrow tracking until MindAdopted; a failed pendingAdoption read retries the range', async () => {
+    const { repos, source, reader, indexer } = setup();
+    // replay: by the time block 60 is indexed, the pending record was deleted by the activation at block 62
+    reader.launched.set(ATOKEN, launchedToken(ACURVE, { deployer: BUYER, creatorFeeRecipient: AACCOUNT }));
+    reader.states.set(`${ACURVE}@62`, state({ quoteReserve: PHANTOM + E, tokenReserve: SUPPLY - SUPPLY / 5n }));
+    source.logs.push(
+      reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT, preparer: CREATOR }, 60n, 0),
+      escrow('Credited', { recipient: AACCOUNT, depositor: ACURVE, amount: 9n }, 61n, 0),
+      reg('MindCreated', mindCreatedArgs(ATOKEN), 62n, 0),
+      reg('MindAdopted', { token: ATOKEN, account: AACCOUNT, creator: CREATOR }, 62n, 1),
+    );
+    source.head = 61n;
+    await indexer.syncOnce();
+    expect(repos.ponsAdoptions.get(ATOKEN, CREATOR)).toMatchObject({ model_id: null, persona_hash: null, metadata_uri: null, claimable: '9' });
+    expect(repos.ponsAdoptions.pending(ATOKEN)).toEqual([]); // not pending any more: not served
+    source.head = 62n;
+    await indexer.syncOnce();
+    expect(repos.pons.get(ATOKEN)).toMatchObject({ account: AACCOUNT, adopted: 1, claimable: '9' });
+    expect(repos.ponsAdoptions.get(ATOKEN, CREATOR)).toBeUndefined();
+
+    // an RPC failure while reading the pending record fails the range (nothing committed)
+    reader.failPendingReads = true;
+    source.logs.push(reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT2, preparer: PREPARER2 }, 63n, 0));
+    source.head = 63n;
+    await expect(indexer.syncOnce()).rejects.toThrow(/rpc down/);
+    expect(repos.state.lastBlock()).toBe(62n);
+    reader.failPendingReads = false;
+    await indexer.syncOnce();
+    expect(repos.ponsAdoptions.get(ATOKEN, PREPARER2)).toMatchObject({ account: AACCOUNT2, model_id: null });
   });
 
   it('adopting a launch that already graduated: phase graduated, price frozen from the swept amounts', async () => {
     const { repos, source, reader, indexer } = setup();
-    reader.launched.set(ATOKEN, launchedToken(ACURVE, { phase: 2, sweptQuote: THRESHOLD, sweptTokens: RESERVED, sweptAt: 1_700_000_000n }));
-    reader.minds.set(ATOKEN, { curve: ACURVE, account: AACCOUNT, launchConfigId: 0n, launchedHere: false, adopted: false });
+    reader.launched.set(ATOKEN, launchedToken(ACURVE, { phase: 2, sweptQuote: THRESHOLD, sweptTokens: RESERVED, sweptAt: 1_700_000_000n, creatorFeeRecipient: AACCOUNT }));
     reader.states.set(`${ACURVE}@50`, { quoteReserve: PHANTOM, tokenReserve: 0n, realQuoteReserve: 0n });
-    source.logs.push(reg('MindCreated', mindCreatedArgs(ATOKEN), 50n, 0), reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT, creator: CREATOR }, 50n, 1));
+    source.logs.push(reg('MindCreated', mindCreatedArgs(ATOKEN), 50n, 0), reg('MindAdopted', { token: ATOKEN, account: AACCOUNT, creator: CREATOR }, 50n, 1));
     source.head = 50n;
     await indexer.syncOnce();
     const m = repos.minds.get(ATOKEN)!;
-    expect([m.phase, m.status, m.price_wei]).toEqual([2, 1, ponsPrice(PHANTOM + THRESHOLD, RESERVED).toString()]);
-    expect(repos.pons.get(ATOKEN)).toMatchObject({ launch_phase: 2, swept_at: 1_700_000_000_000 });
+    expect([m.phase, m.status, m.price_wei]).toEqual([2, 0, ponsPrice(PHANTOM + THRESHOLD, RESERVED).toString()]);
+    expect(repos.pons.get(ATOKEN)).toMatchObject({ launch_phase: 2, swept_at: 1_700_000_000_000, adopted: 1 });
   });
 
   it('an unresolvable registration (no curve) fails the range so it is retried; nothing is committed', async () => {
     const { repos, source, indexer } = setup();
-    source.logs.push(reg('AdoptionPrepared', { token: ATOKEN, account: AACCOUNT, creator: CREATOR }, 5n, 0));
+    source.logs.push(reg('MindCreated', mindCreatedArgs(ATOKEN), 5n, 0), reg('MindAdopted', { token: ATOKEN, account: AACCOUNT, creator: CREATOR }, 5n, 1));
     source.head = 5n;
     await expect(indexer.syncOnce()).rejects.toThrow(/cannot resolve the Pons curve/);
     expect(repos.state.lastBlock()).toBeUndefined();
     expect(repos.minds.get(ATOKEN)).toBeUndefined();
+  });
+
+  it('schema v4 migration: existing Pons rows get has_left = 0 / derived_pool_id = NULL and pons_adoptions exists', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'www-rh-v3-'));
+    try {
+      const file = join(dir, 'v3.sqlite');
+      const v3 = Db.open(file, { schemaVersion: 3 });
+      expect(v3.userVersion).toBe(3);
+      v3.run("INSERT INTO pons_minds (token, curve, account, launched_here, adopted) VALUES (?, ?, ?, 0, 1)", ATOKEN, ACURVE, AACCOUNT);
+      v3.close();
+      const repos = new Repos(Db.open(file));
+      expect(repos.db.userVersion).toBe(SCHEMA_VERSION);
+      expect(repos.pons.get(ATOKEN)).toMatchObject({ adopted: 1, has_left: 0, derived_pool_id: null });
+      expect(repos.ponsAdoptions.accounts()).toEqual([]);
+      repos.db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('walkBackStates: trades of one block are anchored at the state after the last one', () => {

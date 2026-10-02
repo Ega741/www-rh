@@ -40,9 +40,9 @@ contract FakeLaunchFactory {
     }
 }
 
-/// @notice SPEC §9.2 launchMind: value accounting, account clones, Pons launch parameters (recipient, buyback off,
-///         native quote, exemptions), registration and events, initial buy with refund forwarding, creation fee,
-///         economics guard, canLaunch / launch fee gating, validation and pause.
+/// @notice SPEC §9.2/§9.7 launchMind: value accounting (minimum value, surplus refunded), account clones, Pons launch
+///         parameters (recipient, buyback off, native quote, exemptions), registration and events, initial buy with
+///         refund forwarding, creation fee, economics guard, canLaunch / launch fee gating, validation and pause.
 contract PonsMindRegistryLaunchTest is PonsBaseTest {
     // ---------------------------------------------------------------------------------------------
     // Constructor
@@ -248,34 +248,77 @@ contract PonsMindRegistryLaunchTest is PonsBaseTest {
     }
 
     function test_launchMind_wrongValue() public {
+        vm.prank(owner);
+        registry.setCreationFee(0.01 ether);
         IPonsMindRegistry.LaunchParams memory p = _params(SALT);
         vm.startPrank(creator);
         vm.expectRevert(IPonsMindRegistry.WrongValue.selector);
-        registry.launchMind{value: LAUNCH_FEE - 1}(p, 0, 0, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        registry.launchMind{value: LAUNCH_FEE + 0.01 ether - 1}(p, 0, 0, MODEL_ID, PERSONA_HASH, METADATA_URI);
         vm.expectRevert(IPonsMindRegistry.WrongValue.selector);
-        registry.launchMind{value: LAUNCH_FEE + 1}(p, 0, 0, MODEL_ID, PERSONA_HASH, METADATA_URI);
-        vm.expectRevert(IPonsMindRegistry.WrongValue.selector);
-        registry.launchMind{value: LAUNCH_FEE + 1 ether - 1}(p, 1 ether, 0, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        registry.launchMind{value: LAUNCH_FEE + 0.01 ether + 1 ether - 1}(
+            p, 1 ether, 0, MODEL_ID, PERSONA_HASH, METADATA_URI
+        );
         vm.expectRevert(IPonsMindRegistry.WrongValue.selector);
         registry.launchMind{value: 0}(p, 0, 0, MODEL_ID, PERSONA_HASH, METADATA_URI);
         vm.stopPrank();
+        assertEq(registry.mindsLength(), 0);
+    }
+
+    function test_launchMind_surplusRefunded() public {
+        vm.prank(owner);
+        registry.setCreationFee(0.01 ether);
+        IPonsMindRegistry.LaunchParams memory p = _params(SALT);
+        uint256 creatorBefore = creator.balance;
+        vm.prank(creator);
+        (address token, address curve,) =
+            registry.launchMind{value: LAUNCH_FEE + 0.01 ether + 1 ether + 0.7 ether}(
+                p, 1 ether, 0, MODEL_ID, PERSONA_HASH, METADATA_URI
+            );
+        assertEq(creatorBefore - creator.balance, LAUNCH_FEE + 0.01 ether + 1 ether, "surplus back in the same tx");
+        assertEq(address(registry).balance, 0.01 ether, "only the creation fee stays");
+        assertEq(registry.protocolBalance(), 0.01 ether);
+        assertGt(IERC20(token).balanceOf(creator), 0);
+        assertEq(MockPonsCurve(curve).realQuoteReserve(), 1 ether - 0.01 ether - 0.02 ether);
+        _assertSolvent();
+
+        // Surplus and a capped-buy refund are returned together.
+        uint256 before2 = creator.balance;
+        p.salt = keccak256("capped");
+        vm.prank(creator);
+        (, address curve2,) = registry.launchMind{value: LAUNCH_FEE + 0.01 ether + 10 ether + 1 ether}(
+            p, 10 ether, 0, MODEL_ID, PERSONA_HASH, METADATA_URI
+        );
+        uint256 paid = before2 - creator.balance;
+        assertTrue(MockPonsCurve(curve2).graduated(), "capped final buy");
+        assertGt(paid, LAUNCH_FEE + 0.01 ether);
+        assertLt(paid, LAUNCH_FEE + 0.01 ether + 10 ether, "capped-buy refund and surplus both returned");
+        assertEq(address(registry).balance, 0.02 ether);
+        _assertSolvent();
     }
 
     function test_launchMind_followsLiveLaunchFee() public {
+        (uint256 quotedFee, uint256 quotedTotal,) = registry.launchQuote(0, 0);
+        assertEq(quotedFee, LAUNCH_FEE);
         vm.prank(ponsOwner);
         factory.setLaunchFee(0.001 ether);
         IPonsMindRegistry.LaunchParams memory p = _params(SALT);
+        // Quoted before a launch fee increase: too little, refused.
         vm.prank(creator);
         vm.expectRevert(IPonsMindRegistry.WrongValue.selector);
-        registry.launchMind{value: LAUNCH_FEE}(p, 0, 0, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        registry.launchMind{value: quotedTotal}(p, 0, 0, MODEL_ID, PERSONA_HASH, METADATA_URI);
         (uint256 launchFee, uint256 total,) = registry.launchQuote(0, 0);
         assertEq(launchFee, 0.001 ether);
         assertEq(total, 0.001 ether);
         _launch(creator, 0);
-        // Zero launch fee works too.
+        // Quoted before a decrease (here to zero): the launch goes through and the difference is refunded.
+        (, total,) = registry.launchQuote(0, 0);
         vm.prank(ponsOwner);
         factory.setLaunchFee(0);
-        _launchWith(creator, _params(keccak256("other")), 0, 0);
+        uint256 before = creator.balance;
+        vm.prank(creator);
+        registry.launchMind{value: total}(_params(keccak256("other")), 0, 0, MODEL_ID, PERSONA_HASH, METADATA_URI);
+        assertEq(before, creator.balance, "nothing charged at a zero launch fee");
+        assertEq(address(registry).balance, 0);
     }
 
     function test_launchQuote() public {
@@ -356,15 +399,23 @@ contract PonsMindRegistryLaunchTest is PonsBaseTest {
         vm.deal(address(c), 20 ether);
         IPonsMindRegistry.LaunchParams memory p = _params(SALT);
         vm.expectRevert(IMindCore.EthTransferFailed.selector);
-        c.launch{value: LAUNCH_FEE + 10 ether}(p, 10 ether);
+        c.launch{value: LAUNCH_FEE + 10 ether}(p, 10 ether); // capped-buy refund
+        vm.expectRevert(IMindCore.EthTransferFailed.selector);
+        c.launch{value: LAUNCH_FEE + 1 ether + 1}(p, 1 ether); // surplus
         // Without a refund it works.
         c.launch{value: LAUNCH_FEE + 1 ether}(p, 1 ether);
     }
 
-    function testFuzz_launchMind_valueAccounting(uint256 quoteIn, uint256 creationFee, bool exactEconomics) public {
+    function testFuzz_launchMind_valueAccounting(
+        uint256 quoteIn,
+        uint256 creationFee,
+        uint256 surplus,
+        bool exactEconomics
+    ) public {
         quoteIn = bound(quoteIn, 0, 20 ether);
         if (quoteIn != 0 && quoteIn < 1e9) quoteIn = 1e9;
         creationFee = bound(creationFee, 0, 1 ether);
+        surplus = bound(surplus, 0, 5 ether);
         vm.prank(owner);
         registry.setCreationFee(creationFee);
         IPonsMindRegistry.LaunchParams memory p = _params(SALT);
@@ -373,7 +424,10 @@ contract PonsMindRegistryLaunchTest is PonsBaseTest {
         uint256 creatorBefore = creator.balance;
         uint256 protocolBefore = ponsProtocol.balance;
         uint256 heldBefore = address(factory).balance + address(escrow).balance;
-        (address token, address curve,) = _launchWith(creator, p, quoteIn, 0);
+        vm.prank(creator);
+        (address token, address curve,) = registry.launchMind{value: LAUNCH_FEE + quoteIn + creationFee + surplus}(
+            p, quoteIn, 0, MODEL_ID, PERSONA_HASH, METADATA_URI
+        );
 
         uint256 paid = creatorBefore - creator.balance;
         uint256 held = address(factory).balance + address(escrow).balance + curve.balance - heldBefore;
@@ -541,7 +595,7 @@ contract PonsMindRegistryLaunchTest is PonsBaseTest {
         r.launchMind(p, 0, 0, MODEL_ID, PERSONA_HASH, METADATA_URI);
     }
 
-    function test_pause_blocksLaunchAndAdoptionOnly() public {
+    function test_pause_blocksLaunchAndPreparationOnly() public {
         (address token,,) = _launch(creator, 0);
         vm.prank(owner);
         registry.pause();

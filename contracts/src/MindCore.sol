@@ -217,10 +217,11 @@ abstract contract MindCore is IMindCore, Ownable2Step, Pausable, ReentrancyGuard
     }
 
     /// @inheritdoc IMindCore
+    /// @dev Unpausing restores `Alive`, or `Dormant` when the venue's {_canBeAlive} says the mind may not be Alive.
     function setCreatorPaused(address token, bool paused) external onlyCreator(token) {
         MindInfo storage info = _mindInfo[token];
         if (paused == (info.status == MindStatus.Paused)) return;
-        MindStatus status = paused ? MindStatus.Paused : MindStatus.Alive;
+        MindStatus status = paused ? MindStatus.Paused : (_canBeAlive(token) ? MindStatus.Alive : MindStatus.Dormant);
         info.status = status;
         emit MindStatusChanged(token, status);
     }
@@ -269,9 +270,11 @@ abstract contract MindCore is IMindCore, Ownable2Step, Pausable, ReentrancyGuard
     }
 
     /// @inheritdoc IMindCore
+    /// @dev Also reverts `InvalidStatus()` for `Alive` while the venue's {_canBeAlive} is false.
     function setMindStatus(address token, MindStatus status) external onlyOperator onlyMind(token) {
         MindInfo storage info = _mindInfo[token];
         if (status == MindStatus.Paused || info.status == MindStatus.Paused) revert InvalidStatus();
+        if (status == MindStatus.Alive && !_canBeAlive(token)) revert InvalidStatus();
         if (info.status == status) return;
         info.status = status;
         emit MindStatusChanged(token, status);
@@ -353,6 +356,12 @@ abstract contract MindCore is IMindCore, Ownable2Step, Pausable, ReentrancyGuard
         _maxDrawPerEpoch = DEFAULT_MAX_DRAW_PER_EPOCH;
         _drawEpoch = DEFAULT_DRAW_EPOCH;
         emit DrawLimitUpdated(DEFAULT_MAX_DRAW_PER_EPOCH, DEFAULT_DRAW_EPOCH);
+    }
+
+    /// @dev Venue hook: whether `token`'s mind may currently be `Alive` (consulted by {setCreatorPaused} and
+    ///      {setMindStatus}). Always true here; {PonsMindRegistry} returns false while the creator has left.
+    function _canBeAlive(address) internal view virtual returns (bool) {
+        return true;
     }
 
     /// @dev Registers a new mind (the caller emits {MindCreated} or its venue event).

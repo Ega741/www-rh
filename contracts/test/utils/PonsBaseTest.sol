@@ -129,6 +129,27 @@ abstract contract PonsBaseTest is Test {
         (token, curve) = factory.launchToken{value: LAUNCH_FEE}(tp, 0, address(0), new address[](0));
     }
 
+    /// @dev `preparer` prepares an adoption of `token` with the default config (SPEC §9.7).
+    function _prepareAdoption(address token, address preparer) internal returns (address account) {
+        vm.prank(preparer);
+        account = registry.prepareAdoption(token, MODEL_ID, PERSONA_HASH, METADATA_URI);
+    }
+
+    /// @dev Hands the creator fees of `token` from its current recipient (an EOA or contract we can prank) to `to`.
+    function _handOver(address token, address to) internal {
+        vm.prank(factory.getLaunchedToken(token).creatorFeeRecipient);
+        factory.transferCreatorFeeRecipient(token, to);
+    }
+
+    /// @dev Full adoption: `preparer` prepares, the current recipient hands the fees to the preparer's account, a
+    ///      stranger activates.
+    function _adopt(address token, address preparer) internal returns (address account) {
+        account = _prepareAdoption(token, preparer);
+        _handOver(token, account);
+        vm.prank(stranger);
+        registry.activateAdoption(token, preparer);
+    }
+
     function _buy(address who, address curve, uint256 quoteIn) internal returns (uint256 tokensOut) {
         vm.prank(who);
         tokensOut = MockPonsCurve(curve).buy{value: quoteIn}(quoteIn, 0, who);

@@ -6,6 +6,7 @@ import type { Repos } from '../src/db/repos.js';
 import { FixedEthUsd } from '../src/economics/ethUsd.js';
 import { harvestDecision, harvestInputs, type HarvestInputs } from '../src/economics/harvest.js';
 import { EconomicsService } from '../src/economics/service.js';
+import { ponsInfoDto } from '../src/api/dto.js';
 import { HARVEST_TX_SPACING_MS, PonsOps, SWEPT_POOL_DELAY_MS } from '../src/mind/ponsOps.js';
 import { Scheduler } from '../src/mind/scheduler.js';
 import type { TickResult } from '../src/mind/tick.js';
@@ -59,6 +60,12 @@ describe('harvest decision table (SPEC §9.4)', () => {
     expect(harvestInputs({ ...grad, last_harvest_at: o.now - 3_600_000 }, econ, o).poolSweepDue).toBe(false);
     expect(harvestInputs({ ...grad, last_harvest_at: o.now - 6 * 3_600_000 }, econ, o).poolSweepDue).toBe(true);
     expect(harvestInputs({ ...grad, registry_pool_id: null }, econ, o).poolSweepDue).toBe(false);
+    // §9.7: the registry harvests the pool by derivedPoolId when no id was recorded
+    expect(harvestInputs({ ...grad, registry_pool_id: null, derived_pool_id: `0x${'91'.repeat(32)}` }, econ, o).poolSweepDue).toBe(true);
+    // §9.7: after leave the creator share of curve fees goes to the new recipient: nothing to sweep for the mind
+    expect(harvestInputs({ ...row, launched_here: 0, adopted: 1, has_left: 1 }, econ, o).sweepableWei).toBe(0n);
+    expect(harvestInputs({ ...row, has_left: 1 }, econ, o).sweepableWei).toBe(0n);
+    expect(harvestInputs({ ...row, has_left: 0 }, econ, o).sweepableWei).toBe(7500n);
   });
 });
 
@@ -143,7 +150,7 @@ describe('PonsOps (harvest / createGraduatedPool / setPoolId)', () => {
     expect(w.repos.pons.get(PTOKEN)?.launch_phase).toBe(3);
   });
 
-  it('setPoolId for a recorded PoolRegistered the registry does not have yet', async () => {
+  it('setPoolId for a recorded PoolRegistered the registry does not have yet, when derivedPoolId cannot be read (fallback)', async () => {
     const w = world();
     const poolId = `0x${'90'.repeat(32)}`;
     w.repos.pons.patch(PTOKEN, { pool_id: poolId });
@@ -156,7 +163,65 @@ describe('PonsOps (harvest / createGraduatedPool / setPoolId)', () => {
   });
 });
 
+describe('pool id via derivedPoolId (SPEC §9.7)', () => {
+  it('graduated pools get derivedPoolId read through once; a PoolRegistered equal to it sends nothing; a different one is sent as an override', async () => {
+    const w = world();
+    const derived = `0x${'91'.repeat(32)}`;
+    w.reader.derivedPoolIds.set(PTOKEN, derived as `0x${string}`);
+    // still bonding: no read
+    await w.pons.poolSweep();
+    expect(w.reader.calls.filter((c) => c.startsWith('derivedPoolId'))).toEqual([]);
+    w.repos.minds.setGraduated(PTOKEN, null, '7');
+    w.repos.pons.patch(PTOKEN, { launch_phase: 2 });
+    await w.pons.poolSweep();
+    await w.pons.poolSweep();
+    expect(w.reader.calls.filter((c) => c.startsWith('derivedPoolId'))).toEqual([`derivedPoolId ${PTOKEN}`]); // read through once
+    expect(w.repos.pons.get(PTOKEN)?.derived_pool_id).toBe(derived);
+    expect(ponsInfoDto(w.repos.pons.get(PTOKEN)!).poolId).toBe(derived);
+    // the hook's PoolRegistered matches the derived id: no setPoolId (harvest falls back to derivedPoolId)
+    w.repos.pons.patch(PTOKEN, { pool_id: derived });
+    await w.pons.poolSweep();
+    await w.pons.setPoolId(PTOKEN, derived);
+    expect(w.writes()).toEqual([]);
+    // a different observed id: override
+    const other = `0x${'92'.repeat(32)}`;
+    w.repos.pons.patch(PTOKEN, { pool_id: other });
+    await w.pons.poolSweep();
+    expect(w.queue.writes.map((x) => [x.write.functionName, ...x.write.args])).toEqual([['setPoolId', PTOKEN, other]]);
+    expect(ponsInfoDto(w.repos.pons.get(PTOKEN)!).poolId).toBe(other); // the observed hook id wins in the DTO
+  });
+
+  it('a live PoolGraduated reads the derived id; a zero derived id is not stored', async () => {
+    const w = world({ balance: 10n ** 18n });
+    w.reader.derivedPoolIds.set(PTOKEN, `0x${'00'.repeat(32)}`);
+    expect(await w.pons.resolvePoolId(PTOKEN)).toBeNull();
+    expect(w.repos.pons.get(PTOKEN)?.derived_pool_id).toBeNull();
+    w.reader.derivedPoolIds.set(PTOKEN, `0x${'93'.repeat(32)}`);
+    w.scheduler.onEvent({ type: 'graduated', token: PTOKEN, blockNumber: 3, txHash: '0x' });
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    expect(w.repos.pons.get(PTOKEN)?.derived_pool_id).toBe(`0x${'93'.repeat(32)}`);
+    expect(w.writes()).toEqual([]);
+    await w.scheduler.stop();
+  });
+});
+
 describe('Scheduler in Pons mode', () => {
+  it('a mind whose creator left is never set Alive, even with budget (setMindStatus(Alive) would revert); a takeover clears the flag', async () => {
+    const w = world({ balance: 10n ** 18n, status: 1, ticked: 1_799_999_000_000 });
+    w.repos.pons.patch(PTOKEN, { has_left: 1, adopted: 1 });
+    await w.scheduler.reevaluate(PTOKEN);
+    await w.scheduler.sweep();
+    w.scheduler.onEvent({ type: 'mind:funded', token: PTOKEN, amount: 10n ** 18n, blockNumber: 4, txHash: '0x' });
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    expect(w.writes()).toEqual([]);
+    expect(await w.scheduler.poll()).toEqual([]); // Dormant: never ticks
+    // takeover (MindAdopted): the indexer clears has_left and the mind is Alive on chain
+    w.repos.pons.patch(PTOKEN, { has_left: 0 });
+    await w.scheduler.reevaluate(PTOKEN);
+    expect(w.writes()).toEqual(['setMindStatus:0']);
+    await w.scheduler.stop();
+  });
+
   it('never sends the curve graduate / harvest; a live PoolRegistered sends setPoolId', async () => {
     const w = world({ balance: 10n ** 18n });
     w.repos.minds.setComplete(PTOKEN, '1', '1', 1);

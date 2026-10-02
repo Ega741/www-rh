@@ -15,11 +15,14 @@
  * and verified. Economics snapshots are cached for {@link SNAPSHOT_TTL_MS} (invalidated by ticks
  * and vault / status / config events) so the 1 s poll does not rescan every mind's ticks.
  *
- * Pons mode (`docs/SPEC.md` §9.4, `deps.pons`): no curve `graduate` / `harvest` is ever sent. After
+ * Pons mode (`docs/SPEC.md` §9.4, §9.7, `deps.pons`): no curve `graduate` / `harvest` is ever sent. After
  * each re-evaluation the harvest table runs (a `runway` harvest defers the Dormant transition: the
  * vault is about to be refilled); an hourly sweep re-evaluates harvests; every 10 min launches swept
- * for more than 10 min get `createGraduatedPool`, and recorded pool ids are sent with `setPoolId`
- * (also on a live `PoolRegistered`).
+ * for more than 10 min get `createGraduatedPool`, graduated pools get their `derivedPoolId` read
+ * through (also on a live `PoolGraduated`), and an observed `PoolRegistered` id is sent with
+ * `setPoolId` only when it differs from the derived one. A mind whose creator left (`MindLeft`,
+ * `pons_minds.has_left`) is never set `Alive` (the registry would revert `InvalidStatus`) until a
+ * takeover clears the flag.
  *
  * @module mind/scheduler
  */
@@ -238,7 +241,7 @@ export class Scheduler {
         if (mind.last_tick_at === null) return;
         await this.deps.settler.settle(token, { force: true });
         await this.#setStatus(token, 1);
-      } else if (mind.status === 1 && econ.modelKnown && econ.budget.availableUsdMicro >= 2 * econ.thresholdUsdMicro) {
+      } else if (mind.status === 1 && econ.modelKnown && econ.budget.availableUsdMicro >= 2 * econ.thresholdUsdMicro && !this.#hasLeft(token)) {
         await this.#setStatus(token, 0);
       }
     } catch (err) {
@@ -276,7 +279,13 @@ export class Scheduler {
     }
   }
 
+  /** Pons: the creator left (`MindLeft`); `setMindStatus(Alive)` reverts until a takeover (§9.7). */
+  #hasLeft(token: string): boolean {
+    return this.deps.repos.pons.get(token)?.has_left === 1;
+  }
+
   async #setStatus(token: string, status: 0 | 1): Promise<void> {
+    if (status === 0 && this.#hasLeft(token)) return;
     const now = this.#now();
     const last = this.#lastStatusTx.get(token);
     if (last !== undefined && now - last < STATUS_TX_SPACING_MS) return;
@@ -295,11 +304,17 @@ export class Scheduler {
       case 'mind:config':
       case 'pons:credited':
       case 'pons:claimed':
+      case 'pons:adopted':
+      case 'pons:left':
         this.#invalidate(ev.token);
         this.#track(this.reevaluate(ev.token));
         break;
       case 'pons:pool-registered':
         if (this.deps.pons != null) this.#track(this.deps.pons.setPoolId(ev.token, ev.poolId));
+        break;
+      case 'graduated':
+        // Pons: the registry harvests the pool by derivedPoolId (read through for the API and the harvest table)
+        if (this.deps.pons != null) this.#track(this.deps.pons.resolvePoolId(ev.token));
         break;
       case 'mind:status':
         this.#invalidate(ev.token);

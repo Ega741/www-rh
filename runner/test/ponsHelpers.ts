@@ -5,7 +5,7 @@
 import { encodeAbiParameters, encodeEventTopics, keccak256, toHex, type Abi, type AbiEvent, type Address, type Hex } from 'viem';
 import { modelIdToHash, personaHash, type LaunchConfigResponse } from '@www-rh/shared';
 import type { OnchainMind } from '../src/chain/launchpad.js';
-import type { OnchainPonsMind, PonsCurveParams, PonsCurveState, PonsLaunchedToken, PonsReader, PonsTokenInfo, ResolvedPonsContracts } from '../src/chain/pons.js';
+import type { OnchainPonsMind, PonsCurveParams, PonsCurveState, PonsLaunchedToken, PonsPendingAdoption, PonsReader, PonsTokenInfo, ResolvedPonsContracts } from '../src/chain/pons.js';
 import type { RawLog } from '../src/indexer/source.js';
 import { CREATOR, PERSONA } from './helpers.js';
 
@@ -20,6 +20,9 @@ export const ATOKEN = '0x7777777777777777777777777777777777777777' as Address;
 export const ACURVE = '0x8888888888888888888888888888888888888888' as Address;
 export const AACCOUNT = '0x9999999999999999999999999999999999999999' as Address;
 export const BUYER = '0xb0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0' as Address;
+/** A second adopter of ATOKEN (§9.7 takeover) and its account. */
+export const PREPARER2 = '0xc2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2' as Address;
+export const AACCOUNT2 = '0xa2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2' as Address;
 export const E = 10n ** 18n;
 // mainnet launch config 0
 export const SUPPLY = 10n ** 27n;
@@ -61,6 +64,11 @@ export class FakePonsReader implements PonsReader {
   minds = new Map<string, OnchainPonsMind>();
   claimables = new Map<string, bigint>();
   mindInfo = new Map<string, OnchainMind>();
+  /** Pending preparations keyed `${token}:${preparer}` (lowercase); missing = nothing pending (zero account). */
+  pending = new Map<string, PonsPendingAdoption>();
+  /** `derivedPoolId` per token; missing = the read fails. */
+  derivedPoolIds = new Map<string, Hex>();
+  failPendingReads = false;
   calls: string[] = [];
   launchConfigReads = 0;
   failLaunchConfig = false;
@@ -84,6 +92,19 @@ export class FakePonsReader implements PonsReader {
 
   async claimable(token: Address): Promise<bigint> {
     return this.claimables.get(token.toLowerCase()) ?? 0n;
+  }
+
+  async pendingAdoption(token: Address, preparer: Address): Promise<PonsPendingAdoption> {
+    this.calls.push(`pendingAdoption ${token.toLowerCase()} ${preparer.toLowerCase()}`);
+    if (this.failPendingReads) throw new Error('rpc down');
+    return this.pending.get(`${token.toLowerCase()}:${preparer.toLowerCase()}`) ?? { account: '0x0000000000000000000000000000000000000000', modelId: `0x${'00'.repeat(32)}`, personaHash: `0x${'00'.repeat(32)}`, metadataURI: '' };
+  }
+
+  async derivedPoolId(token: Address): Promise<Hex> {
+    this.calls.push(`derivedPoolId ${token.toLowerCase()}`);
+    const id = this.derivedPoolIds.get(token.toLowerCase());
+    if (id === undefined) throw new Error('execution reverted');
+    return id;
   }
 
   async curveState(curve: Address, blockNumber?: bigint): Promise<PonsCurveState> {

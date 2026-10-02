@@ -1,5 +1,5 @@
 /**
- * HTTP API (`docs/SPEC.md` §5, §9.4) as a Hono app under `/api`, CORS for the `PUBLIC_WEB_ORIGIN` list.
+ * HTTP API (`docs/SPEC.md` §5, §9.4, §9.7) as a Hono app under `/api`, CORS for the `PUBLIC_WEB_ORIGIN` list.
  * Errors are `{ error }` with 400 / 404 / 413 / 429 / 500.
  *
  * @module api/routes
@@ -16,6 +16,7 @@ import {
   type HealthResponse,
   type LaunchConfigResponse,
   type MindsResponse,
+  type PonsAdoptionsResponse,
   type StatsResponse,
   type Venue,
 } from '@www-rh/shared';
@@ -27,7 +28,7 @@ import { errorMessage, type Logger } from '../log.js';
 import { buildAnchorBatch, memoryDto } from '../memory/memory.js';
 import { storeMetadata } from '../metadata/store.js';
 import type { StreamBus } from '../stream/bus.js';
-import { activityByToken, drawDto, drawReceiptDto, ledgerEntryDto, mindDetailDto, mindSummaryDto, thoughtDto, tradeDto } from './dto.js';
+import { activityByToken, drawDto, drawReceiptDto, ledgerEntryDto, mindDetailDto, mindSummaryDto, ponsAdoptionDto, thoughtDto, tradeDto } from './dto.js';
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
@@ -232,6 +233,14 @@ export function createApi(deps: ApiDeps): Hono {
     if (row === undefined) return fail(c, 404, 'unknown mind');
     const activity = activityByToken(deps.repos.trades.since([m.token], now() - DAY_MS));
     return c.json(mindDetailDto(row, activity.get(m.token), row.venue === 'pons' ? deps.repos.pons.get(m.token) : undefined));
+  });
+
+  // pending adoption preparations (§9.7): any Pons token address, also tokens that are not minds yet; [] when none
+  app.get('/api/minds/:token/adoptions', (c) => {
+    const raw = c.req.param('token');
+    if (!ADDRESS.test(raw)) return fail(c, 400, 'invalid token address');
+    const body: PonsAdoptionsResponse = deps.repos.ponsAdoptions.pending(raw.toLowerCase()).map(ponsAdoptionDto);
+    return c.json(body);
   });
 
   app.get('/api/launch-config', async (c) => {

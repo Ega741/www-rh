@@ -1,14 +1,22 @@
 /**
- * Pons-mode indexing (`docs/SPEC.md` §9.4). For every block range:
+ * Pons-mode indexing (`docs/SPEC.md` §9.4, adoption v2 of §9.7). For every block range:
  *
  * 1. `PonsMindRegistry` logs (MindCore events + `MindLaunched` / `AdoptionPrepared` / `MindAdopted`
- *    / `MindLeft` / `PoolIdSet` / …); new registrations are resolved (curve, launch record, curve
- *    parameters, token supply) with chain reads before anything is applied;
+ *    / `MindLeft` / `PoolIdSet` / …). A mind row is created by `MindCreated` (emitted by `launchMind`
+ *    and by the first `activateAdoption`); the Pons state (`pons_minds`) of a new registration —
+ *    `MindLaunched`, or the `MindAdopted` of a token that is not registered yet — is resolved (curve,
+ *    launch record, curve parameters, token supply) with chain reads before anything is applied.
+ *    `AdoptionPrepared` is informational: the pending config is read from `pendingAdoption(token,
+ *    preparer)` and stored in `pons_adoptions` (served by `GET /api/minds/:token/adoptions`);
+ *    `MindAdopted` (first adoption or takeover: account, creator, adopted, not left, Alive) and
+ *    `MindLeft` (left, Dormant) update the mind;
  * 2. for the registered tokens (known ones plus those registered in this range): the curves'
  *    `CurveBuy` / `CurveSell` / `CurveBuyRefunded` / `FeesSwept` / `CurveCompleted` (address-filtered
  *    `eth_getLogs` over the set of curves), the factory's `LaunchSwept` / `PoolGraduated` /
  *    `CreatorFeeRecipientUpdated` filtered by token, the escrow's `Credited` / `Claimed` filtered by
- *    mind account, and the hook's `PoolRegistered` filtered by memecoin;
+ *    mind account — plus the accounts of pending adoptions (only those seen in `AdoptionPrepared`), so
+ *    fees credited after a hand-off and before activation are counted — and the hook's
+ *    `PoolRegistered` filtered by memecoin;
  * 3. post-trade reserves: for every (curve, block) with trades, `getReserves()` +
  *    `realQuoteReserve()` are read at that block and the block's trades are walked back from that
  *    end-of-block state (from the `CurveCompleted` amounts when the block graduated the curve), so
@@ -27,8 +35,8 @@
 import { encodeEventTopics, parseEventLogs, zeroAddress, type Abi, type Address, type Hex, type Log } from 'viem';
 import { ponsCurveAbi, ponsFactoryAbi, ponsFeeEscrowAbi, ponsMemeHookAbi, ponsMindRegistryAbi, ponsPrice } from '@www-rh/shared';
 import type { OnchainMind } from '../chain/launchpad.js';
-import { addressTopic, type OnchainPonsMind, type PonsCurveParams, type PonsCurveState, type PonsLaunchedToken, type PonsReader, type PonsTokenInfo } from '../chain/pons.js';
-import type { PonsMindRow, Repos } from '../db/repos.js';
+import { addressTopic, type OnchainPonsMind, type PonsCurveParams, type PonsCurveState, type PonsLaunchedToken, type PonsPendingAdoption, type PonsReader, type PonsTokenInfo } from '../chain/pons.js';
+import type { PonsAdoptionRow, PonsMindRow, Repos } from '../db/repos.js';
 import { errorMessage, type Logger } from '../log.js';
 import { applyCoreEvent, CORE_EVENTS, STATE_TOTAL_FEES_TO_MINDS, STATE_TOTAL_VOLUME, type AnomalySink, type ApplyContext, type CoreEvent } from './apply.js';
 import type { IndexedEvent } from './events.js';
@@ -40,7 +48,7 @@ const WAD = 10n ** 18n;
 export const PONS_LOGS_CHUNK = 100;
 
 /** Chain reads the Pons indexer needs. */
-export type PonsIndexReader = Pick<PonsReader, 'contracts' | 'launchedToken' | 'ponsMind' | 'curveState' | 'curveParams' | 'tokenInfo' | 'getMind'>;
+export type PonsIndexReader = Pick<PonsReader, 'contracts' | 'launchedToken' | 'ponsMind' | 'curveState' | 'curveParams' | 'tokenInfo' | 'getMind' | 'pendingAdoption'>;
 
 type SourceKind = 'registry' | 'curve' | 'factory' | 'escrow' | 'hook';
 
@@ -65,6 +73,12 @@ export interface PonsRegistration {
   /** Read for adoptions whose `MindCreated` is not part of the batch. */
   mind: OnchainMind | null;
 }
+
+/** Pending config of an `AdoptionPrepared` (from `pendingAdoption(token, preparer)`); `null` = no longer pending when read. */
+export type PreparedConfig = Pick<PonsPendingAdoption, 'modelId' | 'personaHash' | 'metadataURI'> | null;
+
+/** Key of a (token, preparer) preparation. */
+export const adoptionKey = (token: string, preparer: string): string => `${token.toLowerCase()}:${preparer.toLowerCase()}`;
 
 /** Reserve state after a trade. */
 export type ReserveState = PonsCurveState;
@@ -147,7 +161,7 @@ const chunks = <T>(items: readonly T[], size: number): T[][] => {
 const topic0 = (abi: Abi, eventName: string): Hex => (encodeEventTopics({ abi, eventName } as Parameters<typeof encodeEventTopics>[0])[0] as Hex);
 
 /** Blocks needing a timestamp: logs that store a time. */
-const TIMESTAMPED = new Set(['MindCreated', 'MindFunded', 'ComputeDrawn', 'Harvested', 'AdoptionPrepared', 'MindLaunched', 'CurveBuy', 'CurveSell', 'CurveCompleted', 'LaunchSwept']);
+const TIMESTAMPED = new Set(['MindCreated', 'MindFunded', 'ComputeDrawn', 'Harvested', 'AdoptionPrepared', 'MindLaunched', 'MindAdopted', 'CurveBuy', 'CurveSell', 'CurveCompleted', 'LaunchSwept']);
 
 /** Pons mode: registry logs plus the address-filtered Pons logs of the registered tokens. */
 export class PonsIndexerVenue implements IndexerVenue {
@@ -198,6 +212,8 @@ export class PonsIndexerVenue implements IndexerVenue {
     const registryLogs = decodeWith(ponsMindRegistryAbi, 'registry', registryRaw);
 
     // ------------------------------------------------------------ registrations in this range
+    // launchMind: MindCreated + MindLaunched; first activateAdoption: MindCreated + MindAdopted (a takeover of a registered
+    // token only updates it: MindConfigUpdated + MindAdopted)
     const created = new Set(registryLogs.filter((d) => d.eventName === 'MindCreated').map((d) => lower(d.args['token'])));
     const pending = new Map<string, { token: string; curve: string | null; account: string; launchedHere: boolean; launchConfigId: bigint | null; block: bigint }>();
     for (const d of registryLogs) {
@@ -205,7 +221,7 @@ export class PonsIndexerVenue implements IndexerVenue {
       if (pending.has(token) || repos.pons.get(token) !== undefined) continue;
       if (d.eventName === 'MindLaunched') {
         pending.set(token, { token, curve: lower(d.args['curve']), account: lower(d.args['account']), launchedHere: true, launchConfigId: d.args['launchConfigId'] as bigint, block: d.log.blockNumber });
-      } else if (d.eventName === 'AdoptionPrepared') {
+      } else if (d.eventName === 'MindAdopted') {
         pending.set(token, { token, curve: null, account: lower(d.args['account']), launchedHere: false, launchConfigId: null, block: d.log.blockNumber });
       }
     }
@@ -213,26 +229,33 @@ export class PonsIndexerVenue implements IndexerVenue {
     for (const r of pending.values()) {
       registrations.set(r.token, await this.#registration(repos, r, !created.has(r.token) && repos.minds.get(r.token) === undefined));
     }
-    // a pending adoption re-prepared by the launch's current recipient: creator and config are overwritten on chain
-    // without MindConfigUpdated, so the config is re-read
-    const reprepared = new Map<string, OnchainMind>();
+
+    // ------------------------------------------------------------ adoption preparations (informational, §9.7)
+    // the event carries no config: read the current pending record once per (token, preparer)
+    const prepared = new Map<string, PreparedConfig>();
     for (const d of registryLogs) {
-      const token = lower(d.args['token']);
-      if (d.eventName !== 'AdoptionPrepared' || pending.has(token) || reprepared.has(token) || repos.pons.get(token) === undefined) continue;
-      if (this.reader === null) throw new Error('Pons reads unavailable: cannot re-read a re-prepared adoption');
-      reprepared.set(token, await this.reader.getMind(token as Address));
+      if (d.eventName !== 'AdoptionPrepared') continue;
+      const [token, preparer] = [lower(d.args['token']), lower(d.args['preparer'])];
+      const key = adoptionKey(token, preparer);
+      if (prepared.has(key)) continue;
+      if (this.reader === null) throw new Error('Pons reads unavailable: cannot read a pending adoption');
+      const p = await this.reader.pendingAdoption(token as Address, preparer as Address);
+      prepared.set(key, p.account === zeroAddress ? null : { modelId: p.modelId, personaHash: p.personaHash, metadataURI: p.metadataURI });
     }
 
     // ------------------------------------------------------------ address sets
     const rows = repos.pons.all();
     const tokens = [...new Set([...rows.map((r) => r.token), ...registrations.keys()])];
     const curves = [...new Set([...rows.map((r) => r.curve), ...[...registrations.values()].map((r) => r.curve)])];
-    const accounts = [...new Set([...rows.map((r) => r.account), ...[...registrations.values()].map((r) => r.account)])];
+    // escrow: mind accounts, accounts of pending adoptions (bounded: only accounts seen in AdoptionPrepared) and accounts
+    // adopted in this range (a takeover replaces the account)
+    const rangeAccounts = registryLogs.filter((d) => d.eventName === 'AdoptionPrepared' || d.eventName === 'MindAdopted').map((d) => lower(d.args['account']));
+    const accounts = [...new Set([...rows.map((r) => r.account), ...[...registrations.values()].map((r) => r.account), ...repos.ponsAdoptions.accounts(), ...rangeAccounts])];
     const tokenSet = new Set(tokens);
 
     let rawCount = registryRaw.length;
     const decoded: PonsDecodedLog[] = [...registryLogs];
-    if (tokens.length > 0) {
+    if (tokens.length > 0 || accounts.length > 0) {
       if (this.reader === null) throw new Error('Pons reads unavailable: cannot index curve / factory / escrow / hook logs');
       const c = await this.reader.contracts();
       const fetchAll = async (filters: Parameters<LogSource['getLogsFiltered']>[0][]): Promise<RawLog[]> => {
@@ -248,7 +271,7 @@ export class PonsIndexerVenue implements IndexerVenue {
       const escrowTopics = ['Credited', 'Claimed'].map((e) => topic0(ponsFeeEscrowAbi, e));
       const escrowRaw = await fetchAll(chunks(accounts, this.chunkSize).map((as) => ({ address: c.feeEscrow, topics: [escrowTopics, as.map(addressTopic)], ...range })));
       // PoolRegistered's memecoin is not indexed: fetch the event, filter here
-      const hookRaw = await fetchAll([{ address: c.memeHook, topics: [[topic0(ponsMemeHookAbi, 'PoolRegistered')]], ...range }]);
+      const hookRaw = tokens.length === 0 ? [] : await fetchAll([{ address: c.memeHook, topics: [[topic0(ponsMemeHookAbi, 'PoolRegistered')]], ...range }]);
       const curveSet = new Set(curves);
       decoded.push(...decodeWith(ponsCurveAbi, 'curve', curveRaw.filter((l) => curveSet.has(l.address.toLowerCase()))));
       decoded.push(...decodeWith(ponsFactoryAbi, 'factory', factoryRaw.filter((l) => l.address.toLowerCase() === c.factory.toLowerCase())).filter((d) => tokenSet.has(lower(d.args['token']))));
@@ -311,7 +334,7 @@ export class PonsIndexerVenue implements IndexerVenue {
       rawCount,
       logCount: decoded.length,
       blocksNeedingTimestamps: [...blocks],
-      apply: (r, timestampOf, onAnomaly) => applyPonsLogs(r, decoded, { registrations, reprepared, anchors, phantoms, postStates }, timestampOf, onAnomaly),
+      apply: (r, timestampOf, onAnomaly) => applyPonsLogs(r, decoded, { registrations, prepared, anchors, phantoms, postStates }, timestampOf, onAnomaly),
     };
   }
 }
@@ -319,8 +342,8 @@ export class PonsIndexerVenue implements IndexerVenue {
 /** Pre-read state {@link applyPonsLogs} uses. */
 export interface PonsPrefetch {
   registrations: ReadonlyMap<string, PonsRegistration>;
-  /** `getMind` of adoptions re-prepared in the batch (tokens already registered). */
-  reprepared?: ReadonlyMap<string, OnchainMind>;
+  /** Pending config of the batch's `AdoptionPrepared` logs, keyed {@link adoptionKey}. */
+  prepared?: ReadonlyMap<string, PreparedConfig>;
   /** End-of-block reserves, keyed `${curve}@${block}`. */
   anchors: ReadonlyMap<string, ReserveState>;
   /** Phantom quote reserve per curve (`quoteReserve − realQuoteReserve`). */
@@ -415,6 +438,7 @@ export function applyPonsLogs(
 
     // the mind this log belongs to
     let row: PonsMindRow | undefined;
+    let adoption: PonsAdoptionRow | undefined;
     let token: string | null = null;
     switch (d.source) {
       case 'registry':
@@ -432,7 +456,9 @@ export function applyPonsLogs(
         break;
       case 'escrow':
         row = repos.pons.byAccount(lower(a['recipient']));
-        token = row?.token ?? null;
+        // not a mind account: the account of a pending adoption (fees credited after the hand-off, before activation)
+        adoption = row === undefined ? repos.ponsAdoptions.byAccount(lower(a['recipient'])) : undefined;
+        token = row?.token ?? adoption?.token ?? null;
         break;
     }
     if (d.source !== 'registry' && token === null) continue; // not ours (e.g. a curve registered later in the range)
@@ -451,55 +477,59 @@ export function applyPonsLogs(
       }
       if (token === null) continue;
       switch (d.eventName) {
-        case 'MindLaunched':
-        case 'AdoptionPrepared': {
+        case 'MindLaunched': {
           const reg = pre.registrations.get(token);
-          const again = d.eventName === 'AdoptionPrepared' ? pre.reprepared?.get(token) : undefined;
-          if (reg === undefined && again !== undefined) {
-            // re-preparation of a pending adoption: new creator (the current recipient) and config, Dormant again
-            const mind = repos.minds.get(token);
-            if (mind !== undefined) {
-              repos.minds.setCreator(token, lower(a['creator']));
-              const [modelId, ph] = [again.modelId.toLowerCase(), again.personaHash.toLowerCase()];
-              if (mind.model_id !== modelId || mind.persona_hash !== ph || mind.metadata_uri !== again.metadataURI) {
-                repos.minds.setConfig(token, modelId, ph, again.metadataURI);
-                out.push({ type: 'mind:config', token, ...base });
-              }
-              const ev = setStatus(token, 1, base);
-              if (ev !== null) out.push(ev);
-            }
-            break;
-          }
           if (reg === undefined) {
             if (repos.pons.get(token) === undefined) onAnomaly('Pons registration without pre-read state (skipped)', { token, event: d.eventName, txHash });
             break;
           }
-          out.push(...register(reg, ctx, d.eventName === 'AdoptionPrepared' ? lower(a['creator']) : null));
-          if (d.eventName === 'AdoptionPrepared') {
-            // registered Dormant until the fee recipient is handed over (activateAdoption)
-            const ev = setStatus(token, 1, base);
-            if (ev !== null) out.push(ev);
+          out.push(...register(reg, ctx, null));
+          break;
+        }
+        case 'AdoptionPrepared': {
+          // informational (§9.7): nothing is registered until activateAdoption
+          const preparer = lower(a['preparer']);
+          const key = adoptionKey(token, preparer);
+          if (pre.prepared === undefined || !pre.prepared.has(key)) {
+            onAnomaly('AdoptionPrepared without a pending-adoption read (skipped)', { token, preparer, txHash });
+            break;
           }
+          const cfg = pre.prepared.get(key) ?? null;
+          repos.ponsAdoptions.upsert({
+            token, preparer, account: lower(a['account']), modelId: cfg?.modelId ?? null, personaHash: cfg?.personaHash ?? null, metadataUri: cfg?.metadataURI ?? null, updatedAt: ctx.ms(),
+          });
           break;
         }
         case 'MindAdopted': {
-          repos.pons.patch(token, { adopted: 1, fee_recipient: lower(a['account']) });
-          out.push({ type: 'pons:adopted', token, ...base });
-          const mind = repos.minds.get(token);
-          if (mind !== undefined && mind.status !== 2) {
-            const ev = setStatus(token, 0, base);
-            if (ev !== null) out.push(ev);
+          // first adoption (after MindCreated) or takeover (after MindConfigUpdated): the preparer becomes the creator,
+          // its account the mind account; adopted, not left, Alive (§9.7)
+          const account = lower(a['account']);
+          const creator = lower(a['creator']);
+          const prior = repos.pons.get(token);
+          if (prior === undefined) {
+            const reg = pre.registrations.get(token);
+            if (reg === undefined) {
+              onAnomaly('Pons registration without pre-read state (skipped)', { token, event: d.eventName, txHash });
+              break;
+            }
+            out.push(...register(reg, ctx, creator));
           }
+          // the registry deletes the pending record; fees credited to a new account before activation move with it
+          const done = repos.ponsAdoptions.delete(token, creator);
+          const newAccount = prior === undefined || prior.account !== account;
+          repos.pons.patch(token, { account, adopted: 1, has_left: 0, fee_recipient: account, claimable: newAccount ? (done?.claimable ?? '0') : undefined });
+          if (repos.minds.get(token)?.creator !== creator) repos.minds.setCreator(token, creator);
+          out.push({ type: 'pons:adopted', token, ...base });
+          const ev = setStatus(token, 0, base);
+          if (ev !== null) out.push(ev);
           break;
         }
         case 'MindLeft': {
-          repos.pons.patch(token, { fee_recipient: lower(a['newRecipient']) });
+          // the creator handed the fee recipient away: Dormant until a takeover (setMindStatus(Alive) reverts, §9.7)
+          repos.pons.patch(token, { fee_recipient: lower(a['newRecipient']), has_left: 1 });
           out.push({ type: 'pons:left', token, ...base });
-          const mind = repos.minds.get(token);
-          if (mind !== undefined && mind.status !== 2) {
-            const ev = setStatus(token, 1, base);
-            if (ev !== null) out.push(ev);
-          }
+          const ev = setStatus(token, 1, base);
+          if (ev !== null) out.push(ev);
           break;
         }
         case 'PoolIdSet':
@@ -565,17 +595,19 @@ export function applyPonsLogs(
       case 'CreatorFeeRecipientUpdated':
         repos.pons.patch(t, { fee_recipient: lower(a['newRecipient']) });
         break;
-      case 'Credited': {
-        const amount = a['amount'] as bigint;
-        repos.pons.addClaimable(t, amount);
-        out.push({ type: 'pons:credited', token: t, amount, ...base });
-        break;
-      }
+      case 'Credited':
       case 'Claimed': {
         const amount = a['amount'] as bigint;
-        const r = repos.pons.addClaimable(t, -amount);
+        const delta = d.eventName === 'Credited' ? amount : -amount;
+        if (row === undefined && adoption !== undefined) {
+          // pending adoption account: kept on the preparation until MindAdopted carries it over (no domain event)
+          const r = repos.ponsAdoptions.addClaimable(adoption.token, adoption.preparer, delta);
+          if (r?.clampedFrom != null) onAnomaly('indexed pending-adoption claimable would go negative; stored as 0', { token: t, account: adoption.account, txHash, wouldBe: r.clampedFrom });
+          break;
+        }
+        const r = repos.pons.addClaimable(t, delta);
         if (r?.clampedFrom != null) onAnomaly('indexed claimable would go negative; stored as 0 (missed escrow credit?)', { token: t, txHash, wouldBe: r.clampedFrom });
-        out.push({ type: 'pons:claimed', token: t, amount, ...base });
+        out.push(d.eventName === 'Credited' ? { type: 'pons:credited', token: t, amount, ...base } : { type: 'pons:claimed', token: t, amount, ...base });
         break;
       }
       case 'PoolRegistered': {

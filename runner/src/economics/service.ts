@@ -4,9 +4,9 @@
  * invalidated after every draw), burn governor, burn rate and runway.
  *
  * Pons mode (§9.4): the budget counts the vault (`mindBalance`) only; `claimableWei` — creator fees
- * credited to the mind account in the Pons escrow and not yet harvested — is reported next to it
- * (`registry.claimable(token)`, cached 60 s and invalidated by escrow / harvest events; the indexed
- * escrow balance when the read fails).
+ * credited to the mind account in the Pons escrow (plus ETH held by the account, §9.7) and not yet
+ * harvested — is reported next to it (`registry.claimable(token)`, cached 60 s and invalidated by
+ * escrow / harvest events; the indexed escrow balance when the read fails).
  *
  * @module economics/service
  */

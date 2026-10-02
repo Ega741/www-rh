@@ -353,8 +353,15 @@ const mindCoreAbiSignatures = [
 ] as const;
 
 /**
- * Human-readable signatures of `PonsMindRegistry` (§9.2): the `MindCore` surface plus the Pons
- * integration (launch, adoption, leave, harvest, pool id, views, events, errors).
+ * Human-readable signatures of `PonsMindRegistry` (§9.2 as amended by §9.7): the `MindCore` surface
+ * plus the Pons integration (launch, adoption v2, leave, harvest, pool id, views, events, errors).
+ *
+ * Adoption v2 (§9.7): every preparation is bound to its preparer — `prepareAdoption` deploys / reuses
+ * the account `clone(keccak256(abi.encode(token, preparer)))` and stores a pending record (nothing is
+ * registered yet, `AdoptionPrepared`); `activateAdoption(token, preparer)` registers the mind
+ * (`MindCreated` + `MindAdopted`) or, when the current account is no longer the fee recipient, takes it
+ * over (`MindConfigUpdated` + `MindAdopted`). `leave` harvests first, then hands the recipient away and
+ * sets `hasLeft(token)` (status Dormant until a takeover).
  */
 export const ponsMindRegistryAbiSignatures = [
   ...mindCoreAbiSignatures,
@@ -366,8 +373,10 @@ export const ponsMindRegistryAbiSignatures = [
   'receive() external payable',
   // ---------------------------------------------------------------- events
   'event MindLaunched(address indexed token, address indexed curve, address indexed account, address creator, uint256 launchConfigId)',
-  'event AdoptionPrepared(address indexed token, address indexed account, address indexed creator)',
-  'event MindAdopted(address indexed token, address indexed account)',
+  // §9.7: emitted by prepareAdoption (and again by a repeat call of the same preparer); informational
+  'event AdoptionPrepared(address indexed token, address indexed account, address indexed preparer)',
+  // §9.7: emitted by activateAdoption after MindCreated (new mind) or MindConfigUpdated (takeover)
+  'event MindAdopted(address indexed token, address indexed account, address indexed creator)',
   'event MindLeft(address indexed token, address newRecipient)',
   'event SweepAttempted(address indexed token, bool curveSwept, bool poolSwept)',
   'event PoolIdSet(address indexed token, bytes32 poolId)',
@@ -380,16 +389,25 @@ export const ponsMindRegistryAbiSignatures = [
   'error AlreadyAdopted()',
   'error WrongValue()',
   'error LaunchFailed()',
+  // §9.7: prepareAdoption on a launch with buybackEnabled == true
+  'error BuybackEnabledLaunch()',
+  // §9.7: leave to the zero address, the registry or any mind account
+  'error InvalidRecipient()',
   // OpenZeppelin Clones / Errors and SafeCast, present in the compiled ABI
   'error FailedDeployment()',
   'error InsufficientBalance(uint256 balance, uint256 needed)',
   'error SafeCastOverflowedUintDowncast(uint8 bits, uint256 value)',
   // ---------------------------------------------------------------- creator
-  // msg.value == factory.launchFee() + quoteIn + creationFee()
+  // msg.value >= factory.launchFee() + quoteIn + creationFee() (else WrongValue); the surplus is refunded in the same tx (§9.7)
   'function launchMind(LaunchParams p, uint256 quoteIn, uint256 minTokensOut, bytes32 modelId, bytes32 personaHash, string metadataURI) payable returns (address token, address curve, address account)',
+  // anyone, for a native-quote Pons launch without buyback; a repeat call updates the pending config (§9.7)
   'function prepareAdoption(address token, bytes32 modelId, bytes32 personaHash, string metadataURI) returns (address account)',
-  'function activateAdoption(address token)',
+  // anyone, once factory.getLaunchedToken(token).creatorFeeRecipient == pendingAdoption(token, preparer).account
+  'function activateAdoption(address token, address preparer)',
+  // creator only: harvest first, then hand the recipient to newRecipient (not 0 / the registry / a mind account)
   'function leave(address token, address newRecipient)',
+  // creator only: the mind account's whole ERC-20 balance of erc20 → the creator (never ETH)
+  'function recoverAccountTokens(address token, address erc20)',
   // ---------------------------------------------------------------- permissionless / operator / owner
   'function harvest(address token)',
   'function createGraduatedPool(address token)',
@@ -400,10 +418,16 @@ export const ponsMindRegistryAbiSignatures = [
   'function accountOf(address token) view returns (address)',
   'function tokenOf(address account) view returns (address)',
   'function predictAccount(address creator, bytes32 salt) view returns (address)',
-  'function predictAdoptionAccount(address token) view returns (address)',
+  'function predictAdoptionAccount(address token, address preparer) view returns (address)',
+  // account == address(0) when there is no pending preparation (none yet, or activated)
+  'function pendingAdoption(address token, address preparer) view returns (address account, bytes32 modelId, bytes32 personaHash, string metadataURI)',
+  'function hasLeft(address token) view returns (bool)',
+  // feeEscrow.balanceOf(account) + account.balance (§9.7)
   'function claimable(address token) view returns (uint256)',
-  // pool id recorded with setPoolId (0 before)
+  // pool id recorded with setPoolId (0 before); harvest falls back to derivedPoolId
   'function poolIdOf(address token) view returns (bytes32)',
+  // keccak256(abi.encode(PoolKey(native, token, lt.poolFee, lt.tickSpacing, memeHook))) of the graduated v4 pool (§9.7)
+  'function derivedPoolId(address token) view returns (bytes32)',
   'function launchQuote(uint256 launchConfigId, uint256 quoteIn) view returns (uint256 launchFee, uint256 total, bytes32 economics)',
   'function factory() view returns (address)',
   'function feeEscrow() view returns (address)',
@@ -412,13 +436,14 @@ export const ponsMindRegistryAbiSignatures = [
   'function mindFeeBps() view returns (uint16)',
 ] as const;
 
-/** Parsed ABI of `PonsMindRegistry` (§9.2). */
+/** Parsed ABI of `PonsMindRegistry` (§9.2, §9.7). */
 export const ponsMindRegistryAbi = parseAbi(ponsMindRegistryAbiSignatures);
 
 /**
- * Human-readable signatures of `MindAccount` (§9.2): the per-mind creator-fee recipient (EIP-1167
- * clone). `sweepCurve` (the account sweeps the curve as its creator fee recipient) is part of the
- * compiled contract in addition to the §9.2 list.
+ * Human-readable signatures of `MindAccount` (§9.2, §9.7): the per-mind creator-fee recipient
+ * (EIP-1167 clone). `sweepCurve` (the account sweeps the curve as its creator fee recipient) is part
+ * of the compiled contract in addition to the §9.2 list; `sweepTokens` backs
+ * `registry.recoverAccountTokens` (§9.7).
  */
 export const mindAccountAbiSignatures = [
   'function initialize(address registry)',
@@ -431,13 +456,17 @@ export const mindAccountAbiSignatures = [
   'function sweepCurve(address curve, uint256 minBuybackTokensOut)',
   'function sweepPool(address hook, bytes32 poolId, uint256 minConversionQuoteOut, uint256 minBuybackTokensOut)',
   'function transferFeeRecipient(address factory, address token, address to)',
+  // registry only: moves the account's whole erc20 balance to `to` (§9.7)
+  'function sweepTokens(address erc20, address to)',
   'error AlreadyInitialized()',
   'error NotRegistry()',
   'error ZeroAddress()',
   'error EthTransferFailed()',
+  // OpenZeppelin SafeERC20 (sweepTokens), present in the compiled ABI
+  'error SafeERC20FailedOperation(address token)',
 ] as const;
 
-/** Parsed ABI of `MindAccount` (§9.2). */
+/** Parsed ABI of `MindAccount` (§9.2, §9.7). */
 export const mindAccountAbi = parseAbi(mindAccountAbiSignatures);
 
 /**

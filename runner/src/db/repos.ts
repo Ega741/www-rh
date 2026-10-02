@@ -89,6 +89,26 @@ export interface PonsMindRow {
   swept_at: number | null;
   /** Block time (ms) of the last indexed `Harvested`. */
   last_harvest_at: number | null;
+  /** 1 after `MindLeft` (the creator handed the fee recipient away); cleared by a takeover (`MindAdopted`, §9.7). */
+  has_left: number;
+  /** `registry.derivedPoolId(token)`, read through once after graduation (§9.7). */
+  derived_pool_id: string | null;
+}
+
+/** `pons_adoptions` row: an adoption preparation seen in `AdoptionPrepared` and not activated yet (§9.7). */
+export interface PonsAdoptionRow {
+  token: string;
+  preparer: string;
+  /** The preparer's `MindAccount` for the token (from the event). */
+  account: string;
+  /** Pending config from `pendingAdoption(token, preparer)`; `null` when the preparation was gone when read. */
+  model_id: string | null;
+  persona_hash: string | null;
+  metadata_uri: string | null;
+  /** Escrow balance of the account observed before activation (Σ `Credited` − Σ `Claimed`). */
+  claimable: string;
+  /** Block time (ms) of the last `AdoptionPrepared` of this (token, preparer). */
+  updated_at: number;
 }
 
 /** `trades` row. */
@@ -432,7 +452,7 @@ export class MindsRepo {
     this.db.run('UPDATE minds SET status = ? WHERE token = ?', status, token);
   }
 
-  /** Pons: a re-prepared adoption changes the mind's creator (the launch's current fee recipient). */
+  /** Pons: `MindAdopted` makes the preparer the mind's creator (first adoption or takeover, §9.7). */
   setCreator(token: string, creator: string): void {
     this.db.run('UPDATE minds SET creator = ? WHERE token = ?', creator.toLowerCase(), token);
   }
@@ -828,7 +848,7 @@ export class TicksRepo {
 const PONS_COLUMNS = new Set<keyof PonsMindRow>([
   'curve', 'account', 'deployer', 'launch_config_id', 'fee_bps', 'creator_tax_bps', 'launched_here', 'adopted', 'fee_recipient', 'pool_id',
   'registry_pool_id', 'claimable', 'phantom_quote', 'supply', 'graduation_threshold', 'quote_reserve', 'token_reserve', 'pending_fee', 'pending_tax',
-  'launch_phase', 'swept_at', 'last_harvest_at',
+  'launch_phase', 'swept_at', 'last_harvest_at', 'has_left', 'derived_pool_id',
 ]);
 
 /** Pons launch state of minds registered by `PonsMindRegistry` (`docs/SPEC.md` §9). */
@@ -892,6 +912,59 @@ export class PonsRepo {
   }
 }
 
+/** Pending adoption preparations (`docs/SPEC.md` §9.7); keys and addresses are lowercase. */
+export class PonsAdoptionsRepo {
+  constructor(private readonly db: Db) {}
+
+  /** Inserts or refreshes a preparation (a repeat `prepareAdoption` updates the config); the observed escrow balance is kept. */
+  upsert(r: { token: string; preparer: string; account: string; modelId: string | null; personaHash: string | null; metadataUri: string | null; updatedAt: number }): void {
+    this.db.run(
+      `INSERT INTO pons_adoptions (token, preparer, account, model_id, persona_hash, metadata_uri, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (token, preparer) DO UPDATE SET account = excluded.account, model_id = excluded.model_id, persona_hash = excluded.persona_hash,
+           metadata_uri = excluded.metadata_uri, updated_at = excluded.updated_at`,
+      r.token.toLowerCase(), r.preparer.toLowerCase(), r.account.toLowerCase(), r.modelId?.toLowerCase() ?? null, r.personaHash?.toLowerCase() ?? null, r.metadataUri, r.updatedAt,
+    );
+  }
+
+  get(token: string, preparer: string): PonsAdoptionRow | undefined {
+    return this.db.get<PonsAdoptionRow>('SELECT * FROM pons_adoptions WHERE token = ? AND preparer = ?', token.toLowerCase(), preparer.toLowerCase());
+  }
+
+  byAccount(account: string): PonsAdoptionRow | undefined {
+    return this.db.get<PonsAdoptionRow>('SELECT * FROM pons_adoptions WHERE account = ? ORDER BY updated_at DESC LIMIT 1', account.toLowerCase());
+  }
+
+  /** Preparations of `token` whose pending config is known, most recently prepared first (`GET /api/minds/:token/adoptions`). */
+  pending(token: string): PonsAdoptionRow[] {
+    return this.db.all<PonsAdoptionRow>(
+      'SELECT * FROM pons_adoptions WHERE token = ? AND model_id IS NOT NULL ORDER BY updated_at DESC, preparer ASC',
+      token.toLowerCase(),
+    );
+  }
+
+  /** Every stored preparation account (the escrow log filter of pending adoptions). */
+  accounts(): string[] {
+    return this.db.all<{ account: string }>('SELECT DISTINCT account FROM pons_adoptions ORDER BY account').map((r) => r.account);
+  }
+
+  /** Adds a signed delta to the observed escrow balance of a preparation account; below zero is stored as 0 and reported. */
+  addClaimable(token: string, preparer: string, delta: bigint): { claimable: bigint; clampedFrom: bigint | null } | undefined {
+    const row = this.get(token, preparer);
+    if (row === undefined) return undefined;
+    const next = BigInt(row.claimable) + delta;
+    const stored = next < 0n ? 0n : next;
+    this.db.run('UPDATE pons_adoptions SET claimable = ? WHERE token = ? AND preparer = ?', stored.toString(10), row.token, row.preparer);
+    return { claimable: stored, clampedFrom: next < 0n ? next : null };
+  }
+
+  /** Removes a preparation (activated: the registry deleted the pending record); returns the removed row. */
+  delete(token: string, preparer: string): PonsAdoptionRow | undefined {
+    const row = this.get(token, preparer);
+    if (row !== undefined) this.db.run('DELETE FROM pons_adoptions WHERE token = ? AND preparer = ?', row.token, row.preparer);
+    return row;
+  }
+}
+
 /** Uploaded metadata documents. */
 export class MetadataRepo {
   constructor(private readonly db: Db) {}
@@ -916,9 +989,11 @@ export class Repos {
   readonly ticks: TicksRepo;
   readonly metadata: MetadataRepo;
   readonly pons: PonsRepo;
+  readonly ponsAdoptions: PonsAdoptionsRepo;
 
   constructor(readonly db: Db) {
     this.pons = new PonsRepo(db);
+    this.ponsAdoptions = new PonsAdoptionsRepo(db);
     this.state = new StateRepo(db);
     this.chain = new ChainRepo(db);
     this.minds = new MindsRepo(db);

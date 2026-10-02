@@ -16,7 +16,7 @@ import {IPonsV2LaunchFactory} from "../../src/interfaces/pons/IPonsV2LaunchFacto
 ///         `ROBINHOOD_RPC_URL=https://… forge test --match-path test/fork/PonsFork.t.sol -vv`.
 ///         It checks that the local interfaces decode the live contracts (struct layouts included), then launches a
 ///         mind through a fresh registry (whitelisting it with the factory owner's key when public launches are
-///         closed), trades on the real curve, harvests, and runs an adoption.
+///         closed), trades on the real curve, harvests, leaves, and runs an adoption with a takeover (SPEC §9.7).
 contract PonsForkTest is Test {
     address internal constant FACTORY = 0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e;
     address internal constant FEE_ESCROW = 0xd3AFEB2a57f70eF218Aa82451c51B2fb0416Ac9e;
@@ -108,10 +108,14 @@ contract PonsForkTest is Test {
         }
         assertEq(registry.claimable(token), 0);
         assertEq(address(registry).balance, registry.mindBalance(token) + registry.protocolBalance());
+        // Pool id the live hook will register at graduation (SPEC §9.7 derivation, checked against PoolRegistered
+        // when a graduated launch is available).
+        console2.logBytes32(registry.derivedPoolId(token));
 
         vm.prank(creator);
         registry.leave(token, creator);
         assertEq(factory.getLaunchedToken(token).creatorFeeRecipient, creator);
+        assertTrue(registry.hasLeft(token));
     }
 
     function test_fork_adoption() public onlyFork {
@@ -124,12 +128,28 @@ contract PonsForkTest is Test {
         vm.startPrank(creator);
         (address token,) = factory.launchToken{value: launchFee}(tp, 0, address(0), new address[](0));
         address account = registry.prepareAdoption(token, keccak256("claude"), bytes32(0), "");
-        assertEq(account, registry.predictAdoptionAccount(token));
+        assertEq(account, registry.predictAdoptionAccount(token, creator));
+        assertFalse(registry.isMind(token), "registered only at activation");
         factory.transferCreatorFeeRecipient(token, account);
         vm.stopPrank();
-        registry.activateAdoption(token);
+        registry.activateAdoption(token, creator);
         assertTrue(registry.ponsMind(token).adopted);
+        assertEq(registry.getMind(token).creator, creator);
         assertEq(factory.getLaunchedToken(token).creatorFeeRecipient, account);
+
+        // Leave (harvests first), then the new recipient takes over with its own account.
+        address heir = makeAddr("forkHeir");
+        vm.prank(creator);
+        registry.leave(token, heir);
+        assertTrue(registry.hasLeft(token));
+        vm.prank(heir);
+        address heirAccount = registry.prepareAdoption(token, keccak256("claude"), bytes32(0), "");
+        vm.prank(heir);
+        factory.transferCreatorFeeRecipient(token, heirAccount);
+        registry.activateAdoption(token, heir);
+        assertEq(registry.getMind(token).creator, heir);
+        assertEq(registry.accountOf(token), heirAccount);
+        assertFalse(registry.hasLeft(token));
     }
 
     /// @dev Whitelists `launcher` with the factory owner's key when public launches are closed.

@@ -37,9 +37,9 @@ export type IndexedEvent =
   | (Base & { type: 'pons:claimed'; amount: bigint })
   /** The hook's `PoolRegistered` for a mind's token: the operator records it with `setPoolId`. */
   | (Base & { type: 'pons:pool-registered'; poolId: string })
-  /** `MindAdopted` (the fee recipient was handed to the mind account). */
+  /** `MindAdopted` (first adoption or takeover, §9.7: the fee recipient was handed to the preparer's account). */
   | (Base & { type: 'pons:adopted' })
-  /** `MindLeft` (the creator moved the fee recipient away). */
+  /** `MindLeft` (the creator moved the fee recipient away; Dormant until a takeover, §9.7). */
   | (Base & { type: 'pons:left' });
 
 /** Event type names. */
