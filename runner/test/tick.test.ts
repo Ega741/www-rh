@@ -62,7 +62,7 @@ class FakeStream implements StreamLike {
 
 /** Mimics BetaToolRunner: yields one stream per iteration and runs the tools of `tool_use` turns. */
 class FakeRunner implements ToolRunnerLike {
-  constructor(readonly params: TickParams, private readonly script: Iteration[], private readonly signal: AbortSignal) {}
+  constructor(readonly params: TickParams, private readonly script: Iteration[], private readonly signal: AbortSignal, private readonly results: unknown[] = []) {}
 
   async *[Symbol.asyncIterator](): AsyncIterator<StreamLike> {
     for (const it of this.script.slice(0, this.params.max_iterations)) {
@@ -72,14 +72,14 @@ class FakeRunner implements ToolRunnerLike {
       for (const b of msg.content) {
         if (b.type !== 'tool_use') continue;
         const tool = this.params.tools.find((t) => 'name' in t && t.name === b.name) as { parse(i: unknown): unknown; run(i: unknown): Promise<unknown> } | undefined;
-        if (tool !== undefined) await tool.run(tool.parse(b.input));
+        if (tool !== undefined) this.results.push(await tool.run(tool.parse(b.input)));
       }
       if (msg.stop_reason !== 'tool_use') return;
     }
   }
 }
 
-function harness(scripts: (Iteration[] | Error)[], config: Partial<TickDeps['config']> = {}) {
+function harness(scripts: (Iteration[] | Error | ToolRunnerLike)[], config: Partial<TickDeps['config']> = {}, browserOverrides: Partial<TickBrowser> = {}) {
   const repos = memoryRepos();
   const bus = new StreamBus();
   const messages: WsServerMessage[] = [];
@@ -88,13 +88,15 @@ function harness(scripts: (Iteration[] | Error)[], config: Partial<TickDeps['con
   const created: TickParams[] = [];
   const sleeps: number[] = [];
   const resets: string[] = [];
+  const toolResults: unknown[] = [];
   const createRunner: RunnerFactory = (params, { signal }) => {
     created.push(params);
     const script = scripts.shift() ?? [];
     if (script instanceof Error) {
       return { params, [Symbol.asyncIterator]: async function* () { throw script; } } as unknown as ToolRunnerLike;
     }
-    return new FakeRunner(params, script, signal);
+    if (!Array.isArray(script)) return script;
+    return new FakeRunner(params, script, signal, toolResults);
   };
   const browser: TickBrowser = {
     currentUrl: () => 'https://example.com/',
@@ -108,6 +110,7 @@ function harness(scripts: (Iteration[] | Error)[], config: Partial<TickDeps['con
     startFrames: () => undefined,
     stopFrames: () => undefined,
     captureFrame: async () => ({ jpegBase64: 'AAAA', url: 'https://example.com/', at: new Date().toISOString() }),
+    ...browserOverrides,
   };
   const allowAll: EgressFilter = { checkUrl: async (url) => ({ ok: true, url: new URL(url), addresses: ['1.1.1.1'] }), checkHost: async () => ({ ok: true, addresses: ['1.1.1.1'] }) };
   const deps: TickDeps = {
@@ -129,7 +132,7 @@ function harness(scripts: (Iteration[] | Error)[], config: Partial<TickDeps['con
     runwayHours: null,
     currentUrl: null,
   };
-  return { repos, messages, created, sleeps, resets, run: () => runTick(deps, input) };
+  return { repos, messages, created, sleeps, resets, toolResults, run: () => runTick(deps, input) };
 }
 
 describe('runTick', () => {
@@ -223,5 +226,58 @@ describe('runTick', () => {
     const r = await h.run();
     expect(r).toMatchObject({ status: 'failed', failed: true, error: 'socket hang up' });
     expect(r.totals.costUsdMicro).toBe(costOfUsageMicroUsd('claude-opus-5-5', U));
+  });
+
+  it('a hung tool is cut at TOOL_TIMEOUT_MS with an error result and a browser reset; the tick goes on (finding 2)', async () => {
+    const h = harness(
+      [[{ blocks: [{ type: 'tool_use', name: 'browse_read', input: {} }], stop: 'tool_use' }, { blocks: [{ type: 'text', text: 'Moved on.' }], stop: 'end_turn' }]],
+      { toolTimeoutMs: 50, timeoutMs: 10_000 },
+      { read: () => new Promise<never>(() => undefined) }, // e.g. page.evaluate on a renderer stuck in while(true){}
+    );
+    const t0 = Date.now();
+    const r = await h.run();
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(r).toMatchObject({ status: 'ok', failed: false });
+    expect(h.toolResults).toEqual(['error: browse_read timed out after 50 ms; the browser was reset']);
+    expect(h.resets).toEqual([TOKEN.toLowerCase()]);
+  });
+
+  it('TICK_TIMEOUT_MS ends the tick even when the tool runner ignores the abort signal (the single-flight lock is released)', async () => {
+    const neverEnding: ToolRunnerLike = {
+      params: {} as TickParams,
+      [Symbol.asyncIterator]: () => ({ next: () => new Promise<IteratorResult<StreamLike>>(() => undefined) }),
+    };
+    const h = harness([neverEnding], { timeoutMs: 100 });
+    const t0 = Date.now();
+    const r = await h.run();
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(r).toMatchObject({ status: 'timeout', failed: true });
+    expect(h.resets).toEqual([TOKEN.toLowerCase()]);
+  });
+
+  it('a tool hung when the tick times out returns at once (tool raced against the tick signal)', async () => {
+    const h = harness(
+      [[{ blocks: [{ type: 'tool_use', name: 'browse_read', input: {} }], stop: 'tool_use' }, { blocks: [{ type: 'text', text: 'never' }], stop: 'end_turn' }]],
+      { toolTimeoutMs: 60_000, timeoutMs: 100 },
+      { read: () => new Promise<never>(() => undefined) },
+    );
+    const t0 = Date.now();
+    const r = await h.run();
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(r).toMatchObject({ status: 'timeout', failed: true });
+  });
+
+  it('persists the running usage after every iteration: a crash mid-tick still charges completed iterations (finding 14)', async () => {
+    const h = harness([[{ blocks: [{ type: 'tool_use', name: 'think_aloud', input: { text: 'first' } }], stop: 'tool_use' }, { blocks: [{ type: 'text', text: 'slow' }], stop: 'end_turn', hang: true }]], { timeoutMs: 300 });
+    const done = h.run();
+    await new Promise((r) => setTimeout(r, 120));
+    const running = h.repos.ticks.ledger(TOKEN.toLowerCase(), 1)[0]!;
+    expect([running.status, running.iterations, running.cost_usd_micro, running.served_model]).toEqual(['running', 1, costOfUsageMicroUsd('claude-opus-5-5', U), 'claude-opus-5-5']);
+    // the process dies here: the next start closes the tick with the persisted totals, which are then settled
+    expect(h.repos.ticks.closeDangling(Date.now())).toBe(1);
+    const closed = h.repos.ticks.get(running.id)!;
+    expect([closed.status, closed.cost_usd_micro]).toEqual(['aborted', costOfUsageMicroUsd('claude-opus-5-5', U)]);
+    expect(h.repos.ticks.eligibleForSettlement(TOKEN.toLowerCase(), 10).map((t) => t.id)).toEqual([running.id]);
+    await done;
   });
 });

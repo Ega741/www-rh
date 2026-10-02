@@ -5,7 +5,9 @@ import { computeBudget, epochRemainingWei, runnableThresholdMicro, usdMicroOfWei
 import { averageTickCostUsd, burnUsdPerHour, dailyBudgetUsd, nextTickAt, runwayHours, shouldStopTick, tickIntervalMs } from '../src/economics/governor.js';
 import { EconomicsService } from '../src/economics/service.js';
 import { selectTicks, Settler } from '../src/economics/settle.js';
-import { FixedEthUsd } from '../src/economics/ethUsd.js';
+import { clampEthUsdMicro, FeedEthUsd, FixedEthUsd } from '../src/economics/ethUsd.js';
+import type { RunnerPublicClient } from '../src/chain/clients.js';
+import type { Logger } from '../src/log.js';
 import { TickUsage } from '../src/economics/usage.js';
 import type { LaunchpadReader } from '../src/chain/launchpad.js';
 import type { TxQueue } from '../src/chain/txQueue.js';
@@ -243,16 +245,52 @@ describe('Settler', () => {
     expect(dry.repos.ticks.unsettledMicro(TOKEN)).toBe(3_000_000);
   });
 
-  it('reconciles pending receipts: indexed draw → confirmed, none after 10 min → failed', async () => {
+  it('reconciles pending receipts: indexed draw → confirmed; never released by age alone (no proof it was not mined)', async () => {
     const { repos, clock, settler } = setup();
     addTick(repos, 3_000_000);
     const r = await settler.settle(TOKEN);
     if (r.kind !== 'settled') throw new Error('expected a receipt');
-    settler.reconcile();
+    await settler.reconcile();
     expect(repos.ticks.receiptByHash(r.receiptHash)?.status).toBe('pending');
     clock.advance(10 * 60_000);
-    settler.reconcile();
-    expect(repos.ticks.receiptByHash(r.receiptHash)?.status).toBe('failed');
-    expect(repos.ticks.eligibleForSettlement(TOKEN, 10)).toHaveLength(1);
+    await settler.reconcile(); // the old behaviour (→ failed after 10 min) allowed a double draw
+    expect(repos.ticks.receiptByHash(r.receiptHash)?.status).toBe('pending');
+    expect(repos.ticks.eligibleForSettlement(TOKEN, 10)).toHaveLength(0);
+    repos.facts.insertDraw({ tx_hash: `0x${'aa'.repeat(32)}`, log_index: 0, block_number: 7, timestamp: 1, token: TOKEN, amount: r.amountWei.toString(), receipt_hash: r.receiptHash.toLowerCase() });
+    await settler.reconcile();
+    expect(repos.ticks.receiptByHash(r.receiptHash)?.status).toBe('confirmed');
+  });
+});
+
+describe('ETH/USD fallback sanity bounds (finding 16)', () => {
+  const bounds = { min: 100_000_000, max: 100_000_000_000 };
+  const feed = (answer: bigint, ageS: number, now: number): RunnerPublicClient =>
+    ({
+      readContract: async ({ functionName }: { functionName: string }) =>
+        functionName === 'decimals' ? 8 : [1n, answer, 0n, BigInt(Math.floor(now / 1000) - ageS), 1n],
+    }) as unknown as RunnerPublicClient;
+  const logs = (): { lines: string[]; log: Logger } => {
+    const lines: string[] = [];
+    const log: Logger = { ...silentLogger, warn: (m) => void lines.push(`warn ${m}`), error: (m) => void lines.push(`error ${m}`), child: () => log };
+    return { lines, log };
+  };
+
+  it('a healthy feed is used; a stale feed falls back to ETH_USD_PRICE clamped into ETH_USD_MIN..ETH_USD_MAX (logged)', async () => {
+    const now = 1_800_000_000_000;
+    expect(await new FeedEthUsd(feed(2_500n * 10n ** 8n, 10, now), TOKEN, 3_000_000_000, silentLogger, () => now, bounds).ethUsdMicro()).toBe(2_500_000_000);
+    const a = logs();
+    expect(await new FeedEthUsd(feed(2_500n * 10n ** 8n, 7_200, now), TOKEN, 3_000_000_000_000, a.log, () => now, bounds).ethUsdMicro()).toBe(100_000_000_000);
+    expect(a.lines).toEqual(['warn ETH/USD feed rejected, using ETH_USD_PRICE', 'error ETH_USD_PRICE fallback outside ETH_USD_MIN..ETH_USD_MAX; clamped']);
+    const b = logs();
+    expect(await new FeedEthUsd(feed(2_500n * 10n ** 8n, 7_200, now), TOKEN, 1_000_000, b.log, () => now, bounds).ethUsdMicro()).toBe(100_000_000);
+  });
+
+  it('an implausible feed answer is rejected like a stale one; a fixed price is clamped too', async () => {
+    const now = 1_800_000_000_000;
+    expect(await new FeedEthUsd(feed(1n * 10n ** 8n, 10, now), TOKEN, 3_000_000_000, silentLogger, () => now, bounds).ethUsdMicro()).toBe(3_000_000_000); // $1 answer → fallback
+    const c = logs();
+    expect(await new FixedEthUsd(5_000_000, bounds, c.log).ethUsdMicro()).toBe(100_000_000);
+    expect(c.lines).toEqual(['error ETH_USD_PRICE outside ETH_USD_MIN..ETH_USD_MAX; clamped']);
+    expect(clampEthUsdMicro(3_000_000_000, bounds)).toEqual({ micro: 3_000_000_000, clamped: false });
   });
 });

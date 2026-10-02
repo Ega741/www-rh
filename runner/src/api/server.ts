@@ -12,7 +12,8 @@ import type { WsHub } from './ws.js';
 export interface RunningServer {
   server: Server;
   port: number;
-  close(): Promise<void>;
+  /** Closes the WS hub first (WebSocket connections would keep `server.close()` pending), then the HTTP server; each step bounded by `timeoutMs`. */
+  close(timeoutMs?: number): Promise<void>;
 }
 
 /** Starts `app` (and `hub` upgrades) on `port` (0 = ephemeral). */
@@ -31,10 +32,34 @@ export async function startServer(app: Hono, hub: WsHub | null, port: number, ho
   return {
     server,
     port: actual,
-    close: () =>
-      new Promise<void>((resolve) => {
-        server.closeAllConnections?.();
-        server.close(() => resolve());
-      }),
+    async close(timeoutMs = 5_000) {
+      // upgraded (WebSocket) sockets are not HTTP connections: server.close() would wait for them forever
+      await withTimeout(hub?.close() ?? Promise.resolve(), timeoutMs);
+      await withTimeout(
+        new Promise<void>((resolve) => {
+          server.close(() => resolve());
+          server.closeIdleConnections?.();
+          server.closeAllConnections?.();
+        }),
+        timeoutMs,
+      );
+    },
   };
+}
+
+/** Resolves when `p` settles or after `ms`, whichever comes first (never rejects). */
+export async function withTimeout(p: Promise<unknown>, ms: number): Promise<'done' | 'timeout'> {
+  let timer: NodeJS.Timeout | undefined;
+  const result = await Promise.race([
+    p.then(
+      () => 'done' as const,
+      () => 'done' as const,
+    ),
+    new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), ms);
+      timer.unref();
+    }),
+  ]);
+  clearTimeout(timer);
+  return result;
 }

@@ -6,7 +6,7 @@ import type { Repos } from '../src/db/repos.js';
 import { FixedEthUsd } from '../src/economics/ethUsd.js';
 import { EconomicsService } from '../src/economics/service.js';
 import { applyLogs, decodeLaunchpadLogs } from '../src/indexer/apply.js';
-import { COOLING_MS, Scheduler } from '../src/mind/scheduler.js';
+import { COOLING_MS, Scheduler, SNAPSHOT_TTL_MS, verifiedPersona } from '../src/mind/scheduler.js';
 import type { TickInput, TickResult } from '../src/mind/tick.js';
 import { FakeClock, FakeQueue, memoryRepos, mindCreatedLog, silentLogger } from './helpers.js';
 
@@ -29,7 +29,9 @@ function setup(opts: { minds?: Address[]; balance?: bigint; max?: number; model?
   // 10 ETH ($30k) keeps the burn governor at its TICK_INTERVAL_MS floor (20 s) for the default tick cost
   for (const t of minds) repos.minds.addBalance(t, opts.balance ?? 10n * ETH);
   const clock = new FakeClock(1_800_000_000_000);
-  const economics = new EconomicsService(repos, new FixedEthUsd(3_000_000_000), null, policy, silentLogger, clock.now);
+  const service = new EconomicsService(repos, new FixedEthUsd(3_000_000_000), null, policy, silentLogger, clock.now);
+  const snapshots: string[] = [];
+  const economics = { snapshot: (token: string) => (snapshots.push(token), service.snapshot(token)) };
   const queue = new FakeQueue();
   const settles: { token: string; force: boolean }[] = [];
   const pending: Pending[] = [];
@@ -64,7 +66,7 @@ function setup(opts: { minds?: Address[]; balance?: bigint; max?: number; model?
   const settle = async (): Promise<void> => {
     for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
   };
-  return { repos, clock, queue, settles, pending, scheduler, settle, curves, maxPerMind: () => maxPerMind };
+  return { repos, clock, queue, settles, pending, scheduler, settle, curves, snapshots, maxPerMind: () => maxPerMind };
 }
 
 const statusWrites = (q: FakeQueue): string[] =>
@@ -140,6 +142,7 @@ describe('Scheduler', () => {
 
   it('status management: settle then Dormant when out of budget; Alive at 2x threshold; ≤ 1 status tx / 60 s; never for paused minds', async () => {
     const s = setup({ minds: [A], balance: 10n ** 13n }); // $0.03
+    s.repos.minds.tickStarted(A, s.clock.now() - 60_000); // it ran before (never-ticked minds are never set Dormant)
     await s.scheduler.reevaluate(A);
     expect(s.settles).toEqual([{ token: A.toLowerCase(), force: true }]);
     expect(statusWrites(s.queue)).toEqual(['1']);
@@ -180,6 +183,62 @@ describe('Scheduler', () => {
     await s.scheduler.graduateSweep();
     await s.scheduler.graduateSweep(); // retried on the next sweep
     expect(s.queue.writes.filter((w) => w.write.functionName === 'graduate')).toHaveLength(3);
+  });
+
+  it('uses a persona only when the metadata is resolved (meta_status ok) and verified (finding 12)', async () => {
+    const s = setup({ minds: [A], max: 1 });
+    s.repos.minds.setMetadata(A, { status: 'ok', image: null, description: null, persona: 'Trains!', personaVerified: true, links: null, at: 1 });
+    await s.scheduler.poll();
+    expect(s.pending[0]?.input.identity.verifiedPersona).toBe('Trains!');
+    s.pending[0]?.resolve({});
+    await s.settle();
+    // a stale verified persona from an older config (meta_status back to pending) is never used
+    s.repos.db.run("UPDATE minds SET meta_status = 'pending' WHERE token = ?", A.toLowerCase());
+    s.clock.advance(20_000);
+    await s.scheduler.poll();
+    expect(s.pending[1]?.input.identity.verifiedPersona).toBeNull();
+    expect(verifiedPersona({ meta_status: 'error', meta_persona_verified: 1, meta_persona: 'x' })).toBeNull();
+  });
+
+  it('never sends setMindStatus(Dormant) for a mind that never ticked (finding 13)', async () => {
+    const s = setup({ minds: [A], balance: 10n ** 13n }); // $0.03, below the runnable threshold
+    await s.scheduler.reevaluate(A);
+    await s.scheduler.sweep();
+    expect(statusWrites(s.queue)).toEqual([]);
+    expect(s.settles).toEqual([]);
+  });
+
+  it('the 60 s sweep re-evaluates every mind: Dormant when out of budget, Alive again, cooling expiry, forced settlement of paused minds (finding 13)', async () => {
+    const D = '0x00000000000000000000000000000000000000d4' as Address;
+    const s = setup({ minds: [A, B, C, D], balance: 10n ** 13n });
+    s.repos.minds.tickStarted(A, s.clock.now() - 60_000); // ran before, now out of budget → Dormant
+    s.repos.minds.setStatus(B, 1);
+    s.repos.minds.addBalance(B, 10n * ETH); // Dormant with budget → Alive
+    s.repos.minds.tickEnded(C, s.clock.now() - 1, 0, s.clock.now() - 1); // cooling expired
+    s.repos.minds.setStatus(D, 2); // paused → forced settlement
+    await s.scheduler.sweep();
+    expect(s.queue.writes.filter((w) => w.write.functionName === 'setMindStatus').map((w) => `${w.write.args[0]}:${w.write.args[1]}`)).toEqual([`${A.toLowerCase()}:1`, `${B.toLowerCase()}:0`]);
+    expect(s.repos.minds.get(C)?.cooling_until).toBeNull();
+    expect(s.settles).toContainEqual({ token: D.toLowerCase(), force: true });
+    expect(s.settles).toContainEqual({ token: A.toLowerCase(), force: true });
+  });
+
+  it('caches economics snapshots in the 1 s poll; ticks and vault events invalidate them (finding 17)', async () => {
+    const s = setup({ minds: [A], max: 1 });
+    await s.scheduler.poll();
+    s.pending[0]?.resolve({});
+    await s.settle();
+    const afterTick = s.snapshots.length;
+    for (let i = 0; i < 5; i++) await s.scheduler.poll(); // A not due: served from the cache
+    expect(s.snapshots.length).toBe(afterTick);
+    s.scheduler.onEvent({ type: 'fee:accrued', token: A.toLowerCase(), mindAmount: 1n, blockNumber: 1, txHash: '0x' });
+    await s.settle();
+    expect(s.snapshots.length).toBe(afterTick + 1); // re-evaluation took a fresh one
+    await s.scheduler.poll();
+    expect(s.snapshots.length).toBe(afterTick + 1);
+    s.clock.advance(SNAPSHOT_TTL_MS);
+    await s.scheduler.poll();
+    expect(s.snapshots.length).toBe(afterTick + 2);
   });
 });
 

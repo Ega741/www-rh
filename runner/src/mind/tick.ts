@@ -10,6 +10,12 @@
  * retried up to 3 times (1 s, 2 s, 4 s or `retry-after`) the same way; `TICK_TIMEOUT_MS` aborts the
  * in-flight request and recreates the mind's browser context.
  *
+ * Hung work can never hold the tick (and with it the scheduler's single-flight lock): every
+ * `next()` of the tool runner and of each stream, and `finalMessage()`, is raced against the tick's
+ * AbortSignal, and each tool `run` against that signal plus `TOOL_TIMEOUT_MS` (a timed-out tool
+ * returns an `error:` result and resets the browser context). The running usage is persisted after
+ * every iteration, so a crash still charges the completed iterations.
+ *
  * @module mind/tick
  */
 import Anthropic from '@anthropic-ai/sdk';
@@ -25,7 +31,7 @@ import type { MemoryService } from '../memory/memory.js';
 import type { StreamBus } from '../stream/bus.js';
 import { buildSystem, type PersonaIdentity } from './persona.js';
 import { buildTickParams, type TickParams } from './request.js';
-import { createMindTools } from './tools.js';
+import { createMindTools, DEFAULT_TOOL_TIMEOUT_MS } from './tools.js';
 
 /** A streamed iteration as yielded by the tool runner. */
 export interface StreamLike extends AsyncIterable<Anthropic.Beta.BetaRawMessageStreamEvent> {
@@ -63,7 +69,7 @@ export interface TickDeps {
   browser(token: string): Promise<TickBrowser>;
   /** Closes and recreates the mind's browser context (after a timeout). */
   resetBrowser(token: string): Promise<void>;
-  config: { maxIterations: number; maxTickCostUsd: number; timeoutMs: number; frameFps: number };
+  config: { maxIterations: number; maxTickCostUsd: number; timeoutMs: number; frameFps: number; toolTimeoutMs?: number };
   log: Logger;
   now?: () => number;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
@@ -126,6 +132,52 @@ export function retryDelayMs(err: unknown, attempt: number): number {
   return 1000 * 2 ** attempt;
 }
 
+const abortReason = (signal: AbortSignal): Error => (signal.reason instanceof Error ? signal.reason : new Error('aborted'));
+
+/** Settles like `p`, or rejects with the signal's reason as soon as it aborts (`p` keeps running unobserved). */
+export function raceAbort<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    p.catch(() => undefined);
+    return Promise.reject(abortReason(signal));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortReason(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (e: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
+/**
+ * Iterates `iterable`, but every `next()` is raced against `signal`: a hung iterator (a tool that
+ * never returns inside the SDK tool runner, a stalled stream) cannot hold the caller. On early exit
+ * the source iterator's `return()` is called without being awaited.
+ */
+export async function* abortable<T>(iterable: AsyncIterable<T>, signal: AbortSignal): AsyncGenerator<T, void, undefined> {
+  const it = iterable[Symbol.asyncIterator]();
+  let done = false;
+  try {
+    for (;;) {
+      const r = await raceAbort(it.next(), signal);
+      if (r.done === true) {
+        done = true;
+        return;
+      }
+      yield r.value;
+    }
+  } finally {
+    if (!done) void Promise.resolve().then(() => it.return?.()).catch(() => undefined);
+  }
+}
+
 const defaultSleep = (ms: number, signal: AbortSignal): Promise<void> =>
   new Promise((resolve, reject) => {
     const t = setTimeout(resolve, ms);
@@ -159,8 +211,13 @@ export async function runTick(deps: TickDeps, input: TickInput): Promise<TickRes
 
   let session: TickBrowser | null = null;
   const publishFrame = (frame: { jpegBase64: string; url: string; at: string }): void => {
-    deps.bus.publishFrame(token, frame);
-    deps.repos.minds.setLastFrameAt(token, Date.parse(frame.at));
+    try {
+      deps.bus.publishFrame(token, frame);
+      deps.repos.minds.setLastFrameAt(token, Date.parse(frame.at));
+    } catch (err) {
+      // a late frame (after shutdown closed the DB) must not become an unhandled rejection
+      log.debug('frame not stored', { error: errorMessage(err) });
+    }
   };
   const saveThought = (kind: 'aloud' | 'summary', text: string): void => {
     const row = deps.repos.ticks.insertThought(token, tickId, kind, text, now());
@@ -182,13 +239,42 @@ export async function runTick(deps: TickDeps, input: TickInput): Promise<TickRes
     afterAction: () => {
       const s = session;
       if (s === null) return;
-      const url = s.currentUrl();
-      deps.repos.minds.setCurrentUrl(token, url === 'about:blank' ? null : url);
-      void s.captureFrame().then((f) => {
-        if (f !== null) publishFrame(f);
-      });
+      try {
+        const url = s.currentUrl();
+        deps.repos.minds.setCurrentUrl(token, url === 'about:blank' ? null : url);
+      } catch (err) {
+        log.debug('current URL not stored', { error: errorMessage(err) });
+      }
+      void s
+        .captureFrame()
+        .then((f) => {
+          if (f !== null) publishFrame(f);
+        })
+        .catch(() => undefined);
+    },
+    signal: controller.signal,
+    toolTimeoutMs: deps.config.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
+    onToolTimeout: async (tool) => {
+      // the page is wedged: drop this session, the next browse tool starts a fresh context
+      const s = session;
+      session = null;
+      s?.stopFrames();
+      log.warn('tool timed out; resetting the browser context', { tool });
+      await deps.resetBrowser(token);
     },
   });
+  const persistUsage = (): void => {
+    const t = usage.totals;
+    deps.repos.ticks.updateUsage(tickId, {
+      servedModel: t.servedModel,
+      iterations: t.iterations,
+      inputTokens: t.inputTokens,
+      outputTokens: t.outputTokens,
+      cacheReadTokens: t.cacheReadTokens,
+      cacheWriteTokens: t.cacheWriteTokens,
+      costUsdMicro: t.costUsdMicro,
+    });
+  };
 
   const memories = deps.memory.recent(token, 10).map((m) => ({ seq: m.seq, kind: m.kind, content: m.content }));
   const system = buildSystem(input.identity, {
@@ -212,13 +298,13 @@ export async function runTick(deps: TickDeps, input: TickInput): Promise<TickRes
 
   outer: for (;;) {
     try {
-      for await (const stream of runner) {
+      for await (const stream of abortable(runner, controller.signal)) {
         started++;
         const blocks = new Map<number, { kind: 'text' | 'thinking'; text: string }>();
         let partial: { model: string; usage: TokenUsage } | null = null;
         let message: Anthropic.Beta.BetaMessage;
         try {
-          for await (const event of stream) {
+          for await (const event of abortable(stream, controller.signal)) {
             switch (event.type) {
               case 'message_start':
                 partial = { model: event.message.model, usage: { ...event.message.usage } };
@@ -257,12 +343,16 @@ export async function runTick(deps: TickDeps, input: TickInput): Promise<TickRes
                 break;
             }
           }
-          message = await stream.finalMessage();
+          message = await raceAbort(stream.finalMessage(), controller.signal);
         } catch (err) {
-          if (partial !== null) usage.charge(partial.model, partial.usage);
+          if (partial !== null) {
+            usage.charge(partial.model, partial.usage);
+            persistUsage();
+          }
           throw err;
         }
         usage.charge(message.model, message.usage);
+        persistUsage();
         stopReason = message.stop_reason;
         const toolUses = message.content.filter((b): b is Anthropic.Beta.BetaToolUseBlock => b.type === 'tool_use');
         for (const t of toolUses) deps.bus.publish(token, { type: 'action', tickId, tool: t.name, input: redactActionInput(t.input), at: at() });
@@ -326,8 +416,10 @@ export async function runTick(deps: TickDeps, input: TickInput): Promise<TickRes
 
   clearTimeout(timer);
   input.signal?.removeEventListener('abort', onShutdown);
+  // tools still running in the background see the abort and return at once
+  if (!controller.signal.aborted) controller.abort(new Error('tick finished'));
   (session as TickBrowser | null)?.stopFrames();
-  if (status === 'timeout') await deps.resetBrowser(token).catch(() => undefined);
+  if (status === 'timeout') await raceAbort(deps.resetBrowser(token), AbortSignal.timeout(15_000)).catch(() => undefined);
   if (status === 'ok' && finalText !== '') saveThought('summary', finalText.slice(0, 4000));
   if (usage.unknownModels.size > 0) log.warn('charged unknown served model(s) at claude-fable-5-1 prices', { models: [...usage.unknownModels] });
   const totals = usage.totals;

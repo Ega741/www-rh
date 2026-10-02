@@ -6,6 +6,11 @@
  * mind's context (asserted by a unit test on the serialized definitions).
  * Expected failures are returned as text results starting with `error:`; `run` never throws.
  *
+ * Every `run` is raced against the tick's AbortSignal and a per-tool deadline (`TOOL_TIMEOUT_MS`):
+ * a tool that hangs (e.g. `page.evaluate` on a renderer stuck in a busy loop) returns an `error:`
+ * result and the mind's browser context is reset, so a hung tool can never hold the tick. Results
+ * are capped at {@link MAX_TOOL_RESULT_CHARS}.
+ *
  * @module mind/tools
  */
 import type Anthropic from '@anthropic-ai/sdk';
@@ -26,7 +31,20 @@ export interface ToolContext {
   thinkAloud(text: string): void;
   /** Called after every browser action (frame capture, current URL). */
   afterAction(): void;
+  /** Aborted when the tick ends (timeout, shutdown): a running tool returns an error result at once. */
+  signal?: AbortSignal;
+  /** Per-tool deadline in ms (`TOOL_TIMEOUT_MS`, default {@link DEFAULT_TOOL_TIMEOUT_MS}). */
+  toolTimeoutMs?: number;
+  /** Called when a tool hit its deadline or a browser operation timed out: resets the browser context. */
+  onToolTimeout?(tool: string): Promise<void> | void;
 }
+
+/** Default per-tool deadline. */
+export const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+/** Largest tool result handed back to the model (characters). */
+export const MAX_TOOL_RESULT_CHARS = 32_000;
+/** How long a browser reset after a tool timeout may take before the tool result is returned anyway. */
+const RESET_WAIT_MS = 5_000;
 
 const httpUrl = z
   .string()
@@ -80,18 +98,71 @@ const DESCRIPTIONS: Record<keyof typeof toolSchemas, string> = {
   think_aloud: 'Share a short public thought with the people watching you (one or two sentences).',
 };
 
-const asText = (value: unknown): string => JSON.stringify(value);
+/** Serializes a tool result, capped at {@link MAX_TOOL_RESULT_CHARS}. */
+export function asText(value: unknown): string {
+  const text = JSON.stringify(value) ?? 'null';
+  return text.length <= MAX_TOOL_RESULT_CHARS ? text : `${text.slice(0, MAX_TOOL_RESULT_CHARS)} …[truncated]`;
+}
 
-async function guarded(fn: () => Promise<string | Anthropic.Beta.Messages.BetaToolResultContentBlockParam[]>): Promise<string | Anthropic.Beta.Messages.BetaToolResultContentBlockParam[]> {
-  try {
-    return await fn();
-  } catch (err) {
-    return `error: ${errorMessage(err)}`;
+type ToolResult = string | Anthropic.Beta.Messages.BetaToolResultContentBlockParam[];
+
+class ToolDeadline extends Error {
+  constructor(readonly reason: 'timeout' | 'aborted', message: string) {
+    super(message);
   }
 }
 
 /** Builds the runnable tools bound to `ctx` (byte-identical definitions for every mind). */
 export function createMindTools(ctx: ToolContext) {
+  const timeoutMs = ctx.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+  const reset = async (tool: string): Promise<void> => {
+    if (ctx.onToolTimeout === undefined) return;
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.resolve()
+        .then(() => ctx.onToolTimeout?.(tool))
+        .catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, RESET_WAIT_MS);
+        timer.unref();
+      }),
+    ]);
+    clearTimeout(timer);
+  };
+  /** Runs `fn` racing the tick signal and the per-tool deadline; never throws. */
+  const guarded = async (tool: string, fn: () => Promise<ToolResult>): Promise<ToolResult> => {
+    const signal = ctx.signal;
+    if (signal?.aborted === true) return `error: ${tool} not run (the tick was aborted)`;
+    let timer: NodeJS.Timeout | undefined;
+    let onAbort: (() => void) | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new ToolDeadline('timeout', `${tool} timed out after ${timeoutMs} ms`)), timeoutMs);
+      timer.unref();
+      onAbort = () => reject(new ToolDeadline('aborted', `${tool} interrupted (the tick was aborted)`));
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+    const work = fn();
+    work.catch(() => undefined); // a hung tool may reject long after we returned
+    try {
+      return await Promise.race([work, deadline]);
+    } catch (err) {
+      if (err instanceof ToolDeadline) {
+        if (err.reason === 'timeout') {
+          await reset(tool);
+          return `error: ${err.message}; the browser was reset`;
+        }
+        return `error: ${err.message}`;
+      }
+      if (err instanceof Error && err.name === 'BrowserTimeoutError') {
+        await reset(tool);
+        return `error: ${errorMessage(err)}; the browser was reset`;
+      }
+      return `error: ${errorMessage(err)}`;
+    } finally {
+      clearTimeout(timer);
+      if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort);
+    }
+  };
   const browse = async (action: (b: MindBrowserApi) => Promise<unknown>): Promise<string> => {
     const b = await ctx.browser();
     try {
@@ -106,33 +177,33 @@ export function createMindTools(ctx: ToolContext) {
       description: DESCRIPTIONS.browse_navigate,
       inputSchema: toolSchemas.browse_navigate,
       run: (input) =>
-        guarded(async () => {
+        guarded('browse_navigate', async () => {
           const verdict = await ctx.egress.checkUrl(input.url);
           if (!verdict.ok) return `error: blocked URL (${verdict.reason})`;
           return browse((b) => b.navigate(input.url));
         }),
     }),
-    betaZodTool({ name: 'browse_read', description: DESCRIPTIONS.browse_read, inputSchema: toolSchemas.browse_read, run: () => guarded(() => browse((b) => b.read())) }),
+    betaZodTool({ name: 'browse_read', description: DESCRIPTIONS.browse_read, inputSchema: toolSchemas.browse_read, run: () => guarded('browse_read', () => browse((b) => b.read())) }),
     betaZodTool({
       name: 'browse_click',
       description: DESCRIPTIONS.browse_click,
       inputSchema: toolSchemas.browse_click,
-      run: (input) => guarded(() => browse((b) => b.click(input.link !== undefined ? { link: input.link } : { selector: input.selector as string }))),
+      run: (input) => guarded('browse_click', () => browse((b) => b.click(input.link !== undefined ? { link: input.link } : { selector: input.selector as string }))),
     }),
     betaZodTool({
       name: 'browse_type',
       description: DESCRIPTIONS.browse_type,
       inputSchema: toolSchemas.browse_type,
-      run: (input) => guarded(() => browse((b) => b.type(input.selector, input.text, input.submit === true))),
+      run: (input) => guarded('browse_type', () => browse((b) => b.type(input.selector, input.text, input.submit === true))),
     }),
-    betaZodTool({ name: 'browse_scroll', description: DESCRIPTIONS.browse_scroll, inputSchema: toolSchemas.browse_scroll, run: (input) => guarded(() => browse((b) => b.scroll(input.direction))) }),
-    betaZodTool({ name: 'browse_back', description: DESCRIPTIONS.browse_back, inputSchema: toolSchemas.browse_back, run: () => guarded(() => browse((b) => b.back())) }),
+    betaZodTool({ name: 'browse_scroll', description: DESCRIPTIONS.browse_scroll, inputSchema: toolSchemas.browse_scroll, run: (input) => guarded('browse_scroll', () => browse((b) => b.scroll(input.direction))) }),
+    betaZodTool({ name: 'browse_back', description: DESCRIPTIONS.browse_back, inputSchema: toolSchemas.browse_back, run: () => guarded('browse_back', () => browse((b) => b.back())) }),
     betaZodTool({
       name: 'browse_screenshot',
       description: DESCRIPTIONS.browse_screenshot,
       inputSchema: toolSchemas.browse_screenshot,
       run: () =>
-        guarded(async () => {
+        guarded('browse_screenshot', async () => {
           const b = await ctx.browser();
           const data = await b.screenshot();
           ctx.afterAction();
@@ -143,21 +214,21 @@ export function createMindTools(ctx: ToolContext) {
       name: 'remember',
       description: DESCRIPTIONS.remember,
       inputSchema: toolSchemas.remember,
-      run: (input) => guarded(async () => asText({ seq: ctx.remember(input.kind, input.content, input.url ?? null).seq })),
+      run: (input) => guarded('remember', async () => asText({ seq: ctx.remember(input.kind, input.content, input.url ?? null).seq })),
     }),
     betaZodTool({
       name: 'recall',
       description: DESCRIPTIONS.recall,
       inputSchema: toolSchemas.recall,
       run: (input) =>
-        guarded(async () => asText(ctx.recall(input.query, input.limit ?? 8).map((m) => ({ seq: m.seq, kind: m.kind, content: m.content, url: m.url, createdAt: m.createdAt })))),
+        guarded('recall', async () => asText(ctx.recall(input.query, input.limit ?? 8).map((m) => ({ seq: m.seq, kind: m.kind, content: m.content, url: m.url, createdAt: m.createdAt })))),
     }),
     betaZodTool({
       name: 'think_aloud',
       description: DESCRIPTIONS.think_aloud,
       inputSchema: toolSchemas.think_aloud,
       run: (input) =>
-        guarded(async () => {
+        guarded('think_aloud', async () => {
           ctx.thinkAloud(input.text);
           return 'ok';
         }),

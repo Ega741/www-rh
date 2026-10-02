@@ -41,6 +41,7 @@ export class WsHub {
   readonly #conns = new Set<Connection>();
   readonly #perMind = new Map<string, number>();
   readonly #pinger: NodeJS.Timeout;
+  #closed = false;
 
   constructor(
     private readonly repos: Repos,
@@ -56,7 +57,7 @@ export class WsHub {
   attach(server: Server): void {
     server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
       const url = new URL(req.url ?? '/', 'http://localhost');
-      if (url.pathname !== '/ws') {
+      if (url.pathname !== '/ws' || this.#closed) {
         socket.destroy();
         return;
       }
@@ -179,10 +180,38 @@ export class WsHub {
     }
   }
 
-  /** Closes every connection and the server. */
-  async close(): Promise<void> {
+  /**
+   * Closes every connection (1001; peers that do not complete the closing handshake within
+   * `graceMs` are terminated) and the server.
+   */
+  async close(graceMs = 1_000): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
     clearInterval(this.#pinger);
-    for (const conn of this.#conns) conn.ws.close(1001, 'server shutting down');
+    const conns = [...this.#conns];
+    for (const conn of conns) conn.ws.close(1001, 'server shutting down');
+    await new Promise<void>((resolve) => {
+      const pending = conns.filter((c) => c.ws.readyState !== c.ws.CLOSED);
+      if (pending.length === 0) {
+        resolve();
+        return;
+      }
+      let left = pending.length;
+      const timer = setTimeout(() => {
+        for (const c of pending) if (c.ws.readyState !== c.ws.CLOSED) c.ws.terminate();
+        resolve();
+      }, graceMs);
+      timer.unref();
+      for (const c of pending)
+        c.ws.once('close', () => {
+          if (--left === 0) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+    });
+    for (const conn of this.#conns) conn.ws.terminate();
+    this.#conns.clear();
     await new Promise<void>((resolve) => this.#wss.close(() => resolve()));
   }
 }

@@ -20,24 +20,25 @@ export class Db {
   /** Whether the FTS5 memory index exists (falls back to `LIKE` search otherwise). */
   readonly hasFts: boolean;
 
-  private constructor(db: DatabaseSync) {
+  private constructor(db: DatabaseSync, schemaVersion?: number) {
     this.#db = db;
-    migrate(this);
+    migrate(this, schemaVersion);
     this.hasFts = this.get<{ n: number }>("SELECT count(*) AS n FROM sqlite_master WHERE name = 'memories_fts'")?.n === 1;
   }
 
   /**
    * Opens (creating if needed) the database at `path`; `':memory:'` gives a private in-memory DB.
-   * Applies pragmas and pending migrations.
+   * Applies pragmas and pending migrations (`opts.schemaVersion` stops at an older version: tests of
+   * the migrations themselves).
    */
-  static open(path: string): Db {
+  static open(path: string, opts: { schemaVersion?: number } = {}): Db {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     const raw = new DatabaseSync(path);
     raw.exec('PRAGMA busy_timeout = 5000');
     if (path !== ':memory:') raw.exec('PRAGMA journal_mode = WAL');
     raw.exec('PRAGMA synchronous = NORMAL');
     raw.exec('PRAGMA foreign_keys = ON');
-    return new Db(raw);
+    return new Db(raw, opts.schemaVersion);
   }
 
   /** Executes one or more SQL statements without parameters. */
@@ -107,8 +108,9 @@ export class Db {
     this.#db.exec(`PRAGMA user_version = ${Math.trunc(version)}`);
   }
 
-  /** Closes the database. */
+  /** Closes the database (idempotent). */
   close(): void {
+    if (!this.#db.isOpen) return;
     this.#cache.clear();
     this.#db.close();
   }

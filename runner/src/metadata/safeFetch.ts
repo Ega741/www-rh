@@ -3,6 +3,10 @@
  * 64 KB cap, the browser egress filter on the URL and on every redirect hop (≤ 3), and the
  * connection pinned to the address that passed the check (no DNS-rebinding window).
  *
+ * The timeout is an absolute deadline over every hop: a timer destroys the request when it
+ * expires, so a server dripping one byte at a time cannot keep the fetch alive (the socket idle
+ * timeout is kept as well).
+ *
  * @module metadata/safeFetch
  */
 import http from 'node:http';
@@ -28,9 +32,16 @@ function pinnedLookup(address: string): LookupFunction {
   }) as LookupFunction;
 }
 
-function getOnce(url: URL, address: string, timeoutMs: number, maxBytes: number): Promise<{ status: number; location: string | undefined; body: string }> {
+function getOnce(url: URL, address: string, timeoutMs: number, maxBytes: number, deadlineMs: number): Promise<{ status: number; location: string | undefined; body: string }> {
   return new Promise((resolve, reject) => {
     const mod = url.protocol === 'https:' ? https : http;
+    let deadline: NodeJS.Timeout | undefined;
+    const done = <T>(fn: (v: T) => void) => (v: T): void => {
+      clearTimeout(deadline);
+      fn(v);
+    };
+    resolve = done(resolve);
+    reject = done(reject);
     const req = mod.request(
       url,
       { method: 'GET', lookup: pinnedLookup(address), headers: { accept: 'application/json, text/plain;q=0.5', 'user-agent': 'www-rh-runner' }, timeout: timeoutMs },
@@ -46,15 +57,27 @@ function getOnce(url: URL, address: string, timeoutMs: number, maxBytes: number)
         res.on('data', (chunk: Buffer) => {
           size += chunk.length;
           if (size > maxBytes) {
-            req.destroy(new Error(`response exceeds ${maxBytes} bytes`));
+            const err = new Error(`response exceeds ${maxBytes} bytes`);
+            reject(err);
+            req.destroy(err);
             return;
           }
           chunks.push(chunk);
         });
         res.on('end', () => resolve({ status, location: undefined, body: Buffer.concat(chunks).toString('utf8') }));
         res.on('error', reject);
+        res.on('close', () => {
+          if (!res.complete) reject(new Error('connection closed before the response completed'));
+        });
       },
     );
+    // absolute deadline (the `timeout` option above is only the socket idle timeout)
+    deadline = setTimeout(() => {
+      const err = new Error(`timeout after ${timeoutMs} ms (deadline)`);
+      reject(err);
+      req.destroy(err);
+    }, Math.max(1, deadlineMs));
+    deadline.unref();
     req.on('timeout', () => req.destroy(new Error(`timeout after ${timeoutMs} ms`)));
     req.on('error', reject);
     req.end();
@@ -72,7 +95,7 @@ export const safeFetchText: FetchText = async (raw, egress, opts = {}) => {
     if (!verdict.ok) throw new Error(`blocked: ${verdict.reason}`);
     const left = deadline - Date.now();
     if (left <= 0) throw new Error(`timeout after ${timeoutMs} ms`);
-    const res = await getOnce(verdict.url, verdict.addresses[0] as string, left, maxBytes);
+    const res = await getOnce(verdict.url, verdict.addresses[0] as string, left, maxBytes, left);
     if (res.status >= 300 && res.status < 400) {
       if (res.location === undefined) throw new Error(`redirect ${res.status} without location`);
       current = new URL(res.location, verdict.url).toString();

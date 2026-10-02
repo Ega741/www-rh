@@ -19,6 +19,12 @@ export interface RawLog {
   blockTimestamp?: bigint;
 }
 
+/** Hash and parent hash of a block. */
+export interface BlockHeader {
+  hash: Hex;
+  parentHash: Hex;
+}
+
 /** What the indexer needs from the chain. */
 export interface LogSource {
   getBlockNumber(): Promise<bigint>;
@@ -26,6 +32,8 @@ export interface LogSource {
   getLogs(address: Address, fromBlock: bigint, toBlock: bigint): Promise<RawLog[]>;
   /** Timestamp (seconds) of a block. */
   getBlockTimestamp(blockNumber: bigint): Promise<bigint>;
+  /** Hash and parent hash of a block (never cached: used for reorg detection). Rejects when the node does not have the block. */
+  getBlockHeader(blockNumber: bigint): Promise<BlockHeader>;
 }
 
 function toBigint(value: unknown): bigint | undefined {
@@ -69,8 +77,19 @@ export class ViemLogSource implements LogSource {
     const cached = this.#timestamps.get(blockNumber);
     if (cached !== undefined) return cached;
     const block = await this.client.getBlock({ blockNumber });
-    if (this.#timestamps.size > 4096) this.#timestamps.clear();
-    this.#timestamps.set(blockNumber, block.timestamp);
+    this.#remember(blockNumber, block.timestamp);
     return block.timestamp;
+  }
+
+  #remember(blockNumber: bigint, timestamp: bigint): void {
+    if (this.#timestamps.size > 4096) this.#timestamps.clear();
+    this.#timestamps.set(blockNumber, timestamp);
+  }
+
+  async getBlockHeader(blockNumber: bigint): Promise<BlockHeader> {
+    const block = await this.client.getBlock({ blockNumber, includeTransactions: false });
+    if (block.hash === null) throw new Error(`block ${blockNumber} is pending`);
+    this.#remember(blockNumber, block.timestamp);
+    return { hash: block.hash, parentHash: block.parentHash };
   }
 }

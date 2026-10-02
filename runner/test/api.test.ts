@@ -1,3 +1,4 @@
+import http from 'node:http';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 import {
@@ -21,6 +22,9 @@ import {
   type WsServerMessage,
 } from '@www-rh/shared';
 import { createApi, type ApiStatus } from '../src/api/routes.js';
+import { createRunnerApp } from '../src/app.js';
+import { loadConfig } from '../src/config.js';
+import { FakeLogSource } from './helpers.js';
 import { startServer, type RunningServer } from '../src/api/server.js';
 import { WsHub } from '../src/api/ws.js';
 import type { TxQueue } from '../src/chain/txQueue.js';
@@ -275,5 +279,95 @@ describe('WebSocket /ws (SPEC §6)', () => {
     const unknown = open(`?token=0x${'99'.repeat(20)}`);
     expect(await unknown.closed).toBe(4404);
     expect(unknown.messages[0]).toEqual({ type: 'error', message: 'unknown token' });
+  });
+});
+
+describe('POST /api/metadata body limit for chunked bodies (finding 7)', () => {
+  const validMeta = JSON.stringify({ name: 'Mind', symbol: 'MIND', persona: PERSONA, model: 'claude-opus-5-5' });
+
+  it('a body streamed without Content-Length is cut at 32 KB (in-process request)', async () => {
+    const w = world();
+    const chunk = new Uint8Array(16 * 1024).fill(32);
+    let pulled = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled++;
+        if (pulled > 1_000) controller.close();
+        else controller.enqueue(chunk);
+      },
+    });
+    const res = await w.app.request('/api/metadata', { method: 'POST', headers: { 'content-type': 'application/json' }, body, duplex: 'half' } as RequestInit);
+    expect(res.status).toBe(413);
+    expect(pulled).toBeLessThan(10); // stopped right after the limit, never read the 16 MB
+    const ok = await w.app.request('/api/metadata', { method: 'POST', headers: { 'content-type': 'application/json' }, body: new Blob([validMeta]).stream(), duplex: 'half' } as RequestInit);
+    expect(ok.status).toBe(200);
+  });
+
+  it('over HTTP: a chunked 64 MB upload gets 413 early and the server stops reading', async () => {
+    const w = world();
+    const server = await startServer(w.app, null, 0, '127.0.0.1');
+    try {
+      const sockets: import('node:net').Socket[] = [];
+      server.server.on('connection', (socket: import('node:net').Socket) => void sockets.push(socket));
+      const result = await new Promise<{ status: number; sentMiB: number }>((resolve, reject) => {
+        let sent = 0;
+        const req = http.request({ host: '127.0.0.1', port: server.port, path: '/api/metadata', method: 'POST', headers: { 'content-type': 'application/json', 'transfer-encoding': 'chunked' } }, (res) => {
+          res.resume();
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, sentMiB: sent / 1048576 }));
+        });
+        req.on('error', (err) => (sent > 0 ? undefined : reject(err)));
+        const chunk = Buffer.alloc(256 * 1024, 32);
+        const pump = (): void => {
+          while (sent < 64 * 1048576) {
+            sent += chunk.length;
+            if (!req.write(chunk)) {
+              req.once('drain', pump);
+              return;
+            }
+          }
+          req.end();
+        };
+        pump();
+      });
+      expect(result.status).toBe(413);
+      const received = sockets.reduce((n, so) => n + so.bytesRead, 0);
+      expect(received).toBeLessThan(16 * 1048576); // the rest was never read into the process
+      const ok = await fetch(`http://127.0.0.1:${server.port}/api/metadata`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: validMeta });
+      expect(ok.status).toBe(200);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+describe('graceful shutdown (finding 11)', () => {
+  it('RunningServer.close() closes WebSocket viewers first instead of hanging', async () => {
+    const w = world();
+    await seed(w);
+    const server = await startServer(w.app, new WsHub(w.repos, w.bus, silentLogger), 0, '127.0.0.1');
+    const ws = new WebSocket(`ws://127.0.0.1:${server.port}/ws?token=${TOKEN}`);
+    await new Promise((resolve) => ws.once('message', resolve));
+    const closed = new Promise<number>((resolve) => ws.once('close', (code) => resolve(code)));
+    const t0 = Date.now();
+    await server.close();
+    expect(Date.now() - t0).toBeLessThan(3_000);
+    expect(await closed).toBe(1001);
+  });
+
+  it('app.stop() runs bounded stages and closes the DB last, also with a WebSocket viewer connected', async () => {
+    const config = loadConfig({ RPC_URL: 'http://127.0.0.1:1', DB_PATH: ':memory:', PORT: '0', DRY_RUN: 'true' });
+    const source = new FakeLogSource();
+    source.head = 5n;
+    const app = await createRunnerApp(config, { logSource: source, log: silentLogger });
+    app.repos.tx(() => applyLogs(app.repos, decodeLaunchpadLogs([mindCreatedLog(TOKEN, 1n)]), () => 1n));
+    await app.start();
+    await app.indexer.whenLive();
+    const ws = new WebSocket(`ws://127.0.0.1:${app.server!.port}/ws?token=${TOKEN}`);
+    await new Promise((resolve) => ws.once('message', resolve));
+    const t0 = Date.now();
+    await Promise.all([app.stop(), app.stop()]); // idempotent
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(ws.readyState).toBe(WebSocket.CLOSED);
+    expect(() => app.repos.minds.get(TOKEN)).toThrow(); // database closed
   });
 });

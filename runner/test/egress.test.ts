@@ -50,6 +50,16 @@ describe('IP classification', () => {
     expect(classifyIp(ip)).toBe(expected);
   });
 
+  it('blocks the local-use NAT64 prefix 64:ff9b:1::/48 whatever it embeds (finding 15)', async () => {
+    expect(classifyIp('64:ff9b:1::a9fe:a9fe')).toBe('nat64-local-use');
+    expect(classifyIp('64:ff9b:1::808:808')).toBe('nat64-local-use');
+    expect(classifyIp('64:ff9b:1:ffff::1')).toBe('nat64-local-use');
+    expect(classifyIp('64:ff9b::808:808')).toBeNull(); // well-known NAT64 prefix with a public IPv4 stays allowed
+    const pub: Resolver = async () => [{ address: '93.184.216.34', family: 4 }];
+    expect((await checkUrl('http://[64:ff9b:1::a9fe:a9fe]/', pub)).ok).toBe(false);
+    expect((await checkUrl('http://mapped.example/', async () => [{ address: '64:ff9b:1::a00:1', family: 6 }])).ok).toBe(false);
+  });
+
   it('parses IPv6 forms', () => {
     expect(parseIPv6('::ffff:127.0.0.1')).toEqual([0, 0, 0, 0, 0, 0xffff, 0x7f00, 1]);
     expect(parseIPv6('[2001:db8::1]')).toEqual([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]);
@@ -136,7 +146,19 @@ describe('redirect hops and tunnels (local servers, simulated hostnames)', () =>
       else if (req.url === '/redirect-good') res.writeHead(302, { location: `http://good.test:${port}/meta.json` }).end();
       else if (req.url === '/meta.json') res.writeHead(200, { 'content-type': 'application/json' }).end('{"name":"Mind"}');
       else if (req.url === '/big') res.writeHead(200).end('x'.repeat(70_000));
-      else res.writeHead(404).end();
+      else if (req.url === '/drip') {
+        // one byte every 100 ms: never idle long enough for the socket timeout
+        res.writeHead(200, { 'content-type': 'application/json' });
+        let n = 0;
+        const iv = setInterval(() => {
+          if (res.destroyed || ++n > 60) {
+            clearInterval(iv);
+            res.end('{}');
+            return;
+          }
+          res.write(' ');
+        }, 100);
+      } else res.writeHead(404).end();
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     port = (server.address() as AddressInfo).port;
@@ -150,6 +172,14 @@ describe('redirect hops and tunnels (local servers, simulated hostnames)', () =>
     expect(hits).not.toContain('/secret');
     await expect(safeFetchText(`http://evil.test:${port}/meta.json`, egress)).rejects.toThrow(/blocked/);
     await expect(safeFetchText(`http://good.test:${port}/big`, egress)).rejects.toThrow(/exceeds/);
+  });
+
+  it('safeFetchText enforces an absolute deadline: a server dripping bytes cannot keep the fetch alive (finding 8)', async () => {
+    const t0 = Date.now();
+    await expect(safeFetchText(`http://good.test:${port}/drip`, localPolicy(), { timeoutMs: 500 })).rejects.toThrow(/timeout after 500 ms/);
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeGreaterThanOrEqual(450);
+    expect(elapsed).toBeLessThan(1_500);
   });
 
   it('the egress proxy blocks plain-HTTP requests and CONNECT tunnels (https / websockets) to blocked hosts', async () => {

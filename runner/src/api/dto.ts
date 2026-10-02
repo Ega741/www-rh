@@ -145,11 +145,14 @@ export function ledgerEntryDto(t: TickRow): LedgerEntry {
   };
 }
 
-/** `DrawReceipt` of a receipt row. */
+/**
+ * `DrawReceipt` of a receipt row. The internal `unknown` status (possibly broadcast, hash unknown)
+ * is reported as `pending` — the §5 contract only knows pending / confirmed / failed / dry_run.
+ */
 export function drawReceiptDto(r: ReceiptRow): DrawReceipt {
   return {
     receiptHash: r.receipt_hash as Hex,
-    status: r.status,
+    status: r.status === 'unknown' ? 'pending' : r.status,
     txHash: r.tx_hash as Hex | null,
     createdAt: iso(r.created_at),
     receipt: JSON.parse(r.receipt_json) as DrawReceiptObject,

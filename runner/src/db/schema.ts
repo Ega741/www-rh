@@ -190,6 +190,33 @@ CREATE TABLE metadata (
 
 const FTS = `CREATE VIRTUAL TABLE memories_fts USING fts5(content, url, content = 'memories', content_rowid = 'id');`;
 
+/**
+ * v2 — draw receipt lifecycle (pending / unknown / confirmed / failed), indexer block hashes.
+ *
+ * - `receipts.tx_nonce` / `raw_tx`: the signed transaction, persisted BEFORE it is broadcast, so a
+ *   receipt whose send outcome is unknown can be resolved by hash and nonce (and re-broadcast with
+ *   the exact same bytes);
+ * - `receipts.nonce_floor` / `check_block` / `check_at`: two-phase proof that a transaction can no
+ *   longer be mined (operator nonce consumed by another transaction, indexer past that point);
+ * - receipts left `pending` without a transaction hash by older runners may have been broadcast:
+ *   they become `unknown` (resolved by the reconciler through the operator nonce).
+ */
+const SCHEMA_V2 = `
+ALTER TABLE receipts ADD COLUMN tx_nonce INTEGER;
+ALTER TABLE receipts ADD COLUMN raw_tx TEXT;
+ALTER TABLE receipts ADD COLUMN nonce_floor INTEGER;
+ALTER TABLE receipts ADD COLUMN check_block INTEGER;
+ALTER TABLE receipts ADD COLUMN check_at INTEGER;
+ALTER TABLE receipts ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE receipts ADD COLUMN broadcast_at INTEGER;
+UPDATE receipts SET status = 'unknown' WHERE status = 'pending' AND tx_hash IS NULL;
+CREATE INDEX receipts_by_status ON receipts (status, id);
+CREATE INDEX ticks_by_receipt ON ticks (receipt_id);
+
+-- hashes of indexed range ends (parent-hash reorg detection)
+CREATE TABLE block_hashes (number INTEGER PRIMARY KEY, hash TEXT NOT NULL);
+`;
+
 /** Ordered migrations; index + 1 is the resulting `user_version`. */
 const MIGRATIONS: readonly ((db: Db) => void)[] = [
   (db) => {
@@ -200,16 +227,17 @@ const MIGRATIONS: readonly ((db: Db) => void)[] = [
       // SQLite built without FTS5: recall falls back to LIKE.
     }
   },
+  (db) => db.exec(SCHEMA_V2),
 ];
 
 /** Latest schema version. */
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
-/** Applies every migration above the database's `user_version`, each in one transaction. */
-export function migrate(db: Db): void {
+/** Applies every migration above the database's `user_version` (up to `target`), each in one transaction. */
+export function migrate(db: Db, target: number = SCHEMA_VERSION): void {
   const current = db.userVersion;
   if (current > SCHEMA_VERSION) throw new Error(`database schema version ${current} is newer than this runner (${SCHEMA_VERSION})`);
-  for (let v = current; v < SCHEMA_VERSION; v++) {
+  for (let v = current; v < Math.min(target, SCHEMA_VERSION); v++) {
     const step = MIGRATIONS[v] as (db: Db) => void;
     db.transaction(() => {
       step(db);

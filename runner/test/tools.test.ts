@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { MODELS, modelSpec, type Memory } from '@www-rh/shared';
 import type { EgressFilter } from '../src/browser/egress.js';
-import type { MindBrowserApi } from '../src/browser/mindBrowser.js';
+import { BrowserTimeoutError, type MindBrowserApi } from '../src/browser/mindBrowser.js';
 import { buildSystem, stablePrefix, TICK_PROMPT, type PersonaIdentity } from '../src/mind/persona.js';
 import { buildTickParams, FALLBACK_BETA } from '../src/mind/request.js';
-import { createMindTools, serializeToolDefinitions, TOOL_NAMES, type ToolContext } from '../src/mind/tools.js';
+import { asText, createMindTools, MAX_TOOL_RESULT_CHARS, serializeToolDefinitions, TOOL_NAMES, type ToolContext } from '../src/mind/tools.js';
 
 const page = { url: 'https://example.com/', title: 'Example', text: 'Example Domain', links: [{ i: 0, text: 'More', href: 'https://iana.org/' }] };
 
@@ -121,6 +121,39 @@ describe('mind tools (SPEC §4.1 tools.ts)', () => {
   it('run never throws: browser failures become error results', async () => {
     const tools = createMindTools({ ...ctx(allowAll, []), browser: async () => ({ ...fakeBrowser([]), read: async () => { throw new Error('Timeout 15000ms exceeded'); } }) });
     expect(await byName(tools, 'browse_read').run({})).toBe('error: Timeout 15000ms exceeded');
+  });
+
+  it('a hung tool is cut at TOOL_TIMEOUT_MS: error result, browser reset (finding 2)', async () => {
+    const resets: string[] = [];
+    const hung = new Promise<never>(() => undefined);
+    const tools = createMindTools({ ...ctx(allowAll, []), browser: async () => ({ ...fakeBrowser([]), read: () => hung, screenshot: () => hung }), toolTimeoutMs: 50, onToolTimeout: (t) => void resets.push(t) });
+    const t0 = Date.now();
+    expect(await byName(tools, 'browse_read').run({})).toBe('error: browse_read timed out after 50 ms; the browser was reset');
+    expect(await byName(tools, 'browse_screenshot').run({})).toMatch(/^error: browse_screenshot timed out/);
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(resets).toEqual(['browse_read', 'browse_screenshot']);
+  });
+
+  it('an aborted tick interrupts a running tool at once; a browser-operation timeout also resets the browser', async () => {
+    const controller = new AbortController();
+    const resets: string[] = [];
+    const tools = createMindTools({ ...ctx(allowAll, []), browser: async () => ({ ...fakeBrowser([]), read: () => new Promise<never>(() => undefined) }), signal: controller.signal, toolTimeoutMs: 60_000, onToolTimeout: (t) => void resets.push(t) });
+    const run = byName(tools, 'browse_read').run({});
+    setTimeout(() => controller.abort(new Error('tick timed out')), 20);
+    expect(await run).toBe('error: browse_read interrupted (the tick was aborted)');
+    expect(await byName(tools, 'think_aloud').run({ text: 'late' })).toBe('error: think_aloud not run (the tick was aborted)');
+    const wedged = createMindTools({ ...ctx(allowAll, []), browser: async () => ({ ...fakeBrowser([]), read: async () => { throw new BrowserTimeoutError('page.evaluate(extract)', 10_000); } }), onToolTimeout: (t) => void resets.push(t) });
+    expect(await byName(wedged, 'browse_read').run({})).toMatch(/^error: browser operation timed out after 10000 ms: page\.evaluate\(extract\); the browser was reset$/);
+    expect(resets).toEqual(['browse_read']);
+  });
+
+  it('tool results are capped (finding 6)', async () => {
+    const huge = 'x'.repeat(2_000);
+    const tools = createMindTools({ ...ctx(allowAll, []), recall: () => Array.from({ length: 40 }, (_, i) => ({ seq: i, kind: 'note' as const, content: huge, url: null, createdAt: '', contentHash: '0x', anchorTx: null })) });
+    const out = (await byName(tools, 'recall').run({ query: 'x' })) as string;
+    expect(out.length).toBeLessThanOrEqual(MAX_TOOL_RESULT_CHARS + 20);
+    expect(out.endsWith('…[truncated]')).toBe(true);
+    expect(asText({ a: 1 })).toBe('{"a":1}');
   });
 });
 

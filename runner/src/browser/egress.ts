@@ -6,7 +6,8 @@
  * WHATWG URL parser normalizes, including IPv4-mapped / -compatible IPv6) are checked directly;
  * hostnames are resolved (`dns.lookup(host, { all: true })`) and blocked when ANY address is
  * loopback, private, link-local, CGNAT, multicast, unspecified, broadcast, reserved/documentation,
- * or an IPv6 form embedding such an IPv4 address. The resolver is injectable for tests.
+ * local-use NAT64 (`64:ff9b:1::/48`), or an IPv6 form embedding such an IPv4 address. The resolver
+ * is injectable for tests.
  *
  * @module browser/egress
  */
@@ -139,6 +140,8 @@ export function classifyIPv6(ip: string): string | null {
     const inner = classifyIPv4(embeddedV4(h, 6)); // NAT64
     return inner === null ? null : `nat64-${inner}`;
   }
+  // 64:ff9b:1::/48 — local-use NAT64 (RFC 8215): translated by a site-local gateway, any embedding
+  if (h0 === 0x64 && h1 === 0xff9b && h2 === 1) return 'nat64-local-use';
   if (h0 === 0x2002) {
     const inner = classifyIPv4(embeddedV4(h, 1)); // 6to4
     return inner === null ? null : `6to4-${inner}`;

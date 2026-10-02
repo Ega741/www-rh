@@ -61,6 +61,8 @@ const envSchema = z.object({
   ANTHROPIC_API_KEY: z.string().min(1).optional(),
   ETH_USD_PRICE: z.coerce.number().finite().positive().default(3000),
   ETH_USD_FEED: optionalAddress,
+  ETH_USD_MIN: z.coerce.number().finite().positive().default(100),
+  ETH_USD_MAX: z.coerce.number().finite().positive().default(100_000),
   MIN_TICK_BUDGET_USD: num(0.05),
   MAX_TICK_COST_USD: num(0.25, 0.000001),
   DRAW_THRESHOLD_USD: num(2),
@@ -73,6 +75,7 @@ const envSchema = z.object({
   TICK_INTERVAL_MS: int(20_000, 1),
   TICK_MAX_ITERATIONS: int(8, 1, 100),
   TICK_TIMEOUT_MS: int(180_000, 1_000),
+  TOOL_TIMEOUT_MS: int(30_000, 1_000),
   ANCHOR_EVERY_N_MEMORIES: int(5, 1, 1_000),
   HARVEST_INTERVAL_MS: int(21_600_000, 1_000),
   BROWSER_HEADLESS: bool(true),
@@ -95,6 +98,8 @@ export interface RunnerConfig {
   /** `Math.round(ETH_USD_PRICE · 1e6)` */
   ethUsdPriceMicro: number;
   ethUsdFeed: Address | null;
+  /** Plausible ETH/USD range (× 1e6) the fallback price is clamped to (`ETH_USD_MIN` / `ETH_USD_MAX`). */
+  ethUsdBoundsMicro: { min: number; max: number };
   minTickBudgetUsd: number;
   maxTickCostUsd: number;
   drawThresholdUsd: number;
@@ -107,6 +112,8 @@ export interface RunnerConfig {
   tickIntervalMs: number;
   tickMaxIterations: number;
   tickTimeoutMs: number;
+  /** Per-tool deadline inside a tick (`TOOL_TIMEOUT_MS`). */
+  toolTimeoutMs: number;
   anchorEveryNMemories: number;
   harvestIntervalMs: number;
   browserHeadless: boolean;
@@ -140,6 +147,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const parsed = envSchema.safeParse(cleaned);
   if (!parsed.success) throw new ConfigError(parsed.error.issues.map((i) => `${i.path.join('.') || '(env)'}: ${i.message}`));
   const e = parsed.data;
+  if (e.ETH_USD_MIN >= e.ETH_USD_MAX) throw new ConfigError([`ETH_USD_MIN: must be below ETH_USD_MAX (${e.ETH_USD_MIN} >= ${e.ETH_USD_MAX})`]);
   const operatorPrivateKey = e.OPERATOR_PRIVATE_KEY ?? null;
   return {
     chainId: e.CHAIN_ID,
@@ -152,6 +160,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     anthropicApiKey: e.ANTHROPIC_API_KEY ?? null,
     ethUsdPriceMicro: Math.round(e.ETH_USD_PRICE * 1e6),
     ethUsdFeed: e.ETH_USD_FEED ?? null,
+    ethUsdBoundsMicro: { min: Math.round(e.ETH_USD_MIN * 1e6), max: Math.round(e.ETH_USD_MAX * 1e6) },
     minTickBudgetUsd: e.MIN_TICK_BUDGET_USD,
     maxTickCostUsd: e.MAX_TICK_COST_USD,
     drawThresholdUsd: e.DRAW_THRESHOLD_USD,
@@ -164,6 +173,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     tickIntervalMs: e.TICK_INTERVAL_MS,
     tickMaxIterations: e.TICK_MAX_ITERATIONS,
     tickTimeoutMs: e.TICK_TIMEOUT_MS,
+    toolTimeoutMs: e.TOOL_TIMEOUT_MS,
     anchorEveryNMemories: e.ANCHOR_EVERY_N_MEMORIES,
     harvestIntervalMs: e.HARVEST_INTERVAL_MS,
     browserHeadless: e.BROWSER_HEADLESS,

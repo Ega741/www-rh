@@ -61,13 +61,28 @@ export class FakeLogSource implements LogSource {
   logs: RawLog[] = [];
   calls: { from: bigint; to: bigint }[] = [];
   failNext = 0;
+  /** Blocks ≥ `forkFrom` hash with `forkSalt` (simulates a reorganization). */
+  forkFrom: bigint | null = null;
+  forkSalt = 'fork-1';
+  /** Heads returned by the next `getBlockNumber` calls, in order, before falling back to `head` (simulates a lagging node). */
+  nextHeads: bigint[] = [];
+
+  blockHash(n: bigint): Hex {
+    const salt = this.forkFrom !== null && n >= this.forkFrom ? this.forkSalt : 'main';
+    return keccak256(toHex(`block-${n}-${salt}`));
+  }
+
+  async getBlockHeader(blockNumber: bigint): Promise<{ hash: Hex; parentHash: Hex }> {
+    if (blockNumber > this.head) throw new Error(`unknown block ${blockNumber}`);
+    return { hash: this.blockHash(blockNumber), parentHash: blockNumber === 0n ? `0x${'00'.repeat(32)}` : this.blockHash(blockNumber - 1n) };
+  }
 
   async getBlockNumber(): Promise<bigint> {
     if (this.failNext > 0) {
       this.failNext--;
       throw new Error('rpc down');
     }
-    return this.head;
+    return this.nextHeads.shift() ?? this.head;
   }
 
   async getLogs(_address: Address, fromBlock: bigint, toBlock: bigint): Promise<RawLog[]> {

@@ -4,6 +4,7 @@
  *
  * @module api/routes
  */
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import {
@@ -75,6 +76,73 @@ function intParam(value: string | undefined, fallback: number, min: number, max:
   if (!/^\d+$/.test(value)) return null;
   const n = Number(value);
   return n >= min && n <= max ? n : null;
+}
+
+/**
+ * Reads a request body of at most `max` bytes. Chunked bodies are streamed and the read stops at the
+ * first byte over the limit (nothing beyond `max` is buffered); `null` = too large. Under
+ * `@hono/node-server` the Node request is read directly and paused on overflow.
+ */
+export async function readBodyCapped(c: Context, max: number): Promise<Uint8Array | null> {
+  const incoming = (c.env as { incoming?: IncomingMessage } | undefined)?.incoming;
+  if (incoming !== undefined && typeof incoming.on === 'function' && !incoming.readableEnded) {
+    return new Promise<Uint8Array | null>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      const cleanup = (): void => {
+        incoming.off('data', onData);
+        incoming.off('end', onEnd);
+        incoming.off('error', onError);
+        incoming.off('aborted', onAborted);
+      };
+      const onData = (chunk: Buffer): void => {
+        size += chunk.length;
+        if (size > max) {
+          cleanup();
+          incoming.pause();
+          resolve(null);
+          return;
+        }
+        chunks.push(chunk);
+      };
+      const onEnd = (): void => {
+        cleanup();
+        resolve(new Uint8Array(Buffer.concat(chunks)));
+      };
+      const onError = (err: Error): void => {
+        cleanup();
+        reject(err);
+      };
+      const onAborted = (): void => onError(new Error('request aborted'));
+      incoming.on('data', onData);
+      incoming.on('end', onEnd);
+      incoming.on('error', onError);
+      incoming.on('aborted', onAborted);
+      incoming.resume();
+    });
+  }
+  const body = c.req.raw.body;
+  if (body === null) return new Uint8Array(0);
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(size);
+  let offset = 0;
+  for (const ch of chunks) {
+    out.set(ch, offset);
+    offset += ch.byteLength;
+  }
+  return out;
 }
 
 function encodeCursor(offset: number): string {
@@ -237,13 +305,22 @@ export function createApi(deps: ApiDeps): Hono {
     return c.json(body);
   });
 
+  const tooLarge = (c: Context): Response => {
+    // stop reading the rest: the connection is closed after this response
+    c.header('Connection', 'close');
+    const env = c.env as { incoming?: IncomingMessage; outgoing?: ServerResponse } | undefined;
+    env?.outgoing?.once('finish', () => setTimeout(() => env.incoming?.socket?.destroy(), 1_000).unref());
+    return fail(c, 413, `body exceeds ${MAX_METADATA_JSON_BYTES} bytes`);
+  };
+
   app.post('/api/metadata', async (c) => {
     if (!limiter.allow()) return fail(c, 429, 'rate limited');
     const declared = Number(c.req.header('content-length') ?? '0');
-    if (declared > MAX_METADATA_JSON_BYTES) return fail(c, 413, `body exceeds ${MAX_METADATA_JSON_BYTES} bytes`);
+    if (declared > MAX_METADATA_JSON_BYTES) return tooLarge(c);
     if (!(c.req.header('content-type') ?? '').toLowerCase().startsWith('application/json')) return fail(c, 400, 'Content-Type must be application/json');
-    const raw = await c.req.arrayBuffer();
-    if (raw.byteLength > MAX_METADATA_JSON_BYTES) return fail(c, 413, `body exceeds ${MAX_METADATA_JSON_BYTES} bytes`);
+    // streamed with a hard cap: a chunked body (no Content-Length) is never buffered beyond 32 KB
+    const raw = await readBodyCapped(c, MAX_METADATA_JSON_BYTES);
+    if (raw === null) return tooLarge(c);
     let body: unknown;
     try {
       body = JSON.parse(new TextDecoder().decode(raw));

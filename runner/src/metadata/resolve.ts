@@ -59,6 +59,9 @@ export function parseExternalMetadata(text: string): MindMetadata {
 export class MetadataResolver {
   readonly #queue = new TaskQueue(2);
   readonly #inFlight = new Set<string>();
+  readonly #again = new Set<string>();
+  readonly #jobs = new Set<Promise<void>>();
+  #stopped = false;
 
   constructor(
     private readonly repos: Repos,
@@ -69,23 +72,31 @@ export class MetadataResolver {
     private readonly now: () => number = Date.now,
   ) {}
 
-  /** Resolves `token` now and stores the result. */
+  /**
+   * Resolves `token` now and stores the result — only if the mind still has the metadata URI and
+   * persona hash that were resolved (a `MindConfigUpdated` meanwhile re-queues it instead).
+   */
   async resolve(token: string): Promise<void> {
     const mind = this.repos.minds.get(token);
-    if (mind === undefined) return;
+    if (mind === undefined || this.#stopped) return;
+    const expect = { metadataUri: mind.metadata_uri, personaHash: mind.persona_hash };
+    let stored: boolean;
     try {
       const meta = parseExternalMetadata(await loadMetadataText(mind.metadata_uri, { repos: this.repos, egress: this.egress, ipfsGateway: this.ipfsGateway, fetchText: this.fetchText }));
-      this.#store(mind, meta);
+      if (this.#stopped) return;
+      stored = this.#store(mind, meta, expect);
     } catch (err) {
+      if (this.#stopped) return;
       this.log.debug('metadata unresolved', { token: mind.token, uri: mind.metadata_uri.slice(0, 120), error: errorMessage(err) });
-      this.repos.minds.setMetadata(mind.token, { status: 'error', image: null, description: null, persona: null, personaVerified: false, links: null, at: this.now() });
+      stored = this.repos.minds.setMetadata(mind.token, { status: 'error', image: null, description: null, persona: null, personaVerified: false, links: null, at: this.now() }, expect);
     }
+    if (!stored) this.#again.add(mind.token);
   }
 
-  #store(mind: MindRow, meta: MindMetadata): void {
+  #store(mind: MindRow, meta: MindMetadata, expect: { metadataUri: string; personaHash: string }): boolean {
     const verified = personaHash(meta.persona).toLowerCase() === mind.persona_hash.toLowerCase();
     const links = { x: meta.links?.x ?? null, website: meta.links?.website ?? null, telegram: meta.links?.telegram ?? null };
-    this.repos.minds.setMetadata(mind.token, {
+    return this.repos.minds.setMetadata(mind.token, {
       status: 'ok',
       image: normalizeImage(meta.image, this.ipfsGateway),
       description: meta.description ?? null,
@@ -93,21 +104,35 @@ export class MetadataResolver {
       personaVerified: verified,
       links: JSON.stringify(links),
       at: this.now(),
+    }, expect);
+  }
+
+  /** Queues resolution of `token` (deduplicated; a request during resolution runs again afterwards). */
+  enqueue(token: string): void {
+    const key = token.toLowerCase();
+    if (this.#stopped) return;
+    if (this.#inFlight.has(key)) {
+      this.#again.add(key);
+      return;
+    }
+    this.#inFlight.add(key);
+    this.#queue.push(async () => {
+      const job = this.resolve(key).catch((err: unknown) => this.log.debug('metadata resolution failed', { token: key, error: errorMessage(err) }));
+      this.#jobs.add(job);
+      try {
+        await job;
+      } finally {
+        this.#jobs.delete(job);
+        this.#inFlight.delete(key);
+        if (this.#again.delete(key)) this.enqueue(key);
+      }
     });
   }
 
-  /** Queues resolution of `token` (deduplicated). */
-  enqueue(token: string): void {
-    const key = token.toLowerCase();
-    if (this.#inFlight.has(key)) return;
-    this.#inFlight.add(key);
-    this.#queue.push(async () => {
-      try {
-        await this.resolve(key);
-      } finally {
-        this.#inFlight.delete(key);
-      }
-    });
+  /** Stops resolving (shutdown): no new job starts, running ones are awaited (their DB writes are skipped). */
+  async stop(): Promise<void> {
+    this.#stopped = true;
+    await Promise.allSettled([...this.#jobs]);
   }
 
   /** Queues every mind whose metadata is still `pending`. */

@@ -848,6 +848,8 @@ below are documented in the root `.env.example`.
 | `TICK_INTERVAL_MS` | `20000` | minimum interval between two ticks of one mind |
 | `TICK_MAX_ITERATIONS` | `8` | `max_iterations` of the tool runner |
 | `TICK_TIMEOUT_MS` | `180000` | wall-clock limit of one tick |
+| `TOOL_TIMEOUT_MS` | `30000` | per-tool-call limit inside a tick; on timeout the tool returns an `error:` result and the browser context is reset |
+| `ETH_USD_MIN` / `ETH_USD_MAX` | `100` / `100000` | sanity bounds for the ETH/USD price (feed answers outside are rejected; the fixed fallback is clamped) |
 | `ANCHOR_EVERY_N_MEMORIES` | `5` | memories per on-chain anchor batch |
 | `HARVEST_INTERVAL_MS` | `21600000` | harvest sweep interval (6 h) |
 | `BROWSER_HEADLESS` | `true` | Chromium headless mode |
@@ -936,11 +938,18 @@ below are documented in the root `.env.example`.
     `amountWei = min(weiOfUsdMicro(Σ cost), cap)`, insert the receipt row (`pending`, or `dry_run`
     in dry run) **before** sending `drawCompute(token, amountWei, receiptHash)`; a successful tx
     stores `txHash`, and the receipt becomes `confirmed` when the indexer commits the matching
-    `ComputeDrawn` log (so the vault balance and the unsettled sum change together); a reverted or
-    unsent tx → `failed` (ticks become eligible again). At startup, `pending` receipts are
-    reconciled against indexed `ComputeDrawn` logs by `receiptHash` (match → `confirmed`; no match
-    after 10 min → `failed`). `dry_run` receipts never count as
-    settled, so a dry-run mind still runs out of budget.
+    `ComputeDrawn` log (so the vault balance and the unsettled sum change together). Transactions
+    are signed locally before broadcast so the hash and nonce are stored on the receipt row first.
+    Only a simulation revert or a failure before broadcast marks the receipt `failed` (ticks become
+    eligible again); any failure after broadcast (timeout waiting for the receipt, transport error,
+    "already known"/"nonce too low" on retry) keeps it `pending` with its hash, or `unknown` when
+    no hash exists. A reconciler runs at startup (before any new draw) and every 60 s: it resolves
+    pending/unknown receipts by indexed `ComputeDrawn`, then `eth_getTransactionReceipt`, then the
+    operator nonce; ticks are released only on proof the tx was never mined (revert, pre-broadcast
+    failure, or nonce consumed by another tx observed on two passes). Retries re-send the same signed
+    bytes; a tick never has two live receipts, and live receipt amounts are subtracted from the
+    drawable cap. `dry_run` receipts never count as settled (a dry-run mind still runs out of
+    budget); when the runner later starts in live mode their ticks become settleable again.
 - **`browser/`** — one Chromium (`chromium.launch({ headless: BROWSER_HEADLESS })`), relaunched
   on `browser.on('disconnected')`. One `BrowserContext` per mind, created lazily at tick start and
   kept in an LRU of `2 × MAX_CONCURRENT_MINDS` contexts (evicted contexts are closed; the next tick

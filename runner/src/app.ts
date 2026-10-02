@@ -1,7 +1,13 @@
 /**
  * Composition root: wires DB, chain clients, indexer, economics, memory, metadata, browser,
  * scheduler, API and WS (`docs/SPEC.md` §4.1 `main.ts`): open DB → start indexer → API/WS →
- * scheduler once the indexer is live (and an Anthropic key is set).
+ * once live: verify the operator, reconcile live receipts and anchors (and, in live mode, re-settle
+ * the spend of dry-run receipts), start the receipt reconciler (every 60 s) and the scheduler
+ * (with an Anthropic key).
+ *
+ * Shutdown runs in bounded stages — scheduler (ticks aborted), receipt reconciler, tx queue
+ * (≤ 30 s), anchoring, metadata resolution, browser, indexer, WS hub + HTTP server — and always
+ * closes the DB last, after every background DB writer has stopped.
  *
  * @module app
  */
@@ -9,13 +15,13 @@ import Anthropic from '@anthropic-ai/sdk';
 import { privateKeyToAccount } from 'viem/accounts';
 import { curvePhaseName, mindStatusName, type WsServerMessage } from '@www-rh/shared';
 import { createApi } from './api/routes.js';
-import { startServer, type RunningServer } from './api/server.js';
+import { startServer, withTimeout, type RunningServer } from './api/server.js';
 import { tradeDto } from './api/dto.js';
 import { WsHub } from './api/ws.js';
 import { createEgressFilter, type EgressFilter } from './browser/egress.js';
 import { BrowserPool } from './browser/pool.js';
 import { createChainClients, type ChainClients } from './chain/clients.js';
-import { ViemLaunchpadReader, ViemLaunchpadSender, type LaunchpadReader } from './chain/launchpad.js';
+import { ViemDrawChainView, ViemLaunchpadReader, ViemLaunchpadSender, type LaunchpadReader } from './chain/launchpad.js';
 import { TxQueue } from './chain/txQueue.js';
 import type { RunnerConfig } from './config.js';
 import { Repos } from './db/repos.js';
@@ -36,6 +42,9 @@ import { StreamBus } from './stream/bus.js';
 
 /** Version reported in logs. */
 export const RUNNER_VERSION = '0.1.0';
+
+/** Upper bounds of the shutdown stages (ms); their sum stays below `main.ts`'s forced exit. */
+export const SHUTDOWN_STAGE_MS = { scheduler: 10_000, settler: 3_000, queue: 30_000, memory: 3_000, metadata: 3_000, browser: 5_000, indexer: 3_000, api: 3_000 } as const;
 
 /** Optional overrides (tests, CLI). */
 export interface RunnerOverrides {
@@ -91,14 +100,23 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
   const sender = !config.dryRun && clients.walletClient !== null && config.launchpad !== null ? new ViemLaunchpadSender(config.launchpad, clients.publicClient, clients.walletClient) : null;
   const queue = new TxQueue(sender, log.child('tx'), config.dryRun ? (config.operatorPrivateKey === null ? 'no OPERATOR_PRIVATE_KEY' : 'DRY_RUN') : null);
 
-  const ethUsd = config.ethUsdFeed === null ? new FixedEthUsd(config.ethUsdPriceMicro) : new FeedEthUsd(clients.publicClient, config.ethUsdFeed, config.ethUsdPriceMicro, log.child('eth-usd'));
+  const ethUsd =
+    config.ethUsdFeed === null
+      ? new FixedEthUsd(config.ethUsdPriceMicro, config.ethUsdBoundsMicro, log.child('eth-usd'))
+      : new FeedEthUsd(clients.publicClient, config.ethUsdFeed, config.ethUsdPriceMicro, log.child('eth-usd'), Date.now, config.ethUsdBoundsMicro);
   const economics = new EconomicsService(repos, ethUsd, reader, config, log.child('economics'));
   const bus = new StreamBus();
   const memory = new MemoryService(repos, bus, queue, { anchorEvery: config.anchorEveryNMemories }, log.child('memory'));
   const egress = overrides.egress ?? createEgressFilter();
   const metadata = new MetadataResolver(repos, egress, config.ipfsGateway, log.child('metadata'));
   const events = new IndexerEvents();
-  const indexer = new Indexer(repos, overrides.logSource ?? new ViemLogSource(clients.publicClient), events, { address: config.launchpad, startBlock: config.startBlock, confirmations: config.confirmations }, log.child('indexer'));
+  const indexer = new Indexer(
+    repos,
+    overrides.logSource ?? new ViemLogSource(clients.publicClient),
+    events,
+    { address: config.launchpad, startBlock: config.startBlock, confirmations: config.confirmations, balanceReader: reader },
+    log.child('indexer'),
+  );
 
   const publish = (token: string, m: WsServerMessage): void => bus.publish(token, m);
   const publishBudget = (token: string, econ: MindEconomics): void =>
@@ -117,7 +135,9 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
     const row = repos.minds.get(token);
     if (row !== undefined) publish(token, { type: 'status', status: mindStatusName(row.status), phase: curvePhaseName(row.phase), at: new Date().toISOString() });
   };
-  const settler = new Settler(repos, economics, queue, config, log.child('settle'), refreshBudget);
+  // read-only chain view for the receipt reconciler (also in dry run, when the operator key is known)
+  const chainView = operatorAccount !== null ? new ViemDrawChainView(clients.publicClient, operatorAccount.address) : null;
+  const settler = new Settler(repos, economics, queue, config, log.child('settle'), refreshBudget, Date.now, { chain: chainView });
 
   let scheduler: Scheduler | null = null;
   let pool: BrowserPool | null = null;
@@ -135,7 +155,7 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
       egress,
       browser: (token) => browserPool.session(token),
       resetBrowser: (token) => browserPool.reset(token),
-      config: { maxIterations: config.tickMaxIterations, maxTickCostUsd: config.maxTickCostUsd, timeoutMs: config.tickTimeoutMs, frameFps: config.frameFps },
+      config: { maxIterations: config.tickMaxIterations, maxTickCostUsd: config.maxTickCostUsd, timeoutMs: config.tickTimeoutMs, frameFps: config.frameFps, toolTimeoutMs: config.toolTimeoutMs },
       log: log.child('mind'),
     };
   };
@@ -169,6 +189,7 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
 
   let server: RunningServer | null = null;
   let metadataTimer: NodeJS.Timeout | null = null;
+  let stopping: Promise<void> | null = null;
 
   const verifyOperator = async (): Promise<void> => {
     if (reader === null || operatorAccount === null) return;
@@ -226,9 +247,19 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
         log.info('API listening', { port: server.port });
       }
       void indexer.whenLive().then(async () => {
+        if (stopping !== null) return;
         await verifyOperator();
-        settler.reconcile();
+        if (stopping !== null) return;
+        // live receipts first: nothing is re-settled before they are resolved
+        await settler.reconcile();
+        if (stopping !== null) return;
         memory.reconcile();
+        if (!queue.dryRun) {
+          // spend recorded during a dry-run period is settled on-chain now (never stranded)
+          settler.releaseDryRunForLive();
+          memory.releaseDryRunForLive();
+        }
+        settler.startReconciler();
         if (createRunnerFn === null) {
           log.warn('ANTHROPIC_API_KEY is not set: minds will not think (indexer and API keep running)');
           return;
@@ -249,15 +280,35 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
         log.info('scheduler started', { maxConcurrentMinds: config.maxConcurrentMinds });
       });
     },
-    async stop() {
-      log.info('stopping runner');
-      await scheduler?.stop();
-      await queue.drain(30_000);
-      if (metadataTimer !== null) clearInterval(metadataTimer);
-      await pool?.close();
-      await indexer.stop();
-      await server?.close();
-      db.close();
+    stop() {
+      stopping ??= (async () => {
+        log.info('stopping runner');
+        const stage = async (name: keyof typeof SHUTDOWN_STAGE_MS, fn: () => Promise<unknown> | undefined): Promise<void> => {
+          const ms = SHUTDOWN_STAGE_MS[name];
+          const r = await withTimeout(Promise.resolve().then(fn), ms);
+          if (r === 'timeout') log.warn('shutdown stage timed out; continuing', { stage: name, ms });
+        };
+        try {
+          if (metadataTimer !== null) clearInterval(metadataTimer);
+          await stage('scheduler', () => scheduler?.stop());
+          await stage('settler', () => settler.stop());
+          queue.close();
+          await stage('queue', () => queue.drain(SHUTDOWN_STAGE_MS.queue));
+          await stage('memory', () => memory.stop());
+          await stage('metadata', () => metadata.stop());
+          await stage('browser', () => pool?.close());
+          await stage('indexer', () => indexer.stop());
+          await stage('api', () => server?.close(SHUTDOWN_STAGE_MS.api / 2));
+        } finally {
+          try {
+            db.close();
+          } catch (err) {
+            log.error('closing the database failed', { error: errorMessage(err) });
+          }
+          log.info('runner stopped');
+        }
+      })();
+      return stopping;
     },
   };
   return app;

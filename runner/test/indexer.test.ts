@@ -3,7 +3,14 @@ import { CURVE_SUPPLY, priceOf } from '@www-rh/shared';
 import { IndexerEvents, type IndexedEvent } from '../src/indexer/events.js';
 import { Indexer } from '../src/indexer/indexer.js';
 import { STATE_TOTAL_FEES_TO_MINDS, STATE_TOTAL_VOLUME } from '../src/indexer/apply.js';
+import type { Logger } from '../src/log.js';
 import { encodeLog, FakeLogSource, LAUNCHPAD, memoryRepos, mindCreatedLog, silentLogger, TOKEN, TOKEN2 } from './helpers.js';
+
+/** A logger that records error lines. */
+function capturingLogger(errors: string[]): Logger {
+  const l: Logger = { ...silentLogger, error: (m) => void errors.push(m), child: () => l };
+  return l;
+}
 
 const ETH = 10n ** 18n;
 
@@ -153,5 +160,68 @@ describe('indexer', () => {
     expect(indexer.status.lastError).toBeNull();
     expect(indexer.status.headBlock).toBe(3n);
     await indexer.stop();
+  });
+
+  it('does not advance past an empty range when the node serving it is behind (verifies the head in the same pass)', async () => {
+    const { repos, source, indexer } = setup();
+    source.head = 20n;
+    source.nextHeads = [20n, 5n]; // the pass sees head 20, but the node that answered [] is at 5
+    await expect(indexer.syncOnce()).rejects.toThrow(/behind block 20/);
+    expect(repos.state.lastBlock()).toBeUndefined();
+    await indexer.syncOnce(); // a healthy node: advances
+    expect(repos.state.lastBlock()).toBe(20n);
+  });
+
+  it('stores range-end block hashes and rewinds on a parent-hash mismatch (reorg), then re-indexes the new fork', async () => {
+    const repos = memoryRepos();
+    const source = new FakeLogSource();
+    const errors: string[] = [];
+    const indexer = new Indexer(repos, source, new IndexerEvents(), { address: LAUNCHPAD, startBlock: 0n, confirmations: 0, reorgRewindBlocks: 5 }, capturingLogger(errors));
+    source.logs = [mindCreatedLog(TOKEN, 10n)];
+    source.head = 20n;
+    await indexer.syncOnce();
+    expect(repos.chain.blockHash(20)).toBe(source.blockHash(20n));
+    // blocks ≥ 18 are replaced; the new fork carries a trade at block 19
+    source.forkFrom = 18n;
+    source.logs.push(trade(19n, 0, true, ETH, 1000n, 0n, ETH, 1000n));
+    source.head = 25n;
+    const r = await indexer.syncOnce();
+    expect(r.reorg).toEqual({ at: 20n, rewoundTo: 15n });
+    expect(errors).toEqual(['chain reorganization detected (parent hash mismatch); rewinding the indexer']);
+    expect(repos.state.lastBlock()).toBe(15n);
+    expect(repos.chain.blockHash(20)).toBeUndefined();
+    await indexer.syncOnce();
+    expect(repos.state.lastBlock()).toBe(25n);
+    expect(repos.trades.listByToken(TOKEN, 10)).toHaveLength(1);
+    expect(repos.chain.blockHash(25)).toBe(source.blockHash(25n));
+  });
+
+  it('drift check: corrects mind_balance from on-chain mindBalance at the last indexed block; negative balances are logged, not silently clamped', async () => {
+    const repos = memoryRepos();
+    const source = new FakeLogSource();
+    const errors: string[] = [];
+    const reads: { token: string; block: bigint | undefined }[] = [];
+    const indexer = new Indexer(
+      repos,
+      source,
+      new IndexerEvents(),
+      { address: LAUNCHPAD, startBlock: 0n, confirmations: 0, balanceReader: { mindBalance: async (token, block) => (reads.push({ token, block }), token.toLowerCase() === TOKEN.toLowerCase() ? 5n * ETH : 0n) } },
+      capturingLogger(errors),
+    );
+    source.logs = [
+      mindCreatedLog(TOKEN, 1n),
+      mindCreatedLog(TOKEN2, 2n),
+      encodeLog('MindFunded', { token: TOKEN, from: TOKEN2, amount: ETH }, { block: 3n, logIndex: 0 }),
+      encodeLog('ComputeDrawn', { token: TOKEN2, amount: 7n, receiptHash: `0x${'ee'.repeat(32)}` }, { block: 4n, logIndex: 0 }),
+    ];
+    source.head = 4n;
+    await indexer.syncOnce();
+    expect(errors).toEqual(['indexed vault balance would go negative; stored as 0 (missed vault change?)']);
+    expect(repos.minds.get(TOKEN2)?.mind_balance).toBe('0');
+    expect(await indexer.checkBalances()).toBe(1);
+    expect(reads.every((r) => r.block === 4n)).toBe(true);
+    expect(repos.minds.get(TOKEN)?.mind_balance).toBe((5n * ETH).toString());
+    expect(errors.at(-1)).toBe('vault balance drift: indexed mind_balance differs from on-chain mindBalance(token); correcting');
+    expect(await indexer.checkBalances()).toBe(0);
   });
 });

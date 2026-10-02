@@ -49,6 +49,8 @@ export function buildAnchorBatch(token: string, rows: readonly MemoryRow[]): Anc
 /** Memory store + anchoring. */
 export class MemoryService {
   readonly #anchoring = new Set<string>();
+  readonly #jobs = new Set<Promise<void>>();
+  #stopped = false;
 
   constructor(
     private readonly repos: Repos,
@@ -70,8 +72,34 @@ export class MemoryService {
     });
     const dto = memoryDto(row);
     this.bus.publish(key, { type: 'memory', memory: dto });
-    void this.maybeAnchor(key);
+    this.#background(key);
     return dto;
+  }
+
+  /** Starts {@link maybeAnchor} in the background (tracked so {@link stop} can wait for it). */
+  #background(token: string): void {
+    if (this.#stopped) return;
+    const job = this.maybeAnchor(token)
+      .catch((err: unknown) => this.log.warn('anchoring failed', { token, error: err instanceof Error ? err.message : String(err) }))
+      .finally(() => this.#jobs.delete(job));
+    this.#jobs.add(job);
+  }
+
+  /** Stops starting anchor batches and waits for the running ones (shutdown, before the DB closes). */
+  async stop(): Promise<void> {
+    this.#stopped = true;
+    await Promise.allSettled([...this.#jobs]);
+  }
+
+  /**
+   * Live mode after a dry-run period: memories of `dry_run` anchors are released (the rows stay as
+   * history) and anchored on-chain. Returns the affected tokens.
+   */
+  releaseDryRunForLive(): string[] {
+    const tokens = this.repos.tx(() => this.repos.memories.releaseDryRunAnchors());
+    if (tokens.length > 0) this.log.warn('live mode: memories of dry-run anchors will be anchored on-chain', { minds: tokens.length });
+    for (const t of tokens) this.#background(t);
+    return tokens;
   }
 
   /** FTS / LIKE recall. */
@@ -91,6 +119,7 @@ export class MemoryService {
     this.#anchoring.add(key);
     try {
       for (;;) {
+        if (this.#stopped) return;
         const rows = this.repos.memories.unanchored(key, this.opts.anchorEvery);
         if (rows.length < this.opts.anchorEvery) return;
         const batch = buildAnchorBatch(key, rows);
@@ -108,9 +137,13 @@ export class MemoryService {
         const outcome = await this.queue.enqueue({ functionName: 'anchorMemory', args: [key as Address, BigInt(batch.toSeq), contentHash, uri] }, `anchor ${uri}`);
         if (outcome.kind === 'confirmed') this.repos.memories.updateAnchor(id, 'confirmed', outcome.hash, null, this.now());
         else if (outcome.kind === 'dry_run') this.repos.memories.updateAnchor(id, 'dry_run', null, null, this.now());
-        else {
+        else if (outcome.kind === 'unknown' || (outcome.kind === 'failed' && outcome.hash !== null)) {
+          // may still be mined: stays pending (confirmed by the indexed MemoryAnchored log, or reconciled at startup)
+          this.repos.memories.updateAnchor(id, 'pending', outcome.hash, outcome.error, this.now());
+          return;
+        } else {
           this.repos.tx(() => {
-            this.repos.memories.updateAnchor(id, 'failed', outcome.hash, outcome.kind === 'reverted' ? 'transaction reverted' : outcome.error, this.now());
+            this.repos.memories.updateAnchor(id, 'failed', outcome.kind === 'reverted' ? outcome.hash : null, outcome.kind === 'reverted' ? 'transaction reverted' : outcome.error, this.now());
             this.repos.memories.releaseAnchor(id);
           });
           return; // retry on the next memory

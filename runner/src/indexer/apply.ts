@@ -48,13 +48,27 @@ export function blocksNeedingTimestamps(decoded: readonly { log: RawLog; parsed:
   return [...blocks];
 }
 
+/** Receives inconsistencies found while applying logs (logged as errors by the indexer). */
+export type AnomalySink = (message: string, fields: Record<string, unknown>) => void;
+
 /**
  * Applies decoded logs (chain order) and returns the domain events of the newly applied ones.
  *
  * @param timestampOf block number → unix seconds (pre-fetched by the caller).
+ * @param onAnomaly inconsistencies (a vault balance that would go negative, a `ComputeDrawn` for a
+ *   receipt that had been released) — never silently swallowed.
  */
-export function applyLogs(repos: Repos, decoded: readonly { log: RawLog; parsed: Parsed }[], timestampOf: (block: bigint) => bigint): IndexedEvent[] {
+export function applyLogs(
+  repos: Repos,
+  decoded: readonly { log: RawLog; parsed: Parsed }[],
+  timestampOf: (block: bigint) => bigint,
+  onAnomaly: AnomalySink = () => undefined,
+): IndexedEvent[] {
   const out: IndexedEvent[] = [];
+  const addBalance = (token: string, delta: bigint, event: string, txHash: string): void => {
+    const r = repos.minds.addBalance(token, delta);
+    if (r?.clampedFrom != null) onAnomaly('indexed vault balance would go negative; stored as 0 (missed vault change?)', { token, event, txHash, wouldBe: r.clampedFrom });
+  };
   for (const { log, parsed } of decoded) {
     const args = parsed.args as { token?: string };
     const token = typeof args.token === 'string' ? args.token.toLowerCase() : null;
@@ -119,7 +133,7 @@ export function applyLogs(repos: Repos, decoded: readonly { log: RawLog; parsed:
         const a = parsed.args;
         const t = a.token.toLowerCase();
         repos.facts.insertFeeAccrual({ txHash, logIndex: log.logIndex, blockNumber, token: t, mindAmount: a.mindAmount.toString(10), protocolAmount: a.protocolAmount.toString(10) });
-        repos.minds.addBalance(t, a.mindAmount);
+        addBalance(t, a.mindAmount, 'FeeAccrued', txHash);
         repos.state.addBigint(STATE_TOTAL_FEES_TO_MINDS, a.mindAmount);
         out.push({ type: 'fee:accrued', token: t, mindAmount: a.mindAmount, ...base });
         break;
@@ -128,7 +142,7 @@ export function applyLogs(repos: Repos, decoded: readonly { log: RawLog; parsed:
         const a = parsed.args;
         const t = a.token.toLowerCase();
         repos.facts.insertFunding({ txHash, logIndex: log.logIndex, blockNumber, timestamp: ms(), token: t, from: a.from.toLowerCase(), amount: a.amount.toString(10) });
-        repos.minds.addBalance(t, a.amount);
+        addBalance(t, a.amount, 'MindFunded', txHash);
         out.push({ type: 'mind:funded', token: t, amount: a.amount, ...base });
         break;
       }
@@ -138,10 +152,15 @@ export function applyLogs(repos: Repos, decoded: readonly { log: RawLog; parsed:
         const receiptHash = a.receiptHash.toLowerCase();
         const at = ms();
         repos.facts.insertDraw({ tx_hash: txHash, log_index: log.logIndex, block_number: blockNumber, timestamp: at, token: t, amount: a.amount.toString(10), receipt_hash: receiptHash });
-        repos.minds.addBalance(t, -a.amount);
+        addBalance(t, -a.amount, 'ComputeDrawn', txHash);
         // the receipt becomes confirmed together with the vault balance change (SPEC §4.1 settlement)
         const receipt = repos.ticks.receiptByHash(receiptHash);
-        if (receipt !== undefined) repos.ticks.updateReceipt(receipt.id, 'confirmed', txHash, null, at);
+        if (receipt !== undefined) {
+          if (receipt.status === 'failed' || receipt.status === 'dry_run') {
+            onAnomaly('ComputeDrawn for a receipt that was not live (possible double draw)', { token: t, receiptHash, status: receipt.status, txHash });
+          }
+          repos.ticks.updateReceipt(receipt.id, 'confirmed', txHash, null, at);
+        }
         out.push({ type: 'compute:drawn', token: t, amount: a.amount, receiptHash, ...base });
         break;
       }

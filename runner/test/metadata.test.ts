@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { canonicalJson, metadataDataUri, metadataHash, personaHash, type MindMetadata } from '@www-rh/shared';
 import type { EgressFilter } from '../src/browser/egress.js';
 import { applyLogs, decodeLaunchpadLogs } from '../src/indexer/apply.js';
+import { mindDetailDto } from '../src/api/dto.js';
 import { MetadataResolver, normalizeImage, parseExternalMetadata } from '../src/metadata/resolve.js';
 import { storeMetadata } from '../src/metadata/store.js';
 import type { FetchText } from '../src/metadata/safeFetch.js';
@@ -70,5 +71,43 @@ describe('metadata resolution (SPEC §4.1 metadata/)', () => {
     expect(normalizeImage('data:image/png;base64,AAAA', GATEWAY)).toBeNull();
     expect(normalizeImage(undefined, GATEWAY)).toBeNull();
     expect(() => parseExternalMetadata('{"name":"x"}')).toThrow();
+  });
+});
+
+describe('stale persona after MindConfigUpdated (finding 12)', () => {
+  it('a config change clears the verified persona until the new metadata is resolved', async () => {
+    const { repos, resolver } = setup(metadataDataUri(meta));
+    await resolver.resolve(TOKEN);
+    expect(repos.minds.get(TOKEN)?.meta_persona).toBe(PERSONA);
+    const other = 'A different persona.';
+    repos.tx(() => applyLogs(repos, decodeLaunchpadLogs([encodeLog('MindConfigUpdated', { token: TOKEN, modelId: repos.minds.get(TOKEN)!.model_id, personaHash: personaHash(other), metadataURI: metadataDataUri({ ...meta, persona: other }) }, { block: 3n, logIndex: 0 })]), () => 1n));
+    const m = repos.minds.get(TOKEN)!;
+    expect([m.meta_status, m.meta_persona, m.meta_persona_verified]).toEqual(['pending', null, 0]);
+    expect(mindDetailDto(m, undefined).persona).toBeNull();
+    await resolver.resolve(TOKEN);
+    expect(repos.minds.get(TOKEN)?.meta_persona).toBe(other);
+  });
+
+  it('a resolution racing a config change never stores the old document; the mind is resolved again', async () => {
+    let calls = 0;
+    const other = 'Persona number two.';
+    let repos!: ReturnType<typeof setup>['repos'];
+    const fetchText: FetchText = async () => {
+      calls++;
+      if (calls === 1) {
+        // MindConfigUpdated lands while the first fetch is in flight
+        repos.minds.setConfig(TOKEN, repos.minds.get(TOKEN)!.model_id, personaHash(other), 'https://meta.example/v2.json');
+        return canonicalJson(meta);
+      }
+      return canonicalJson({ ...meta, persona: other });
+    };
+    const w = setup('https://meta.example/v1.json', fetchText);
+    repos = w.repos;
+    w.resolver.enqueue(TOKEN);
+    for (let i = 0; i < 50 && (calls < 2 || repos.minds.get(TOKEN)?.meta_status === 'pending'); i++) await new Promise((r) => setTimeout(r, 5));
+    const m = repos.minds.get(TOKEN)!;
+    expect(calls).toBe(2);
+    expect([m.meta_status, m.metadata_uri, m.meta_persona, m.meta_persona_verified]).toEqual(['ok', 'https://meta.example/v2.json', other, 1]);
+    await w.resolver.stop();
   });
 });

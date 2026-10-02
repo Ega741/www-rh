@@ -48,3 +48,15 @@ describe('loadConfig (SPEC §4 env)', () => {
     expect(c.launchpad).toBe('0x5FbDB2315678afecb367f032d93F642f64180aa3');
   });
 });
+
+describe('loadConfig: review additions', () => {
+  it('TOOL_TIMEOUT_MS and ETH_USD_MIN / ETH_USD_MAX defaults and validation', () => {
+    const c = loadConfig({ RPC_URL: 'http://x' });
+    expect(c.toolTimeoutMs).toBe(30_000);
+    expect(c.ethUsdBoundsMicro).toEqual({ min: 100_000_000, max: 100_000_000_000 });
+    const d = loadConfig({ RPC_URL: 'http://x', TOOL_TIMEOUT_MS: '5000', ETH_USD_MIN: '500', ETH_USD_MAX: '20000' });
+    expect([d.toolTimeoutMs, d.ethUsdBoundsMicro]).toEqual([5_000, { min: 500_000_000, max: 20_000_000_000 }]);
+    expect(() => loadConfig({ RPC_URL: 'http://x', ETH_USD_MIN: '5000', ETH_USD_MAX: '100' })).toThrow(ConfigError);
+    expect(() => loadConfig({ RPC_URL: 'http://x', TOOL_TIMEOUT_MS: '10' })).toThrow(ConfigError);
+  });
+});

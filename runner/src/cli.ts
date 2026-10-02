@@ -12,6 +12,7 @@ import { createRunnerApp } from './app.js';
 import { ConfigError, ENV_VARS, loadConfig } from './config.js';
 import { microToUsd } from './economics/budget.js';
 import { createLogger, errorMessage } from './log.js';
+import { verifiedPersona } from './mind/scheduler.js';
 import { runTick } from './mind/tick.js';
 
 /** Usage text. */
@@ -100,7 +101,7 @@ export async function cli(argv: string[]): Promise<number> {
         if (spec === undefined) throw new Error(`mind ${token} uses a model outside the catalog`);
         const econ = await app.economics.snapshot(token);
         const result = await runTick(app.tickDeps(), {
-          identity: { token, name: mind.name, symbol: mind.symbol, modelId: mind.model_id, personaHash: mind.persona_hash, verifiedPersona: mind.meta_persona_verified === 1 ? mind.meta_persona : null },
+          identity: { token, name: mind.name, symbol: mind.symbol, modelId: mind.model_id, personaHash: mind.persona_hash, verifiedPersona: verifiedPersona(mind) },
           spec,
           vaultUsd: microToUsd(econ.budget.vaultUsdMicro),
           runwayHours: econ.runwayHours,

@@ -6,8 +6,16 @@
  */
 import type { Db } from './sqlite.js';
 
-/** Settlement / anchoring status of a runner-originated record. */
-export type RecordStatus = 'pending' | 'confirmed' | 'failed' | 'dry_run';
+/**
+ * Settlement / anchoring status of a runner-originated record.
+ *
+ * Draw receipts: `pending` (inserted before the send; once broadcast it carries the tx hash and may
+ * be mined at any time), `unknown` (the transaction may have been broadcast but its hash is not
+ * known), `confirmed` (the matching `ComputeDrawn` log is indexed), `failed` (proven never mined:
+ * simulation revert, failure before broadcast, reverted receipt, or nonce consumed by another
+ * transaction — only then do its ticks become eligible again), `dry_run` (never sent).
+ */
+export type RecordStatus = 'pending' | 'unknown' | 'confirmed' | 'failed' | 'dry_run';
 
 /** `minds` row. */
 export interface MindRow {
@@ -149,6 +157,32 @@ export interface ReceiptRow {
   error: string | null;
   created_at: number;
   updated_at: number;
+  /** Nonce of the signed transaction (persisted before broadcast). */
+  tx_nonce: number | null;
+  /** Signed raw transaction (re-broadcast with the exact same bytes). */
+  raw_tx: string | null;
+  /** `unknown` receipts: operator `pending` nonce observed when the proof started. */
+  nonce_floor: number | null;
+  /** Head observed when "cannot be mined any more" was first seen (two-phase release). */
+  check_block: number | null;
+  check_at: number | null;
+  /** Broadcast attempts (first send + re-broadcasts). */
+  attempts: number;
+  broadcast_at: number | null;
+}
+
+/** Fields of a receipt row a new insert provides. */
+export type NewReceipt = Pick<ReceiptRow, 'token' | 'receipt_hash' | 'receipt_json' | 'amount_wei' | 'status' | 'tx_hash' | 'error' | 'created_at' | 'updated_at'>;
+
+/** Running usage of a tick (persisted after every iteration). */
+export interface TickUsageTotals {
+  servedModel: string | null;
+  iterations: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsdMicro: number;
 }
 
 const one = (db: Db, sql: string, ...params: (string | number | null)[]): number => db.get<{ n: number | null }>(sql, ...params)?.n ?? 0;
@@ -165,14 +199,20 @@ export class StateRepo {
     this.db.run('INSERT INTO indexer_state (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value', key, value);
   }
 
+  delete(key: string): void {
+    this.db.run('DELETE FROM indexer_state WHERE key = ?', key);
+  }
+
   /** `last_processed_block`, or `undefined` before the first range. */
   lastBlock(): bigint | undefined {
     const v = this.get('last_processed_block');
     return v === undefined ? undefined : BigInt(v);
   }
 
+  /** Sets `last_processed_block`; a value below 0 forgets it (re-index from `START_BLOCK`). */
   setLastBlock(block: bigint): void {
-    this.set('last_processed_block', block.toString(10));
+    if (block < 0n) this.delete('last_processed_block');
+    else this.set('last_processed_block', block.toString(10));
   }
 
   /** Adds `delta` to a bigint counter stored as a decimal string. */
@@ -204,6 +244,27 @@ export class ChainRepo {
 
   putBlockTimestamp(block: number, timestamp: number): void {
     this.db.run('INSERT OR REPLACE INTO blocks (number, timestamp) VALUES (?, ?)', block, timestamp);
+  }
+
+  /** Stored hash of an indexed range end, if any. */
+  blockHash(block: number): string | undefined {
+    return this.db.get<{ hash: string }>('SELECT hash FROM block_hashes WHERE number = ?', block)?.hash;
+  }
+
+  /** Records the hash of an indexed block and keeps only the newest `keep` entries. */
+  putBlockHash(block: number, hash: string, keep = 512): void {
+    this.db.run('INSERT OR REPLACE INTO block_hashes (number, hash) VALUES (?, ?)', block, hash.toLowerCase());
+    this.db.run('DELETE FROM block_hashes WHERE number < (SELECT number FROM block_hashes ORDER BY number DESC LIMIT 1 OFFSET ?)', keep - 1);
+  }
+
+  /** Highest block ≤ `block` with a stored hash. */
+  latestHashedBlockAtOrBelow(block: number): number | undefined {
+    return this.db.get<{ number: number }>('SELECT number FROM block_hashes WHERE number <= ? ORDER BY number DESC LIMIT 1', block)?.number;
+  }
+
+  /** Forgets the hashes above `block` (after a reorg rewind). */
+  deleteBlockHashesAbove(block: number): void {
+    this.db.run('DELETE FROM block_hashes WHERE number > ?', block);
   }
 }
 
@@ -299,28 +360,57 @@ export class MindsRepo {
     this.db.run("UPDATE minds SET phase = 2, pool = ?, position_id = ?, real_eth_reserve = '0' WHERE token = ?", pool, positionId, token);
   }
 
-  /** Adds a signed delta to the indexed vault balance. */
-  addBalance(token: string, delta: bigint): void {
+  /**
+   * Adds a signed delta to the indexed vault balance. A result below zero (the indexed state missed
+   * a vault change) is stored as 0 and reported through `clampedFrom` so the caller logs it.
+   */
+  addBalance(token: string, delta: bigint): { balance: bigint; clampedFrom: bigint | null } | undefined {
     const row = this.db.get<{ mind_balance: string }>('SELECT mind_balance FROM minds WHERE token = ?', token);
-    if (row === undefined) return;
+    if (row === undefined) return undefined;
     const next = BigInt(row.mind_balance) + delta;
-    this.db.run('UPDATE minds SET mind_balance = ? WHERE token = ?', (next < 0n ? 0n : next).toString(10), token);
+    const stored = next < 0n ? 0n : next;
+    this.db.run('UPDATE minds SET mind_balance = ? WHERE token = ?', stored.toString(10), token);
+    return { balance: stored, clampedFrom: next < 0n ? next : null };
+  }
+
+  /** Overwrites the indexed vault balance (drift correction against `mindBalance(token)`). */
+  setBalance(token: string, balanceWei: bigint): void {
+    this.db.run('UPDATE minds SET mind_balance = ? WHERE token = ?', (balanceWei < 0n ? 0n : balanceWei).toString(10), token);
   }
 
   setStatus(token: string, status: number): void {
     this.db.run('UPDATE minds SET status = ? WHERE token = ?', status, token);
   }
 
+  /**
+   * `MindConfigUpdated`: new model / persona hash / metadata URI. The previously verified persona
+   * belongs to the old `personaHash`, so it is cleared until the new metadata is resolved.
+   */
   setConfig(token: string, modelId: string, personaHash: string, metadataUri: string): void {
-    this.db.run("UPDATE minds SET model_id = ?, persona_hash = ?, metadata_uri = ?, meta_status = 'pending' WHERE token = ?", modelId, personaHash, metadataUri, token);
+    this.db.run(
+      "UPDATE minds SET model_id = ?, persona_hash = ?, metadata_uri = ?, meta_status = 'pending', meta_persona = NULL, meta_persona_verified = 0 WHERE token = ?",
+      modelId, personaHash, metadataUri, token,
+    );
   }
 
-  setMetadata(token: string, m: MindMetaFields): void {
-    this.db.run(
-      `UPDATE minds SET meta_status = ?, meta_image = ?, meta_description = ?, meta_persona = ?, meta_persona_verified = ?, meta_links = ?,
-         meta_resolved_at = ? WHERE token = ?`,
-      m.status, m.image, m.description, m.persona, m.personaVerified ? 1 : 0, m.links, m.at, token,
-    );
+  /**
+   * Stores resolved metadata. With `expect`, only when the mind still has that metadata URI and
+   * persona hash (a `MindConfigUpdated` during resolution must not be overwritten by stale data);
+   * returns whether the row was updated.
+   */
+  setMetadata(token: string, m: MindMetaFields, expect?: { metadataUri: string; personaHash: string }): boolean {
+    const sql = `UPDATE minds SET meta_status = ?, meta_image = ?, meta_description = ?, meta_persona = ?, meta_persona_verified = ?, meta_links = ?,
+         meta_resolved_at = ? WHERE token = ?`;
+    const params = [m.status, m.image, m.description, m.persona, m.personaVerified ? 1 : 0, m.links, m.at, token] as const;
+    if (expect === undefined) return this.db.run(sql, ...params).changes === 1;
+    return this.db.run(`${sql} AND metadata_uri = ? AND persona_hash = ?`, ...params, expect.metadataUri, expect.personaHash).changes === 1;
+  }
+
+  /** Clears expired cooling periods; returns the tokens whose cooling ended. */
+  clearExpiredCooling(now: number): string[] {
+    const rows = this.db.all<{ token: string }>('SELECT token FROM minds WHERE cooling_until IS NOT NULL AND cooling_until <= ?', now);
+    if (rows.length > 0) this.db.run('UPDATE minds SET cooling_until = NULL WHERE cooling_until IS NOT NULL AND cooling_until <= ?', now);
+    return rows.map((r) => r.token);
   }
 
   tickStarted(token: string, at: number): void {
@@ -480,6 +570,18 @@ export class MemoriesRepo {
     this.db.run('UPDATE memories SET anchor_id = NULL WHERE anchor_id = ?', id);
   }
 
+  /**
+   * Live mode after a dry-run period: detaches the memories of `dry_run` anchors (the rows stay as
+   * history) so they are anchored for real. Returns the affected tokens.
+   */
+  releaseDryRunAnchors(): string[] {
+    const rows = this.db.all<{ token: string }>(
+      "SELECT DISTINCT m.token AS token FROM memories m JOIN anchors a ON a.id = m.anchor_id WHERE a.status = 'dry_run'",
+    );
+    if (rows.length > 0) this.db.run("UPDATE memories SET anchor_id = NULL WHERE anchor_id IN (SELECT id FROM anchors WHERE status = 'dry_run')");
+    return rows.map((r) => r.token);
+  }
+
   anchorsWithStatus(status: RecordStatus): AnchorRow[] {
     return this.db.all<AnchorRow>('SELECT * FROM anchors WHERE status = ? ORDER BY id', status);
   }
@@ -513,6 +615,15 @@ export class TicksRepo {
     );
   }
 
+  /** Persists the running usage of a tick after every iteration (a crash still charges them). */
+  updateUsage(id: number, u: TickUsageTotals): void {
+    this.db.run(
+      `UPDATE ticks SET served_model = ?, iterations = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
+         cost_usd_micro = ? WHERE id = ? AND status = 'running'`,
+      u.servedModel, u.iterations, u.inputTokens, u.outputTokens, u.cacheReadTokens, u.cacheWriteTokens, u.costUsdMicro, id,
+    );
+  }
+
   get(id: number): TickRow | undefined {
     return this.db.get<TickRow>(`${TICK_SELECT} WHERE t.id = ?`, id);
   }
@@ -541,15 +652,31 @@ export class TicksRepo {
     );
   }
 
-  /** Finished ticks with a positive cost and no receipt or a failed one, in id order. */
-  eligibleForSettlement(token: string, limit: number): TickRow[] {
+  /**
+   * Finished ticks with a positive cost and no receipt or a `failed` one (with `includeDryRun`, also
+   * ticks of `dry_run` receipts: in live mode those were never sent), in id order. Ticks of a
+   * `pending` / `unknown` receipt are never eligible: that draw may still be mined.
+   */
+  eligibleForSettlement(token: string, limit: number, opts: { includeDryRun?: boolean } = {}): TickRow[] {
+    const released = opts.includeDryRun === true ? "r.status IN ('failed', 'dry_run')" : "r.status = 'failed'";
     return this.db.all<TickRow>(
-      `${TICK_SELECT} WHERE t.token = ? AND t.status != 'running' AND t.cost_usd_micro > 0 AND (t.receipt_id IS NULL OR r.status = 'failed') ORDER BY t.id LIMIT ?`,
+      `${TICK_SELECT} WHERE t.token = ? AND t.status != 'running' AND t.cost_usd_micro > 0 AND (t.receipt_id IS NULL OR ${released}) ORDER BY t.id LIMIT ?`,
       token, limit,
     );
   }
 
-  /** Ticks left `running` by a crashed process are closed as `aborted`. */
+  /** Ticks attached to `dry_run` receipts (spend that live mode must settle). */
+  dryRunTickCount(): { ticks: number; receipts: number; costUsdMicro: number } {
+    const r = this.db.get<{ ticks: number; receipts: number; cost: number | null }>(
+      "SELECT count(*) AS ticks, count(DISTINCT t.receipt_id) AS receipts, sum(t.cost_usd_micro) AS cost FROM ticks t JOIN receipts r ON r.id = t.receipt_id WHERE r.status = 'dry_run'",
+    );
+    return { ticks: r?.ticks ?? 0, receipts: r?.receipts ?? 0, costUsdMicro: r?.cost ?? 0 };
+  }
+
+  /**
+   * Ticks left `running` by a crashed process are closed as `aborted`; their usage columns hold the
+   * totals persisted after the last completed iteration, so that spend is still settled.
+   */
   closeDangling(at: number): number {
     return this.db.run("UPDATE ticks SET status = 'aborted', ended_at = ?, error = 'runner restarted' WHERE status = 'running'", at).changes;
   }
@@ -564,15 +691,27 @@ export class TicksRepo {
   }
 
   /**
-   * Inserts a receipt and attaches `tickIds` to it. A previously `failed` receipt with the same hash
-   * (identical ticks and price) is revived instead of duplicated.
+   * Inserts a receipt and attaches `tickIds` to it. A previously `failed` (or, for a live receipt,
+   * `dry_run`) receipt with the same hash — identical ticks and price, never mined — is revived
+   * instead of duplicated. Refuses to attach a tick that belongs to a live (`pending` / `unknown`)
+   * receipt: one tick never has two live receipts.
    */
-  insertReceipt(r: Omit<ReceiptRow, 'id'>, tickIds: readonly number[]): number {
+  insertReceipt(r: NewReceipt, tickIds: readonly number[]): number {
     const existing = this.receiptByHash(r.receipt_hash);
-    if (existing !== undefined && existing.status !== 'failed') throw new Error(`receipt ${r.receipt_hash} already exists (${existing.status})`);
+    const revivable = existing !== undefined && (existing.status === 'failed' || (existing.status === 'dry_run' && r.status !== 'dry_run'));
+    if (existing !== undefined && !revivable) throw new Error(`receipt ${r.receipt_hash} already exists (${existing.status})`);
+    for (const t of tickIds) {
+      const live = this.db.get<{ status: string }>("SELECT r.status AS status FROM ticks t JOIN receipts r ON r.id = t.receipt_id WHERE t.id = ? AND r.status IN ('pending', 'unknown')", t);
+      if (live !== undefined) throw new Error(`tick ${t} already has a live receipt (${live.status})`);
+    }
     const id =
       existing !== undefined
-        ? (this.db.run('UPDATE receipts SET status = ?, tx_hash = NULL, error = NULL, updated_at = ? WHERE id = ?', r.status, r.updated_at, existing.id), existing.id)
+        ? (this.db.run(
+            `UPDATE receipts SET status = ?, tx_hash = NULL, error = NULL, updated_at = ?, tx_nonce = NULL, raw_tx = NULL, nonce_floor = NULL,
+               check_block = NULL, check_at = NULL, attempts = 0, broadcast_at = NULL WHERE id = ?`,
+            r.status, r.updated_at, existing.id,
+          ),
+          existing.id)
         : this.db.run(
             'INSERT INTO receipts (token, receipt_hash, receipt_json, amount_wei, status, tx_hash, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
             r.token, r.receipt_hash, r.receipt_json, r.amount_wei, r.status, r.tx_hash, r.error, r.created_at, r.updated_at,
@@ -582,7 +721,34 @@ export class TicksRepo {
   }
 
   updateReceipt(id: number, status: RecordStatus, txHash: string | null, error: string | null, at: number): void {
-    this.db.run('UPDATE receipts SET status = ?, tx_hash = coalesce(?, tx_hash), error = ?, updated_at = ? WHERE id = ?', status, txHash, error, at, id);
+    this.db.run(
+      'UPDATE receipts SET status = ?, tx_hash = coalesce(?, tx_hash), error = ?, updated_at = ?, check_block = NULL, check_at = NULL WHERE id = ?',
+      status, txHash, error, at, id,
+    );
+  }
+
+  /** Persists the signed transaction of a receipt BEFORE it is broadcast. */
+  markSigned(id: number, s: { hash: string; nonce: number; raw: string }, at: number): void {
+    this.db.run(
+      "UPDATE receipts SET status = 'pending', tx_hash = ?, tx_nonce = ?, raw_tx = ?, attempts = attempts + 1, broadcast_at = ?, updated_at = ? WHERE id = ?",
+      s.hash.toLowerCase(), s.nonce, s.raw, at, at, id,
+    );
+  }
+
+  /** Records a re-broadcast of the stored signed transaction. */
+  markRebroadcast(id: number, at: number): void {
+    this.db.run('UPDATE receipts SET attempts = attempts + 1, broadcast_at = ?, updated_at = ? WHERE id = ?', at, at, id);
+  }
+
+  /** Stores (or clears, with `null`s) the first phase of a "cannot be mined any more" proof. */
+  setReceiptCheck(id: number, check: { nonceFloor?: number | null; checkBlock: number | null; checkAt: number | null }): void {
+    if (check.nonceFloor !== undefined) this.db.run('UPDATE receipts SET nonce_floor = ? WHERE id = ?', check.nonceFloor, id);
+    this.db.run('UPDATE receipts SET check_block = ?, check_at = ? WHERE id = ?', check.checkBlock, check.checkAt, id);
+  }
+
+  /** Live (`pending` / `unknown`) receipts of `token`. */
+  liveReceipts(token: string): ReceiptRow[] {
+    return this.db.all<ReceiptRow>("SELECT * FROM receipts WHERE token = ? AND status IN ('pending', 'unknown') ORDER BY id", token);
   }
 
   receipt(id: number): ReceiptRow | undefined {
@@ -597,8 +763,9 @@ export class TicksRepo {
     return this.db.all<ReceiptRow>('SELECT * FROM receipts WHERE token = ? ORDER BY id DESC LIMIT ?', token, limit);
   }
 
-  receiptsWithStatus(status: RecordStatus): ReceiptRow[] {
-    return this.db.all<ReceiptRow>('SELECT * FROM receipts WHERE status = ? ORDER BY id', status);
+  receiptsWithStatus(...statuses: RecordStatus[]): ReceiptRow[] {
+    if (statuses.length === 0) return [];
+    return this.db.all<ReceiptRow>(`SELECT * FROM receipts WHERE status IN (${statuses.map(() => '?').join(',')}) ORDER BY id`, ...statuses);
   }
 }
 

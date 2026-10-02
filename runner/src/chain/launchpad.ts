@@ -5,7 +5,16 @@
  *
  * @module chain/launchpad
  */
-import { BaseError, ContractFunctionRevertedError, type Address, type Hex } from 'viem';
+import {
+  BaseError,
+  ContractFunctionRevertedError,
+  encodeFunctionData,
+  keccak256,
+  TransactionNotFoundError,
+  TransactionReceiptNotFoundError,
+  type Address,
+  type Hex,
+} from 'viem';
 import { mindLaunchpadAbi } from '@www-rh/shared';
 import type { RunnerPublicClient, RunnerWalletClient } from './clients.js';
 
@@ -33,7 +42,8 @@ export interface LaunchpadReader {
   readonly address: Address;
   getMind(token: Address): Promise<OnchainMind>;
   getCurve(token: Address): Promise<OnchainCurve>;
-  mindBalance(token: Address): Promise<bigint>;
+  /** `mindBalance(token)` at `latest`, or at `blockNumber` (drift check against the indexed state). */
+  mindBalance(token: Address, blockNumber?: bigint): Promise<bigint>;
   drawLimit(): Promise<{ maxPerEpoch: bigint; epochSeconds: number }>;
   drawnInEpoch(token: Address): Promise<{ drawn: bigint; epochStart: bigint }>;
   feeParams(): Promise<{ tradeFeeBps: number; mindShareBps: number; graduationFeeBps: number }>;
@@ -50,14 +60,41 @@ export type LaunchpadWrite =
   | { functionName: 'graduate'; args: readonly [Address] }
   | { functionName: 'harvest'; args: readonly [Address] };
 
-/** Simulates + sends transactions and waits for receipts (used by the tx queue). */
+/** A transaction signed locally; nothing has been broadcast yet. */
+export interface SignedTx {
+  hash: Hex;
+  nonce: number;
+  raw: Hex;
+}
+
+/**
+ * Simulates, signs and broadcasts operator transactions (used by the tx queue). Signing and
+ * broadcasting are separate steps so the transaction hash and nonce are known — and persisted —
+ * before anything leaves the process: a failure after that point can always be resolved by hash.
+ */
 export interface LaunchpadSender {
   /** The operator account. */
   readonly account: Address;
-  /** Simulates (`eth_call`) then sends the transaction; resolves to its hash. */
-  send(write: LaunchpadWrite): Promise<Hex>;
-  /** Waits for the receipt (rejects on timeout). */
+  /** Simulates (`eth_call`), prepares (nonce, gas, fees) and signs locally. Throws on revert or RPC failure; nothing is broadcast. */
+  sign(write: LaunchpadWrite): Promise<SignedTx>;
+  /** `eth_sendRawTransaction`; re-sending identical bytes can never create a second transaction. */
+  broadcast(raw: Hex): Promise<Hex>;
+  /** Waits for the receipt of `hash` (rejects on timeout, transport errors, or when another transaction took its nonce). */
   waitForReceipt(hash: Hex, timeoutMs: number): Promise<'success' | 'reverted'>;
+}
+
+/** Read-only chain access of the draw-receipt reconciler. */
+export interface DrawChainView {
+  /** The operator account. */
+  readonly account: Address;
+  /** `eth_getTransactionReceipt`; `null` while the transaction is not mined (or unknown to the node). */
+  transactionReceipt(hash: Hex): Promise<{ status: 'success' | 'reverted'; blockNumber: bigint } | null>;
+  /** Nonce of a transaction the node knows (`eth_getTransactionByHash`), else `null`. */
+  transactionNonce(hash: Hex): Promise<number | null>;
+  /** Operator transaction count at `latest` (= mined nonces) or `pending`. */
+  nonce(blockTag: 'latest' | 'pending'): Promise<number>;
+  /** `eth_blockNumber`. */
+  blockNumber(): Promise<bigint>;
 }
 
 /** Custom error name of a contract revert (e.g. `DrawLimitExceeded`), if `err` is one. */
@@ -85,8 +122,14 @@ export class ViemLaunchpadReader implements LaunchpadReader {
     return { realEthReserve: c.realEthReserve, tokensSold: c.tokensSold, phase: c.phase, pool: c.pool, positionId: c.positionId };
   }
 
-  mindBalance(token: Address): Promise<bigint> {
-    return this.client.readContract({ address: this.address, abi: mindLaunchpadAbi, functionName: 'mindBalance', args: [token] });
+  mindBalance(token: Address, blockNumber?: bigint): Promise<bigint> {
+    return this.client.readContract({
+      address: this.address,
+      abi: mindLaunchpadAbi,
+      functionName: 'mindBalance',
+      args: [token],
+      ...(blockNumber !== undefined ? { blockNumber } : {}),
+    });
   }
 
   async drawLimit(): Promise<{ maxPerEpoch: bigint; epochSeconds: number }> {
@@ -125,33 +168,78 @@ export class ViemLaunchpadSender implements LaunchpadSender {
     return this.walletClient.account.address;
   }
 
-  async send(write: LaunchpadWrite): Promise<Hex> {
+  /** Simulates `write` (decoded custom-error reverts) and returns its calldata. */
+  async #simulateAndEncode(write: LaunchpadWrite): Promise<Hex> {
     const base = { account: this.walletClient.account, address: this.launchpad, abi: mindLaunchpadAbi } as const;
     switch (write.functionName) {
-      case 'drawCompute': {
-        const { request } = await this.publicClient.simulateContract({ ...base, functionName: 'drawCompute', args: [...write.args] });
-        return this.walletClient.writeContract(request);
-      }
-      case 'anchorMemory': {
-        const { request } = await this.publicClient.simulateContract({ ...base, functionName: 'anchorMemory', args: [...write.args] });
-        return this.walletClient.writeContract(request);
-      }
-      case 'setMindStatus': {
-        const { request } = await this.publicClient.simulateContract({ ...base, functionName: 'setMindStatus', args: [...write.args] });
-        return this.walletClient.writeContract(request);
-      }
-      case 'graduate': {
-        const { request } = await this.publicClient.simulateContract({ ...base, functionName: 'graduate', args: [...write.args] });
-        return this.walletClient.writeContract(request);
-      }
-      case 'harvest': {
-        const { request } = await this.publicClient.simulateContract({ ...base, functionName: 'harvest', args: [...write.args] });
-        return this.walletClient.writeContract(request);
-      }
+      case 'drawCompute':
+        await this.publicClient.simulateContract({ ...base, functionName: 'drawCompute', args: [...write.args] });
+        return encodeFunctionData({ abi: mindLaunchpadAbi, functionName: 'drawCompute', args: [...write.args] });
+      case 'anchorMemory':
+        await this.publicClient.simulateContract({ ...base, functionName: 'anchorMemory', args: [...write.args] });
+        return encodeFunctionData({ abi: mindLaunchpadAbi, functionName: 'anchorMemory', args: [...write.args] });
+      case 'setMindStatus':
+        await this.publicClient.simulateContract({ ...base, functionName: 'setMindStatus', args: [...write.args] });
+        return encodeFunctionData({ abi: mindLaunchpadAbi, functionName: 'setMindStatus', args: [...write.args] });
+      case 'graduate':
+        await this.publicClient.simulateContract({ ...base, functionName: 'graduate', args: [...write.args] });
+        return encodeFunctionData({ abi: mindLaunchpadAbi, functionName: 'graduate', args: [...write.args] });
+      case 'harvest':
+        await this.publicClient.simulateContract({ ...base, functionName: 'harvest', args: [...write.args] });
+        return encodeFunctionData({ abi: mindLaunchpadAbi, functionName: 'harvest', args: [...write.args] });
     }
   }
 
+  async sign(write: LaunchpadWrite): Promise<SignedTx> {
+    const data = await this.#simulateAndEncode(write);
+    const request = await this.walletClient.prepareTransactionRequest({ account: this.walletClient.account, chain: this.walletClient.chain, to: this.launchpad, data });
+    const raw = await this.walletClient.signTransaction(request);
+    return { hash: keccak256(raw), nonce: request.nonce, raw };
+  }
+
+  broadcast(raw: Hex): Promise<Hex> {
+    return this.walletClient.sendRawTransaction({ serializedTransaction: raw });
+  }
+
   async waitForReceipt(hash: Hex, timeoutMs: number): Promise<'success' | 'reverted'> {
-    return (await this.publicClient.waitForTransactionReceipt({ hash, timeout: timeoutMs })).status;
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash, timeout: timeoutMs });
+    // viem resolves with the replacement's receipt when another transaction took the nonce
+    if (receipt.transactionHash.toLowerCase() !== hash.toLowerCase()) throw new Error(`transaction ${hash} was replaced by ${receipt.transactionHash}`);
+    return receipt.status;
+  }
+}
+
+/** viem implementation of {@link DrawChainView}. */
+export class ViemDrawChainView implements DrawChainView {
+  constructor(
+    private readonly publicClient: RunnerPublicClient,
+    readonly account: Address,
+  ) {}
+
+  async transactionReceipt(hash: Hex): Promise<{ status: 'success' | 'reverted'; blockNumber: bigint } | null> {
+    try {
+      const r = await this.publicClient.getTransactionReceipt({ hash });
+      return { status: r.status, blockNumber: r.blockNumber };
+    } catch (err) {
+      if (err instanceof BaseError && err.walk((e) => e instanceof TransactionReceiptNotFoundError) !== null) return null;
+      throw err;
+    }
+  }
+
+  async transactionNonce(hash: Hex): Promise<number | null> {
+    try {
+      return (await this.publicClient.getTransaction({ hash })).nonce;
+    } catch (err) {
+      if (err instanceof BaseError && err.walk((e) => e instanceof TransactionNotFoundError) !== null) return null;
+      throw err;
+    }
+  }
+
+  nonce(blockTag: 'latest' | 'pending'): Promise<number> {
+    return this.publicClient.getTransactionCount({ address: this.account, blockTag });
+  }
+
+  blockNumber(): Promise<bigint> {
+    return this.publicClient.getBlockNumber({ cacheTime: 0 });
   }
 }
