@@ -148,8 +148,10 @@ abstract contract PonsBaseTest is Test {
         return pending - pending * PROTOCOL_SHARE_BPS / 10_000 + MockPonsCurve(curve).creatorTaxBalance();
     }
 
-    /// @dev Buys past the threshold (auto-graduation to `Swept`).
+    /// @dev Buys past the threshold (auto-graduation to `Swept`), after the snipe-tax window if `who` is not exempt.
     function _graduate(address who, address curve) internal {
+        MockPonsCurve c = MockPonsCurve(curve);
+        if (c.currentSnipeTaxBps(who) != 0) vm.warp(c.launchedAt() + c.snipeTaxSeconds());
         _buy(who, curve, 10 ether);
         assertTrue(MockPonsCurve(curve).graduated(), "graduated");
     }

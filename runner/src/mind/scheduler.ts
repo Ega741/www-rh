@@ -15,6 +15,12 @@
  * and verified. Economics snapshots are cached for {@link SNAPSHOT_TTL_MS} (invalidated by ticks
  * and vault / status / config events) so the 1 s poll does not rescan every mind's ticks.
  *
+ * Pons mode (`docs/SPEC.md` §9.4, `deps.pons`): no curve `graduate` / `harvest` is ever sent. After
+ * each re-evaluation the harvest table runs (a `runway` harvest defers the Dormant transition: the
+ * vault is about to be refilled); an hourly sweep re-evaluates harvests; every 10 min launches swept
+ * for more than 10 min get `createGraduatedPool`, and recorded pool ids are sent with `setPoolId`
+ * (also on a live `PoolRegistered`).
+ *
  * @module mind/scheduler
  */
 import type { Address } from 'viem';
@@ -26,6 +32,7 @@ import { microToUsd } from '../economics/budget.js';
 import type { MindEconomics } from '../economics/service.js';
 import type { IndexedEvent } from '../indexer/events.js';
 import { errorMessage, type Logger } from '../log.js';
+import { PONS_HARVEST_SWEEP_MS, PONS_POOL_SWEEP_MS, type PonsOps } from './ponsOps.js';
 import type { TickInput, TickResult } from './tick.js';
 
 /** Consecutive failures before cooling. */
@@ -56,6 +63,8 @@ export interface SchedulerDeps {
   log: Logger;
   config: { maxConcurrentMinds: number; harvestIntervalMs: number };
   now?: () => number;
+  /** Pons mode: harvest / createGraduatedPool / setPoolId (replaces the curve graduation and harvest). */
+  pons?: PonsOps | null;
 }
 
 /** Schedules ticks, status transactions, graduation and harvest. */
@@ -109,18 +118,24 @@ export class Scheduler {
     return econ;
   }
 
-  /** Starts the timers and runs the one-off graduation sweep. */
+  /** Starts the timers and runs the one-off graduation (curve) / pool (Pons) sweep. */
   start(): void {
     if (this.#pollTimer !== null) return;
     this.#pollTimer = setInterval(() => void this.poll(), SCHEDULER_POLL_MS);
     this.#pollTimer.unref();
-    this.#harvestTimer = setInterval(() => this.#track(this.harvestSweep()), this.deps.config.harvestIntervalMs);
+    const pons = this.deps.pons ?? null;
+    if (pons !== null) {
+      this.#harvestTimer = setInterval(() => this.#track(pons.harvestSweep()), PONS_HARVEST_SWEEP_MS);
+      this.#graduateTimer = setInterval(() => this.#track(pons.poolSweep()), PONS_POOL_SWEEP_MS);
+    } else {
+      this.#harvestTimer = setInterval(() => this.#track(this.harvestSweep()), this.deps.config.harvestIntervalMs);
+      this.#graduateTimer = setInterval(() => this.#track(this.graduateSweep()), GRADUATE_RETRY_MS);
+    }
     this.#harvestTimer.unref();
-    this.#graduateTimer = setInterval(() => this.#track(this.graduateSweep()), GRADUATE_RETRY_MS);
     this.#graduateTimer.unref();
     this.#sweepTimer = setInterval(() => this.#track(this.sweep()), SWEEP_MS);
     this.#sweepTimer.unref();
-    this.#track(this.graduateSweep());
+    this.#track(pons !== null ? pons.poolSweep() : this.graduateSweep());
     this.#track(this.sweep());
     void this.poll();
   }
@@ -213,8 +228,12 @@ export class Scheduler {
         return;
       }
       if (opts.afterTick === true || opts.sweep === true) await this.deps.settler.settle(token);
+      // Pons: claim escrowed creator fees into the vault when worth it (§9.4)
+      const harvest = this.deps.pons != null ? await this.deps.pons.maybeHarvest(token, econ, 'evaluate') : null;
       if (mind.status === 0 && (!econ.hasBudget || !econ.modelKnown)) {
         if (this.#inFlight.has(token) && opts.afterTick !== true) return;
+        // the harvest just queued refills the vault: no Dormant round trip
+        if (harvest === 'runway' && econ.modelKnown) return;
         // a mind that never ticked has nothing to settle and costs nothing: no status transaction (spam coins)
         if (mind.last_tick_at === null) return;
         await this.deps.settler.settle(token, { force: true });
@@ -244,7 +263,12 @@ export class Scheduler {
       for (const mind of this.deps.repos.minds.all()) {
         if (this.#stopped) break;
         if (this.#inFlight.has(mind.token)) continue;
-        const relevant = mind.status === 2 || (mind.status === 0 && mind.last_tick_at !== null) || (mind.status === 1 && mind.mind_balance !== '0');
+        const relevant =
+          mind.status === 2 ||
+          (mind.status === 0 && mind.last_tick_at !== null) ||
+          (mind.status === 1 && mind.mind_balance !== '0') ||
+          // Pons: escrowed creator fees may refill an empty vault (runway harvest)
+          (this.deps.pons != null && mind.venue === 'pons' && (this.deps.repos.pons.get(mind.token)?.claimable ?? '0') !== '0');
         if (relevant) await this.reevaluate(mind.token, { sweep: true });
       }
     } finally {
@@ -269,8 +293,13 @@ export class Scheduler {
       case 'mind:funded':
       case 'compute:drawn':
       case 'mind:config':
+      case 'pons:credited':
+      case 'pons:claimed':
         this.#invalidate(ev.token);
         this.#track(this.reevaluate(ev.token));
+        break;
+      case 'pons:pool-registered':
+        if (this.deps.pons != null) this.#track(this.deps.pons.setPoolId(ev.token, ev.poolId));
         break;
       case 'mind:status':
         this.#invalidate(ev.token);
@@ -280,7 +309,8 @@ export class Scheduler {
         } else this.#track(this.reevaluate(ev.token));
         break;
       case 'curve:complete':
-        this.#track(this.#graduate(ev.token));
+        // Pons launches graduate automatically; the pool sweep seeds the v4 pool after 10 min
+        if (this.deps.pons == null) this.#track(this.#graduate(ev.token));
         break;
       default:
         break;
@@ -303,16 +333,18 @@ export class Scheduler {
     }
   }
 
-  /** When the indexer becomes live and every 10 min: graduate every mind still `Complete`. */
+  /** When the indexer becomes live and every 10 min: graduate every mind still `Complete` (curve mode only). */
   async graduateSweep(): Promise<void> {
+    if (this.deps.pons != null) return;
     for (const m of this.deps.repos.minds.all()) {
       if (this.#stopped) return;
       if (m.phase === 1) await this.#graduate(m.token);
     }
   }
 
-  /** Every `HARVEST_INTERVAL_MS`: harvest every graduated mind with `positionId != 0`. */
+  /** Every `HARVEST_INTERVAL_MS`: harvest every graduated mind with `positionId != 0` (curve mode only). */
   async harvestSweep(): Promise<void> {
+    if (this.deps.pons != null) return;
     for (const m of this.deps.repos.minds.all()) {
       if (this.#stopped) return;
       if (m.phase !== 2 || m.position_id === null || m.position_id === '0') continue;
@@ -328,6 +360,7 @@ export class Scheduler {
   /** Stops picking ticks, aborts in-flight ticks and waits for them and for background work. */
   async stop(): Promise<void> {
     this.#stopped = true;
+    this.deps.pons?.stop();
     for (const t of [this.#pollTimer, this.#harvestTimer, this.#graduateTimer, this.#sweepTimer]) if (t !== null) clearInterval(t);
     this.#pollTimer = null;
     this.#harvestTimer = null;

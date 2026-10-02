@@ -5,6 +5,10 @@
  * the spend of dry-run receipts), start the receipt reconciler (every 60 s) and the scheduler
  * (with an Anthropic key).
  *
+ * Venue (`docs/SPEC.md` §9.4): `VENUE=curve` indexes `MindLaunchpad`; `VENUE=pons` indexes
+ * `PonsMindRegistry` plus the Pons logs of the registered tokens, reads `claimable(token)` and runs
+ * the Pons harvest / pool transactions. The MindCore surface (draws, anchors, status) is shared.
+ *
  * Shutdown runs in bounded stages — scheduler (ticks aborted), receipt reconciler, tx queue
  * (≤ 30 s), anchoring, metadata resolution, browser, indexer, WS hub + HTTP server — and always
  * closes the DB last, after every background DB writer has stopped.
@@ -22,8 +26,9 @@ import { createEgressFilter, type EgressFilter } from './browser/egress.js';
 import { BrowserPool } from './browser/pool.js';
 import { createChainClients, type ChainClients } from './chain/clients.js';
 import { ViemDrawChainView, ViemLaunchpadReader, ViemLaunchpadSender, type LaunchpadReader } from './chain/launchpad.js';
+import { LaunchConfigCache, ViemPonsReader, type PonsReader } from './chain/pons.js';
 import { TxQueue } from './chain/txQueue.js';
-import type { RunnerConfig } from './config.js';
+import { mindContract, type RunnerConfig } from './config.js';
 import { Repos } from './db/repos.js';
 import { Db } from './db/sqlite.js';
 import { microToUsd } from './economics/budget.js';
@@ -32,10 +37,13 @@ import { EconomicsService, type MindEconomics } from './economics/service.js';
 import { Settler } from './economics/settle.js';
 import { IndexerEvents, type IndexedEvent } from './indexer/events.js';
 import { Indexer } from './indexer/indexer.js';
+import { PonsIndexerVenue } from './indexer/pons.js';
 import { ViemLogSource, type LogSource } from './indexer/source.js';
+import { CurveIndexerVenue } from './indexer/venue.js';
 import { createLogger, errorMessage, type Logger } from './log.js';
 import { MemoryService } from './memory/memory.js';
 import { MetadataResolver } from './metadata/resolve.js';
+import { PonsOps } from './mind/ponsOps.js';
 import { Scheduler } from './mind/scheduler.js';
 import { runTick, sdkRunnerFactory, type RunnerFactory, type TickDeps } from './mind/tick.js';
 import { StreamBus } from './stream/bus.js';
@@ -49,6 +57,8 @@ export const SHUTDOWN_STAGE_MS = { scheduler: 10_000, settler: 3_000, queue: 30_
 /** Optional overrides (tests, CLI). */
 export interface RunnerOverrides {
   logSource?: LogSource;
+  /** Pons chain reads (tests). */
+  ponsReader?: PonsReader;
   egress?: EgressFilter;
   createRunner?: RunnerFactory;
   /** Skip the HTTP server (CLI commands). */
@@ -66,7 +76,10 @@ export interface RunnerApp {
   economics: EconomicsService;
   memory: MemoryService;
   settler: Settler;
+  /** MindCore reads on the launchpad (curve) or the registry (pons). */
   reader: LaunchpadReader | null;
+  /** Pons reads (Pons mode with a registry). */
+  ponsReader: PonsReader | null;
   clients: ChainClients;
   server: RunningServer | null;
   scheduler(): Scheduler | null;
@@ -76,12 +89,14 @@ export interface RunnerApp {
   stop(): Promise<void>;
 }
 
-/** Wires every service from `config`. Throws when no launchpad is known outside dry run. */
+/** Wires every service from `config`. Throws when no launchpad (curve) / registry (pons) is known outside dry run. */
 export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOverrides = {}): Promise<RunnerApp> {
   const log = overrides.log ?? createLogger('runner');
-  if (config.launchpad === null) {
-    if (!config.dryRun) throw new Error('no launchpad address: set LAUNCHPAD_ADDRESS or run `pnpm deployments:sync` (refusing to send transactions)');
-    log.error('no launchpad address (LAUNCHPAD_ADDRESS unset and no deployment for CHAIN_ID): running degraded — API up, indexer tracks the head only');
+  const contract = mindContract(config);
+  if (contract === null) {
+    const [what, env] = config.venue === 'pons' ? ['registry', 'REGISTRY_ADDRESS'] : ['launchpad', 'LAUNCHPAD_ADDRESS'];
+    if (!config.dryRun) throw new Error(`no ${what} address (VENUE=${config.venue}): set ${env} or run \`pnpm deployments:sync\` (refusing to send transactions)`);
+    log.error(`no ${what} address (VENUE=${config.venue}, ${env} unset and no deployment for CHAIN_ID): running degraded — API up, indexer tracks the head only`);
   }
 
   const db = Db.open(config.dbPath);
@@ -96,15 +111,17 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
     pollingIntervalMs: 1_000,
   });
   const operatorAccount = config.operatorPrivateKey === null ? null : privateKeyToAccount(config.operatorPrivateKey);
-  const reader = config.launchpad === null ? null : new ViemLaunchpadReader(config.launchpad, clients.publicClient);
-  const sender = !config.dryRun && clients.walletClient !== null && config.launchpad !== null ? new ViemLaunchpadSender(config.launchpad, clients.publicClient, clients.walletClient) : null;
+  // MindCore reads / writes have the same selectors on the launchpad and on the registry
+  const reader = contract === null ? null : new ViemLaunchpadReader(contract, clients.publicClient);
+  const ponsReader = config.venue === 'pons' && config.registry !== null ? (overrides.ponsReader ?? new ViemPonsReader(config.registry, clients.publicClient, config.pons)) : null;
+  const sender = !config.dryRun && clients.walletClient !== null && contract !== null ? new ViemLaunchpadSender(contract, clients.publicClient, clients.walletClient, config.venue) : null;
   const queue = new TxQueue(sender, log.child('tx'), config.dryRun ? (config.operatorPrivateKey === null ? 'no OPERATOR_PRIVATE_KEY' : 'DRY_RUN') : null);
 
   const ethUsd =
     config.ethUsdFeed === null
       ? new FixedEthUsd(config.ethUsdPriceMicro, config.ethUsdBoundsMicro, log.child('eth-usd'))
       : new FeedEthUsd(clients.publicClient, config.ethUsdFeed, config.ethUsdPriceMicro, log.child('eth-usd'), Date.now, config.ethUsdBoundsMicro);
-  const economics = new EconomicsService(repos, ethUsd, reader, config, log.child('economics'));
+  const economics = new EconomicsService(repos, ethUsd, reader, config, log.child('economics'), Date.now, ponsReader === null ? null : (token) => ponsReader.claimable(token));
   const bus = new StreamBus();
   const memory = new MemoryService(repos, bus, queue, { anchorEvery: config.anchorEveryNMemories }, log.child('memory'));
   const egress = overrides.egress ?? createEgressFilter();
@@ -114,9 +131,16 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
     repos,
     overrides.logSource ?? new ViemLogSource(clients.publicClient),
     events,
-    { address: config.launchpad, startBlock: config.startBlock, confirmations: config.confirmations, balanceReader: reader },
+    {
+      address: contract,
+      venue: config.venue === 'pons' ? new PonsIndexerVenue(config.registry, ponsReader, log.child('indexer')) : new CurveIndexerVenue(config.launchpad),
+      startBlock: config.startBlock,
+      confirmations: config.confirmations,
+      balanceReader: reader,
+    },
     log.child('indexer'),
   );
+  const launchConfig = ponsReader === null ? null : new LaunchConfigCache(() => ponsReader.launchConfig());
 
   const publish = (token: string, m: WsServerMessage): void => bus.publish(token, m);
   const publishBudget = (token: string, econ: MindEconomics): void =>
@@ -181,6 +205,11 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
         if (ev.type === 'compute:drawn') economics.invalidateEpoch(ev.token);
         refreshBudget(ev.token);
         break;
+      case 'pons:credited':
+      case 'pons:claimed':
+      case 'harvested':
+        economics.invalidateClaimable(ev.token);
+        break;
       default:
         break;
     }
@@ -216,6 +245,7 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
     memory,
     settler,
     reader,
+    ponsReader,
     clients,
     get server() {
       return server;
@@ -223,7 +253,7 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
     scheduler: () => scheduler,
     tickDeps,
     async start() {
-      log.info('starting runner', { version: RUNNER_VERSION, chainId: config.chainId, launchpad: config.launchpad, dryRun: queue.dryRun, db: config.dbPath });
+      log.info('starting runner', { version: RUNNER_VERSION, chainId: config.chainId, venue: config.venue, launchpad: config.launchpad, registry: config.registry, dryRun: queue.dryRun, db: config.dbPath });
       indexer.start();
       metadata.sweepPending();
       metadataTimer = setInterval(() => metadata.sweepPending(), 30_000);
@@ -235,9 +265,12 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
           bus,
           origins: config.publicWebOrigins,
           log: log.child('api'),
+          launchConfig: launchConfig === null ? null : () => launchConfig.get(),
           status: {
             chainId: config.chainId,
+            venue: config.venue,
             launchpad: config.launchpad,
+            registry: config.registry,
             dryRun: () => queue.dryRun,
             indexer: () => indexer.status,
             activeMinds: () => scheduler?.inFlight ?? 0,
@@ -275,6 +308,10 @@ export async function createRunnerApp(config: RunnerConfig, overrides: RunnerOve
           publishBudget,
           log: log.child('scheduler'),
           config: { maxConcurrentMinds: config.maxConcurrentMinds, harvestIntervalMs: config.harvestIntervalMs },
+          pons:
+            config.venue === 'pons'
+              ? new PonsOps({ repos, queue, reader: ponsReader, economics, log: log.child('pons'), config: { harvestMinWei: config.harvestMinWei, harvestIntervalMs: config.harvestIntervalMs } })
+              : null,
         });
         scheduler.start();
         log.info('scheduler started', { maxConcurrentMinds: config.maxConcurrentMinds });

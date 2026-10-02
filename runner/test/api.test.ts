@@ -88,9 +88,11 @@ describe('HTTP API (SPEC §5)', () => {
     const w = world();
     const { status, body } = await getJson(w, '/api/health');
     expect(status).toBe(200);
-    expect(healthResponseSchema.parse(body)).toEqual({ ok: true, chainId: 46630, launchpad: '0x5fbdb2315678afecb367f032d93f642f64180aa3', lastIndexedBlock: 118, headBlock: 120, activeMinds: 1, dryRun: true });
+    expect(healthResponseSchema.parse(body)).toEqual({
+      ok: true, chainId: 46630, venue: 'curve', launchpad: '0x5fbdb2315678afecb367f032d93f642f64180aa3', registry: null, lastIndexedBlock: 118, headBlock: 120, activeMinds: 1, dryRun: true,
+    });
     const degraded = await getJson(world({ launchpad: null }), '/api/health');
-    expect(healthResponseSchema.parse(degraded.body)).toMatchObject({ ok: false, launchpad: '0x0000000000000000000000000000000000000000' });
+    expect(healthResponseSchema.parse(degraded.body)).toMatchObject({ ok: false, venue: 'curve', launchpad: '0x0000000000000000000000000000000000000000', registry: null });
   });
 
   it('GET /api/minds: DTOs, 24 h activity (gross ETH), sorting, cursor pagination, validation', async () => {

@@ -311,7 +311,7 @@ describe('PonsMindRegistry / MindAccount ABIs (§9.2)', () => {
     const fns = names(ponsMindRegistryAbi, 'function');
     for (const name of [
       'launchMind', 'prepareAdoption', 'activateAdoption', 'leave', 'harvest', 'createGraduatedPool', 'setPoolId', 'ponsMind', 'accountOf', 'tokenOf',
-      'predictAccount', 'predictAdoptionAccount', 'claimable', 'launchQuote', 'factory', 'feeEscrow', 'memeHook', 'accountImplementation', 'mindFeeBps', 'setMindFeeBps',
+      'predictAccount', 'predictAdoptionAccount', 'claimable', 'poolIdOf', 'launchQuote', 'factory', 'feeEscrow', 'memeHook', 'accountImplementation', 'mindFeeBps', 'setMindFeeBps',
       'fundMind', 'drawCompute', 'anchorMemory', 'setMindStatus', 'setMindConfig', 'setCreatorPaused', 'getMind', 'mindBalance', 'protocolBalance', 'mindsLength',
       'mindAt', 'isMind', 'creationFee', 'setCreationFee', 'drawLimit', 'setDrawLimit', 'drawnInEpoch', 'operator', 'treasury', 'computeTreasury', 'setOperator',
       'setTreasury', 'setComputeTreasury', 'pause', 'unpause', 'paused', 'withdrawProtocolFees', 'owner', 'pendingOwner', 'transferOwnership', 'acceptOwnership',
@@ -347,8 +347,8 @@ describe('PonsMindRegistry / MindAccount ABIs (§9.2)', () => {
     for (const [topic, sig] of lp.events) if (names(ponsMindRegistryAbi, 'event').has(sig.slice(0, sig.indexOf('(')))) expect(reg.events.get(topic), sig).toBe(sig);
   });
 
-  it('MindAccount has exactly the §9.2 functions', () => {
-    expect(sorted(mindAccountAbi, 'function')).toEqual(['claim', 'initialize', 'registry', 'sweepPool', 'transferFeeRecipient']);
+  it('MindAccount has the §9.2 functions plus sweepCurve', () => {
+    expect(sorted(mindAccountAbi, 'function')).toEqual(['claim', 'initialize', 'registry', 'sweepCurve', 'sweepPool', 'transferFeeRecipient']);
     expect(mindAccountAbi.some((i) => i.type === 'receive')).toBe(true);
   });
 });

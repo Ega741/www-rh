@@ -6,6 +6,8 @@
  *
  * Usage: node scripts/sync-abi.mjs [--no-check]
  * Requires: `forge build` (contracts/out) and `pnpm --filter @www-rh/shared build` (dist/abi.js).
+ * Pons mode (docs/SPEC.md §9.2): PonsMindRegistry and MindAccount are checked against
+ * ponsMindRegistryAbi / mindAccountAbi; until they are compiled their absence is reported, not fatal.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +26,9 @@ const CONTRACTS = [
   { name: 'IGraduator', shared: 'graduatorAbi', alsoFrom: ['UniswapV3Graduator', 'MockGraduator'] },
   { name: 'UniswapV3Graduator', shared: null },
   { name: 'MockGraduator', shared: null },
+  // Pons mode (§9.2); optional until the contracts exist
+  { name: 'PonsMindRegistry', shared: 'ponsMindRegistryAbi', optional: true },
+  { name: 'MindAccount', shared: 'mindAccountAbi', optional: true },
 ];
 
 function typeOf(input) {
@@ -62,9 +67,13 @@ function implementationSignatures(names) {
   return out;
 }
 
-for (const { name, shared, alsoFrom } of CONTRACTS) {
+for (const { name, shared, alsoFrom, optional } of CONTRACTS) {
   const artifact = path.join(outDir, `${name}.sol`, `${name}.json`);
   if (!existsSync(artifact)) {
+    if (optional) {
+      console.warn(`skipped ${name}: no artifact ${path.relative(root, artifact)} (not compiled yet)`);
+      continue;
+    }
     console.error(`missing artifact ${artifact}: run \`forge build\` in contracts/ first`);
     process.exit(2);
   }

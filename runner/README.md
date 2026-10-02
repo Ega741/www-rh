@@ -4,14 +4,16 @@ The runner gives every coin on the launchpad a **mind**: a Claude model driving 
 remembering what it finds, and paying for its own compute out of the coin's trading fees. It is a
 single Node 22 process that
 
-- **indexes** `MindLaunchpad` logs into SQLite (`node:sqlite`, WAL),
+- **indexes** the minds' contract into SQLite (`node:sqlite`, WAL): `PonsMindRegistry` plus the Pons V2
+  logs of the registered tokens in **Pons mode** (`VENUE=pons`, the mainnet default, see
+  [Pons mode](#pons-mode)), or `MindLaunchpad` in **curve mode** (`VENUE=curve`, testnet / anvil),
 - **schedules ticks**: one tick = one Claude tool-runner conversation with browser / memory tools,
 - **accounts** every API response at the model that served it and **settles** the spend on-chain with
   `drawCompute(token, amountWei, receiptHash)`,
 - **anchors** memories on-chain in batches with `anchorMemory(token, toSeq, contentHash, uri)`,
 - serves the **HTTP API** (`/api/*`) and the **WebSocket stream** (`/ws`) used by the web app.
 
-The normative description is `docs/SPEC.md` §3–§6.
+The normative description is `docs/SPEC.md` §3–§6 and §9 (Pons mode).
 
 ## Run
 
@@ -22,6 +24,14 @@ pnpm --filter @www-rh/runner build
 
 # minimal local run (anvil + MockGraduator deployment, nothing is ever sent):
 RPC_URL=http://127.0.0.1:8545 CHAIN_ID=31337 LAUNCHPAD_ADDRESS=0x… DRY_RUN=true \
+  node runner/dist/main.js
+
+# Pons mode on mainnet (VENUE defaults to pons on 4663; the Pons addresses come from @www-rh/shared):
+RPC_URL=https://rpc.mainnet.chain.robinhood.com CHAIN_ID=4663 REGISTRY_ADDRESS=0x… DRY_RUN=true \
+  node runner/dist/main.js
+
+# Pons mode against a local registry + Pons mocks (factory / escrow / hook are read from the registry):
+RPC_URL=http://127.0.0.1:8545 CHAIN_ID=31337 VENUE=pons REGISTRY_ADDRESS=0x… DRY_RUN=true \
   node runner/dist/main.js
 
 # or with the repository .env file
@@ -36,10 +46,10 @@ CLI (`node runner/dist/cli.js …`, also installed as `www-rh-runner`):
 | Command | What it does |
 |---|---|
 | `start` | indexer + API/WS + scheduler (same as `dist/main.js`) |
-| `index [--follow]` | index launchpad logs up to the head (and keep following) |
+| `index [--follow]` | index the venue's logs up to the head (and keep following) |
 | `tick --token 0x…` | run one tick of one mind now (needs `ANTHROPIC_API_KEY`) |
-| `graduate --token 0x…` | queue `graduate(token)` if the curve is `Complete` (DRY_RUN-aware) |
-| `harvest --token 0x…` | queue `harvest(token)` if the coin is `Graduated` (DRY_RUN-aware) |
+| `graduate --token 0x…` | curve: queue `graduate(token)` if the curve is `Complete`; pons: queue `createGraduatedPool(token)` if the launch is `Swept` (DRY_RUN-aware) |
+| `harvest --token 0x…` | curve: queue `harvest(token)` if the coin is `Graduated`; pons: queue the registry's `harvest(token)` (DRY_RUN-aware) |
 | `--help` | usage |
 
 Startup order: open DB → start indexer → API/WS → once the indexer has processed the head it saw at
@@ -57,9 +67,10 @@ close the WebSocket hub and then the HTTP server (≤ 3 s), and finally — alwa
 timed out — close the DB. A stage that times out is logged and skipped; the process is forced out
 after 70 s.
 
-Without a launchpad address the runner refuses to start unless `DRY_RUN` is on; in dry run it starts
-degraded (API up, `/api/health` `ok: false`, the indexer only tracks the chain head and retries the
-RPC with exponential backoff).
+Without a launchpad address (curve mode) / registry address (Pons mode) the runner refuses to start
+unless `DRY_RUN` is on; in dry run it starts degraded (API up, `/api/health` `ok: false`, the indexer
+only tracks the chain head and retries the RPC with exponential backoff). An unreachable RPC never
+stops the process: the indexer retries with backoff and the API keeps answering.
 
 ## Environment
 
@@ -67,7 +78,13 @@ RPC with exponential backoff).
 |---|---|---|
 | `CHAIN_ID` | `46630` | 4663 mainnet, 46630 testnet, 31337 anvil |
 | `RPC_URL` | required | JSON-RPC HTTP endpoint |
-| `LAUNCHPAD_ADDRESS` | unset | overrides `launchpadAddress(CHAIN_ID)` from `@www-rh/shared` (zero address = unset) |
+| `VENUE` | `pons` on 4663, `curve` elsewhere | `pons`: index `PonsMindRegistry` + Pons V2; `curve`: index `MindLaunchpad` |
+| `LAUNCHPAD_ADDRESS` | unset | curve mode: overrides `launchpadAddress(CHAIN_ID)` from `@www-rh/shared` (zero address = unset) |
+| `REGISTRY_ADDRESS` | unset | Pons mode: overrides `registryAddress(CHAIN_ID)` from `@www-rh/shared` (zero address = unset) |
+| `HARVEST_MIN_WEI` | `2000000000000000` | Pons mode: harvest when `claimable(token)` reaches this (wei, 0.002 ether) |
+| `PONS_FACTORY` | `PONS.factory` on 4663 | Pons V2 `PonsV2LaunchFactory`; elsewhere read from `registry.factory()` when unset |
+| `PONS_FEE_ESCROW` | `PONS.feeEscrow` on 4663 | Pons V2 `FeeEscrow`; elsewhere read from `registry.feeEscrow()` when unset |
+| `PONS_MEME_HOOK` | `PONS.memeHook` on 4663 | Pons V2 `PonsV2MemeHook`; elsewhere read from `registry.memeHook()` when unset |
 | `START_BLOCK` | `0` | first block indexed when the DB is empty |
 | `CONFIRMATIONS` | `0` | index only up to `head − CONFIRMATIONS` |
 | `OPERATOR_PRIVATE_KEY` | unset | operator hot wallet; unset or `0x` forces dry run |
@@ -91,7 +108,7 @@ RPC with exponential backoff).
 | `TICK_TIMEOUT_MS` | `180000` | wall-clock limit of a tick |
 | `TOOL_TIMEOUT_MS` | `30000` | deadline of one tool call inside a tick (≥ 1000); a timed-out tool returns an `error:` result and resets the browser context |
 | `ANCHOR_EVERY_N_MEMORIES` | `5` | memories per anchor batch |
-| `HARVEST_INTERVAL_MS` | `21600000` | harvest sweep interval |
+| `HARVEST_INTERVAL_MS` | `21600000` | curve: harvest sweep interval; Pons: minimum spacing of the graduated-pool harvests of the hourly sweep |
 | `BROWSER_HEADLESS` | `true` | Chromium headless |
 | `FRAME_FPS` | `1` | frame capture rate while a tick runs |
 | `IPFS_GATEWAY` | `https://ipfs.io/ipfs/` | gateway for `ipfs://` metadata and images |
@@ -154,6 +171,71 @@ config events.
 every 10 min) for every mind still `Complete`; a revert such as `PoolPriceSkewed` is simply retried
 by the next sweep. `CurveReopened` (a post-grace sell on a `Complete` curve) sets the phase back to
 `bonding`. Graduated coins are harvested every `HARVEST_INTERVAL_MS`.
+
+### Pons mode
+
+`VENUE=pons` (the default on 4663) layers minds on Pons V2 launches (`docs/SPEC.md` §9): the
+registry (`PonsMindRegistry`) holds the same MindCore surface as the launchpad — vault, draws,
+anchors, status, config — so settlement, anchoring and status management are unchanged; only the
+indexing, the budget's income and the venue transactions differ.
+
+**Indexing.** Per range: the registry's logs (MindCore events plus `MindLaunched`, `AdoptionPrepared`,
+`MindAdopted`, `MindLeft`, `PoolIdSet`, …); new registrations are resolved with chain reads before
+anything is applied (curve, `getLaunchedToken`, curve fee / creator tax / threshold, token supply,
+and — `prepareAdoption` emits no `MindCreated` — the mind from `getMind` + the token's name / symbol).
+Then, for every registered token: `CurveBuy` / `CurveSell` / `CurveBuyRefunded` / `FeesSwept` /
+`CurveCompleted` of the known curves (address-filtered `eth_getLogs`), the factory's `LaunchSwept` /
+`PoolGraduated` / `CreatorFeeRecipientUpdated` filtered by token, the escrow's `Credited` / `Claimed`
+filtered by mind account, and the hook's `PoolRegistered` filtered by memecoin. Everything is
+applied in `(blockNumber, logIndex)` order in the range's single transaction (idempotent).
+
+| Pons | runner / API |
+|---|---|
+| `CurveBuy` / `CurveSell` | §5 `Trade`: `ethAmountWei` = `quoteIn` (spent) / `quoteOut`, `feeWei` = fee + tax, `trader` = recipient (buys) / seller (sells), post-trade `priceWei` from the reserves, `realEthReserveWei` = `realQuoteReserve`, `tokensSold` = supply − token reserve |
+| `LaunchSwept` / `CurveCompleted` (phase `Swept`) | phase `complete`, price frozen at the final curve state |
+| `PoolGraduated` (`PoolCreated`), `Rescued` (read by the pool sweep) | phase `graduated`, `positionId` |
+| escrow `Credited` − `Claimed` (mind account) | `MindDetail.pons.claimableWei` |
+| hook `PoolRegistered` | `MindDetail.pons.poolId`, then `setPoolId` |
+| `Harvested` | vault income (`StatsResponse.totalFeesToMindsWei`) |
+
+Post-trade reserves are anchored to chain state: for every (curve, block) with trades the runner reads
+`getReserves()` + `realQuoteReserve()` at that block and walks the block's trades back from it (from the
+`CurveCompleted` amounts when the block graduated the curve). When the node cannot serve that
+historical read, reserves follow forward from the last indexed state. Market cap = price × token
+supply; progress = `realQuoteReserve · 10000 / graduationThreshold` while bonding.
+
+**Budget.** `availableUsd` counts the vault (`mindBalance`) only. Creator fees reach the mind in two
+steps: a sweep credits them to the mind account in the Pons escrow (Pons' operator, or `harvest`
+itself), then `harvest(token)` claims them into the vault. `claimableWei` (`registry.claimable(token)`,
+cached 60 s, the indexed escrow balance as fallback) is reported in `MindDetail.pons`.
+
+**Harvest** (`registry.harvest(token)`, operator transaction, ≤ 1 per mind per 5 min):
+
+| rule | when | reason |
+|---|---|---|
+| 1 | `claimable ≥ HARVEST_MIN_WEI` | `threshold` |
+| 2 | the vault cannot cover the next tick and vault + claimable + sweepable can | `runway` (the Dormant transition is skipped: the vault is about to be refilled) |
+| 3 | hourly sweep: `claimable + sweepable ≥ HARVEST_MIN_WEI` | `hourly` |
+| 4 | hourly sweep: graduated, pool id recorded, no harvest for `HARVEST_INTERVAL_MS` | `pool` |
+
+`sweepable` is the creator share of the curve fees indexed since the last `FeesSwept`, counted while
+`harvest` can sweep the curve itself (still bonding; launched here or adopted). Rules 1–2 run after
+every tick and on vault / escrow events; the 60 s sweep also re-evaluates minds with an escrow balance.
+
+**Graduation.** Pons graduates the curve itself (phase `Swept`); nothing is sent for the curve. A
+launch `Swept` for more than 10 min gets `createGraduatedPool(token)` (best effort, re-read first,
+retried every 10 min). The hook's pool id is recorded on the registry with `setPoolId` (on a live
+`PoolRegistered`, and by the 10-min sweep for any pool id the registry does not have yet). No
+`MindLaunchpad.graduate` / curve harvest is ever sent in Pons mode. All of this runs in the scheduler
+(started once the indexer is live and `ANTHROPIC_API_KEY` is set) and goes through the DRY_RUN-aware
+transaction queue.
+
+**API.** `/api/health` adds `venue` and `registry`; `MindSummary.venue`; `MindDetail.pons`
+(`curve, account, deployer, launchConfigId, feeBps, creatorTaxBps, claimableWei, launchedHere, adopted,
+poolId`, `null` for curve minds); `GET /api/launch-config` (Pons only, 404 in curve mode) returns the
+factory's `{ launchFee, configs, maxCreatorTaxBps, snipeTaxSeconds }` through a 60 s read-through cache.
+
+Pons' own contracts (factory, curves, escrow, hook) are third-party and outside the www-rh audit.
 
 ### Browser safety
 
@@ -227,7 +309,7 @@ All under `/api`; addresses lowercase, wei amounts decimal strings named `…Wei
 
 | Route | Response |
 |---|---|
-| `GET /api/health` | `{ ok, chainId, launchpad, lastIndexedBlock, headBlock, activeMinds, dryRun }` |
+| `GET /api/health` | `{ ok, chainId, venue, launchpad, registry, lastIndexedBlock, headBlock, activeMinds, dryRun }` |
 | `GET /api/minds?sort=created\|mcap\|activity&limit=1..200&cursor=` | `{ items: MindSummary[], nextCursor }` |
 | `GET /api/minds/:token` | `MindDetail` |
 | `GET /api/minds/:token/trades?limit=1..500` | `Trade[]` newest first |
@@ -237,11 +319,14 @@ All under `/api`; addresses lowercase, wei amounts decimal strings named `…Wei
 | `GET /api/minds/:token/compute` | `ComputeResponse` (ledger, `receipts`, draws) |
 | `GET /api/minds/:token/frame.jpg` | last frame (`Cache-Control: no-store`) or 404 |
 | `GET /api/models` | public model catalog |
+| `GET /api/launch-config` | Pons mode: `{ launchFee, configs: [{ id, supply, curveFeeBps, phantomQuote, graduationThreshold, enabled }], maxCreatorTaxBps, snipeTaxSeconds }` (cached 60 s; 404 in curve mode, 500 when the factory cannot be read) |
 | `GET /api/stats` | `{ minds, alive, graduated, totalVolumeWei, totalFeesToMindsWei }` |
 | `POST /api/metadata` | `{ uri, hash, personaHash }` (≤ 32 KB — chunked bodies are streamed and cut at the limit, 413 + connection closed; strict schema, 60 req/min) |
 | `GET /api/metadata/:hash` | the stored metadata document (immutable) |
 
-DTO schemas: `@www-rh/shared` (`mindSummarySchema`, `computeResponseSchema`, …).
+DTO schemas: `@www-rh/shared` (`mindSummarySchema`, `computeResponseSchema`, `launchConfigResponseSchema`, …).
+`MindSummary` / `MindDetail` carry `venue`; `MindDetail.pons` is the Pons launch state (see
+[Pons mode](#pons-mode)).
 
 ## WebSocket `/ws?token=0x…`
 
@@ -307,8 +392,13 @@ settlement tables, the receipt lifecycle (`test/settlement.test.ts`: tx-queue ou
 after an unknown outcome, reconciliation by hash / nonce / indexed log, dry-run spend in live mode,
 schema migration), egress filter (IP classes, IPv4-mapped IPv6, NAT64, stub resolver, redirect hops,
 CONNECT tunnels, metadata deadline), indexer idempotency / ordering / live-vs-replay / lagging node /
-reorg rewind / balance drift, scheduler (fake clock, fake ticks, sweep, persona gating, snapshot
-cache), tick loop (fake tool runner: stop reasons, retries, JSON rebuild, timeout, hung tools and
+reorg rewind / balance drift, the Pons indexer (`test/pons.indexer.test.ts`: fake registry / curve /
+factory / escrow / hook logs — registration, trade DTO mapping, per-block reserve anchoring and the
+forward fallback, escrow balance, sweep / graduation phases, pool ids, adoption, idempotent replay —
+and the curve venue), the harvest decision table, Pons scheduler operations (createGraduatedPool after
+10 min `Swept`, setPoolId, no curve graduate / harvest, runway harvest instead of Dormant), the
+launch-config route and its cache, Pons DTO schema conformance, a Pons-mode startup against an
+unreachable RPC, scheduler (fake clock, fake ticks, sweep, persona gating, snapshot cache), tick loop (fake tool runner: stop reasons, retries, JSON rebuild, timeout, hung tools and
 runners, per-iteration usage), API + WS handlers on an in-memory DB (chunked body limit, shutdown with
 open WebSockets), metadata resolution, tool input validation and deadlines, request shapes per model,
 and Playwright tests (extraction caps and isolated world, busy-loop timeouts, fetch-body disposal,

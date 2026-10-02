@@ -15,7 +15,7 @@ import {UniswapV3Graduator} from "../src/UniswapV3Graduator.sol";
 ///         `transferOwnership(OWNER)` on the launchpad and on a `UniswapV3Graduator` — Ownable2Step, so `OWNER` must
 ///         call `acceptOwnership()` on each afterwards, (5) assert the wiring, (6) write
 ///         `deployments/<chainId>.json` with the keys `chainId`, `launchpad`, `graduator`, `graduatorKind`,
-///         `deployedAt` (unix seconds). Dry runs (no `--broadcast`) write `deployments/dry-run/<chainId>.json`.
+///         `venue` (`"curve"`, SPEC §9.2) and `deployedAt` (unix seconds). Dry runs (no `--broadcast`) write `deployments/dry-run/<chainId>.json`.
 /// @dev Environment:
 ///      - `DEPLOYER_PRIVATE_KEY`  (required) broadcaster key.
 ///      - `OWNER`, `TREASURY`, `COMPUTE_TREASURY`, `OPERATOR`  each defaults to the deployer when unset/empty.
@@ -180,6 +180,7 @@ contract Deploy is Script {
         vm.serializeAddress(obj, "launchpad", d.launchpad);
         vm.serializeAddress(obj, "graduator", d.graduator);
         vm.serializeString(obj, "graduatorKind", d.graduatorKind);
+        vm.serializeString(obj, "venue", "curve");
         vm.serializeUint(obj, "chainId", block.chainid);
         string memory json = vm.serializeUint(obj, "deployedAt", block.timestamp);
         vm.writeJson(json, d.outFile);

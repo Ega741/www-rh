@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /**
  * Runner CLI: `start | index [--follow] | tick --token <0x…> | graduate --token <0x…> |
- * harvest --token <0x…> | --help`. Every command reads the same environment as `main.ts`.
+ * harvest --token <0x…> | --help`. Every command reads the same environment as `main.ts`;
+ * `graduate` / `harvest` follow `VENUE` (Pons: `createGraduatedPool` / registry `harvest`).
  *
  * @module cli
  */
 import { parseArgs } from 'node:util';
 import type { Address } from 'viem';
-import { curvePhaseName, modelById } from '@www-rh/shared';
+import { curvePhaseName, modelById, ponsPhaseName } from '@www-rh/shared';
 import { createRunnerApp } from './app.js';
 import { ConfigError, ENV_VARS, loadConfig } from './config.js';
 import { microToUsd } from './economics/budget.js';
@@ -20,10 +21,12 @@ export const USAGE = `www-rh runner — every coin has a mind
 
 Usage:
   www-rh-runner start                      run indexer + API/WS + scheduler (same as dist/main.js)
-  www-rh-runner index [--follow]           index launchpad logs up to the head (and keep following with --follow)
+  www-rh-runner index [--follow]           index launchpad (curve) / registry + Pons (pons) logs up to the head (--follow keeps following)
   www-rh-runner tick --token <address>     run one tick of one mind now (needs ANTHROPIC_API_KEY)
-  www-rh-runner graduate --token <address> queue graduate(token) if the curve is Complete (DRY_RUN-aware)
-  www-rh-runner harvest --token <address>  queue harvest(token) if the coin is Graduated (DRY_RUN-aware)
+  www-rh-runner graduate --token <address> curve: queue graduate(token) if the curve is Complete
+                                           pons: queue createGraduatedPool(token) if the launch is Swept (DRY_RUN-aware)
+  www-rh-runner harvest --token <address>  curve: queue harvest(token) if the coin is Graduated
+                                           pons: queue registry harvest(token) (sweep + claim into the vault; DRY_RUN-aware)
   www-rh-runner --help                     show this help
 
 Environment (see the repository .env.example and runner/README.md):
@@ -118,6 +121,20 @@ export async function cli(argv: string[]): Promise<number> {
       const token = requireToken(values.token);
       const app = await createRunnerApp(config, { api: false });
       try {
+        if (config.venue === 'pons') {
+          if (app.ponsReader === null) throw new Error('no registry address configured (REGISTRY_ADDRESS)');
+          if (command === 'graduate') {
+            const phase = (await app.ponsReader.launchedToken(token)).phase;
+            if (phase !== 1) {
+              process.stdout.write(`skipped: Pons launch phase is ${ponsPhaseName(phase)} (${phase})\n`);
+              return 0;
+            }
+          }
+          const write = command === 'graduate' ? ({ functionName: 'createGraduatedPool', args: [token] } as const) : ({ functionName: 'harvest', args: [token] } as const);
+          const outcome = await app.queue.enqueue(write, `${write.functionName} ${token}`);
+          process.stdout.write(`${JSON.stringify(outcome)}\n`);
+          return outcome.kind === 'confirmed' || outcome.kind === 'dry_run' ? 0 : 1;
+        }
         if (app.reader === null) throw new Error('no launchpad address configured');
         const curve = await app.reader.getCurve(token);
         const wanted = command === 'graduate' ? 1 : 2;

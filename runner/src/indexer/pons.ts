@@ -175,7 +175,7 @@ export class PonsIndexerVenue implements IndexerVenue {
     const launch = await soft('getLaunchedToken', reader ? () => reader.launchedToken(token) : undefined);
     let curve = r.curve ?? (launch !== null && launch.curve !== zeroAddress ? launch.curve.toLowerCase() : null);
     let pons: OnchainPonsMind | null = null;
-    if (curve === null || r.launchConfigId === null) {
+    if (curve === null || (r.launchedHere && r.launchConfigId === null)) {
       pons = await soft('ponsMind', reader ? () => reader.ponsMind(token) : undefined);
       if (curve === null && pons !== null && pons.curve !== zeroAddress) curve = pons.curve.toLowerCase();
     }
@@ -187,7 +187,9 @@ export class PonsIndexerVenue implements IndexerVenue {
       known?.supply != null ? Promise.resolve(null) : soft('token info', reader ? () => reader.tokenInfo(token) : undefined),
       needMind ? soft('getMind', reader ? () => reader.getMind(token) : undefined) : Promise.resolve(null),
     ]);
-    return { token: r.token, curve, account: r.account, launchedHere: r.launchedHere, launchConfigId: r.launchConfigId ?? pons?.launchConfigId ?? null, launch, params, tokenInfo, mind };
+    // adoptions record launchConfigId 0 as a placeholder on the registry: the real id is unknown (null)
+    const launchConfigId = r.launchedHere ? (r.launchConfigId ?? pons?.launchConfigId ?? null) : null;
+    return { token: r.token, curve, account: r.account, launchedHere: r.launchedHere, launchConfigId, launch, params, tokenInfo, mind };
   }
 
   async fetchRange(source: LogSource, fromBlock: bigint, toBlock: bigint, repos: Repos): Promise<RangeBatch> {
@@ -412,14 +414,14 @@ export function applyPonsLogs(
         token = row?.token ?? null;
         break;
       case 'factory':
-        token = lower(a['token']);
+      case 'hook':
+        // only once the mind is registered (an adoption later in the same range starts from its own reads)
+        row = repos.pons.get(lower(d.source === 'factory' ? a['token'] : a['memecoin']));
+        token = row?.token ?? null;
         break;
       case 'escrow':
         row = repos.pons.byAccount(lower(a['recipient']));
         token = row?.token ?? null;
-        break;
-      case 'hook':
-        token = lower(a['memecoin']);
         break;
     }
     if (d.source !== 'registry' && token === null) continue; // not ours (e.g. a curve registered later in the range)

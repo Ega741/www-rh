@@ -6,7 +6,7 @@ import { encodeAbiParameters, encodeEventTopics, keccak256, toHex, type AbiEvent
 import { mindLaunchpadAbi, modelIdToHash, personaHash } from '@www-rh/shared';
 import { Repos } from '../src/db/repos.js';
 import { Db } from '../src/db/sqlite.js';
-import type { RawLog, LogSource } from '../src/indexer/source.js';
+import type { LogFilter, RawLog, LogSource } from '../src/indexer/source.js';
 import { silentLogger } from '../src/log.js';
 import type { LaunchpadWrite } from '../src/chain/launchpad.js';
 import type { TxOutcome } from '../src/chain/txQueue.js';
@@ -85,9 +85,25 @@ export class FakeLogSource implements LogSource {
     return this.nextHeads.shift() ?? this.head;
   }
 
+  /** Filtered queries received (Pons mode). */
+  filtered: LogFilter[] = [];
+
   async getLogs(_address: Address, fromBlock: bigint, toBlock: bigint): Promise<RawLog[]> {
     this.calls.push({ from: fromBlock, to: toBlock });
-    return this.logs.filter((l) => l.blockNumber >= fromBlock && l.blockNumber <= toBlock);
+    return this.logs.filter((l) => l.blockNumber >= fromBlock && l.blockNumber <= toBlock && (this.byAddress ? l.address.toLowerCase() === _address.toLowerCase() : true));
+  }
+
+  /** When true, `getLogs` also filters by address (Pons tests mix several contracts in `logs`). */
+  byAddress = false;
+
+  /** `eth_getLogs` semantics: address set, topic positions (`null` = any, array = OR), inclusive range. */
+  async getLogsFiltered(f: LogFilter): Promise<RawLog[]> {
+    this.filtered.push(f);
+    const addresses = new Set((Array.isArray(f.address) ? f.address : [f.address]).map((a: string) => a.toLowerCase()));
+    return this.logs.filter((l) => {
+      if (l.blockNumber < f.fromBlock || l.blockNumber > f.toBlock || !addresses.has(l.address.toLowerCase())) return false;
+      return (f.topics ?? []).every((t, i) => t === null || (Array.isArray(t) ? t : [t]).some((v) => v.toLowerCase() === l.topics[i]?.toLowerCase()));
+    });
   }
 
   async getBlockTimestamp(blockNumber: bigint): Promise<bigint> {

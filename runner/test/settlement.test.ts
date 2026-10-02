@@ -13,6 +13,7 @@ import { drawReceiptDto } from '../src/api/dto.js';
 import type { DrawChainView, LaunchpadSender, LaunchpadWrite, SignedTx } from '../src/chain/launchpad.js';
 import { TxQueue, type TxOutcome } from '../src/chain/txQueue.js';
 import { Repos } from '../src/db/repos.js';
+import { SCHEMA_VERSION } from '../src/db/schema.js';
 import { Db } from '../src/db/sqlite.js';
 import { weiOfUsdMicro } from '../src/economics/budget.js';
 import { FixedEthUsd } from '../src/economics/ethUsd.js';
@@ -411,7 +412,7 @@ describe('schema v2 migration', () => {
     v1.run("INSERT INTO receipts (token, receipt_hash, receipt_json, amount_wei, status, tx_hash, error, created_at, updated_at) VALUES (?, ?, '{}', '1', 'pending', ?, NULL, 1, 1)", TOKEN, `0x${'0c'.repeat(32)}`, `0x${'cc'.repeat(32)}`);
     v1.close();
     const repos = new Repos(Db.open(file));
-    expect(repos.db.userVersion).toBe(2);
+    expect(repos.db.userVersion).toBe(SCHEMA_VERSION); // v2 (receipt lifecycle) and later migrations applied
     expect(repos.ticks.receiptByHash(`0x${'0b'.repeat(32)}`)?.status).toBe('unknown');
     expect(repos.ticks.receiptByHash(`0x${'0c'.repeat(32)}`)?.status).toBe('pending');
     repos.db.close();

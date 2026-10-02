@@ -347,7 +347,8 @@ const mindCoreAbiSignatures = [
   'function pendingOwner() view returns (address)',
   'function transferOwnership(address newOwner)',
   'function acceptOwnership()',
-  'function renounceOwnership()',
+  // always reverts RenounceDisabled()
+  'function renounceOwnership() pure',
   'function paused() view returns (bool)',
 ] as const;
 
@@ -379,6 +380,10 @@ export const ponsMindRegistryAbiSignatures = [
   'error AlreadyAdopted()',
   'error WrongValue()',
   'error LaunchFailed()',
+  // OpenZeppelin Clones / Errors and SafeCast, present in the compiled ABI
+  'error FailedDeployment()',
+  'error InsufficientBalance(uint256 balance, uint256 needed)',
+  'error SafeCastOverflowedUintDowncast(uint8 bits, uint256 value)',
   // ---------------------------------------------------------------- creator
   // msg.value == factory.launchFee() + quoteIn + creationFee()
   'function launchMind(LaunchParams p, uint256 quoteIn, uint256 minTokensOut, bytes32 modelId, bytes32 personaHash, string metadataURI) payable returns (address token, address curve, address account)',
@@ -397,6 +402,8 @@ export const ponsMindRegistryAbiSignatures = [
   'function predictAccount(address creator, bytes32 salt) view returns (address)',
   'function predictAdoptionAccount(address token) view returns (address)',
   'function claimable(address token) view returns (uint256)',
+  // pool id recorded with setPoolId (0 before)
+  'function poolIdOf(address token) view returns (bytes32)',
   'function launchQuote(uint256 launchConfigId, uint256 quoteIn) view returns (uint256 launchFee, uint256 total, bytes32 economics)',
   'function factory() view returns (address)',
   'function feeEscrow() view returns (address)',
@@ -408,16 +415,26 @@ export const ponsMindRegistryAbiSignatures = [
 /** Parsed ABI of `PonsMindRegistry` (§9.2). */
 export const ponsMindRegistryAbi = parseAbi(ponsMindRegistryAbiSignatures);
 
-/** Human-readable signatures of `MindAccount` (§9.2): the per-mind creator-fee recipient (EIP-1167 clone). */
+/**
+ * Human-readable signatures of `MindAccount` (§9.2): the per-mind creator-fee recipient (EIP-1167
+ * clone). `sweepCurve` (the account sweeps the curve as its creator fee recipient) is part of the
+ * compiled contract in addition to the §9.2 list.
+ */
 export const mindAccountAbiSignatures = [
   'function initialize(address registry)',
   'function registry() view returns (address)',
   // accepts ETH from anyone (escrow payouts)
   'receive() external payable',
   // registry only: escrow.claim(), then forwards the whole balance to the registry; returns the amount sent
-  'function claim(address escrow) returns (uint256)',
+  'function claim(address escrow) returns (uint256 amount)',
+  // registry only: curve.sweepFees as the curve's creator fee recipient
+  'function sweepCurve(address curve, uint256 minBuybackTokensOut)',
   'function sweepPool(address hook, bytes32 poolId, uint256 minConversionQuoteOut, uint256 minBuybackTokensOut)',
   'function transferFeeRecipient(address factory, address token, address to)',
+  'error AlreadyInitialized()',
+  'error NotRegistry()',
+  'error ZeroAddress()',
+  'error EthTransferFailed()',
 ] as const;
 
 /** Parsed ABI of `MindAccount` (§9.2). */

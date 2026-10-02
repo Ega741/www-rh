@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ConfigError, loadConfig } from '../src/config.js';
+import { ConfigError, DEFAULT_HARVEST_MIN_WEI, loadConfig, mindContract } from '../src/config.js';
 
 describe('loadConfig (SPEC §4 env)', () => {
   it('applies the spec defaults with only RPC_URL set', () => {
@@ -58,5 +58,31 @@ describe('loadConfig: review additions', () => {
     expect([d.toolTimeoutMs, d.ethUsdBoundsMicro]).toEqual([5_000, { min: 500_000_000, max: 20_000_000_000 }]);
     expect(() => loadConfig({ RPC_URL: 'http://x', ETH_USD_MIN: '5000', ETH_USD_MAX: '100' })).toThrow(ConfigError);
     expect(() => loadConfig({ RPC_URL: 'http://x', TOOL_TIMEOUT_MS: '10' })).toThrow(ConfigError);
+  });
+});
+
+describe('loadConfig: Pons mode (SPEC §9.4)', () => {
+  it('VENUE defaults to pons on 4663 and curve elsewhere; HARVEST_MIN_WEI defaults to 0.002 ether; PONS_* default to the mainnet contracts', () => {
+    const main = loadConfig({ RPC_URL: 'http://x', CHAIN_ID: '4663' });
+    expect(main).toMatchObject({ venue: 'pons', registry: null, launchpad: null, harvestMinWei: 2_000_000_000_000_000n });
+    expect(DEFAULT_HARVEST_MIN_WEI).toBe(2n * 10n ** 15n);
+    expect(main.pons).toEqual({ factory: '0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e', feeEscrow: '0xd3AFEB2a57f70eF218Aa82451c51B2fb0416Ac9e', memeHook: '0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044' });
+    const test = loadConfig({ RPC_URL: 'http://x' });
+    expect(test.venue).toBe('curve');
+    expect(test.pons).toEqual({ factory: null, feeEscrow: null, memeHook: null });
+  });
+
+  it('VENUE / REGISTRY_ADDRESS / HARVEST_MIN_WEI / PONS_* overrides and validation; mindContract follows the venue', () => {
+    const c = loadConfig({
+      RPC_URL: 'http://x', VENUE: 'pons', REGISTRY_ADDRESS: '0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0', LAUNCHPAD_ADDRESS: '0x5fbdb2315678afecb367f032d93f642f64180aa3',
+      HARVEST_MIN_WEI: '5000000000000000', PONS_FACTORY: '0x1111111111111111111111111111111111111111', PONS_FEE_ESCROW: '0x0000000000000000000000000000000000000000',
+    });
+    expect([c.venue, c.registry, c.harvestMinWei, c.pons.factory, c.pons.feeEscrow]).toEqual(['pons', '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0', 5n * 10n ** 15n, '0x1111111111111111111111111111111111111111', null]);
+    expect(mindContract(c)).toBe(c.registry);
+    expect(mindContract({ ...c, venue: 'curve' })).toBe(c.launchpad);
+    expect(loadConfig({ RPC_URL: 'http://x', CHAIN_ID: '4663', VENUE: 'curve' }).venue).toBe('curve');
+    for (const [key, value] of [['VENUE', 'pump'], ['HARVEST_MIN_WEI', '0.002'], ['HARVEST_MIN_WEI', '-1'], ['REGISTRY_ADDRESS', '0x12'], ['PONS_MEME_HOOK', 'hook']] as const) {
+      expect(() => loadConfig({ RPC_URL: 'http://x', [key]: value }), `${key}=${value}`).toThrow(ConfigError);
+    }
   });
 });
