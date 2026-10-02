@@ -122,7 +122,7 @@ export function EmptyState({ title, children }: { title: string; children?: Reac
 
 /** Inline status line for a {@link TxFlow}. */
 export function TxStatus({ tx, labels = {} }: { tx: TxFlow; labels?: Partial<Record<'signing' | 'pending' | 'confirmed', string>> }) {
-  if (tx.phase === 'idle' && tx.error === null) return null;
+  if (tx.phase === 'idle' && tx.error === null && tx.notice === null) return null;
   return (
     <div className="mt-2 space-y-0.5 text-[12px]">
       {tx.phase === 'signing' && <p className="text-dim">{labels.signing ?? 'Confirm in your wallet…'}</p>}
@@ -137,6 +137,7 @@ export function TxStatus({ tx, labels = {} }: { tx: TxFlow; labels?: Partial<Rec
         </p>
       )}
       {tx.error !== null && <p className="text-danger">{tx.error}</p>}
+      {tx.notice !== null && <p className="text-amber">{tx.notice}</p>}
     </div>
   );
 }

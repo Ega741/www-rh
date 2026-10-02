@@ -23,6 +23,8 @@ export interface TxFlow {
   hash: Hex | undefined;
   receipt: TransactionReceipt | undefined;
   error: string | null;
+  /** Non-fatal notice from {@link TxFlowOptions.onRevert} (e.g. "retry later"); not an error. */
+  notice: string | null;
   busy: boolean;
   /** Sends a transaction produced by `send` and tracks it until mined. Resolves to the hash, or `null` on failure. */
   run: (send: () => Promise<Hex>) => Promise<Hex | null>;
@@ -35,9 +37,10 @@ export interface TxFlowOptions {
   onConfirmed?: (receipt: TransactionReceipt) => void;
   /**
    * Called with the custom error name when sending fails with a contract revert (simulation);
-   * return `true` to treat it as handled (phase back to `idle`, no error shown).
+   * return `true` to treat it as handled (phase back to `idle`, no error shown), or a string to
+   * treat it as handled and show that string as a non-fatal {@link TxFlow.notice}.
    */
-  onRevert?: (errorName: string) => boolean;
+  onRevert?: (errorName: string) => boolean | string;
 }
 
 /** Tracks one transaction at a time. */
@@ -45,6 +48,7 @@ export function useTxFlow(options: TxFlowOptions = {}): TxFlow {
   const [phase, setPhase] = useState<TxPhase>('idle');
   const [hash, setHash] = useState<Hex | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const onConfirmed = useRef(options.onConfirmed);
   onConfirmed.current = options.onConfirmed;
   const onRevert = useRef(options.onRevert);
@@ -77,6 +81,7 @@ export function useTxFlow(options: TxFlowOptions = {}): TxFlow {
 
   const run = useCallback(async (send: () => Promise<Hex>): Promise<Hex | null> => {
     setError(null);
+    setNotice(null);
     setHash(undefined);
     setPhase('signing');
     try {
@@ -86,8 +91,10 @@ export function useTxFlow(options: TxFlowOptions = {}): TxFlow {
       return h;
     } catch (e) {
       const name = revertErrorName(e);
-      if (name !== null && onRevert.current?.(name) === true) {
+      const handledAs = name !== null ? onRevert.current?.(name) : undefined;
+      if (handledAs === true || typeof handledAs === 'string') {
         setPhase('idle');
+        if (typeof handledAs === 'string') setNotice(handledAs);
         return null;
       }
       setPhase(isUserRejection(e) ? 'idle' : 'error');
@@ -100,6 +107,7 @@ export function useTxFlow(options: TxFlowOptions = {}): TxFlow {
     setPhase('idle');
     setHash(undefined);
     setError(null);
+    setNotice(null);
   }, []);
 
   return {
@@ -107,6 +115,7 @@ export function useTxFlow(options: TxFlowOptions = {}): TxFlow {
     hash,
     receipt: wait.data,
     error,
+    notice,
     busy: phase === 'signing' || phase === 'pending',
     run,
     reset,

@@ -42,17 +42,19 @@ function subscribe(periodMs: number, listener: () => void): () => void {
   };
 }
 
-/** Returns a counter that increments every `periodMs` (shared timer per period). */
-export function useTick(periodMs: number): number {
+const noop = (): void => undefined;
+
+/** Returns a counter that increments every `periodMs` (shared timer per period); `0` and no timer while `enabled` is false. */
+export function useTick(periodMs: number, enabled = true): number {
   return useSyncExternalStore(
-    (listener) => subscribe(periodMs, listener),
-    () => getTicker(periodMs).count,
+    (listener) => (enabled ? subscribe(periodMs, listener) : noop),
+    () => (enabled ? getTicker(periodMs).count : 0),
     () => 0,
   );
 }
 
-/** Current time in ms, refreshed every `periodMs` (for "12s ago" labels). */
-export function useNow(periodMs = 1_000): number {
-  useTick(periodMs);
+/** Current time in ms, refreshed every `periodMs` while `enabled` (for "12s ago" labels and countdowns). */
+export function useNow(periodMs = 1_000, enabled = true): number {
+  useTick(periodMs, enabled);
   return Date.now();
 }
