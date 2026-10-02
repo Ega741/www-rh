@@ -1,0 +1,30 @@
+# node
+node_modules/
+dist/
+build/
+.turbo/
+*.tsbuildinfo
+.pnpm-store/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/**/dry-run/
+contracts/.env
+
+# runner data
+runner/data/
+*.sqlite
+*.sqlite-journal
+*.db
+
+# misc
+.DS_Store
+*.log
+coverage/
+.vite/
