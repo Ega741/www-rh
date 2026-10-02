@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master, "claude/**"]
+  pull_request:
+
+env:
+  FOUNDRY_PROFILE: ci
+  FOUNDRY_DISABLE_NIGHTLY_WARNING: 1
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: forge fmt
+        run: forge fmt --check
+        working-directory: contracts
+      - name: forge build
+        run: forge build --sizes
+        working-directory: contracts
+      - name: forge test
+        run: forge test -vvv
+        working-directory: contracts
+      - name: fixtures
+        run: forge script script/GenerateFixtures.s.sol && git diff --exit-code ../packages/shared/fixtures/curve.json
+        working-directory: contracts
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: forge build (for ABI equivalence tests)
+        run: forge build
+        working-directory: contracts
+      - name: playwright chromium
+        run: pnpm --filter @www-rh/runner exec playwright install --with-deps chromium
+      - run: pnpm -r run build
+      - run: pnpm -r run typecheck
+      - run: pnpm -r run test
+      - name: ABI sync check
+        run: node scripts/sync-abi.mjs
+      - name: anvil e2e
+        run: bash scripts/anvil-e2e.sh
