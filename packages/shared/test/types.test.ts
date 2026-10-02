@@ -1,38 +1,36 @@
 import { describe, expect, it } from 'vitest';
-import { MODEL_IDS } from '../src/models.js';
 import {
   addressSchema,
+  anchorBatchSchema,
   bigintStringSchema,
   computeResponseSchema,
   curvePhaseName,
   curvePhaseValue,
   drawReceiptSchema,
   fromBigintString,
+  hash32Schema,
   healthResponseSchema,
-  memoryBatchSchema,
-  memoryBatchUri,
+  ledgerEntrySchema,
   memorySchema,
-  metadataUri,
+  metadataUploadResponseSchema,
   mindDetailSchema,
   mindMetadataSchema,
   mindStatusName,
   mindStatusValue,
   mindSummarySchema,
-  mindsQuerySchema,
-  modelIdSchema,
+  mindsResponseSchema,
   redactActionInput,
-  roundUsd,
+  statsResponseSchema,
   thoughtSchema,
   toBigintString,
   tradeSchema,
-  utf8ByteLength,
   wsClientMessageSchema,
   wsServerMessageSchema,
   type MindSummary,
 } from '../src/types.js';
 
-const token = '0x' + 'ab'.repeat(20);
-const hash = '0x' + 'cd'.repeat(32);
+const token = `0x${'ab'.repeat(20)}` as const;
+const hash = `0x${'cd'.repeat(32)}` as const;
 const at = '2026-10-02T10:00:00.000Z';
 
 const summary: MindSummary = {
@@ -40,7 +38,7 @@ const summary: MindSummary = {
   name: 'Mind',
   symbol: 'MIND',
   creator: token,
-  metadataURI: 'runner://metadata/abc',
+  metadataURI: 'runner://metadata/' + 'ab'.repeat(32),
   image: null,
   modelId: hash,
   model: 'claude-opus-5-5',
@@ -57,14 +55,34 @@ const summary: MindSummary = {
   createdAt: at,
   trades24h: 0,
   volume24hWei: '0',
-  cooling: false,
 };
 
-describe('API DTO schemas (R11)', () => {
-  it('address must be lowercase hex', () => {
-    expect(addressSchema.safeParse(token).success).toBe(true);
-    expect(addressSchema.safeParse(token.toUpperCase().replace('0X', '0x')).success).toBe(false);
+const detail = {
+  ...summary,
+  personaHash: hash,
+  persona: null,
+  personaVerified: false,
+  description: null,
+  links: { x: null, website: null, telegram: null },
+  pool: null,
+  positionId: null,
+  lastFrameAt: null,
+};
+
+const receiptObject = {
+  token,
+  fromTickId: 1,
+  toTickId: 2,
+  ticks: [{ tickId: 1, model: 'claude-opus-5-5', inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, costUsdMicro: 140 }],
+  ethUsdPriceMicro: 3_000_000_000,
+  amountWei: '46666666667',
+};
+
+describe('primitives', () => {
+  it('addresses and hashes are lowercased; malformed values rejected', () => {
+    expect(addressSchema.parse(token.toUpperCase().replace('0X', '0x'))).toBe(token);
     expect(addressSchema.safeParse('0x123').success).toBe(false);
+    expect(hash32Schema.parse(hash.toUpperCase().replace('0X', '0x'))).toBe(hash);
   });
 
   it('bigint strings round-trip', () => {
@@ -76,40 +94,6 @@ describe('API DTO schemas (R11)', () => {
     expect(() => toBigintString(-1n)).toThrow(RangeError);
   });
 
-  it('MindSummary / MindDetail validate, nulls instead of omitted fields', () => {
-    expect(mindSummarySchema.parse(summary)).toEqual(summary);
-    const detail = mindDetailSchema.parse({
-      ...summary,
-      personaHash: hash,
-      personaVerified: true,
-      pool: token,
-      positionId: '7',
-      graduator: null,
-      description: null,
-      persona: 'curious',
-      links: null,
-      lastFrameAt: null,
-      metadataStatus: 'ok',
-    });
-    expect(detail.pool).toBe(token);
-    expect(mindSummarySchema.safeParse({ ...summary, status: 'retired' }).success).toBe(false);
-    expect(mindSummarySchema.safeParse({ ...summary, status: 'paused' }).success).toBe(true);
-    expect(mindSummarySchema.safeParse({ ...summary, progressBps: 10001 }).success).toBe(false);
-    expect(mindSummarySchema.safeParse({ ...summary, model: null }).success).toBe(true);
-    const { image: _image, ...withoutImage } = summary;
-    expect(mindSummarySchema.safeParse(withoutImage).success).toBe(false);
-  });
-
-  it('every wei field ends in Wei', () => {
-    for (const schema of [mindSummarySchema, tradeSchema, computeResponseSchema]) {
-      for (const key of Object.keys(schema.shape)) {
-        if (/eth|fee|balance|volume|price|reserve|amount|cap/i.test(key) && !/Usd|tokenAmount|ethUsd/.test(key)) {
-          expect(key.endsWith('Wei'), key).toBe(true);
-        }
-      }
-    }
-  });
-
   it('enum name/value helpers (MindStatus { Alive, Dormant, Paused })', () => {
     expect(mindStatusName(0)).toBe('alive');
     expect(mindStatusName(1)).toBe('dormant');
@@ -119,105 +103,99 @@ describe('API DTO schemas (R11)', () => {
     expect(mindStatusValue('paused')).toBe(2);
     expect(curvePhaseValue('complete')).toBe(1);
   });
+});
 
-  it('modelIdSchema stays in sync with the catalog', () => {
-    expect(modelIdSchema.options).toEqual([...MODEL_IDS]);
+describe('§5 DTOs', () => {
+  it('MindSummary / MindDetail accept the §5 shape', () => {
+    expect(mindSummarySchema.parse(summary)).toEqual(summary);
+    expect(mindDetailSchema.parse(detail)).toEqual(detail);
+    expect(mindSummarySchema.safeParse({ ...summary, status: 'retired' }).success).toBe(false);
+    expect(mindSummarySchema.safeParse({ ...summary, progressBps: 10001 }).success).toBe(false);
+    expect(mindSummarySchema.safeParse({ ...summary, model: 'gpt-5' }).success).toBe(false);
   });
 
-  it('minds query applies defaults and coerces', () => {
-    expect(mindsQuerySchema.parse({})).toEqual({ sort: 'created', limit: 50 });
-    expect(mindsQuerySchema.parse({ sort: 'mcap', limit: '10', cursor: 'x' })).toEqual({ sort: 'mcap', limit: 10, cursor: 'x' });
-    expect(mindsQuerySchema.safeParse({ sort: 'nope' }).success).toBe(false);
+  it('nullable fields must be present (undefined is rejected)', () => {
+    for (const key of ['image', 'model', 'lastTickAt', 'currentUrl'] as const) {
+      expect(mindSummarySchema.safeParse({ ...summary, [key]: undefined }).success, key).toBe(false);
+    }
+    for (const key of ['persona', 'description', 'pool', 'positionId', 'lastFrameAt'] as const) {
+      expect(mindDetailSchema.safeParse({ ...detail, [key]: undefined }).success, key).toBe(false);
+    }
+    expect(mindDetailSchema.safeParse({ ...detail, links: { x: null, website: null } }).success).toBe(false);
   });
 
-  it('compute response with receipts', () => {
-    const receipt = {
-      token,
-      fromTickId: 1,
-      toTickId: 2,
-      ticks: [{ tickId: 1, model: 'claude-opus-5-5', inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, costUsdMicro: 140 }],
-      ethUsdPriceMicro: 3_000_000_000,
-      amountWei: '46666666666',
-    };
-    expect(drawReceiptSchema.parse(receipt)).toEqual(receipt);
-    const r = computeResponseSchema.parse({
-      balanceWei: '1',
-      balanceUsd: 0.003,
-      unsettledUsd: 0,
-      availableUsd: 0.003,
-      ethUsd: 3000,
-      burnUsdPerHour: 0,
-      runwayHours: null,
-      dailyBudgetUsd: 0.5,
-      tickIntervalMs: 20000,
-      ledger: [],
-      receipts: [{ receiptHash: hash, receipt, status: 'dry_run', txHash: null, createdAt: at, error: null }],
-      draws: [],
-    });
-    expect(r.runwayHours).toBeNull();
-    expect(r.receipts[0]?.receipt.ticks[0]?.costUsdMicro).toBe(140);
-  });
-
-  it('memories, thoughts and batches (R2, R7)', () => {
-    expect(memorySchema.safeParse({ seq: 1, kind: 'thought', content: 'x', url: null, createdAt: at, contentHash: hash, anchorTx: null, anchorUri: null }).success).toBe(false);
-    expect(memorySchema.parse({ seq: 1, kind: 'finding', content: 'x', url: null, createdAt: at, contentHash: hash, anchorTx: null, anchorUri: null }).kind).toBe('finding');
+  it('Trade / Memory / Thought / LedgerEntry / receipts / draws', () => {
+    expect(
+      tradeSchema.parse({
+        txHash: hash, logIndex: 0, blockNumber: 10, timestamp: at, trader: token, isBuy: true, ethAmountWei: '1000', tokenAmount: '5',
+        feeWei: '10', priceWei: '1', realEthReserveWei: '990', tokensSold: '5',
+      }).isBuy,
+    ).toBe(true);
+    expect(memorySchema.safeParse({ seq: 1, kind: 'finding', content: 'x', url: null, createdAt: at, contentHash: hash, anchorTx: null }).success).toBe(true);
+    expect(memorySchema.safeParse({ seq: 1, kind: 'thought', content: 'x', url: null, createdAt: at, contentHash: hash, anchorTx: null }).success).toBe(false);
     expect(thoughtSchema.safeParse({ id: 1, tickId: 1, kind: 'aloud', text: 'hi', createdAt: at }).success).toBe(true);
     expect(thoughtSchema.safeParse({ id: 1, tickId: 1, kind: 'thought', text: 'hi', createdAt: at }).success).toBe(false);
-    expect(memoryBatchSchema.parse({ token, fromSeq: 1, toSeq: 1, memories: [{ seq: 1, kind: 'note', content: 'a', url: null, createdAt: at }] }).toSeq).toBe(1);
-    expect(memoryBatchUri(token.toUpperCase().replace('0X', '0x'), 1, 5)).toBe(`runner://memories/${token}/1-5`);
-    expect(metadataUri(hash.toUpperCase().replace('0X', '0x'))).toBe(`runner://metadata/${hash}`);
-  });
-
-  it('health allows null launchpad and head', () => {
     expect(
-      healthResponseSchema.parse({
-        ok: true,
-        chainId: 46630,
-        launchpad: null,
-        lastIndexedBlock: null,
-        headBlock: null,
-        activeMinds: 0,
-        dryRun: true,
-        indexer: { status: 'error', lastError: 'connect ECONNREFUSED' },
-        anthropic: false,
-        operator: null,
-        version: '0.1.0',
-      }).ok,
-    ).toBe(true);
+      ledgerEntrySchema.parse({
+        tickId: 1, startedAt: at, model: 'claude-opus-4-8', iterations: 3, inputTokens: 1, outputTokens: 2, cacheReadTokens: 3,
+        cacheWriteTokens: 4, costUsd: 0.012345, stopReason: 'end_turn', error: null, receiptHash: null,
+      }).model,
+    ).toBe('claude-opus-4-8');
+    expect(drawReceiptSchema.parse({ receiptHash: hash, status: 'dry_run', txHash: null, createdAt: at, receipt: receiptObject }).receipt).toEqual(receiptObject);
+    expect(drawReceiptSchema.safeParse({ receiptHash: hash, status: 'submitted', txHash: null, createdAt: at, receipt: receiptObject }).success).toBe(false);
   });
 
-  it('metadata JSON (R1): strict, byte-bounded name/symbol, catalog model', () => {
-    const meta = mindMetadataSchema.parse({ name: 'Mind', symbol: 'MIND', persona: 'curious', model: 'claude-opus-5-5' });
-    expect(meta).toEqual({ name: 'Mind', symbol: 'MIND', persona: 'curious', model: 'claude-opus-5-5' });
-    expect(mindMetadataSchema.safeParse({ name: '', symbol: 'MIND', persona: 'x', model: 'claude-opus-5-5' }).success).toBe(false);
-    expect(mindMetadataSchema.safeParse({ name: 'M', symbol: 'MIND', persona: 'x', model: 'gpt-5' }).success).toBe(false);
-    expect(mindMetadataSchema.safeParse({ name: 'M', symbol: 'MIND', persona: 'x', model: 'claude-opus-5-5', extra: 1 }).success).toBe(false);
-    expect(mindMetadataSchema.safeParse({ name: 'M', symbol: 'MIND', persona: 'x', model: 'claude-opus-5-5', links: { x: 'https://x.com/a' } }).success).toBe(true);
-    expect(mindMetadataSchema.safeParse({ name: 'M', symbol: 'MIND', persona: 'x', model: 'claude-opus-5-5', links: { discord: 'x' } }).success).toBe(false);
-    // 16 bytes max: 5 three-byte characters = 15 bytes ok, 6 = 18 bytes rejected
-    expect(utf8ByteLength('€€€€€')).toBe(15);
-    expect(mindMetadataSchema.safeParse({ name: 'M', symbol: '€€€€€', persona: 'x', model: 'claude-opus-5-5' }).success).toBe(true);
-    expect(mindMetadataSchema.safeParse({ name: 'M', symbol: '€€€€€€', persona: 'x', model: 'claude-opus-5-5' }).success).toBe(false);
+  it('ComputeResponse with null runway and interval', () => {
+    const r = computeResponseSchema.parse({
+      balanceWei: '1', balanceUsd: 0.003, unsettledUsd: 0, availableUsd: 0.003, burnUsdPerHour: 0, runwayHours: null,
+      tickIntervalMs: null, ledger: [], receipts: [], draws: [{ txHash: hash, blockNumber: 1, timestamp: at, amountWei: '5', receiptHash: hash }],
+    });
+    expect(r.runwayHours).toBeNull();
+    expect(r.draws[0]?.amountWei).toBe('5');
   });
 
-  it('roundUsd keeps 6 decimals', () => {
-    expect(roundUsd(0.1234564)).toBe(0.123456);
-    expect(roundUsd(0.1234565)).toBe(0.123457);
+  it('Health / Minds / Stats / AnchorBatch / metadata upload', () => {
+    expect(healthResponseSchema.parse({ ok: false, chainId: 46630, launchpad: token, lastIndexedBlock: 0, headBlock: 0, activeMinds: 0, dryRun: true }).ok).toBe(false);
+    expect(mindsResponseSchema.parse({ items: [summary], nextCursor: null }).items).toHaveLength(1);
+    expect(statsResponseSchema.parse({ minds: 1, alive: 1, graduated: 0, totalVolumeWei: '0', totalFeesToMindsWei: '0' }).minds).toBe(1);
+    expect(anchorBatchSchema.parse({ token, fromSeq: 1, toSeq: 1, memories: [{ seq: 1, kind: 'note', content: 'a', url: null, createdAt: at }] }).toSeq).toBe(1);
+    expect(metadataUploadResponseSchema.safeParse({ uri: 'runner://metadata/x', hash: 'ab'.repeat(32), personaHash: hash }).success).toBe(true);
+    expect(metadataUploadResponseSchema.safeParse({ uri: 'runner://metadata/x', hash: '0x' + 'ab'.repeat(32), personaHash: hash }).success).toBe(false);
+  });
+
+  it('MindMetadata: strict, byte-bounded name/symbol, catalog model, http(s)/ipfs image, no empty strings', () => {
+    const base = { name: 'Mind', symbol: 'MIND', persona: 'curious', model: 'claude-opus-5-5' };
+    expect(mindMetadataSchema.parse(base)).toEqual(base);
+    expect(mindMetadataSchema.safeParse({ ...base, name: '' }).success).toBe(false);
+    expect(mindMetadataSchema.safeParse({ ...base, description: '' }).success).toBe(false);
+    expect(mindMetadataSchema.safeParse({ ...base, model: 'gpt-5' }).success).toBe(false);
+    expect(mindMetadataSchema.safeParse({ ...base, extra: 1 }).success).toBe(false);
+    expect(mindMetadataSchema.safeParse({ ...base, image: 'ipfs://bafy/img.png' }).success).toBe(true);
+    expect(mindMetadataSchema.safeParse({ ...base, image: 'javascript:alert(1)' }).success).toBe(false);
+    expect(mindMetadataSchema.safeParse({ ...base, links: { x: 'https://x.com/a' } }).success).toBe(true);
+    expect(mindMetadataSchema.safeParse({ ...base, links: { x: 'x.com/a' } }).success).toBe(false);
+    expect(mindMetadataSchema.safeParse({ ...base, links: { discord: 'https://d.gg' } }).success).toBe(false);
+    expect(mindMetadataSchema.safeParse({ ...base, symbol: '€€€€€' }).success).toBe(true); // 15 bytes
+    expect(mindMetadataSchema.safeParse({ ...base, symbol: '€€€€€€' }).success).toBe(false); // 18 bytes
+    expect(mindMetadataSchema.safeParse({ ...base, persona: 'p'.repeat(8001) }).success).toBe(false);
   });
 });
 
-describe('WebSocket schemas (R7, R10)', () => {
+describe('§6 WebSocket schemas', () => {
   it('server messages are discriminated by type', () => {
-    expect(wsServerMessageSchema.parse({ type: 'hello', token, status: 'alive', phase: 'bonding', cooling: false, currentUrl: null, lastFrame: null, at }).type).toBe('hello');
-    expect(wsServerMessageSchema.parse({ type: 'frame', jpegBase64: 'AAAA', url: 'https://example.com', at }).type).toBe('frame');
+    const frame = { jpegBase64: 'AAAA', url: 'https://example.com', at };
+    expect(wsServerMessageSchema.parse({ type: 'hello', token, status: 'alive', phase: 'bonding', frame: null, at }).type).toBe('hello');
+    expect(wsServerMessageSchema.parse({ type: 'hello', token, status: 'alive', phase: 'bonding', frame, at }).type).toBe('hello');
+    expect(wsServerMessageSchema.safeParse({ type: 'hello', token, status: 'alive', phase: 'bonding', at }).success).toBe(false);
+    expect(wsServerMessageSchema.parse({ type: 'frame', ...frame }).type).toBe('frame');
     expect(wsServerMessageSchema.parse({ type: 'thought', tickId: 1, kind: 'thinking', text: 'hi', delta: true, at }).type).toBe('thought');
     expect(wsServerMessageSchema.safeParse({ type: 'thought', tickId: 1, kind: 'aloud', text: 'hi', delta: true, at }).success).toBe(false);
+    expect(wsServerMessageSchema.parse({ type: 'thoughtSaved', thought: { id: 1, tickId: 1, kind: 'summary', text: 's', createdAt: at } }).type).toBe('thoughtSaved');
     expect(wsServerMessageSchema.parse({ type: 'action', tickId: 1, tool: 'browse_navigate', input: '{"url":"x"}', at }).type).toBe('action');
-    expect(wsServerMessageSchema.parse({ type: 'status', status: 'paused', phase: 'complete', cooling: false, at }).type).toBe('status');
-    expect(wsServerMessageSchema.parse({ type: 'budget', balanceWei: '1', balanceUsd: 1, availableUsd: 1, burnUsdPerHour: 0.1, tickIntervalMs: 20000, at }).type).toBe('budget');
-    expect(wsServerMessageSchema.parse({ type: 'pong', at }).type).toBe('pong');
-    expect(wsServerMessageSchema.parse({ type: 'error', message: 'bad token' }).type).toBe('error');
-    expect(wsServerMessageSchema.parse({ type: 'tick', tickId: 3, state: 'finished', model: 'claude-opus-5-5', costUsd: 0.01, stopReason: 'end_turn', at }).type).toBe('tick');
+    expect(wsServerMessageSchema.parse({ type: 'status', status: 'paused', phase: 'complete', at }).type).toBe('status');
+    expect(wsServerMessageSchema.parse({ type: 'budget', balanceWei: '1', balanceUsd: 1, burnUsdPerHour: 0.1, runwayHours: 10, at }).type).toBe('budget');
+    expect(wsServerMessageSchema.parse({ type: 'pong' }).type).toBe('pong');
+    expect(wsServerMessageSchema.parse({ type: 'error', message: 'unknown token' }).type).toBe('error');
     expect(wsServerMessageSchema.safeParse({ type: 'nope' }).success).toBe(false);
     expect(wsServerMessageSchema.safeParse({ type: 'action', tickId: 1, tool: 't', input: 'x'.repeat(301), at }).success).toBe(false);
   });

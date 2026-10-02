@@ -16,18 +16,18 @@ import type { MindSummary } from '../lib/types';
 import { FeedMind } from './FeedMind';
 import { MindAvatar, PhaseBadge, ProgressBar, StatusBadge } from './common';
 
-/** Display label of a mind's model (catalog label, id, or "unknown model"). */
+/** Display label of a mind's model: catalog label, else `model ?? 'unsupported model'` (SPEC §7). */
 export function modelLabel(mind: Pick<MindSummary, 'model' | 'modelId'>): string {
   const spec = modelById(mind.modelId);
   if (spec !== undefined) return spec.label;
-  return mind.model ?? 'unknown model';
+  return mind.model ?? 'unsupported model';
 }
 
 /** One card of the home grid. */
 export function MindCard({ mind }: { mind: MindSummary }) {
   const ref = useRef<HTMLElement>(null);
   const inView = useInView(ref);
-  const frame = useLiveFrame(mind.token, inView && mind.status !== 'paused');
+  const frame = useLiveFrame(mind.token, { enabled: inView, refresh: mind.status === 'alive' });
   const now = useNow(5_000);
   const [feeding, setFeeding] = useState(false);
   const href = `/mind/${mind.token}`;
@@ -39,7 +39,7 @@ export function MindCard({ mind }: { mind: MindSummary }) {
           <img src={frame.src} alt="" className="h-full w-full object-cover object-top opacity-90 transition-opacity group-hover:opacity-100" />
         ) : (
           <div className="flex h-full w-full flex-col items-center justify-center gap-1 text-[11px] text-mute">
-            <span>{mind.status === 'alive' ? 'waiting for the first frame' : mind.status === 'paused' ? 'paused by creator' : 'asleep: vault empty'}</span>
+            <span>{mind.status === 'alive' ? 'waiting for the first frame' : mind.status === 'paused' ? 'paused by creator' : 'sleeping: vault cannot pay for compute'}</span>
           </div>
         )}
         <div className="scanlines pointer-events-none absolute inset-0" />

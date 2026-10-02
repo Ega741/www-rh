@@ -11,12 +11,12 @@ import { useWriteContract } from 'wagmi';
 import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
 import { formatEth, formatRunway, formatUsd, parseAmount, weiToEth } from '../format';
 import { useTxFlow } from '../hooks/useTxFlow';
-import { launchpadAbi } from '../lib/abi';
+import { mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
 import { queryKeys } from '../queries';
 import { ChainGuard } from './ChainGuard';
 import { TxStatus } from './common';
 
-const PRESETS = ['0.005', '0.01', '0.05', '0.1'] as const;
+const PRESETS = ['0.001', '0.01', '0.05', '0.1'] as const;
 
 /** Props of {@link FeedMind}. */
 export interface FeedMindProps {
@@ -32,7 +32,7 @@ export interface FeedMindProps {
 
 /** Amount input + presets + fundMind transaction. */
 export function FeedMind({ token, symbol, ethUsd = null, burnUsdPerHour = null, compact = false, onFunded }: FeedMindProps) {
-  const [amount, setAmount] = useState('0.01');
+  const [amount, setAmount] = useState(compact ? '0.001' : '0.01');
   const queryClient = useQueryClient();
   const write = useWriteContract();
   const tx = useTxFlow({

@@ -31,7 +31,7 @@ import { useNow } from '../hooks/useTick';
 import { tokenUrl } from '../lib/chain';
 import { describeError } from '../lib/errors';
 import type { MindDetail } from '../lib/types';
-import { useCompute, useThoughts, useTrades } from '../queries';
+import { isNotFound, useCompute, useThoughts, useTrades } from '../queries';
 
 /** Mind route. */
 export function Mind() {
@@ -98,16 +98,24 @@ function MindPage({ token }: { token: Address }) {
   return (
     <div className="space-y-4">
       <MindHeader mind={live} />
-      {data.apiError !== null && data.apiError !== undefined && (
-        <p className="rounded border border-amber/40 bg-amber/5 px-3 py-2 text-[12px] text-amber">
-          The runner is not answering ({describeError(data.apiError)}). Curve, balances and trading come straight from the chain; the stream,
-          memories and history return when it does.
+      {isNotFound(data.apiError) ? (
+        <p className="rounded border border-info/40 bg-info/5 px-3 py-2 text-[12px] text-info">
+          indexing… The runner has not picked this coin up yet (it appears within a few blocks of creation). Curve and trading already work from the
+          chain; the stream starts once it is indexed.
         </p>
+      ) : (
+        data.apiError !== null &&
+        data.apiError !== undefined && (
+          <p className="rounded border border-amber/40 bg-amber/5 px-3 py-2 text-[12px] text-amber">
+            The runner is not answering ({describeError(data.apiError)}). Curve, balances and trading come straight from the chain; the stream,
+            memories and history return when it does.
+          </p>
+        )
       )}
       <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-[minmax(0,1.6fr)_minmax(300px,1fr)_minmax(300px,1fr)]">
         <div className="min-w-0 space-y-4 lg:col-span-2 xl:col-span-1">
           <StreamPanel mind={live} stream={stream} />
-          <ThoughtsTicker blocks={stream.blocks} history={thoughts.data} historyError={thoughts.isError} />
+          <ThoughtsTicker blocks={stream.blocks} history={thoughts.data} saved={stream.savedThoughts} historyError={thoughts.isError} />
           <ActionLog actions={stream.actions} />
         </div>
         <div className="min-w-0 space-y-4">

@@ -40,8 +40,10 @@ describe('slippage, deadline, estimates', () => {
     expect(slippagePercentToBps('0.5')).toBe(50n);
     expect(slippagePercentToBps('.25')).toBe(25n);
     expect(slippagePercentToBps('2,5')).toBe(250n);
-    expect(slippagePercentToBps('50')).toBe(5_000n);
-    expect(slippagePercentToBps('50.01')).toBeNull();
+    expect(slippagePercentToBps('20')).toBe(2_000n);
+    expect(slippagePercentToBps('20.01')).toBeNull();
+    expect(slippagePercentToBps('0.1')).toBe(10n);
+    expect(slippagePercentToBps('0.05')).toBeNull();
     expect(slippagePercentToBps('-1')).toBeNull();
     expect(slippagePercentToBps('0.001')).toBeNull();
     expect(slippagePercentToBps('')).toBeNull();

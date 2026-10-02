@@ -47,7 +47,7 @@ export interface StreamPanelProps {
 export function StreamPanel({ mind, stream }: StreamPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const now = useNow(1_000);
-  const fallback = useLiveFrame(mind.token, stream.frame === null);
+  const fallback = useLiveFrame(mind.token, { enabled: stream.frame === null, refresh: stream.frame === null && (stream.status ?? mind.status) === 'alive' });
   const url = stream.currentUrl ?? mind.currentUrl;
   const status = stream.status ?? mind.status;
   const frameAt = stream.frame?.at ?? fallback.loadedAt;

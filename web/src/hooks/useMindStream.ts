@@ -30,7 +30,7 @@ export function useMindStream(token: Address | undefined): StreamState {
           void queryClient.invalidateQueries({ queryKey: queryKeys.trades(token) });
         } else if (message.type === 'status') {
           void queryClient.invalidateQueries({ queryKey: queryKeys.mind(token) });
-        } else if (message.type === 'memory' && message.memory.anchorTx !== null) {
+        } else if (message.type === 'anchor' || (message.type === 'memory' && message.memory.anchorTx !== null)) {
           void queryClient.invalidateQueries({ queryKey: queryKeys.memories(token) });
         }
       },

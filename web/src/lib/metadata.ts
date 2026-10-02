@@ -1,25 +1,27 @@
 /**
- * Mind metadata (R1): draft validation, the JSON document uploaded to `POST /api/metadata`,
- * the on-chain `personaHash` / `modelId` (R12), and the `data:` URI fallback used when the
- * runner is unreachable (W2).
+ * Mind metadata (SPEC §5 `MindMetadata`, §3.2): draft validation (SPEC limits + the shared
+ * `mindMetadataSchema`), building the document, the on-chain `personaHash` / `modelId`, and the
+ * `data:` URI fallback (`metadataDataUri` from `@www-rh/shared`) used when the runner is unreachable.
  *
  * @module lib/metadata
  */
-import { modelIdToHash } from '@www-rh/shared';
+import { isModelId, metadataDataUri, mindMetadataSchema, modelIdToHash } from '@www-rh/shared';
 import { keccak256, toBytes, type Hex } from 'viem';
-import { canonicalJson, jsonDataUri, utf8ByteLength } from './canonical';
+import { canonicalJson, utf8ByteLength } from './canonical';
 import type { MindLinks, MindMetadata } from './types';
 
-/** Limits enforced by the contracts (D10) and the runner (R1). */
+/** Limits of SPEC §5 (`MindMetadata`) and §2.3 (`metadataURI` ≤ 2048 bytes). */
 export const METADATA_LIMITS = {
   nameBytes: 64,
   symbolBytes: 16,
-  /** `metadataURI` ≤ 2048 bytes on-chain (D10) — bounds the `data:` URI fallback. */
-  metadataUriBytes: 2048,
-  /** `POST /api/metadata` body ≤ 32 KB (R1). */
-  metadataJsonBytes: 32 * 1024,
+  descriptionChars: 2000,
+  imageChars: 512,
   personaChars: 8000,
-  descriptionChars: 1000,
+  linkChars: 256,
+  /** `POST /api/metadata` body limit. */
+  metadataJsonBytes: 32_768,
+  /** On-chain `metadataURI` limit — bounds the `data:` URI fallback (`MAX_METADATA_URI_BYTES`). */
+  metadataUriBytes: 2048,
 } as const;
 
 /** Form state of the create / reconfigure flows. */
@@ -34,7 +36,7 @@ export interface MetadataDraft {
 }
 
 /** Field → message map of validation problems. */
-export type DraftErrors = Partial<Record<'name' | 'symbol' | 'description' | 'image' | 'persona' | 'model' | 'links' | 'size', string>>;
+export type DraftErrors = Partial<Record<'name' | 'symbol' | 'description' | 'image' | 'persona' | 'model' | 'links' | 'schema', string>>;
 
 function isHttpUrl(text: string): boolean {
   try {
@@ -45,16 +47,17 @@ function isHttpUrl(text: string): boolean {
   }
 }
 
-function isImageRef(text: string): boolean {
-  return isHttpUrl(text) || text.startsWith('ipfs://') || /^data:image\/(png|jpeg|webp|gif);base64,/.test(text);
-}
-
-/** Builds the metadata JSON from a draft: trims strings and omits empty optional fields. */
+/**
+ * Builds the `MindMetadata` document from a draft: empty optional fields are omitted (the runner
+ * rejects empty strings). The persona is used verbatim — `personaHash` is computed over the exact
+ * string (SPEC §3.2), so it is not trimmed. Throws when the model is not a catalog id.
+ */
 export function buildMetadata(draft: MetadataDraft): MindMetadata {
+  if (!isModelId(draft.model)) throw new Error(`Unknown model "${draft.model}".`);
   const meta: MindMetadata = {
     name: draft.name.trim(),
     symbol: draft.symbol.trim(),
-    persona: draft.persona.trim(),
+    persona: draft.persona,
     model: draft.model,
   };
   const description = draft.description.trim();
@@ -72,32 +75,30 @@ export function buildMetadata(draft: MetadataDraft): MindMetadata {
   return meta;
 }
 
-/** Canonical JSON of a metadata document (R2) — the bytes hashed by the runner and embedded in `data:` URIs. */
+/** Canonical JSON of a metadata document — the bytes the runner hashes and the `data:` URI embeds. */
 export function metadataJson(meta: MindMetadata): string {
   return canonicalJson({ ...meta, links: meta.links === undefined ? undefined : { ...meta.links } });
 }
 
-/** `data:application/json;base64,…` with the canonical JSON (W2 fallback). */
-export function metadataDataUri(meta: MindMetadata): string {
-  return jsonDataUri(metadataJson(meta));
-}
-
-/** `keccak256(utf8(persona))` — the on-chain `personaHash` (R1). */
+/**
+ * `keccak256(utf8(persona))` — the on-chain `personaHash`.
+ * LOCAL FALLBACK for the SPEC §3.2 shared `personaHash(persona)`.
+ */
 export function personaHashOf(persona: string): Hex {
   return keccak256(toBytes(persona));
 }
 
-/** `keccak256(utf8(modelId))` — the on-chain `modelId` (R12). */
+/** `keccak256(utf8(modelId))` — the on-chain `modelId` (`modelIdToHash` from shared). */
 export function modelHashOf(model: string): Hex {
   return modelIdToHash(model);
 }
 
-/** Validates a draft against D10 / R1 limits. Returns an empty object when valid. */
+/** Validates a draft against SPEC §5 limits and the shared `mindMetadataSchema`. Empty object = valid. */
 export function validateDraft(draft: MetadataDraft): DraftErrors {
   const errors: DraftErrors = {};
   const name = draft.name.trim();
   const symbol = draft.symbol.trim();
-  const persona = draft.persona.trim();
+  const persona = draft.persona;
   if (name === '') errors.name = 'Give the coin a name.';
   else if (utf8ByteLength(name) > METADATA_LIMITS.nameBytes) errors.name = `At most ${METADATA_LIMITS.nameBytes} bytes.`;
   if (symbol === '') errors.symbol = 'Pick a ticker.';
@@ -107,28 +108,32 @@ export function validateDraft(draft: MetadataDraft): DraftErrors {
     errors.description = `At most ${METADATA_LIMITS.descriptionChars} characters.`;
   }
   const image = draft.image.trim();
-  if (image !== '' && !isImageRef(image)) errors.image = 'Use an https:// or ipfs:// image URL, or upload a file.';
-  if (persona.length < 20) errors.persona = 'Describe the mind in at least 20 characters: what it is curious about and how it talks.';
+  if (image !== '' && !(isHttpUrl(image) || image.startsWith('ipfs://'))) errors.image = 'Use an https:// or ipfs:// image URL.';
+  else if (image.length > METADATA_LIMITS.imageChars) errors.image = `At most ${METADATA_LIMITS.imageChars} characters.`;
+  if (persona.trim().length < 20) errors.persona = 'Describe the mind in at least 20 characters: what it is curious about and how it talks.';
   else if (persona.length > METADATA_LIMITS.personaChars) errors.persona = `At most ${METADATA_LIMITS.personaChars} characters.`;
-  if (draft.model === '') errors.model = 'Choose a model.';
-  const { x, website, telegram } = draft.links;
-  for (const link of [x, website, telegram]) {
+  if (!isModelId(draft.model)) errors.model = 'Choose a model.';
+  for (const link of [draft.links.x, draft.links.website, draft.links.telegram]) {
     const t = link.trim();
-    if (t !== '' && !isHttpUrl(t)) {
-      errors.links = 'Links must be full http(s) URLs.';
+    if (t !== '' && (!isHttpUrl(t) || t.length > METADATA_LIMITS.linkChars)) {
+      errors.links = `Links must be full http(s) URLs of at most ${METADATA_LIMITS.linkChars} characters.`;
       break;
     }
   }
   if (Object.keys(errors).length === 0) {
-    const size = utf8ByteLength(metadataJson(buildMetadata(draft)));
-    if (size > METADATA_LIMITS.metadataJsonBytes) {
-      errors.size = `Metadata is ${size} bytes; the runner accepts at most ${METADATA_LIMITS.metadataJsonBytes}. Use a smaller image or a shorter persona.`;
+    const meta = buildMetadata(draft);
+    const parsed = mindMetadataSchema.safeParse(meta);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      errors.schema = `Metadata rejected by the shared schema${issue !== undefined ? ` (${issue.path.map(String).join('.')}: ${issue.message})` : ''}.`;
+    } else if (utf8ByteLength(metadataJson(meta)) > METADATA_LIMITS.metadataJsonBytes) {
+      errors.schema = `Metadata exceeds ${METADATA_LIMITS.metadataJsonBytes} bytes; shorten the persona.`;
     }
   }
   return errors;
 }
 
-/** Whether the `data:` URI fallback fits the on-chain `metadataURI` limit (D10). */
+/** The `data:` URI fallback and whether it fits the 2048-byte on-chain `metadataURI` limit. */
 export function dataUriFits(meta: MindMetadata): { uri: string; bytes: number; fits: boolean } {
   const uri = metadataDataUri(meta);
   const bytes = utf8ByteLength(uri);

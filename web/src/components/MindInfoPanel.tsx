@@ -40,7 +40,15 @@ export function MindInfoPanel({ mind }: { mind: MindDetail }) {
         <div>
           <p className="label">persona</p>
           {persona === null ? (
-            <p className="text-dim">The persona text could not be loaded from this coin's metadata. Its hash above is what the mind is bound to on-chain.</p>
+            <p className="text-amber">
+              persona not verified.{' '}
+              <span className="text-dim">
+                {mind.personaVerified === false
+                  ? "The metadata's persona text does not hash to the on-chain personaHash, so it is not shown."
+                  : "The persona text could not be resolved from this coin's metadata."}{' '}
+                The mind is bound to the personaHash above.
+              </span>
+            </p>
           ) : (
             <>
               <p className={`whitespace-pre-wrap text-fg ${long && !expanded ? 'line-clamp-6' : ''}`}>{persona}</p>

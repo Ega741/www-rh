@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 /**
  * Generates packages/shared/src/deployments.generated.ts from contracts/deployments/*.json
- * (written by contracts/script/Deploy.s.sol; keys: launchpad, graduator, graduatorKind, chainId,
- * deployedAt — D11). @www-rh/shared never reads files at runtime (R13); run this after a deploy:
+ * (written by contracts/script/Deploy.s.sol, docs/SPEC.md §2.6):
+ *
+ *   { "chainId": <number>, "launchpad": "<address>", "graduator": "<address>",
+ *     "graduatorKind": "uniswapv3" | "mock", "deployedAt": <unix seconds> }
+ *
+ * @www-rh/shared never reads files at runtime (§3.1); run this after every deploy:
  *
  *   node scripts/sync-deployments.mjs [--check] [--deployments <dir>] [--out <file>]
  *
- * --check exits 1 when the generated file is out of date (CI).
+ * --check exits 1 when the generated file is out of date (for CI).
  */
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -22,57 +27,71 @@ const deploymentsDir = argValue('--deployments', join(root, 'contracts', 'deploy
 const outFile = argValue('--out', join(root, 'packages', 'shared', 'src', 'deployments.generated.ts'));
 const check = args.includes('--check');
 
+// EIP-55 checksumming via the viem copy installed for @www-rh/shared.
+const { getAddress } = createRequire(join(root, 'packages', 'shared', 'package.json'))('viem');
+
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const ZERO = '0x0000000000000000000000000000000000000000';
 
-/** EIP-55 checksum without dependencies is overkill here: addresses are stored lowercase and
- *  re-checksummed by viem's getAddress() inside @www-rh/shared at lookup time. */
-function normalizeAddress(value, field, file) {
-  if (typeof value !== 'string' || !ADDRESS.test(value)) throw new Error(`${file}: "${field}" must be a 0x address`);
-  return value.toLowerCase();
+function fail(file, message) {
+  throw new Error(`${file}: ${message}`);
+}
+
+function address(value, field, file) {
+  if (typeof value !== 'string' || !ADDRESS.test(value)) fail(file, `"${field}" must be a 0x address`);
+  if (value.toLowerCase() === ZERO) fail(file, `"${field}" is the zero address`);
+  return getAddress(value);
 }
 
 function parseRecord(file) {
-  const raw = JSON.parse(readFileSync(file, 'utf8'));
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`${file}: expected a JSON object`);
-  const fromName = Number.parseInt(file.split(/[\\/]/).pop().replace(/\.json$/, ''), 10);
-  const chainId = raw.chainId !== undefined ? Number(raw.chainId) : fromName;
-  if (!Number.isSafeInteger(chainId) || chainId <= 0) throw new Error(`${file}: invalid chainId`);
-  if (Number.isSafeInteger(fromName) && fromName !== chainId) throw new Error(`${file}: chainId ${chainId} does not match file name`);
-  const launchpad = normalizeAddress(raw.launchpad ?? raw.MindLaunchpad ?? raw.launchpadAddress, 'launchpad', file);
-  if (launchpad === ZERO) throw new Error(`${file}: launchpad is the zero address`);
-  const record = { chainId, launchpad };
-  if (raw.graduator !== undefined) record.graduator = normalizeAddress(raw.graduator, 'graduator', file);
-  if (raw.graduatorKind !== undefined) record.graduatorKind = String(raw.graduatorKind);
-  if (raw.deployedAt !== undefined) {
-    record.deployedAt = typeof raw.deployedAt === 'number' ? raw.deployedAt : String(raw.deployedAt);
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (err) {
+    fail(file, `invalid JSON (${err.message})`);
   }
-  const block = raw.blockNumber ?? raw.deployBlock ?? raw.startBlock;
-  if (block !== undefined) {
-    const n = Number(block);
-    if (!Number.isSafeInteger(n) || n < 0) throw new Error(`${file}: invalid block number`);
-    record.blockNumber = n;
-  }
-  return record;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) fail(file, 'expected a JSON object');
+  const fromName = Number.parseInt(file.split(/[\\/]/).pop(), 10);
+  const chainId = Number(raw.chainId);
+  if (!Number.isSafeInteger(chainId) || chainId <= 0) fail(file, '"chainId" must be a positive integer');
+  if (chainId !== fromName) fail(file, `chainId ${chainId} does not match the file name`);
+  if (raw.graduatorKind !== 'uniswapv3' && raw.graduatorKind !== 'mock') fail(file, '"graduatorKind" must be "uniswapv3" or "mock"');
+  const deployedAt = Number(raw.deployedAt);
+  if (!Number.isSafeInteger(deployedAt) || deployedAt < 0) fail(file, '"deployedAt" must be unix seconds');
+  return {
+    chainId,
+    launchpad: address(raw.launchpad, 'launchpad', file),
+    graduator: address(raw.graduator, 'graduator', file),
+    graduatorKind: raw.graduatorKind,
+    deployedAt,
+  };
 }
 
 function render(records) {
-  const body = records.length === 0
-    ? '{}'
-    : `{\n${records.map((r) => `  ${r.chainId}: ${JSON.stringify(r)},`).join('\n')}\n}`;
+  const body =
+    records.length === 0
+      ? '{}'
+      : `{\n${records
+          .map(
+            (r) =>
+              `  ${r.chainId}: { chainId: ${r.chainId}, launchpad: '${r.launchpad}', graduator: '${r.graduator}', graduatorKind: '${r.graduatorKind}', deployedAt: ${r.deployedAt} },`,
+          )
+          .join('\n')}\n}`;
   return [
     '// AUTO-GENERATED by scripts/sync-deployments.mjs from contracts/deployments/*.json — do not edit.',
-    '// Regenerate with `node scripts/sync-deployments.mjs` (or `pnpm --filter @www-rh/shared sync:deployments`).',
+    '// Regenerate with `pnpm deployments:sync` (node scripts/sync-deployments.mjs).',
     "import type { DeploymentRecord } from './addresses.js';",
     '',
     '/** Deployed contracts keyed by chain id. */',
-    `export const DEPLOYMENTS: Readonly<Record<number, DeploymentRecord>> = Object.freeze(${body} as Record<number, DeploymentRecord>);`,
+    `export const DEPLOYMENTS: Readonly<Record<number, DeploymentRecord>> = Object.freeze(${body});`,
     '',
-  ].join('\n').replace('Object.freeze({} as Record<number, DeploymentRecord>)', 'Object.freeze({})');
+  ].join('\n');
 }
 
 const files = existsSync(deploymentsDir)
-  ? readdirSync(deploymentsDir).filter((f) => /^\d+\.json$/.test(f)).sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10))
+  ? readdirSync(deploymentsDir)
+      .filter((f) => /^\d+\.json$/.test(f))
+      .sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10))
   : [];
 const records = files.map((f) => parseRecord(join(deploymentsDir, f)));
 const output = render(records);
@@ -80,11 +99,11 @@ const current = existsSync(outFile) ? readFileSync(outFile, 'utf8') : '';
 
 if (check) {
   if (current !== output) {
-    console.error(`${outFile} is out of date; run node scripts/sync-deployments.mjs`);
+    console.error(`${outFile} is out of date; run: node scripts/sync-deployments.mjs`);
     process.exit(1);
   }
   console.log(`${outFile} is up to date (${records.length} deployment(s))`);
 } else {
   if (current !== output) writeFileSync(outFile, output);
-  console.log(`wrote ${outFile} with ${records.length} deployment(s)${records.length ? `: ${records.map((r) => r.chainId).join(', ')}` : ''}`);
+  console.log(`wrote ${outFile}: ${records.length} deployment(s)${records.length ? ` (${records.map((r) => r.chainId).join(', ')})` : ''}`);
 }

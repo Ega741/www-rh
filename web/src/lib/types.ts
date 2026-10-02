@@ -11,6 +11,8 @@
 import type { Address, Hex } from 'viem';
 import type { JsonObject } from './json';
 
+export type { MindMetadata } from '@www-rh/shared';
+
 /** Mind status names (R11 / D4). `paused` is set by the creator only. */
 export type MindStatusName = 'alive' | 'dormant' | 'paused';
 /** Curve phase names (R11). */
@@ -57,6 +59,8 @@ export interface MindSummary {
 /** `MindDetail` = summary + resolved metadata and graduation info. */
 export interface MindDetail extends MindSummary {
   personaHash: Hex;
+  /** Runner's verdict: the resolved persona hashes to `personaHash` (`null` = not resolved). */
+  personaVerified: boolean | null;
   pool: Address | null;
   positionId: bigint | null;
   description: string | null;
@@ -107,19 +111,27 @@ export interface Thought {
 /** Per-tick compute ledger row. */
 export interface LedgerEntry {
   tickId: number;
+  /** Served model (the price applied). */
   model: string;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
   costUsd: number;
-  settledTx: Hex | null;
-  createdAt: number | null;
+  iterations: number | null;
+  stopReason: string | null;
+  error: string | null;
+  /** Receipt this tick was settled in (`null` while unsettled). */
+  receiptHash: Hex | null;
+  settled: boolean;
+  startedAt: number | null;
 }
 
 /** A compute draw receipt as shown in the UI (W6). */
 export interface ComputeReceipt {
   receiptHash: Hex;
+  /** `pending` | `submitted` | `confirmed` | `failed` | `dry_run` (or `null` when not reported). */
+  status: string | null;
   txHash: Hex | null;
   amountWei: bigint;
   fromTickId: number | null;
@@ -141,6 +153,12 @@ export interface ComputeInfo {
   burnUsdPerHour: number;
   /** `null` = no burn (infinite runway). */
   runwayHours: number | null;
+  /** Spend not yet drawn from the vault. */
+  unsettledUsd: number | null;
+  /** `balanceUsd − unsettledUsd`. */
+  availableUsd: number | null;
+  /** Burn-governor tick interval (R5), `null` when the mind is not runnable. */
+  tickIntervalMs: number | null;
   ledger: LedgerEntry[];
   receipts: ComputeReceipt[];
 }
@@ -182,17 +200,6 @@ export interface ModelInfo {
 export interface MindsPage {
   items: MindSummary[];
   nextCursor: string | null;
-}
-
-/** Metadata JSON uploaded with `POST /api/metadata` (R1). */
-export interface MindMetadata {
-  name: string;
-  symbol: string;
-  description?: string;
-  image?: string;
-  persona: string;
-  model: string;
-  links?: MindLinks;
 }
 
 /** `POST /api/metadata` response (R1). */

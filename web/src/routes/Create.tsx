@@ -8,7 +8,7 @@
  */
 import { DEFAULT_MODEL, DEFAULT_TRADE_FEE_BPS, TOTAL_SUPPLY } from '@www-rh/shared';
 import { useQueryClient } from '@tanstack/react-query';
-import { useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { zeroAddress, type Address, type Hex, type TransactionReceipt } from 'viem';
 import { useReadContract, useWriteContract } from 'wagmi';
@@ -18,10 +18,9 @@ import { MindAvatar, TxLink } from '../components/common';
 import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
 import { formatBps, formatEth, formatTokens, parseAmount } from '../format';
 import { useTxFlow } from '../hooks/useTxFlow';
-import { launchpadAbi } from '../lib/abi';
+import { mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
 import { describeError } from '../lib/errors';
 import { mindCreatedToken } from '../lib/events';
-import { imageFileToThumbnail } from '../lib/image';
 import { METADATA_LIMITS, buildMetadata, metadataJson, modelHashOf, validateDraft, type DraftErrors, type MetadataDraft } from '../lib/metadata';
 import { publishMetadata, type PublishedMetadata } from '../lib/publish';
 import { DEFAULT_SLIPPAGE_BPS, planInitialBuy, slippagePercentToBps } from '../lib/quote';
@@ -66,7 +65,6 @@ export function Create() {
   const [flowError, setFlowError] = useState<string | null>(null);
   const [published, setPublished] = useState<{ json: string; result: PublishedMetadata } | null>(null);
   const [createdToken, setCreatedToken] = useState<Address | null>(null);
-  const [imageError, setImageError] = useState<string | null>(null);
 
   const launchpad = LAUNCHPAD_ADDRESS ?? zeroAddress;
   const readBase = { address: launchpad, abi: launchpadAbi, chainId: TARGET_CHAIN.id, query: { enabled: LAUNCHPAD_ADDRESS !== null } } as const;
@@ -124,18 +122,16 @@ export function Create() {
     void navigate(`/mind/${token}`);
   }
 
+  // The vault seed is optional: a rejected or failed fundMind still lands on the new mind (SPEC §7 step 5).
+  useEffect(() => {
+    if (step === 'seeding' && seedTx.error !== null && createdToken !== null) {
+      setStep('done');
+      void navigate(`/mind/${createdToken}`, { state: { seedError: seedTx.error } });
+    }
+  }, [step, seedTx.error, createdToken, navigate]);
+
   function update<K extends keyof MetadataDraft>(key: K, value: MetadataDraft[K]) {
     setDraft((d) => ({ ...d, [key]: value }));
-  }
-
-  async function onImageFile(file: File | undefined) {
-    setImageError(null);
-    if (file === undefined) return;
-    try {
-      update('image', await imageFileToThumbnail(file));
-    } catch (e) {
-      setImageError(describeError(e));
-    }
   }
 
   const amountsValid = initialBuyWei !== null && seedWei !== null && slippageBps !== null && plan !== null;
@@ -144,7 +140,14 @@ export function Create() {
   async function submit() {
     setTouched(true);
     setFlowError(null);
-    if (!canSubmit || plan === null || LAUNCHPAD_ADDRESS === null) return;
+    if (!canSubmit || initialBuyWei === null || slippageBps === null || LAUNCHPAD_ADDRESS === null) return;
+    // Re-read creationFee and feeParams right before submitting (SPEC §7 step 3).
+    const [freshFee, freshParams] = await Promise.all([creationFee.refetch(), feeParams.refetch()]);
+    if (freshFee.data === undefined || freshParams.data === undefined) {
+      setFlowError(`Could not read the creation fee from ${TARGET_CHAIN.name}: ${describeError(freshFee.error ?? freshParams.error)}`);
+      return;
+    }
+    const finalPlan = planInitialBuy({ initialBuyWei, creationFee: freshFee.data, tradeFeeBps: BigInt(freshParams.data.tradeFeeBps), slippageBps });
     const meta = buildMetadata(draft);
     const json = metadataJson(meta);
     setStep('publishing');
@@ -164,8 +167,8 @@ export function Create() {
         address: LAUNCHPAD_ADDRESS as Address,
         abi: launchpadAbi,
         functionName: 'createMind',
-        args: [meta.name, meta.symbol, pub.uri, modelHashOf(meta.model), pub.personaHash, plan.minTokensOut],
-        value: plan.value,
+        args: [meta.name, meta.symbol, pub.uri, modelHashOf(meta.model), pub.personaHash, finalPlan.minTokensOut],
+        value: finalPlan.value,
         chainId: TARGET_CHAIN.id,
       }),
     );
@@ -220,26 +223,17 @@ export function Create() {
             <Field label="description" error={shownErrors.description} hint="Optional. Shown on the coin page.">
               <textarea className="field min-h-16" value={draft.description} disabled={busy} onChange={(e) => update('description', e.target.value)} placeholder="A coin whose mind reads the sky so you don't have to." />
             </Field>
-            <Field label="image" error={shownErrors.image ?? imageError ?? undefined} hint="An https:// or ipfs:// URL, or upload a file (stored as a small thumbnail in the metadata).">
+            <Field label="image" error={shownErrors.image} hint="Optional. An https:// or ipfs:// URL (up to 512 characters), square works best.">
               <div className="flex items-center gap-3">
                 <MindAvatar image={draft.image.trim() === '' ? null : draft.image.trim()} symbol={draft.symbol || '?'} size={44} />
                 <input
                   className={`field flex-1 ${shownErrors.image ? 'field-error' : ''}`}
-                  value={draft.image.startsWith('data:') ? '(uploaded thumbnail)' : draft.image}
-                  disabled={busy || draft.image.startsWith('data:')}
+                  value={draft.image}
+                  maxLength={512}
+                  disabled={busy}
                   onChange={(e) => update('image', e.target.value)}
                   placeholder="https://… or ipfs://…"
                 />
-                {draft.image.startsWith('data:') ? (
-                  <button type="button" className="btn btn-sm" onClick={() => update('image', '')} disabled={busy}>
-                    remove
-                  </button>
-                ) : (
-                  <label className="btn btn-sm cursor-pointer">
-                    upload
-                    <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" className="hidden" disabled={busy} onChange={(e) => void onImageFile(e.target.files?.[0])} />
-                  </label>
-                )}
               </div>
             </Field>
             <Field label="links" error={shownErrors.links} hint="Optional.">
@@ -269,7 +263,7 @@ export function Create() {
               <Field label="initial buy (ETH)" error={initialBuyWei === null ? 'Not a valid ETH amount.' : undefined} hint="Optional. You buy first, at the lowest price.">
                 <input className={`field ${initialBuyWei === null ? 'field-error' : ''}`} inputMode="decimal" value={initialBuy} disabled={busy} onChange={(e) => setInitialBuy(e.target.value)} placeholder="0.0" />
               </Field>
-              <Field label="slippage (%)" error={slippageBps === null ? 'Between 0 and 50.' : undefined} hint="Applied to the initial buy.">
+              <Field label="slippage (%)" error={slippageBps === null ? 'Between 0.1 and 20.' : undefined} hint="Applied to the initial buy.">
                 <input className={`field ${slippageBps === null ? 'field-error' : ''}`} inputMode="decimal" value={slippage} disabled={busy} onChange={(e) => setSlippage(e.target.value)} placeholder="1" />
               </Field>
               <Field label="seed the vault (ETH)" error={seedWei === null ? 'Not a valid ETH amount.' : undefined} hint="Optional. Sent with fundMind right after creation.">
@@ -286,7 +280,7 @@ export function Create() {
           {paused.data === true && (
             <p className="rounded border border-amber/40 bg-amber/5 p-2 text-[12px] text-amber">The launchpad is paused by its owner: new coins cannot be created right now.</p>
           )}
-          {touched && errors.size !== undefined && <p className="text-[12px] text-danger">{errors.size}</p>}
+          {touched && errors.schema !== undefined && <p className="text-[12px] text-danger">{errors.schema}</p>}
           {flowError !== null && <p className="rounded border border-danger/40 bg-danger/5 p-2 text-[12px] text-danger">{flowError}</p>}
           {createTx.error !== null && step === 'form' && <p className="text-[12px] text-danger">{createTx.error}</p>}
 
@@ -295,6 +289,11 @@ export function Create() {
               {submitLabel()}
             </button>
           </ChainGuard>
+          {step === 'seeding' && createdToken !== null && (
+            <button type="button" className="btn btn-sm w-full" onClick={() => finish(createdToken)}>
+              skip seeding and open the mind
+            </button>
+          )}
           <StepLog step={step} published={published?.result ?? null} createHash={createTx.hash} seedHash={seedTx.hash} seedError={seedTx.error} token={createdToken} />
         </form>
 

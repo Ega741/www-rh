@@ -16,14 +16,17 @@ export const ROBINHOOD_TESTNET_CHAIN_ID = 46630 as const;
 export const ANVIL_CHAIN_ID = 31337 as const;
 
 /**
- * Canonical Multicall3 address (`0xcA11bde05977b3631167028862bE2a173976CA11`).
- *
- * NOTE: Multicall3 is deployed at this deterministic address on most EVM chains including
- * Arbitrum Orbit chains, but we could not verify the deployment on Robinhood Chain from the
- * build sandbox (no RPC access). If `eth_getCode` returns empty on your RPC, override
- * `contracts.multicall3` when configuring wagmi or set `multicall: false` on the client.
+ * Canonical Multicall3 address (EIP-55). Multicall3 is deployed at this deterministic address on
+ * most EVM chains, but its presence on Robinhood Chain could not be verified, so the chain
+ * definitions below do NOT declare it; opt in with {@link withMulticall3} after checking
+ * `cast code 0xcA11bde05977b3631167028862bE2a173976CA11` on your RPC.
  */
-export const MULTICALL3_ADDRESS = '0xca11bde05977b3631167028862be2a173976ca11' as const;
+export const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11' as const;
+
+/** Returns a copy of `chain` declaring `contracts.multicall3` at {@link MULTICALL3_ADDRESS}. */
+export function withMulticall3(chain: Chain): Chain {
+  return { ...chain, contracts: { ...chain.contracts, multicall3: { address: MULTICALL3_ADDRESS } } };
+}
 
 /** Robinhood Chain mainnet (chain id 4663). Parent chain: Ethereum (1). */
 export const robinhoodChain: Chain = /* #__PURE__ */ defineChain({
@@ -59,10 +62,6 @@ export const robinhoodChain: Chain = /* #__PURE__ */ defineChain({
     robinscan: { name: 'Robinscan', url: 'https://robinscan.io' },
     hoodscan: { name: 'Hoodscan', url: 'https://hoodscan.co' },
   },
-  contracts: {
-    // See the note on MULTICALL3_ADDRESS: unverified from the sandbox, standard CREATE2 address.
-    multicall3: { address: MULTICALL3_ADDRESS },
-  },
   sourceId: 1,
   testnet: false,
 });
@@ -94,10 +93,6 @@ export const robinhoodChainTestnet: Chain = /* #__PURE__ */ defineChain({
       apiUrl: 'https://explorer.testnet.chain.robinhood.com/api',
     },
   },
-  contracts: {
-    // See the note on MULTICALL3_ADDRESS.
-    multicall3: { address: MULTICALL3_ADDRESS },
-  },
   sourceId: 11_155_111,
   testnet: true,
 });
@@ -110,10 +105,6 @@ export const anvilChain: Chain = /* #__PURE__ */ defineChain({
   nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
   rpcUrls: {
     default: { http: ['http://127.0.0.1:8545'], webSocket: ['ws://127.0.0.1:8545'] },
-  },
-  contracts: {
-    // anvil does not pre-deploy Multicall3; the deploy script may deploy it at the canonical address.
-    multicall3: { address: MULTICALL3_ADDRESS },
   },
   testnet: true,
 });

@@ -6,7 +6,7 @@
  *
  * @module config
  */
-import { chainById, launchpadAddress, robinhoodChainTestnet } from '@www-rh/shared';
+import { chainById, launchpadAddress, robinhoodChainTestnet, withMulticall3 } from '@www-rh/shared';
 import { isAddress, zeroAddress, type Address, type Chain } from 'viem';
 
 /** The subset of `import.meta.env` the app reads. */
@@ -55,20 +55,21 @@ export function resolveWsBase(env: WebEnv, location: { protocol: string; host: s
 /**
  * The chain the app targets: `VITE_CHAIN_ID` resolved through `@www-rh/shared` chains
  * (default: Robinhood Chain Testnet), with an optional `VITE_RPC_URL` override. Multicall3 is
- * removed from the chain object unless `VITE_MULTICALL=1` (directive W5).
+ * declared only when `VITE_MULTICALL=1` (`withMulticall3`, SPEC §7 / W5); any multicall3 entry of
+ * the base definition is removed otherwise.
  */
 export function resolveChain(env: WebEnv): Chain {
   const id = Number(clean(env.VITE_CHAIN_ID) || robinhoodChainTestnet.id);
   const base = chainById(id) ?? robinhoodChainTestnet;
   const rpc = clean(env.VITE_RPC_URL);
-  const multicall = clean(env.VITE_MULTICALL) === '1';
   const { contracts, ...rest } = base;
+  const { multicall3: _unverified, ...otherContracts } = contracts ?? {};
   const chain: Chain = {
     ...rest,
+    ...(Object.keys(otherContracts).length > 0 ? { contracts: otherContracts } : {}),
     rpcUrls: rpc === '' ? base.rpcUrls : { ...base.rpcUrls, default: { http: [rpc] } },
   };
-  if (multicall && contracts !== undefined) chain.contracts = contracts;
-  return chain;
+  return clean(env.VITE_MULTICALL) === '1' ? withMulticall3(chain) : chain;
 }
 
 /**

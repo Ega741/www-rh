@@ -2,72 +2,28 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { keccak256, toEventSelector, toFunctionSelector, type Abi, type AbiEvent, type AbiFunction } from 'viem';
-import {
-  CurvePhase,
-  MindStatus,
-  OPTIONAL_LAUNCHPAD_FUNCTIONS,
-  REMOVED_LAUNCHPAD_MEMBERS,
-  aggregatorV3Abi,
-  graduatorAbi,
-  mindLaunchpadAbi,
-  mindTokenAbi,
-} from '../src/abi.js';
+import { toEventSelector, toFunctionSelector, type Abi, type AbiEvent, type AbiFunction } from 'viem';
+import { BURN_ADDRESS, CurvePhase, MindStatus, graduatorAbi, mindLaunchpadAbi, mindTokenAbi } from '../src/abi.js';
 
 type AbiError = Extract<Abi[number], { type: 'error' }>;
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-/** Artifact locations: Foundry output first, then the `abi:sync` copy. */
-function artifactCandidates(contract: string): string[] {
-  return [
-    resolve(here, `../../../contracts/out/${contract}.sol/${contract}.json`),
-    resolve(here, `../abi/${contract}.json`),
-  ];
-}
+/** Custom errors declared by `IMindLaunchpad` (SPEC §2.3). */
+const LAUNCHPAD_CUSTOM_ERRORS = [
+  'NotAMind', 'WrongPhase', 'Slippage', 'Expired', 'ZeroAmount', 'ExceedsTokensSold', 'NotCreator', 'NotOperator',
+  'InvalidStatus', 'InvalidName', 'InvalidSymbol', 'MetadataTooLong', 'InvalidModel', 'InsufficientCreationFee',
+  'InsufficientMindBalance', 'DrawLimitExceeded', 'InvalidDrawLimit', 'FeeTooHigh', 'ZeroAddress', 'EthTransferFailed',
+  'GraduatorNotSet', 'EthReturnMismatch', 'DirectEthNotAccepted',
+];
 
-const contractsRoot = resolve(here, '../../../contracts');
-
-interface LoadedArtifact {
-  abi: Abi;
-  path: string;
-  /** Why the artifact cannot be trusted to reflect the current sources, if so. */
-  stale?: string;
-}
-
-/**
- * Foundry metadata records `keccak256` of every source it compiled. An artifact whose `src/` sources
- * no longer hash to the files on disk was built from an older revision (e.g. before the contract
- * directives) and is not a meaningful reference for the human-readable ABI.
- */
-function stalenessOf(raw: unknown): string | undefined {
-  const meta = (raw as { metadata?: unknown }).metadata;
-  const parsed: unknown = typeof meta === 'string' ? JSON.parse(meta) : meta;
-  const sources = (parsed as { sources?: Record<string, { keccak256?: string }> } | undefined)?.sources;
-  if (sources === undefined) return undefined;
-  for (const [file, info] of Object.entries(sources)) {
-    if (!file.startsWith('src/') || info.keccak256 === undefined) continue;
-    const onDisk = resolve(contractsRoot, file);
-    if (!existsSync(onDisk)) return `${file} no longer exists`;
-    if (keccak256(readFileSync(onDisk)).toLowerCase() !== info.keccak256.toLowerCase()) return `${file} changed since the build`;
-  }
-  return undefined;
-}
-
-function loadArtifactAbi(contract: string): LoadedArtifact | undefined {
-  for (const path of artifactCandidates(contract)) {
-    if (!existsSync(path)) continue;
-    const raw: unknown = JSON.parse(readFileSync(path, 'utf8'));
-    const abi = Array.isArray(raw) ? raw : (raw as { abi?: unknown }).abi;
-    if (!Array.isArray(abi)) continue;
-    const typed = abi as Abi;
-    const removed = typed
-      .filter((i) => 'name' in i && REMOVED_LAUNCHPAD_MEMBERS.includes(i.name))
-      .map((i) => ('name' in i ? i.name : ''));
-    const stale = removed.length > 0 ? `declares members removed by the directives: ${removed.join(', ')}` : Array.isArray(raw) ? undefined : stalenessOf(raw);
-    return stale === undefined ? { abi: typed, path } : { abi: typed, path, stale };
-  }
-  return undefined;
+/** ABI copied by `pnpm abi:sync` into `packages/shared/abi/<Name>.json` (SPEC §3.3). */
+function loadSyncedAbi(contract: string): Abi | undefined {
+  const path = resolve(here, `../abi/${contract}.json`);
+  if (!existsSync(path)) return undefined;
+  const raw: unknown = JSON.parse(readFileSync(path, 'utf8'));
+  const abi = Array.isArray(raw) ? raw : (raw as { abi?: unknown }).abi;
+  return Array.isArray(abi) ? (abi as Abi) : undefined;
 }
 
 interface Selectors {
@@ -76,8 +32,10 @@ interface Selectors {
   errors: Map<string, string>; // selector -> signature
 }
 
-function describeInputs(inputs: readonly { type: string }[]): string {
-  return inputs.map((i) => i.type).join(',');
+type Param = { type: string; components?: readonly Param[] };
+
+function describeInputs(inputs: readonly Param[]): string {
+  return inputs.map((i) => (i.type.startsWith('tuple') && i.components ? `(${describeInputs(i.components)})${i.type.slice(5)}` : i.type)).join(',');
 }
 
 function selectorsOf(abi: Abi): Selectors {
@@ -91,81 +49,80 @@ function selectorsOf(abi: Abi): Selectors {
       out.events.set(toEventSelector(e), `${e.name}(${describeInputs(e.inputs)})`);
     } else if (item.type === 'error') {
       const e = item as AbiError;
-      // error selectors are computed exactly like function selectors
       out.errors.set(toFunctionSelector({ ...e, type: 'function', stateMutability: 'pure', outputs: [] }), `${e.name}(${describeInputs(e.inputs)})`);
     }
   }
   return out;
 }
 
-function missing(expected: Map<string, string>, actual: Map<string, string>, skip: readonly string[] = []): string[] {
-  const out: string[] = [];
-  for (const [sel, sig] of expected) {
-    if (actual.has(sel)) continue;
-    const name = sig.slice(0, sig.indexOf('('));
-    if (skip.includes(name)) continue;
-    out.push(`${sig} [${sel}]`);
-  }
-  return out;
+function missing(expected: Map<string, string>, actual: Map<string, string>): string[] {
+  return [...expected].filter(([sel]) => !actual.has(sel)).map(([sel, sig]) => `${sig} [${sel}]`);
 }
 
-describe('human-readable ABI sanity', () => {
-  it('parses every function, event and error required by SPEC §2.3 + D1–D10', () => {
-    const fnNames = new Set<string>(mindLaunchpadAbi.filter((i) => i.type === 'function').map((i) => i.name));
+const names = (abi: Abi, type: 'function' | 'event' | 'error'): Set<string> =>
+  new Set(abi.filter((i) => i.type === type).map((i) => (i as { name: string }).name));
+
+describe('human-readable ABI (SPEC §2.3, §3.3)', () => {
+  it('declares every IMindLaunchpad function, event and custom error plus the inherited surface', () => {
+    const fns = names(mindLaunchpadAbi, 'function');
     for (const name of [
-      'createMind', 'buy', 'sell', 'graduate', 'harvest', 'fundMind',
-      'quoteBuy', 'quoteSell', 'currentPrice', 'getMind', 'getCurve', 'mindBalance', 'protocolBalance',
-      'mindsLength', 'mindAt', 'isMind', 'feeParams', 'creationFee', 'drawLimit', 'drawnInEpoch',
-      'operator', 'treasury', 'computeTreasury', 'graduator', 'graduatorOf', 'isGraduator',
-      'VIRTUAL_ETH', 'VIRTUAL_TOKENS', 'CURVE_SUPPLY', 'LP_SUPPLY', 'TOTAL_SUPPLY',
-      'setMindConfig', 'setCreatorPaused', 'drawCompute', 'anchorMemory', 'setMindStatus',
-      'setOperator', 'setTreasury', 'setComputeTreasury', 'setGraduator', 'setFeeParams', 'setCreationFee', 'setDrawLimit',
-      'pause', 'unpause', 'withdrawProtocolFees', 'owner', 'pendingOwner', 'transferOwnership', 'acceptOwnership', 'paused',
+      'createMind', 'buy', 'sell', 'graduate', 'harvest', 'fundMind', 'setMindConfig', 'setCreatorPaused',
+      'drawCompute', 'anchorMemory', 'setMindStatus', 'setOperator', 'setTreasury', 'setComputeTreasury', 'setGraduator',
+      'setFeeParams', 'setCreationFee', 'setDrawLimit', 'pause', 'unpause', 'withdrawProtocolFees', 'quoteBuy', 'quoteSell',
+      'currentPrice', 'getMind', 'getCurve', 'mindBalance', 'protocolBalance', 'mindsLength', 'mindAt', 'isMind', 'feeParams',
+      'creationFee', 'drawLimit', 'drawnInEpoch', 'operator', 'treasury', 'computeTreasury', 'graduator', 'graduatorOf',
+      'isGraduator', 'TOTAL_SUPPLY', 'CURVE_SUPPLY', 'LP_SUPPLY', 'VIRTUAL_ETH', 'VIRTUAL_TOKENS',
+      'owner', 'pendingOwner', 'transferOwnership', 'acceptOwnership', 'renounceOwnership', 'paused',
     ]) {
-      expect(fnNames.has(name), `function ${name}`).toBe(true);
+      expect(fns.has(name), `function ${name}`).toBe(true);
     }
-    const eventNames = new Set<string>(mindLaunchpadAbi.filter((i) => i.type === 'event').map((i) => i.name));
+    expect(fns.size).toBe(52);
+    const events = names(mindLaunchpadAbi, 'event');
     for (const name of [
-      'MindCreated', 'Trade', 'CurveCompleted', 'Graduated', 'MindFunded', 'FeeAccrued', 'ComputeDrawn', 'MemoryAnchored',
-      'MindConfigUpdated', 'MindStatusChanged', 'Harvested', 'ProtocolFeesWithdrawn',
-      'OperatorUpdated', 'TreasuryUpdated', 'ComputeTreasuryUpdated', 'GraduatorUpdated', 'FeeParamsUpdated',
-      'CreationFeeUpdated', 'DrawLimitUpdated',
+      'MindCreated', 'Trade', 'CurveCompleted', 'Graduated', 'FeeAccrued', 'MindFunded', 'Harvested', 'ComputeDrawn',
+      'MemoryAnchored', 'MindConfigUpdated', 'MindStatusChanged', 'ProtocolFeesWithdrawn', 'OperatorUpdated',
+      'TreasuryUpdated', 'ComputeTreasuryUpdated', 'GraduatorUpdated', 'FeeParamsUpdated', 'CreationFeeUpdated',
+      'DrawLimitUpdated', 'OwnershipTransferStarted', 'OwnershipTransferred', 'Paused', 'Unpaused',
     ]) {
-      expect(eventNames.has(name), `event ${name}`).toBe(true);
+      expect(events.has(name), `event ${name}`).toBe(true);
     }
-    const errorNames = new Set<string>(mindLaunchpadAbi.filter((i) => i.type === 'error').map((i) => i.name));
+    const errors = names(mindLaunchpadAbi, 'error');
     for (const name of [
-      'NotAMind', 'WrongPhase', 'Slippage', 'Expired', 'ZeroAmount', 'NotCreator', 'NotOperator',
-      'InvalidStatus', 'DrawLimitExceeded', 'InsufficientMindBalance', 'FeeTooHigh', 'InsufficientCreationFee', 'ZeroAddress',
-      'EthTransferFailed', 'DirectEthNotAccepted', 'GraduatorNotSet',
+      ...LAUNCHPAD_CUSTOM_ERRORS, 'OwnableUnauthorizedAccount', 'OwnableInvalidOwner', 'EnforcedPause', 'ExpectedPause',
+      'ReentrancyGuardReentrantCall', 'SafeERC20FailedOperation', 'SafeCastOverflowedUintDowncast',
     ]) {
-      expect(errorNames.has(name), `error ${name}`).toBe(true);
+      expect(errors.has(name), `error ${name}`).toBe(true);
     }
+    for (const removed of ['creditMind', 'retireMind', 'withdrawRetiredMind', 'graduateFor', 'RetiredMindWithdrawn', 'PoolPriceSkewed', 'Retired', 'NotGraduator']) {
+      expect(fns.has(removed) || events.has(removed) || errors.has(removed), removed).toBe(false);
+    }
+    expect(mindLaunchpadAbi.some((i) => i.type === 'receive')).toBe(true);
+    const ctor = mindLaunchpadAbi.find((i) => i.type === 'constructor') as { inputs: readonly { name: string }[] } | undefined;
+    expect(ctor?.inputs.map((i) => i.name)).toEqual(['initialOwner', 'treasury', 'computeTreasury', 'operator']);
   });
 
-  it('drops every member removed by the directives and has no constructor', () => {
-    const names = new Set<string>(mindLaunchpadAbi.filter((i) => 'name' in i).map((i) => (i as { name: string }).name));
-    for (const removed of REMOVED_LAUNCHPAD_MEMBERS) expect(names.has(removed), removed).toBe(false);
-    expect(names.has('Retired')).toBe(false);
-    const kinds = (abi: readonly { type: string }[]): string[] => abi.map((i) => i.type);
-    expect(kinds(mindLaunchpadAbi)).not.toContain('constructor');
-    expect(kinds(mindTokenAbi)).not.toContain('constructor');
-    expect(mindLaunchpadAbi.some((i) => i.type === 'receive')).toBe(true);
-    expect(OPTIONAL_LAUNCHPAD_FUNCTIONS).toEqual([]);
+  it('event parameter names match §2.3 (viem decodes by name)', () => {
+    const event = (name: string): AbiEvent => mindLaunchpadAbi.find((i) => i.type === 'event' && i.name === name) as AbiEvent;
+    expect(event('OperatorUpdated').inputs.map((i) => i.name)).toEqual(['newOperator']);
+    expect(event('TreasuryUpdated').inputs.map((i) => i.name)).toEqual(['newTreasury']);
+    expect(event('ComputeTreasuryUpdated').inputs.map((i) => i.name)).toEqual(['newComputeTreasury']);
+    expect(event('GraduatorUpdated').inputs.map((i) => i.name)).toEqual(['newGraduator']);
+    expect(event('CreationFeeUpdated').inputs.map((i) => i.name)).toEqual(['newCreationFee']);
+    expect(event('ComputeDrawn').inputs.map((i) => `${i.name}${i.indexed === true ? '*' : ''}`)).toEqual(['token*', 'amount', 'receiptHash']);
+    expect(event('MemoryAnchored').inputs.map((i) => `${i.name}${i.indexed === true ? '*' : ''}`)).toEqual(['token*', 'seq*', 'contentHash', 'uri']);
   });
 
   it('well-known selectors / topics are stable', () => {
     const s = selectorsOf(mindLaunchpadAbi);
     expect(s.functions.get(toFunctionSelector('buy(address,uint256,uint256)'))).toBe('buy(address,uint256,uint256)');
     expect(s.functions.get(toFunctionSelector('sell(address,uint256,uint256,uint256)'))).toBe('sell(address,uint256,uint256,uint256)');
-    expect(s.functions.get(toFunctionSelector('setFeeParams((uint16,uint16,uint16))'))).toBe('setFeeParams(tuple)');
+    expect(s.functions.get(toFunctionSelector('setFeeParams((uint16,uint16,uint16))'))).toBe('setFeeParams((uint16,uint16,uint16))');
+    expect(s.functions.get(toFunctionSelector('drawCompute(address,uint256,bytes32)'))).toBe('drawCompute(address,uint256,bytes32)');
+    expect(s.functions.get(toFunctionSelector('setCreatorPaused(address,bool)'))).toBe('setCreatorPaused(address,bool)');
     expect(s.events.has(toEventSelector('Trade(address,address,bool,uint256,uint256,uint256,uint256,uint256)'))).toBe(true);
     expect(s.events.has(toEventSelector('MindStatusChanged(address,uint8)'))).toBe(true);
     expect(s.events.has(toEventSelector('ComputeDrawn(address,uint256,bytes32)'))).toBe(true);
-    expect(s.functions.get(toFunctionSelector('drawCompute(address,uint256,bytes32)'))).toBe('drawCompute(address,uint256,bytes32)');
-    expect(s.functions.get(toFunctionSelector('setCreatorPaused(address,bool)'))).toBe('setCreatorPaused(address,bool)');
-    expect(s.functions.get(toFunctionSelector('graduatorOf(address)'))).toBe('graduatorOf(address)');
-    expect(s.errors.get(toFunctionSelector('DirectEthNotAccepted()'))).toBe('DirectEthNotAccepted()');
+    expect(s.errors.get(toFunctionSelector('EthReturnMismatch()'))).toBe('EthReturnMismatch()');
     const token = selectorsOf(mindTokenAbi);
     expect(token.functions.has('0xa9059cbb')).toBe(true); // transfer(address,uint256)
     expect(token.functions.has('0xd505accf')).toBe(true); // permit(...)
@@ -173,19 +130,25 @@ describe('human-readable ABI sanity', () => {
     const grad = selectorsOf(graduatorAbi);
     expect(grad.functions.get(toFunctionSelector('graduate(address,uint256)'))).toBe('graduate(address,uint256)');
     expect(grad.functions.get(toFunctionSelector('harvest(address)'))).toBe('harvest(address)');
+    expect(grad.functions.get(toFunctionSelector('launchpad()'))).toBe('launchpad()');
     expect(grad.events.has(toEventSelector('GraduatedAtSkewedPrice(address,uint160,uint160)'))).toBe(true);
     const graduate = graduatorAbi.find((i) => i.type === 'function' && i.name === 'graduate') as AbiFunction;
     expect(graduate.stateMutability).toBe('payable');
     expect(graduate.outputs.map((o) => o.name)).toEqual(['pool', 'positionId', 'ethReturned']);
-    expect(selectorsOf(aggregatorV3Abi).functions.has('0xfeaf968c')).toBe(true); // latestRoundData()
+    const skew = graduatorAbi.find((i) => i.type === 'event') as AbiEvent;
+    expect(skew.inputs[0]).toMatchObject({ name: 'token', indexed: true });
+    expect(names(graduatorAbi, 'error')).toEqual(
+      new Set(['NotLaunchpad', 'AlreadyGraduated', 'NoPosition', 'UnexpectedEthSender', 'UnsupportedFeeTier', 'ZeroAddress', 'EthTransferFailed']),
+    );
   });
 
   it('enum helpers match the Solidity declaration order', () => {
     expect(CurvePhase).toEqual({ Bonding: 0, Complete: 1, Graduated: 2 });
     expect(MindStatus).toEqual({ Alive: 0, Dormant: 1, Paused: 2 });
+    expect(BURN_ADDRESS).toBe('0x000000000000000000000000000000000000dEaD');
   });
 
-  it('struct returns are tuples with the SPEC field order', () => {
+  it('struct returns are tuples with the §2.3 field order', () => {
     const getMind = mindLaunchpadAbi.find((i) => i.type === 'function' && i.name === 'getMind') as AbiFunction;
     const out = getMind.outputs[0] as { type: string; components?: { name: string }[] };
     expect(out.type).toBe('tuple');
@@ -196,63 +159,53 @@ describe('human-readable ABI sanity', () => {
   });
 });
 
-const launchpadArtifactRaw = loadArtifactAbi('MindLaunchpad');
-const tokenArtifactRaw = loadArtifactAbi('MindToken');
-const launchpadArtifact = launchpadArtifactRaw?.stale === undefined ? launchpadArtifactRaw : undefined;
-const tokenArtifact = tokenArtifactRaw?.stale === undefined ? tokenArtifactRaw : undefined;
+const launchpadArtifact = loadSyncedAbi('MindLaunchpad');
+const tokenArtifact = loadSyncedAbi('MindToken');
+const graduatorArtifact = loadSyncedAbi('IGraduator');
 
-describe.skipIf(launchpadArtifact === undefined)('MindLaunchpad ABI equivalence with the Foundry artifact', () => {
+describe.skipIf(launchpadArtifact === undefined)('MindLaunchpad ABI equivalence with abi/MindLaunchpad.json', () => {
   const ours = selectorsOf(mindLaunchpadAbi);
-  const theirs = selectorsOf(launchpadArtifact?.abi ?? []);
+  const theirs = selectorsOf(launchpadArtifact ?? []);
 
-  it('every function in the human-readable ABI exists in the artifact (same selector)', () => {
-    expect(missing(ours.functions, theirs.functions, OPTIONAL_LAUNCHPAD_FUNCTIONS)).toEqual([]);
-  });
-  it('every event in the human-readable ABI exists in the artifact (same topic0)', () => {
-    expect(missing(ours.events, theirs.events)).toEqual([]);
-  });
-  it('every error in the human-readable ABI exists in the artifact (same selector)', () => {
-    expect(missing(ours.errors, theirs.errors)).toEqual([]);
-  });
-  it('the artifact has no functions or events the human-readable ABI lacks', () => {
-    expect(missing(theirs.functions, ours.functions)).toEqual([]);
-    expect(missing(theirs.events, ours.events)).toEqual([]);
-  });
-  it('reports artifact errors the human-readable ABI lacks (library errors are tolerated)', () => {
-    const extra = missing(theirs.errors, ours.errors);
-    if (extra.length > 0) {
-      // eslint-disable-next-line no-console
-      console.info(`[abi.test] artifact declares extra errors not in mindLaunchpadAbi: ${extra.join(', ')}`);
-    }
-    // Only a handful of library-level errors are acceptable; anything from SPEC must already be in ours.
-    expect(extra.length).toBeLessThanOrEqual(8);
-  });
-});
-
-describe.skipIf(tokenArtifact === undefined)('MindToken ABI equivalence with the Foundry artifact', () => {
-  const ours = selectorsOf(mindTokenAbi);
-  const theirs = selectorsOf(tokenArtifact?.abi ?? []);
-
-  it('functions and events match in both directions', () => {
+  it('function selectors are set-equal in both directions', () => {
     expect(missing(ours.functions, theirs.functions)).toEqual([]);
-    expect(missing(ours.events, theirs.events)).toEqual([]);
     expect(missing(theirs.functions, ours.functions)).toEqual([]);
+  });
+  it('event topics are set-equal in both directions', () => {
+    expect(missing(ours.events, theirs.events)).toEqual([]);
     expect(missing(theirs.events, ours.events)).toEqual([]);
   });
-  it('every error in the human-readable ABI exists in the artifact', () => {
-    expect(missing(ours.errors, theirs.errors)).toEqual([]);
+  it('every compiled error is in mindLaunchpadAbi and every IMindLaunchpad custom error is in both', () => {
+    expect(missing(theirs.errors, ours.errors)).toEqual([]);
+    const compiled = new Set([...theirs.errors.values()].map((s) => s.slice(0, s.indexOf('('))));
+    for (const name of LAUNCHPAD_CUSTOM_ERRORS) expect(compiled.has(name), name).toBe(true);
   });
 });
 
-for (const [name, raw] of [['MindLaunchpad', launchpadArtifactRaw], ['MindToken', tokenArtifactRaw]] as const) {
-  if (raw === undefined) {
+describe.skipIf(tokenArtifact === undefined)('MindToken ABI equivalence with abi/MindToken.json', () => {
+  it('functions and events are set-equal; compiled errors are covered', () => {
+    const ours = selectorsOf(mindTokenAbi);
+    const theirs = selectorsOf(tokenArtifact ?? []);
+    expect(missing(ours.functions, theirs.functions)).toEqual([]);
+    expect(missing(theirs.functions, ours.functions)).toEqual([]);
+    expect(missing(ours.events, theirs.events)).toEqual([]);
+    expect(missing(theirs.events, ours.events)).toEqual([]);
+    expect(missing(theirs.errors, ours.errors)).toEqual([]);
+  });
+});
+
+describe.skipIf(graduatorArtifact === undefined)('IGraduator ABI equivalence with abi/IGraduator.json', () => {
+  it('functions are set-equal', () => {
+    const ours = selectorsOf(graduatorAbi);
+    const theirs = selectorsOf(graduatorArtifact ?? []);
+    expect(missing(ours.functions, theirs.functions)).toEqual([]);
+    expect(missing(theirs.functions, ours.functions)).toEqual([]);
+  });
+});
+
+for (const [name, abi] of [['MindLaunchpad', launchpadArtifact], ['MindToken', tokenArtifact]] as const) {
+  if (abi === undefined) {
     // eslint-disable-next-line no-console
-    console.info(
-      `[abi.test] contracts/out/${name}.sol/${name}.json not found — artifact equivalence skipped. ` +
-        'Run `cd contracts && forge build` (or `pnpm abi:sync`) to enable it.',
-    );
-  } else if (raw.stale !== undefined) {
-    // eslint-disable-next-line no-console
-    console.info(`[abi.test] ${raw.path} is stale (${raw.stale}) — artifact equivalence skipped; rebuild with \`forge build\`.`);
+    console.info(`[abi.test] packages/shared/abi/${name}.json not found — equivalence skipped (run \`forge build && pnpm abi:sync\`).`);
   }
 }

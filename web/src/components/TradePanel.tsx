@@ -15,7 +15,7 @@ import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
 import { formatBps, formatEth, formatPrice, formatTokens, parseAmount, progressPercent } from '../format';
 import { useDebounced } from '../hooks/useDebounced';
 import { useTxFlow } from '../hooks/useTxFlow';
-import { launchpadAbi } from '../lib/abi';
+import { mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
 import { addressUrl, tokenUrl } from '../lib/chain';
 import { DEFAULT_DEADLINE_MINUTES, deadlineFromNow, estimateBuy, estimateSell, minOutWithSlippage, priceImpactBps, slippagePercentToBps } from '../lib/quote';
 import type { MindDetail } from '../lib/types';
@@ -74,8 +74,8 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
     query: { enabled: address !== undefined && hasLaunchpad && side === 'sell' },
   });
   const quoteEnabled = hasLaunchpad && bonding && parsed !== null && parsed > 0n;
-  const buyQuote = useReadContract({ ...lp, functionName: 'quoteBuy', args: [mind.token, parsed ?? 0n], query: { enabled: quoteEnabled && side === 'buy', refetchInterval: 5_000 } });
-  const sellQuote = useReadContract({ ...lp, functionName: 'quoteSell', args: [mind.token, parsed ?? 0n], query: { enabled: quoteEnabled && side === 'sell', refetchInterval: 5_000 } });
+  const buyQuote = useReadContract({ ...lp, functionName: 'quoteBuy', args: [mind.token, parsed ?? 0n], query: { enabled: quoteEnabled && side === 'buy', refetchInterval: 2_000 } });
+  const sellQuote = useReadContract({ ...lp, functionName: 'quoteSell', args: [mind.token, parsed ?? 0n], query: { enabled: quoteEnabled && side === 'sell', refetchInterval: 2_000 } });
 
   const tradeFeeBps = feeParams.data !== undefined ? BigInt(feeParams.data.tradeFeeBps) : 100n;
   const reserves = { realEthReserve: mind.realEthReserveWei, tokensSold: mind.tokensSold };
@@ -142,7 +142,16 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
     },
   });
   const approveTx = useTxFlow({ onConfirmed: () => void allowance.refetch() });
-  const phaseTx = useTxFlow({ onConfirmed: afterTx });
+  // A WrongPhase revert on graduate means someone else graduated first: refetch, no error (SPEC §7).
+  const phaseTx = useTxFlow({
+    onConfirmed: afterTx,
+    onRevert: (name) => {
+      if (name !== 'WrongPhase' || mind.phase !== 'complete') return false;
+      afterTx();
+      return true;
+    },
+  });
+  const mockGraduator = mind.phase === 'graduated' && (mind.positionId === null || mind.positionId === 0n);
 
   const canTrade =
     hasLaunchpad && bonding && !stale && parsed !== null && parsed > 0n && minOut !== null && deadlineValid && !insufficient && !sellExceedsCurve && !tradeTx.busy;
@@ -229,20 +238,24 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
       )}
 
       {mind.phase === 'graduated' && (
-        <Panel title="dex">
+        <Panel title={mockGraduator ? 'graduated' : 'dex'}>
           <div className="space-y-2 p-3 text-[12px]">
-            <p className="text-dim">The curve is closed. {symbol} now trades against WETH in its DEX pool.</p>
+            <p className="text-dim">
+              {mockGraduator
+                ? `The curve is closed. This launchpad uses the MockGraduator, so ${symbol} has no DEX pool: the liquidity is held by the graduator contract.`
+                : `The curve is closed. ${symbol} now trades against WETH in its full-range DEX pool.`}
+            </p>
             <div className="flex flex-wrap gap-2">
               <ExternalLink href={tokenUrl(mind.token)} className="btn btn-sm">
                 token on explorer
               </ExternalLink>
               {mind.pool !== null && (
                 <ExternalLink href={addressUrl(mind.pool)} className="btn btn-sm">
-                  pool on explorer
+                  {mockGraduator ? 'MockGraduator (no DEX)' : 'pool on explorer'}
                 </ExternalLink>
               )}
             </div>
-            <p className="text-dim">LP fees belong to the mind: harvesting sends the ETH side to its vault and burns the token side.</p>
+            <p className="text-dim">LP fees belong to the mind: harvesting sends the ETH side to its vault and burns the token side. Anyone can trigger it.</p>
             <ChainGuard action="harvest" compact>
               <button
                 type="button"
@@ -250,7 +263,7 @@ export function TradePanel({ mind, onTx }: TradePanelProps) {
                 disabled={phaseTx.busy}
                 onClick={() => void phaseTx.run(() => write.mutateAsync({ ...lp, address: LAUNCHPAD_ADDRESS as Address, functionName: 'harvest', args: [mind.token] }))}
               >
-                {phaseTx.busy ? 'Harvesting…' : 'Harvest LP fees into the vault'}
+                {phaseTx.busy ? 'Harvesting…' : 'Harvest fees'}
               </button>
             </ChainGuard>
             <TxStatus tx={phaseTx} labels={{ confirmed: 'Harvested.' }} />

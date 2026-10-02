@@ -9,7 +9,7 @@ import { marketCap, priceOf, progressBps } from '@www-rh/shared';
 import { erc20Abi, zeroAddress, type Address } from 'viem';
 import { useReadContract } from 'wagmi';
 import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
-import { launchpadAbi } from '../lib/abi';
+import { mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
 import { toPhaseName, toStatusName } from '../lib/normalize';
 import type { MindDetail } from '../lib/types';
 import { useMindDetail } from '../queries';
@@ -69,6 +69,7 @@ export function useMindData(token: Address | undefined): MindData {
       trades24h: 0,
       volume24hWei: 0n,
       personaHash: chainInfo.personaHash,
+      personaVerified: null,
       pool: null,
       positionId: null,
       description: null,

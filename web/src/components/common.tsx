@@ -11,7 +11,7 @@ import type { TxFlow } from '../hooks/useTxFlow';
 
 /** Status dot + label (W3: paused is shown as "paused by creator"). */
 export function StatusBadge({ status, compact = false }: { status: MindStatusName; compact?: boolean }) {
-  const label = status === 'alive' ? 'alive' : status === 'paused' ? 'paused by creator' : 'dormant';
+  const label = status === 'alive' ? 'alive' : status === 'paused' ? 'paused by creator' : 'sleeping';
   const dot =
     status === 'alive'
       ? 'bg-acid animate-pulse-dot'
@@ -23,7 +23,7 @@ export function StatusBadge({ status, compact = false }: { status: MindStatusNam
       ? 'The mind is running: browsing, thinking and remembering.'
       : status === 'paused'
         ? 'The creator paused this mind. Its vault is untouched until it resumes.'
-        : 'The mind is asleep: its vault cannot pay for compute. Feeding it wakes it up.';
+        : 'Dormant: the vault cannot pay for compute right now. Feeding the mind (or trading its coin) wakes it up.';
   return (
     <span className="inline-flex items-center gap-1.5 text-[11px]" title={title}>
       <span className={`inline-block h-2 w-2 rounded-full ${dot}`} />

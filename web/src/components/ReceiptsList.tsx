@@ -11,6 +11,13 @@ import { verifyReceipt } from '../lib/receipts';
 import type { ComputeInfo } from '../lib/types';
 import { CopyButton, Panel, TxLink } from './common';
 
+function statusClass(status: string): string {
+  if (status === 'confirmed') return 'text-acid';
+  if (status === 'failed') return 'text-danger';
+  if (status === 'dry_run') return 'text-amber';
+  return 'text-dim';
+}
+
 function VerifyBadge({ result }: { result: ReturnType<typeof verifyReceipt> }) {
   if (result === 'verified') return <span className="chip border-acid/40 text-acid" title="keccak256(canonical receipt JSON) equals the on-chain receiptHash">hash verified</span>;
   if (result === 'mismatch') return <span className="chip border-danger/50 text-danger" title="The served receipt does not hash to receiptHash">hash mismatch</span>;
@@ -49,12 +56,13 @@ export function ReceiptsList({ compute, error }: { compute: ComputeInfo | undefi
                 <p className="flex flex-wrap items-center gap-x-2 text-mute">
                   <span title={r.receiptHash}>receipt {shortHash(r.receiptHash, 10)}</span>
                   <CopyButton value={r.receiptHash} />
+                  {r.status !== null && <span className={statusClass(r.status)}>{r.status.replace('_', ' ')}</span>}
                   {r.txHash !== null ? (
                     <span>
                       tx <TxLink hash={r.txHash} />
                     </span>
                   ) : (
-                    <span>pending draw</span>
+                    r.status === null && <span>not drawn yet</span>
                   )}
                 </p>
               </li>
@@ -75,13 +83,16 @@ export function ReceiptsList({ compute, error }: { compute: ComputeInfo | undefi
               </thead>
               <tbody>
                 {recentTicks.map((t) => (
-                  <tr key={t.tickId} className="text-dim">
-                    <td>#{t.tickId}</td>
+                  <tr key={t.tickId} className="text-dim" title={t.error ?? (t.stopReason !== null ? `stop: ${t.stopReason}` : undefined)}>
+                    <td>
+                      #{t.tickId}
+                      {t.error !== null && <span className="ml-1 text-danger">!</span>}
+                    </td>
                     <td className="max-w-24 truncate">{t.model.replace(/^claude-/, '')}</td>
                     <td className="text-right">
                       {t.inputTokens} / {t.cacheReadTokens} / {t.outputTokens}
                     </td>
-                    <td className={`text-right ${t.settledTx === null ? 'text-fg' : ''}`}>{formatUsd(t.costUsd)}</td>
+                    <td className={`text-right ${!t.settled ? 'text-fg' : ''}`}>{formatUsd(t.costUsd)}</td>
                   </tr>
                 ))}
               </tbody>

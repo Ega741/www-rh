@@ -18,21 +18,24 @@ import {
 
 /** Default slippage tolerance: 1 % (SPEC §7). */
 export const DEFAULT_SLIPPAGE_BPS = 100n;
-/** Upper bound accepted by the UI: 50 %. */
-export const MAX_SLIPPAGE_BPS = 5_000n;
+/** Lower bound accepted by the UI: 0.1 % (SPEC §7: 10..2000 bps). */
+export const MIN_SLIPPAGE_BPS = 10n;
+/** Upper bound accepted by the UI: 20 %. */
+export const MAX_SLIPPAGE_BPS = 2_000n;
 /** Default trade deadline in minutes. */
 export const DEFAULT_DEADLINE_MINUTES = 10;
 
 /**
  * Parses a slippage percentage typed by the user (`"1"`, `"0.5"`) into basis points.
- * Returns `null` when invalid, negative, more than 2 decimals or above {@link MAX_SLIPPAGE_BPS}.
+ * Returns `null` when invalid, more than 2 decimals, or outside
+ * [{@link MIN_SLIPPAGE_BPS}, {@link MAX_SLIPPAGE_BPS}].
  */
 export function slippagePercentToBps(input: string): bigint | null {
   const text = input.trim().replace(',', '.');
   if (!/^[0-9]+(\.[0-9]{0,2})?$|^\.[0-9]{1,2}$/.test(text)) return null;
   const [int = '0', frac = ''] = text.split('.');
   const bps = BigInt(int === '' ? '0' : int) * 100n + BigInt((frac + '00').slice(0, 2));
-  return bps > MAX_SLIPPAGE_BPS ? null : bps;
+  return bps < MIN_SLIPPAGE_BPS || bps > MAX_SLIPPAGE_BPS ? null : bps;
 }
 
 /** `amount · (1 − slippage)` — the min-out passed to the contract. */

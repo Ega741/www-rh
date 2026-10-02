@@ -19,7 +19,9 @@ const noCheck = process.argv.includes('--no-check');
 const CONTRACTS = [
   { name: 'MindLaunchpad', shared: 'mindLaunchpadAbi' },
   { name: 'MindToken', shared: 'mindTokenAbi' },
-  { name: 'IGraduator', shared: 'graduatorAbi' },
+  // SPEC §3.3: graduatorAbi = IGraduator + GraduatedAtSkewedPrice + implementation errors, so its
+  // events/errors may come from the compiled graduator implementations (functions must match IGraduator).
+  { name: 'IGraduator', shared: 'graduatorAbi', alsoFrom: ['UniswapV3Graduator', 'MockGraduator'] },
   { name: 'UniswapV3Graduator', shared: null },
   { name: 'MockGraduator', shared: null },
 ];
@@ -50,7 +52,17 @@ if (!noCheck) {
   sharedAbi = await import(distPath);
 }
 
-for (const { name, shared } of CONTRACTS) {
+function implementationSignatures(names) {
+  const out = new Set();
+  for (const ref of names ?? []) {
+    const file = path.join(outDir, `${ref}.sol`, `${ref}.json`);
+    if (!existsSync(file)) continue;
+    for (const s of signatures(JSON.parse(readFileSync(file, 'utf8')).abi)) if (!s.startsWith('function ')) out.add(s);
+  }
+  return out;
+}
+
+for (const { name, shared, alsoFrom } of CONTRACTS) {
   const artifact = path.join(outDir, `${name}.sol`, `${name}.json`);
   if (!existsSync(artifact)) {
     console.error(`missing artifact ${artifact}: run \`forge build\` in contracts/ first`);
@@ -64,7 +76,8 @@ for (const { name, shared } of CONTRACTS) {
     const actual = signatures(sharedAbi[shared]);
     // The shared ABI for MindToken only needs to be a subset (ERC20 surface); others must match exactly.
     const missing = [...expected].filter((s) => !actual.has(s));
-    const extra = [...actual].filter((s) => !expected.has(s));
+    const fromImplementations = implementationSignatures(alsoFrom);
+    const extra = [...actual].filter((s) => !expected.has(s) && !fromImplementations.has(s));
     const subsetOk = name === 'MindToken';
     if ((missing.length && !subsetOk) || extra.length) {
       failed = true;

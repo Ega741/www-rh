@@ -1,13 +1,10 @@
 /**
- * Human-readable ABIs (viem `parseAbi`) for the www-rh contracts, mirroring `docs/SPEC.md` §2 as
- * amended by the contract directives D1–D10 (no `creditMind` / `retireMind` / `graduateFor`;
- * ETH returns from graduators through gated `receive()`; compute draws go to `computeTreasury`;
- * `MindStatus { Alive, Dormant, Paused }`).
+ * Human-readable ABIs (viem `parseAbi`) for the www-rh contracts — `docs/SPEC.md` §2 and §3.3.
  *
- * Enums (`CurvePhase`, `MindStatus`) are `uint8` at the ABI level; the numeric values are
- * exported as `CurvePhase` / `MindStatus` below. Constructors are intentionally omitted (these
- * ABIs describe the deployed interface only). A vitest test compares every function selector,
- * event topic and error selector against the Foundry artifacts when they are present and current.
+ * Enums (`CurvePhase`, `MindStatus`) are `uint8` at the ABI level; their numeric values are
+ * exported as const objects below. Event parameter names, struct field names and named outputs
+ * match §2 exactly because viem decodes by name. A vitest test compares selectors / topics with
+ * the compiled artifacts copied by `pnpm abi:sync` (`packages/shared/abi/*.json`).
  *
  * @module abi
  */
@@ -22,8 +19,8 @@ export const CurvePhase = {
 export type CurvePhase = (typeof CurvePhase)[keyof typeof CurvePhase];
 
 /**
- * `enum MindStatus { Alive, Dormant, Paused }` (D4). `Paused` is set/unset only by the creator via
- * `setCreatorPaused`; the operator's `setMindStatus` toggles `Alive <-> Dormant` only.
+ * `enum MindStatus { Alive, Dormant, Paused }`. `Paused` is set/unset only by the creator
+ * (`setCreatorPaused`); the operator's `setMindStatus` toggles `Alive <-> Dormant` only.
  */
 export const MindStatus = {
   Alive: 0,
@@ -32,61 +29,87 @@ export const MindStatus = {
 } as const;
 export type MindStatus = (typeof MindStatus)[keyof typeof MindStatus];
 
-/** Struct declarations shared by the launchpad ABI (human-readable ABI syntax). */
-const launchpadStructs = [
+/** Human-readable signatures of `MindLaunchpad` (§2.3 + inherited OpenZeppelin surface). */
+export const mindLaunchpadAbiSignatures = [
+  // ---------------------------------------------------------------- types
   'struct MindInfo { address creator; bytes32 modelId; bytes32 personaHash; string metadataURI; uint64 createdAt; uint8 status; }',
   'struct CurveState { uint128 realEthReserve; uint128 tokensSold; uint8 phase; address pool; uint256 positionId; }',
   'struct FeeParams { uint16 tradeFeeBps; uint16 mindShareBps; uint16 graduationFeeBps; }',
-] as const;
-
-/**
- * `MindLaunchpad` functions (SPEC §2.3 + D1–D10) plus the public surface inherited from
- * OpenZeppelin `Ownable2Step` and `Pausable`.
- */
-const launchpadFunctions = [
-  // --- user ---
+  'constructor(address initialOwner, address treasury, address computeTreasury, address operator)',
+  // accepts ETH only from isGraduator[msg.sender], else DirectEthNotAccepted()
+  'receive() external payable',
+  // ---------------------------------------------------------------- events
+  'event MindCreated(address indexed token, address indexed creator, string name, string symbol, string metadataURI, bytes32 modelId, bytes32 personaHash)',
+  'event Trade(address indexed token, address indexed trader, bool isBuy, uint256 ethAmount, uint256 tokenAmount, uint256 fee, uint256 realEthReserve, uint256 tokensSold)',
+  'event CurveCompleted(address indexed token, uint256 realEthReserve)',
+  'event Graduated(address indexed token, address pool, uint256 positionId, uint256 ethLiquidity, uint256 tokenLiquidity, uint256 graduationFee)',
+  'event FeeAccrued(address indexed token, uint256 mindAmount, uint256 protocolAmount)',
+  'event MindFunded(address indexed token, address indexed from, uint256 amount)',
+  'event Harvested(address indexed token, uint256 ethOut, uint256 tokensBurned)',
+  'event ComputeDrawn(address indexed token, uint256 amount, bytes32 receiptHash)',
+  'event MemoryAnchored(address indexed token, uint64 indexed seq, bytes32 contentHash, string uri)',
+  'event MindConfigUpdated(address indexed token, bytes32 modelId, bytes32 personaHash, string metadataURI)',
+  'event MindStatusChanged(address indexed token, uint8 status)',
+  'event ProtocolFeesWithdrawn(address indexed to, uint256 amount)',
+  'event OperatorUpdated(address newOperator)',
+  'event TreasuryUpdated(address newTreasury)',
+  'event ComputeTreasuryUpdated(address newComputeTreasury)',
+  'event GraduatorUpdated(address newGraduator)',
+  'event FeeParamsUpdated(uint16 tradeFeeBps, uint16 mindShareBps, uint16 graduationFeeBps)',
+  'event CreationFeeUpdated(uint256 newCreationFee)',
+  'event DrawLimitUpdated(uint256 maxPerEpoch, uint32 epochSeconds)',
+  // inherited (Ownable2Step, Pausable)
+  'event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner)',
+  'event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)',
+  'event Paused(address account)',
+  'event Unpaused(address account)',
+  // ---------------------------------------------------------------- errors
+  'error NotAMind()',
+  'error WrongPhase()',
+  'error Slippage()',
+  'error Expired()',
+  'error ZeroAmount()',
+  'error ExceedsTokensSold()',
+  'error NotCreator()',
+  'error NotOperator()',
+  'error InvalidStatus()',
+  'error InvalidName()',
+  'error InvalidSymbol()',
+  'error MetadataTooLong()',
+  'error InvalidModel()',
+  'error InsufficientCreationFee()',
+  'error InsufficientMindBalance()',
+  'error DrawLimitExceeded()',
+  'error InvalidDrawLimit()',
+  'error FeeTooHigh()',
+  'error ZeroAddress()',
+  'error EthTransferFailed()',
+  'error GraduatorNotSet()',
+  'error EthReturnMismatch()',
+  'error DirectEthNotAccepted()',
+  // inherited / library
+  'error OwnableUnauthorizedAccount(address account)',
+  'error OwnableInvalidOwner(address owner)',
+  'error EnforcedPause()',
+  'error ExpectedPause()',
+  'error ReentrancyGuardReentrantCall()',
+  'error SafeERC20FailedOperation(address token)',
+  'error SafeCastOverflowedUintDowncast(uint8 bits, uint256 value)',
+  // ---------------------------------------------------------------- user
   'function createMind(string name, string symbol, string metadataURI, bytes32 modelId, bytes32 personaHash, uint256 minTokensOut) payable returns (address token)',
   'function buy(address token, uint256 minTokensOut, uint256 deadline) payable returns (uint256 tokensOut)',
   'function sell(address token, uint256 tokensIn, uint256 minEthOut, uint256 deadline) returns (uint256 ethOut)',
   'function graduate(address token)',
   'function harvest(address token)',
   'function fundMind(address token) payable',
-  // Accepts ETH only from addresses with isGraduator == true (D1); reverts DirectEthNotAccepted otherwise.
-  'receive() external payable',
-  // --- views ---
-  'function quoteBuy(address token, uint256 ethIn) view returns (uint256 tokensOut, uint256 ethUsed, uint256 fee)',
-  'function quoteSell(address token, uint256 tokensIn) view returns (uint256 ethOut, uint256 fee)',
-  'function currentPrice(address token) view returns (uint256 weiPer1e18Tokens)',
-  'function getMind(address token) view returns (MindInfo info)',
-  'function getCurve(address token) view returns (CurveState curve)',
-  'function mindBalance(address token) view returns (uint256)',
-  'function protocolBalance() view returns (uint256)',
-  'function mindsLength() view returns (uint256)',
-  'function mindAt(uint256 index) view returns (address)',
-  'function isMind(address token) view returns (bool)',
-  'function feeParams() view returns (FeeParams params)',
-  'function creationFee() view returns (uint256)',
-  'function drawLimit() view returns (uint256 maxPerEpoch, uint32 epochSeconds)',
-  'function drawnInEpoch(address token) view returns (uint256 drawn, uint64 epochStart)',
-  'function operator() view returns (address)',
-  'function treasury() view returns (address)',
-  'function computeTreasury() view returns (address)',
-  'function graduator() view returns (address)',
-  'function graduatorOf(address token) view returns (address)',
-  'function isGraduator(address account) view returns (bool)',
-  'function VIRTUAL_ETH() view returns (uint256)',
-  'function VIRTUAL_TOKENS() view returns (uint256)',
-  'function CURVE_SUPPLY() view returns (uint256)',
-  'function LP_SUPPLY() view returns (uint256)',
-  'function TOTAL_SUPPLY() view returns (uint256)',
-  // --- creator ---
+  // ---------------------------------------------------------------- creator
   'function setMindConfig(address token, bytes32 modelId, bytes32 personaHash, string metadataURI)',
   'function setCreatorPaused(address token, bool paused)',
-  // --- operator ---
+  // ---------------------------------------------------------------- operator
   'function drawCompute(address token, uint256 amount, bytes32 receiptHash)',
   'function anchorMemory(address token, uint64 seq, bytes32 contentHash, string uri)',
   'function setMindStatus(address token, uint8 status)',
-  // --- owner ---
+  // ---------------------------------------------------------------- owner
   'function setOperator(address newOperator)',
   'function setTreasury(address newTreasury)',
   'function setComputeTreasury(address newComputeTreasury)',
@@ -96,8 +119,35 @@ const launchpadFunctions = [
   'function setDrawLimit(uint256 maxPerEpoch, uint32 epochSeconds)',
   'function pause()',
   'function unpause()',
+  // ---------------------------------------------------------------- owner or treasury
   'function withdrawProtocolFees(address to)',
-  // --- Ownable2Step / Pausable (OpenZeppelin 5.x) ---
+  // ---------------------------------------------------------------- views
+  'function quoteBuy(address token, uint256 ethIn) view returns (uint256 tokensOut, uint256 ethUsed, uint256 fee)',
+  'function quoteSell(address token, uint256 tokensIn) view returns (uint256 ethOut, uint256 fee)',
+  'function currentPrice(address token) view returns (uint256 weiPer1e18Tokens)',
+  'function getMind(address token) view returns (MindInfo)',
+  'function getCurve(address token) view returns (CurveState)',
+  'function mindBalance(address token) view returns (uint256)',
+  'function protocolBalance() view returns (uint256)',
+  'function mindsLength() view returns (uint256)',
+  'function mindAt(uint256 index) view returns (address)',
+  'function isMind(address token) view returns (bool)',
+  'function feeParams() view returns (FeeParams)',
+  'function creationFee() view returns (uint256)',
+  'function drawLimit() view returns (uint256 maxPerEpoch, uint32 epochSeconds)',
+  'function drawnInEpoch(address token) view returns (uint256 drawn, uint64 epochStart)',
+  'function operator() view returns (address)',
+  'function treasury() view returns (address)',
+  'function computeTreasury() view returns (address)',
+  'function graduator() view returns (address)',
+  'function graduatorOf(address token) view returns (address)',
+  'function isGraduator(address account) view returns (bool)',
+  'function TOTAL_SUPPLY() view returns (uint256)',
+  'function CURVE_SUPPLY() view returns (uint256)',
+  'function LP_SUPPLY() view returns (uint256)',
+  'function VIRTUAL_ETH() view returns (uint256)',
+  'function VIRTUAL_TOKENS() view returns (uint256)',
+  // inherited (Ownable2Step, Pausable)
   'function owner() view returns (address)',
   'function pendingOwner() view returns (address)',
   'function transferOwnership(address newOwner)',
@@ -106,87 +156,12 @@ const launchpadFunctions = [
   'function paused() view returns (bool)',
 ] as const;
 
-/** `MindLaunchpad` events (SPEC §2.3 + D1–D10) plus OpenZeppelin `Ownable2Step` / `Pausable` events. */
-const launchpadEvents = [
-  'event MindCreated(address indexed token, address indexed creator, string name, string symbol, string metadataURI, bytes32 modelId, bytes32 personaHash)',
-  'event Trade(address indexed token, address indexed trader, bool isBuy, uint256 ethAmount, uint256 tokenAmount, uint256 fee, uint256 realEthReserve, uint256 tokensSold)',
-  'event CurveCompleted(address indexed token, uint256 realEthReserve)',
-  'event Graduated(address indexed token, address pool, uint256 positionId, uint256 ethLiquidity, uint256 tokenLiquidity, uint256 graduationFee)',
-  // fundMind, graduator ETH returns and harvest proceeds (from = graduator); fee shares emit FeeAccrued (D8).
-  'event MindFunded(address indexed token, address indexed from, uint256 amount)',
-  'event FeeAccrued(address indexed token, uint256 mindAmount, uint256 protocolAmount)',
-  'event ComputeDrawn(address indexed token, uint256 amount, bytes32 receiptHash)',
-  'event MemoryAnchored(address indexed token, uint64 indexed seq, bytes32 contentHash, string uri)',
-  'event MindConfigUpdated(address indexed token, bytes32 modelId, bytes32 personaHash, string metadataURI)',
-  'event MindStatusChanged(address indexed token, uint8 status)',
-  'event Harvested(address indexed token, uint256 ethOut, uint256 tokensBurned)',
-  'event ProtocolFeesWithdrawn(address indexed to, uint256 amount)',
-  'event OperatorUpdated(address operator)',
-  'event TreasuryUpdated(address treasury)',
-  'event ComputeTreasuryUpdated(address computeTreasury)',
-  'event GraduatorUpdated(address graduator)',
-  'event FeeParamsUpdated(uint16 tradeFeeBps, uint16 mindShareBps, uint16 graduationFeeBps)',
-  'event CreationFeeUpdated(uint256 creationFee)',
-  'event DrawLimitUpdated(uint256 maxPerEpoch, uint32 epochSeconds)',
-  // --- OpenZeppelin ---
-  'event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)',
-  'event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner)',
-  'event Paused(address account)',
-  'event Unpaused(address account)',
-] as const;
-
-/**
- * `MindLaunchpad` errors: SPEC §2.3 / D1–D10, input validation (D10), the graduator balance check
- * (D1), and the OpenZeppelin / library errors the contract can revert with.
- */
-const launchpadErrors = [
-  'error NotAMind()',
-  'error WrongPhase()',
-  'error Slippage()',
-  'error Expired()',
-  'error ZeroAmount()',
-  'error NotCreator()',
-  'error NotOperator()',
-  'error InvalidStatus()',
-  'error DrawLimitExceeded()',
-  'error InsufficientMindBalance()',
-  'error FeeTooHigh()',
-  'error InsufficientCreationFee()',
-  'error ZeroAddress()',
-  'error EthTransferFailed()',
-  'error DirectEthNotAccepted()',
-  'error GraduatorNotSet()',
-  // balance after a graduator call != balBefore - ethSent + ethReturned (D1)
-  'error BalanceMismatch()',
-  // createMind / setMindConfig input validation (D10)
-  'error InvalidName()',
-  'error InvalidSymbol()',
-  'error InvalidMetadataURI()',
-  'error InvalidModelId()',
-  'error ExceedsTokensSold()',
-  // --- OpenZeppelin ---
-  'error OwnableUnauthorizedAccount(address account)',
-  'error OwnableInvalidOwner(address owner)',
-  'error EnforcedPause()',
-  'error ExpectedPause()',
-  'error ReentrancyGuardReentrantCall()',
-  'error SafeERC20FailedOperation(address token)',
-  'error SafeCastOverflowedUintDowncast(uint8 bits, uint256 value)',
-] as const;
-
-/** Human-readable signatures of `MindLaunchpad` (structs, functions, events, errors). */
-export const mindLaunchpadAbiSignatures = [
-  ...launchpadStructs,
-  ...launchpadFunctions,
-  ...launchpadEvents,
-  ...launchpadErrors,
-] as const;
-
 /** Parsed ABI of `MindLaunchpad`. Fully typed for viem / wagmi. */
 export const mindLaunchpadAbi = parseAbi(mindLaunchpadAbiSignatures);
 
-/** Human-readable signatures of `MindToken` (ERC20 + ERC20Permit + `launchpad()` / `creator()`). */
+/** Human-readable signatures of `MindToken` (ERC20 + ERC20Permit + `launchpad()` / `creator()`, §2.1). */
 export const mindTokenAbiSignatures = [
+  'constructor(string name, string symbol, address launchpad, address creator)',
   // --- MindToken ---
   'function launchpad() view returns (address)',
   'function creator() view returns (address)',
@@ -220,58 +195,35 @@ export const mindTokenAbiSignatures = [
   'error ECDSAInvalidSignature()',
   'error ECDSAInvalidSignatureLength(uint256 length)',
   'error ECDSAInvalidSignatureS(bytes32 s)',
+  // OpenZeppelin ShortStrings (EIP712 name/version), present in the compiled ABI
   'error InvalidShortString()',
   'error StringTooLong(string str)',
 ] as const;
 
-/** Parsed ABI of `MindToken` (SPEC §2.1). */
+/** Parsed ABI of `MindToken` (§2.1). */
 export const mindTokenAbi = parseAbi(mindTokenAbiSignatures);
 
 /**
- * Human-readable signatures of `IGraduator` (D1) plus the `GraduatedAtSkewedPrice` event emitted
- * by `UniswapV3Graduator` when a pre-created pool is initialized at another price (D3).
+ * Human-readable signatures of `IGraduator` (§2.2) plus the `UniswapV3Graduator` event and the
+ * errors of both implementations (§2.4, §2.5), so clients can decode graduation reverts.
  */
 export const graduatorAbiSignatures = [
-  // The graduator sends `ethReturned` back to the launchpad (plain call → gated receive()) before returning.
+  'function launchpad() view returns (address)',
+  // the graduator sends `ethReturned` back to the launchpad (plain call → gated receive()) before returning
   'function graduate(address token, uint256 tokenAmount) payable returns (address pool, uint256 positionId, uint256 ethReturned)',
   'function harvest(address token) returns (uint256 ethOut, uint256 tokensBurned)',
-  'event GraduatedAtSkewedPrice(address token, uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96)',
+  'event GraduatedAtSkewedPrice(address indexed token, uint160 expectedSqrtPriceX96, uint160 actualSqrtPriceX96)',
+  'error NotLaunchpad()',
+  'error AlreadyGraduated()',
+  'error NoPosition()',
+  'error UnexpectedEthSender()',
+  'error UnsupportedFeeTier()',
+  'error ZeroAddress()',
+  'error EthTransferFailed()',
 ] as const;
 
-/** Parsed ABI of `IGraduator` (+ `GraduatedAtSkewedPrice`). */
+/** Parsed ABI of `IGraduator` (+ `GraduatedAtSkewedPrice` and implementation errors). */
 export const graduatorAbi = parseAbi(graduatorAbiSignatures);
 
-/**
- * Minimal Chainlink `AggregatorV3Interface` (ETH/USD feed read by the runner when `ETH_USD_FEED`
- * is configured).
- */
-export const aggregatorV3Abi = parseAbi([
-  'function decimals() view returns (uint8)',
-  'function description() view returns (string)',
-  'function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)',
-]);
-
-/**
- * Names of launchpad functions that the spec marks as optional (may be absent from the artifact).
- * Empty since D7 removed `graduateFor`; kept for API stability.
- */
-export const OPTIONAL_LAUNCHPAD_FUNCTIONS: readonly string[] = [];
-
-/**
- * Functions / events / errors removed by the contract directives. The ABI equivalence test treats
- * an artifact that still declares any of them as stale (built from pre-directive sources).
- */
-export const REMOVED_LAUNCHPAD_MEMBERS: readonly string[] = [
-  'creditMind',
-  'retireMind',
-  'withdrawRetiredMind',
-  'graduateFor',
-  'RetiredMindWithdrawn',
-  'PoolPriceSkewed',
-];
-
-/** The address tokens are "burned" to by the graduator (SPEC §2.4, D3). */
+/** The address tokens are "burned" to by the graduator (§2.0). */
 export const BURN_ADDRESS = '0x000000000000000000000000000000000000dEaD' as const;
-
-/** The zero address. */
-export const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as const;

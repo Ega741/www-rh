@@ -1,10 +1,26 @@
 /**
- * Normalisers from runner JSON (SPEC §5 as amended by R1/R2/R7/R11) to UI view models.
- * Required identity fields throw {@link ShapeError}; optional fields degrade to `null`.
- * Old field names are accepted alongside the R11 `…Wei` names.
+ * Normalisers from runner JSON (SPEC §5) to UI view models.
+ *
+ * Every payload is first validated with the shared zod schema (`@www-rh/shared/types`). A mismatch
+ * is logged once per payload kind and the payload is then read leniently instead of being
+ * rejected, so a runner/shared version skew degrades the UI instead of blanking it. Required
+ * identity fields still throw {@link ShapeError}; optional fields degrade to `null`; pre-R11 field
+ * names are accepted alongside the `…Wei` names.
  *
  * @module lib/normalize
  */
+import {
+  computeResponseSchema,
+  healthResponseSchema,
+  memorySchema,
+  metadataUploadResponseSchema,
+  mindDetailSchema,
+  mindsResponseSchema,
+  publicModelSchema,
+  statsResponseSchema,
+  thoughtSchema,
+  tradeSchema,
+} from '@www-rh/shared';
 import type { Address, Hex } from 'viem';
 import {
   ShapeError,
@@ -47,6 +63,28 @@ import type {
 function obj(raw: unknown, what: string): Record<string, unknown> {
   if (!isObject(raw)) throw new ShapeError(`${what}: expected an object`);
   return raw;
+}
+
+/** Structural view of a zod schema (the web app does not depend on zod directly). */
+export interface SafeParser {
+  safeParse(value: unknown): { success: true } | { success: false; error: { issues: ReadonlyArray<{ path: ReadonlyArray<PropertyKey>; message: string }> } };
+}
+
+const warnedShapes = new Set<string>();
+
+/**
+ * Validates `raw` with a shared zod schema. Returns `true` when it matches; otherwise logs the
+ * first issues once per `label` and returns `false` (callers keep rendering leniently).
+ */
+export function checkShape(schema: SafeParser, raw: unknown, label: string): boolean {
+  const result = schema.safeParse(raw);
+  if (result.success) return true;
+  if (!warnedShapes.has(label)) {
+    warnedShapes.add(label);
+    const issues = result.error.issues.slice(0, 3).map((i) => `${i.path.map(String).join('.') || '(root)'}: ${i.message}`);
+    console.warn(`[www-rh] ${label} does not match the shared schema; rendering leniently.`, issues);
+  }
+  return false;
 }
 
 /** Maps any status value (R11 name or on-chain enum number) to a status name. */
@@ -107,6 +145,7 @@ function normalizeLinks(raw: unknown): MindLinks | null {
 
 /** `MindDetail`. Accepts metadata fields at the top level or under `metadata`. */
 export function normalizeMindDetail(raw: unknown): MindDetail {
+  checkShape(mindDetailSchema, raw, 'MindDetail');
   const o = obj(raw, 'mind');
   const meta = isObject(o['metadata']) ? o['metadata'] : {};
   const summary = normalizeMindSummary(o);
@@ -115,6 +154,7 @@ export function normalizeMindDetail(raw: unknown): MindDetail {
     ...summary,
     image: summary.image ?? readText(meta, 'image'),
     personaHash: readHash(o, 'personaHash') ?? ZERO_HASH,
+    personaVerified: readBoolean(o, 'personaVerified'),
     pool: pool === '0x0000000000000000000000000000000000000000' ? null : pool,
     positionId: readBigint(o, 'positionId'),
     description: readText(o, 'description') ?? readText(meta, 'description'),
@@ -126,6 +166,7 @@ export function normalizeMindDetail(raw: unknown): MindDetail {
 
 /** `GET /api/minds` page (`{ items, nextCursor }` or a bare array). */
 export function normalizeMindsPage(raw: unknown): MindsPage {
+  checkShape(mindsResponseSchema, raw, 'GET /api/minds');
   const items = mapValid(readList(raw, 'items', 'minds'), normalizeMindSummary, 'mind');
   const cursor = isObject(raw) ? raw['nextCursor'] : null;
   return {
@@ -136,6 +177,7 @@ export function normalizeMindsPage(raw: unknown): MindsPage {
 
 /** `Trade`. */
 export function normalizeTrade(raw: unknown): Trade {
+  checkShape(tradeSchema, raw, 'Trade');
   const o = obj(raw, 'trade');
   const txHash = readHash(o, 'txHash', 'transactionHash');
   if (txHash === null) throw new ShapeError('trade: missing txHash');
@@ -155,6 +197,7 @@ export function normalizeTrade(raw: unknown): Trade {
 
 /** `Memory` (R7: kind ∈ note | finding). */
 export function normalizeMemory(raw: unknown): Memory {
+  checkShape(memorySchema, raw, 'Memory');
   const o = obj(raw, 'memory');
   const seq = readNumber(o, 'seq');
   if (seq === null) throw new ShapeError('memory: missing seq');
@@ -173,6 +216,7 @@ export function normalizeMemory(raw: unknown): Memory {
 
 /** `Thought` (R7: kind ∈ aloud | summary). */
 export function normalizeThought(raw: unknown): Thought {
+  checkShape(thoughtSchema, raw, 'Thought');
   const o = obj(raw, 'thought');
   return {
     id: readNumber(o, 'id') ?? 0,
@@ -186,6 +230,7 @@ export function normalizeThought(raw: unknown): Thought {
 function normalizeLedgerEntry(raw: unknown): LedgerEntry {
   const o = obj(raw, 'ledger entry');
   const micro = readNumber(o, 'costUsdMicro');
+  const receiptHash = readHash(o, 'receiptHash');
   return {
     tickId: readNumber(o, 'tickId', 'id') ?? 0,
     model: readString(o, 'model') ?? 'unknown',
@@ -194,8 +239,12 @@ function normalizeLedgerEntry(raw: unknown): LedgerEntry {
     cacheReadTokens: readNumber(o, 'cacheReadTokens') ?? 0,
     cacheWriteTokens: readNumber(o, 'cacheWriteTokens') ?? 0,
     costUsd: readNumber(o, 'costUsd') ?? (micro !== null ? micro / 1e6 : 0),
-    settledTx: readHash(o, 'settledTx', 'drawTx'),
-    createdAt: readTime(o, 'createdAt', 'startedAt', 'at'),
+    iterations: readNumber(o, 'iterations'),
+    stopReason: readText(o, 'stopReason'),
+    error: readText(o, 'error'),
+    receiptHash,
+    settled: receiptHash !== null || readHash(o, 'settledTx', 'drawTx') !== null,
+    startedAt: readTime(o, 'startedAt', 'createdAt', 'at'),
   };
 }
 
@@ -231,6 +280,7 @@ export function normalizeReceipt(raw: unknown): ComputeReceipt {
   }
   return {
     receiptHash,
+    status: readText(o, 'status'),
     txHash: readHash(o, 'txHash', 'drawTx', 'tx'),
     amountWei: readBigint(o, 'amountWei') ?? readBigint(inner, 'amountWei') ?? 0n,
     fromTickId: readNumber(o, 'fromTickId') ?? readNumber(inner, 'fromTickId'),
@@ -244,6 +294,7 @@ export function normalizeReceipt(raw: unknown): ComputeReceipt {
 
 /** `GET /api/minds/:token/compute` (receipts per R2; legacy `draws` accepted). */
 export function normalizeCompute(raw: unknown): ComputeInfo {
+  checkShape(computeResponseSchema, raw, 'GET /api/minds/:token/compute');
   const o = obj(raw, 'compute');
   const balanceUsd = readNumber(o, 'balanceUsd') ?? 0;
   const burnUsdPerHour = readNumber(o, 'burnUsdPerHour') ?? 0;
@@ -253,6 +304,9 @@ export function normalizeCompute(raw: unknown): ComputeInfo {
     balanceUsd,
     burnUsdPerHour,
     runwayHours: typeof runway === 'number' && Number.isFinite(runway) ? runway : null,
+    unsettledUsd: readNumber(o, 'unsettledUsd'),
+    availableUsd: readNumber(o, 'availableUsd'),
+    tickIntervalMs: readNumber(o, 'tickIntervalMs'),
     ledger: mapValid(readList(o['ledger']), normalizeLedgerEntry, 'ledger entry'),
     receipts: mapValid(readList(o['receipts'] ?? o['draws']), normalizeReceipt, 'receipt'),
   };
@@ -260,18 +314,20 @@ export function normalizeCompute(raw: unknown): ComputeInfo {
 
 /** `GET /api/stats`. */
 export function normalizeStats(raw: unknown): Stats {
+  checkShape(statsResponseSchema, raw, 'GET /api/stats');
   const o = obj(raw, 'stats');
   return {
     minds: readNumber(o, 'minds') ?? 0,
     alive: readNumber(o, 'alive') ?? 0,
     graduated: readNumber(o, 'graduated') ?? 0,
-    volumeWei: readBigintOr(o, 0n, 'volumeWei', 'volumeWeiTotal', 'volumeTotalWei', 'volumeEthTotal'),
-    feesToMindsWei: readBigintOr(o, 0n, 'feesToMindsWei', 'feesToMindsEth'),
+    volumeWei: readBigintOr(o, 0n, 'totalVolumeWei', 'volumeTotalWei', 'volumeWei', 'volumeEthTotal'),
+    feesToMindsWei: readBigintOr(o, 0n, 'totalFeesToMindsWei', 'feesToMindsWei', 'feesToMindsEth'),
   };
 }
 
 /** `GET /api/health`. */
 export function normalizeHealth(raw: unknown): Health {
+  checkShape(healthResponseSchema, raw, 'GET /api/health');
   const o = obj(raw, 'health');
   return {
     ok: readBoolean(o, 'ok') ?? false,
@@ -286,6 +342,7 @@ export function normalizeHealth(raw: unknown): Health {
 
 /** `GET /api/models` item. */
 export function normalizeModel(raw: unknown): ModelInfo {
+  checkShape(publicModelSchema, raw, 'PublicModel');
   const o = obj(raw, 'model');
   const id = requireString(o, 'id', 'id');
   const hash = readHash(o, 'modelIdHash', 'modelId');
@@ -305,6 +362,7 @@ export function normalizeModel(raw: unknown): ModelInfo {
 
 /** `POST /api/metadata` response (R1). */
 export function normalizeMetadataUpload(raw: unknown): MetadataUploadResult {
+  checkShape(metadataUploadResponseSchema, raw, 'POST /api/metadata');
   const o = obj(raw, 'metadata upload');
   const uri = requireString(o, 'uri', 'uri');
   const personaHash = readHash(o, 'personaHash');

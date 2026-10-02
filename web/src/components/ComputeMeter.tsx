@@ -6,7 +6,7 @@
  * @module components/ComputeMeter
  */
 import { TARGET_RUNWAY_DAYS } from '../config';
-import { formatEth, formatRunway, formatUsd, impliedEthUsd, runwayHours, weiToEth } from '../format';
+import { formatDuration, formatEth, formatRunway, formatUsd, impliedEthUsd, runwayHours, weiToEth } from '../format';
 import type { StreamState } from '../lib/stream';
 import type { ComputeInfo, MindDetail } from '../lib/types';
 import { FeedMind } from './FeedMind';
@@ -21,6 +21,8 @@ export interface ComputeFigures {
   ethUsd: number | null;
   spentUsd: number;
   unsettledUsd: number;
+  availableUsd: number | null;
+  tickIntervalMs: number | null;
 }
 
 /** Combines on-chain balance, REST compute data and the latest WS budget message. */
@@ -40,7 +42,9 @@ export function computeFigures(mind: MindDetail, compute: ComputeInfo | undefine
     runwayHours: runway,
     ethUsd,
     spentUsd: ledger.reduce((s, e) => s + e.costUsd, 0),
-    unsettledUsd: ledger.filter((e) => e.settledTx === null).reduce((s, e) => s + e.costUsd, 0),
+    unsettledUsd: compute?.unsettledUsd ?? ledger.filter((e) => !e.settled).reduce((s, e) => s + e.costUsd, 0),
+    availableUsd: compute?.availableUsd ?? null,
+    tickIntervalMs: compute?.tickIntervalMs ?? null,
   };
 }
 
@@ -84,15 +88,25 @@ export function ComputeMeter({ mind, compute, computeError, budget, onFunded }: 
               : `${formatRunway(f.runwayHours)} of thinking left at the current pace (the runner paces minds toward ${TARGET_RUNWAY_DAYS} days).`}
           </p>
         </div>
-        {compute !== undefined && (f.spentUsd > 0 || f.unsettledUsd > 0) && (
+        {compute !== undefined && (
           <dl className="text-[12px]">
             <div className="kv">
-              <dt>spent (recent ticks)</dt>
+              <dt>spent (last {compute.ledger.length} ticks)</dt>
               <dd>{formatUsd(f.spentUsd)}</dd>
             </div>
             <div className="kv">
-              <dt>not yet drawn from vault</dt>
+              <dt>spent, not yet drawn</dt>
               <dd>{formatUsd(f.unsettledUsd)}</dd>
+            </div>
+            {f.availableUsd !== null && (
+              <div className="kv">
+                <dt>available for thinking</dt>
+                <dd>{formatUsd(f.availableUsd)}</dd>
+              </div>
+            )}
+            <div className="kv">
+              <dt>pace</dt>
+              <dd>{f.tickIntervalMs !== null && f.tickIntervalMs > 0 ? `a thought every ~${formatDuration(f.tickIntervalMs)}` : 'not scheduled'}</dd>
             </div>
           </dl>
         )}

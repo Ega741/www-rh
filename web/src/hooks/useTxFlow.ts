@@ -12,7 +12,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Hex, TransactionReceipt } from 'viem';
 import { useWaitForTransactionReceipt } from 'wagmi';
 import { TARGET_CHAIN } from '../config';
-import { describeError, isUserRejection } from '../lib/errors';
+import { describeError, isUserRejection, revertErrorName } from '../lib/errors';
 
 /** Lifecycle phase of a transaction. */
 export type TxPhase = 'idle' | 'signing' | 'pending' | 'confirmed' | 'reverted' | 'error';
@@ -29,13 +29,26 @@ export interface TxFlow {
   reset: () => void;
 }
 
-/** Tracks one transaction at a time. `onConfirmed` fires once per successful receipt. */
-export function useTxFlow(options: { onConfirmed?: (receipt: TransactionReceipt) => void } = {}): TxFlow {
+/** Options of {@link useTxFlow}. */
+export interface TxFlowOptions {
+  /** Fires once per successful receipt. */
+  onConfirmed?: (receipt: TransactionReceipt) => void;
+  /**
+   * Called with the custom error name when sending fails with a contract revert (simulation);
+   * return `true` to treat it as handled (phase back to `idle`, no error shown).
+   */
+  onRevert?: (errorName: string) => boolean;
+}
+
+/** Tracks one transaction at a time. */
+export function useTxFlow(options: TxFlowOptions = {}): TxFlow {
   const [phase, setPhase] = useState<TxPhase>('idle');
   const [hash, setHash] = useState<Hex | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const onConfirmed = useRef(options.onConfirmed);
   onConfirmed.current = options.onConfirmed;
+  const onRevert = useRef(options.onRevert);
+  onRevert.current = options.onRevert;
   const handled = useRef<Hex | null>(null);
 
   const wait = useWaitForTransactionReceipt({
@@ -72,6 +85,11 @@ export function useTxFlow(options: { onConfirmed?: (receipt: TransactionReceipt)
       setPhase('pending');
       return h;
     } catch (e) {
+      const name = revertErrorName(e);
+      if (name !== null && onRevert.current?.(name) === true) {
+        setPhase('idle');
+        return null;
+      }
       setPhase(isUserRejection(e) ? 'idle' : 'error');
       setError(describeError(e));
       return null;

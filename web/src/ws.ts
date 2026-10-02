@@ -1,25 +1,28 @@
 /**
  * WebSocket client for the live mind stream (SPEC §6 as amended by R7 and R10).
  *
- * - `parseWsMessage` validates and normalises one server message (unknown types → `null`).
+ * - `parseWsMessage` validates one server message with the shared `wsServerMessageSchema`
+ *   (mismatches are logged once and read leniently) and normalises it (unknown types → `null`).
  * - `MindSocket` connects to `<WS_BASE>?token=0x…`, pings every 20 s, and reconnects with
- *   exponential backoff + jitter (longer after close code 1013 "try again later", which the
- *   runner sends when a mind has 100 viewers).
+ *   exponential backoff + jitter: at least 10 s after close 1013 (too many viewers), every 3 s
+ *   (max 10 attempts) after 4404 (token not indexed yet), never after 1008 (bad token).
  *
  * @module ws
  */
+import { wsServerMessageSchema } from '@www-rh/shared';
 import type { Address } from 'viem';
 import { isObject, readBigint, readNumber, readString, readText, readTime } from './lib/json';
-import { normalizeMemory, normalizeTrade, toPhaseName, toStatusName } from './lib/normalize';
-import type { CurvePhaseName, Memory, MindStatusName, Trade } from './lib/types';
+import { checkShape, normalizeMemory, normalizeThought, normalizeTrade, toPhaseName, toStatusName } from './lib/normalize';
+import type { CurvePhaseName, Memory, MindStatusName, Thought, Trade } from './lib/types';
 
-/** `hello` — sent once after connecting. */
+/** `hello` — sent after connecting (and after a `subscribe`). */
 export interface WsHello {
   type: 'hello';
   token: Address | null;
   status: MindStatusName;
   phase: CurvePhaseName;
-  lastFrame: string | null;
+  /** Last captured frame (SPEC `frame: {jpegBase64,url,at}`; legacy `lastFrame` string accepted). */
+  frame: { jpegBase64: string; url: string | null; at: number } | null;
   currentUrl: string | null;
 }
 /** `frame` — latest browser screenshot (JPEG, base64). */
@@ -45,6 +48,15 @@ export interface WsAction {
   input: string;
   tickId: number | null;
   at: number;
+}
+/** `thoughtSaved` — an `aloud` / `summary` thought was persisted. */
+export interface WsThoughtSaved {
+  type: 'thoughtSaved';
+  thought: Thought;
+}
+/** `anchor` — a memory batch anchor changed state (runner extension; triggers a memory refetch). */
+export interface WsAnchor {
+  type: 'anchor';
 }
 /** `memory` — a new memory was recorded. */
 export interface WsMemory {
@@ -83,7 +95,19 @@ export interface WsError {
 }
 
 /** Every server → client message the web app understands. */
-export type WsMessage = WsHello | WsFrame | WsThought | WsAction | WsMemory | WsStatus | WsBudget | WsTrade | WsPong | WsError;
+export type WsMessage =
+  | WsHello
+  | WsFrame
+  | WsThought
+  | WsThoughtSaved
+  | WsAction
+  | WsMemory
+  | WsAnchor
+  | WsStatus
+  | WsBudget
+  | WsTrade
+  | WsPong
+  | WsError;
 
 /**
  * Parses one raw WebSocket payload (string or already-parsed object). Returns `null` for
@@ -99,18 +123,22 @@ export function parseWsMessage(data: unknown, now: number = Date.now()): WsMessa
     }
   }
   if (!isObject(raw)) return null;
+  checkShape(wsServerMessageSchema, raw, `ws message "${String(raw['type'])}"`);
   const at = readTime(raw, 'at') ?? now;
   try {
     switch (raw['type']) {
       case 'hello': {
         const token = readString(raw, 'token');
+        const frameObj = isObject(raw['frame']) ? raw['frame'] : null;
+        const frameData = frameObj !== null ? readText(frameObj, 'jpegBase64') : readText(raw, 'lastFrame');
+        const frameUrl = frameObj !== null ? readText(frameObj, 'url') : readText(raw, 'currentUrl', 'url');
         return {
           type: 'hello',
           token: token !== null && /^0x[0-9a-fA-F]{40}$/.test(token) ? (token.toLowerCase() as Address) : null,
           status: toStatusName(raw['status']),
           phase: toPhaseName(raw['phase']),
-          lastFrame: readText(raw, 'lastFrame', 'jpegBase64'),
-          currentUrl: readText(raw, 'currentUrl', 'url'),
+          frame: frameData !== null ? { jpegBase64: frameData, url: frameUrl, at: (frameObj !== null ? readTime(frameObj, 'at') : null) ?? at } : null,
+          currentUrl: frameUrl ?? readText(raw, 'currentUrl'),
         };
       }
       case 'frame': {
@@ -142,6 +170,11 @@ export function parseWsMessage(data: unknown, now: number = Date.now()): WsMessa
           at,
         };
       }
+      case 'thoughtSaved':
+      case 'thought_saved':
+        return { type: 'thoughtSaved', thought: normalizeThought(raw['thought']) };
+      case 'anchor':
+        return { type: 'anchor' };
       case 'memory':
         return { type: 'memory', memory: normalizeMemory(raw['memory']) };
       case 'status':
@@ -197,12 +230,19 @@ export interface MindSocketOptions {
 
 /** Close code the runner uses when a mind already has the maximum number of viewers (R10). */
 export const WS_CLOSE_TRY_AGAIN_LATER = 1013;
+/** Close code for a malformed / missing token (no retry). */
+export const WS_CLOSE_POLICY = 1008;
+/** Close code for a token that is not indexed yet (retry every 3 s, at most 10 times). */
+export const WS_CLOSE_UNKNOWN_TOKEN = 4404;
+/** Max reconnects after {@link WS_CLOSE_UNKNOWN_TOKEN}. */
+export const UNKNOWN_TOKEN_MAX_RETRIES = 10;
 
 /**
  * Backoff for reconnect attempt `attempt` (0-based): exponential from `min` to `max`, ±20 %
  * jitter; at least 10 s after a 1013 close.
  */
 export function backoffDelay(attempt: number, opts: { min: number; max: number; code?: number | undefined; random?: number }): number {
+  if (opts.code === WS_CLOSE_UNKNOWN_TOKEN) return 3_000;
   const base = Math.min(opts.max, opts.min * 2 ** Math.max(0, attempt));
   const jitter = 1 + ((opts.random ?? Math.random()) * 0.4 - 0.2);
   const delay = Math.round(base * jitter);
@@ -213,6 +253,7 @@ export function backoffDelay(attempt: number, opts: { min: number; max: number; 
 export class MindSocket {
   private socket: WebSocket | null = null;
   private attempt = 0;
+  private unknownTokenRetries = 0;
   private stopped = true;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -295,7 +336,21 @@ export class MindSocket {
       if (this.pingTimer !== null) clearInterval(this.pingTimer);
       this.pingTimer = null;
       this.socket = null;
-      if (!this.stopped) this.scheduleReconnect(event.code);
+      if (this.stopped) return;
+      if (event.code === WS_CLOSE_POLICY) {
+        this.opts.onState?.('closed', { code: event.code });
+        return;
+      }
+      if (event.code === WS_CLOSE_UNKNOWN_TOKEN) {
+        this.unknownTokenRetries += 1;
+        if (this.unknownTokenRetries > UNKNOWN_TOKEN_MAX_RETRIES) {
+          this.opts.onState?.('closed', { code: event.code });
+          return;
+        }
+      } else {
+        this.unknownTokenRetries = 0;
+      }
+      this.scheduleReconnect(event.code);
     };
   }
 

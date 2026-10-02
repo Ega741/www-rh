@@ -4,10 +4,6 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   BPS,
-  Q96,
-  graduationSqrtPriceX96,
-  sqrtBigint,
-  sqrtPriceX96FromAmounts,
   CURVE_SUPPLY,
   DEFAULT_FEE_PARAMS,
   DEFAULT_TRADE_FEE_BPS,
@@ -99,7 +95,7 @@ describe('curve constants (SPEC §1)', () => {
     expect(price).toBeCloseTo(1.965e-8, 10);
     const split = graduationSplit(done);
     expect(Number(split.lpPriceWei) / 1e18).toBeCloseTo(1.95e-8, 10);
-    expect(split.lpPriceWei < split.targetPriceWei).toBe(true);
+    expect(split.lpPriceWei < split.finalPriceWei).toBe(true);
   });
 });
 
@@ -344,7 +340,7 @@ describe('completion and refund', () => {
     expect(split.mindFee).toBe((split.graduationFee * 7000n) / BPS);
     expect(split.ethLiquidity + split.graduationFee).toBe(done.realEthReserve);
     expect(split.tokenLiquidity).toBe(LP_SUPPLY);
-    expect(split.targetPriceWei).toBe(priceOf(done));
+    expect(split.finalPriceWei).toBe(priceOf(done));
   });
 });
 
@@ -440,26 +436,3 @@ if (fixture === undefined) {
   );
 }
 
-describe('graduation sqrtPriceX96 (D3)', () => {
-  it('sqrtBigint is the integer floor square root', () => {
-    for (const n of [0n, 1n, 2n, 3n, 4n, 15n, 16n, 17n, 10n ** 40n, 10n ** 40n - 1n, 2n ** 192n]) {
-      const r = sqrtBigint(n);
-      expect(r * r <= n).toBe(true);
-      expect((r + 1n) * (r + 1n) > n).toBe(true);
-    }
-  });
-
-  it('equal amounts give sqrtPriceX96 = 2^96 and the order of tokens inverts the price', () => {
-    expect(sqrtPriceX96FromAmounts(10n ** 18n, 10n ** 18n)).toBe(Q96);
-    const done = completionReserves();
-    const lowToken = '0x0000000000000000000000000000000000000001';
-    const highToken = '0xffffffffffffffffffffffffffffffffffffffff';
-    const weth = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
-    const a = graduationSqrtPriceX96(done, lowToken, weth); // token0 = token: price = eth/token (small)
-    const b = graduationSqrtPriceX96(done, highToken, weth); // token0 = weth: price = token/eth (large)
-    expect(a < Q96).toBe(true);
-    expect(b > Q96).toBe(true);
-    // price1/0 = (sqrt/2^96)^2 ≈ ethLiquidity / LP_SUPPLY ≈ 1.95e-8
-    expect((Number(a) / 2 ** 96) ** 2).toBeCloseTo(1.95e-8, 10);
-  });
-});

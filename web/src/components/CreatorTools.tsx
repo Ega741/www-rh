@@ -12,7 +12,7 @@ import type { Address } from 'viem';
 import { useWriteContract } from 'wagmi';
 import { LAUNCHPAD_ADDRESS, TARGET_CHAIN } from '../config';
 import { useTxFlow } from '../hooks/useTxFlow';
-import { launchpadAbi } from '../lib/abi';
+import { mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
 import { describeError } from '../lib/errors';
 import { METADATA_LIMITS, buildMetadata, modelHashOf, personaHashOf, validateDraft, type MetadataDraft } from '../lib/metadata';
 import { publishMetadata } from '../lib/publish';
@@ -64,7 +64,7 @@ export function CreatorTools({ mind, currentModel, onChanged }: CreatorToolsProp
     links: { x: mind.links?.x ?? '', website: mind.links?.website ?? '', telegram: mind.links?.telegram ?? '' },
   };
   const errors = validateDraft(draft);
-  const blocking = errors.persona ?? errors.model ?? errors.size ?? errors.image ?? errors.links ?? null;
+  const blocking = errors.persona ?? errors.model ?? errors.schema ?? errors.image ?? errors.links ?? null;
   const unchanged = model === currentModel && mind.persona !== null && personaHashOf(persona.trim()) === mind.personaHash;
 
   async function saveConfig() {

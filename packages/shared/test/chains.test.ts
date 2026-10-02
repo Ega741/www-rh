@@ -9,7 +9,9 @@ import {
   robinhoodChain,
   robinhoodChainTestnet,
   toAddEthereumChainParameter,
+  withMulticall3,
 } from '../src/chains.js';
+import { getAddress } from 'viem';
 
 describe('chains', () => {
   it('mainnet 4663 and testnet 46630 per docs/ROBINHOOD_CHAIN.md', () => {
@@ -21,7 +23,10 @@ describe('chains', () => {
     expect(robinhoodChain.blockExplorers?.default.apiUrl).toBe('https://robinhoodchain.blockscout.com/api');
     expect(robinhoodChain.sourceId).toBe(1);
     expect(robinhoodChain.testnet).toBe(false);
-    expect(robinhoodChain.contracts?.multicall3?.address.toLowerCase()).toBe(MULTICALL3_ADDRESS);
+    expect(robinhoodChain.contracts?.multicall3).toBeUndefined();
+    expect(withMulticall3(robinhoodChain).contracts?.multicall3?.address).toBe(MULTICALL3_ADDRESS);
+    expect(robinhoodChain.contracts?.multicall3).toBeUndefined(); // withMulticall3 does not mutate
+    expect(getAddress(MULTICALL3_ADDRESS)).toBe(MULTICALL3_ADDRESS);
 
     expect(robinhoodChainTestnet.id).toBe(46630);
     expect(robinhoodChainTestnet.rpcUrls.default.http[0]).toBe('https://rpc.testnet.chain.robinhood.com/rpc');

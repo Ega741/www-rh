@@ -6,7 +6,7 @@
 import { MODELS, toPublicModelSpec } from '@www-rh/shared';
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import type { Address } from 'viem';
-import { getCompute, getHealth, getMemories, getMind, getMinds, getModels, getStats, getThoughts, getTrades } from './api';
+import { ApiError, getCompute, getHealth, getMemories, getMind, getMinds, getModels, getStats, getThoughts, getTrades } from './api';
 import type { MindsSort, ModelInfo } from './lib/types';
 
 /** Query keys. */
@@ -33,14 +33,19 @@ export function useMindsList(sort: MindsSort) {
   });
 }
 
-/** Mind detail from the runner. */
+/** Whether `error` is an API 404 (e.g. a freshly created mind that is not indexed yet). */
+export function isNotFound(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 404;
+}
+
+/** Mind detail from the runner; polls every 2 s while the runner answers 404 ("indexing…", SPEC §7). */
 export function useMindDetail(token: Address | undefined) {
   return useQuery({
     queryKey: queryKeys.mind(token ?? ''),
     queryFn: () => getMind(token as Address),
     enabled: token !== undefined,
-    refetchInterval: 15_000,
-    retry: 1,
+    refetchInterval: (query) => (isNotFound(query.state.error) ? 2_000 : 15_000),
+    retry: (count, error) => !isNotFound(error) && count < 1,
   });
 }
 

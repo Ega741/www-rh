@@ -4,7 +4,7 @@
  * @module lib/events
  */
 import { parseEventLogs, type Address, type Log } from 'viem';
-import { launchpadAbi } from './abi';
+import { mindLaunchpadAbi as launchpadAbi } from '@www-rh/shared';
 
 /**
  * Token address from the `MindCreated` event emitted by `launchpad` in a `createMind` receipt

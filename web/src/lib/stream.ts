@@ -6,7 +6,7 @@
  * @module lib/stream
  */
 import type { SocketState, WsMessage } from '../ws';
-import type { CurvePhaseName, Memory, MindStatusName, Trade } from './types';
+import type { CurvePhaseName, Memory, MindStatusName, Thought, Trade } from './types';
 
 /** One assembled thought block (a `text` or `thinking` content block of a tick). */
 export interface ThoughtBlock {
@@ -40,6 +40,8 @@ export interface StreamState {
   blocks: ThoughtBlock[];
   /** Newest first. */
   actions: ActionEntry[];
+  /** Persisted thoughts announced live (`thoughtSaved`), newest first. */
+  savedThoughts: Thought[];
   /** Newest first. */
   memories: Memory[];
   /** Newest first. */
@@ -56,7 +58,7 @@ export type StreamEvent =
   | { type: 'reset' };
 
 /** Caps for the in-memory lists. */
-export const STREAM_LIMITS = { blocks: 40, actions: 80, memories: 50, trades: 50 } as const;
+export const STREAM_LIMITS = { blocks: 40, actions: 80, savedThoughts: 50, memories: 50, trades: 50 } as const;
 
 /** Initial (empty) stream state. */
 export const initialStreamState: StreamState = {
@@ -68,6 +70,7 @@ export const initialStreamState: StreamState = {
   budget: null,
   blocks: [],
   actions: [],
+  savedThoughts: [],
   memories: [],
   trades: [],
   lastError: null,
@@ -123,7 +126,7 @@ export function streamReducer(state: StreamState, event: StreamEvent): StreamSta
         status: msg.status,
         phase: msg.phase,
         currentUrl: msg.currentUrl ?? base.currentUrl,
-        frame: msg.lastFrame !== null && base.frame === null ? { jpegBase64: msg.lastFrame, url: msg.currentUrl, at: event.receivedAt } : base.frame,
+        frame: msg.frame !== null && base.frame === null ? msg.frame : base.frame,
         lastError: null,
       };
     case 'frame':
@@ -136,6 +139,13 @@ export function streamReducer(state: StreamState, event: StreamEvent): StreamSta
         actions: [{ id: base.nextId, tool: msg.tool, input: msg.input, tickId: msg.tickId, at: msg.at }, ...base.actions].slice(0, STREAM_LIMITS.actions),
         nextId: base.nextId + 1,
       };
+    case 'thoughtSaved':
+      return {
+        ...base,
+        savedThoughts: [msg.thought, ...base.savedThoughts.filter((t) => t.id !== msg.thought.id)].slice(0, STREAM_LIMITS.savedThoughts),
+      };
+    case 'anchor':
+      return base;
     case 'memory':
       return {
         ...base,
