@@ -189,7 +189,7 @@ export const DEFAULT_CATALOG: readonly ModelSpec[] = Object.freeze([
     tier: 'frontier',
     contextWindow: 1_000_000,
     maxOutput: 128_000,
-    price: { inputPerM: 10_000_000, outputPerM: 50_000_000, cacheReadPerM: 250_000 },
+    price: { inputPerM: 10_000_000, outputPerM: 50_000_000, cacheReadPerM: 250_000, cacheWritePerM: 12_500_000 },
     capabilities: ALL,
     autoEligible: false,
     notes: 'explicit only: never picked by aliases or fallback',

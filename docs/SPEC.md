@@ -148,7 +148,8 @@ Pricing:
 function quote(uint256 amount) public view returns (uint256 usdMicro, uint256 priceE18, uint256 updatedAt);
 ```
 `_price()` reads `priceSource.latestPrice()`; reverts `PriceUnavailable()` if `priceSource == 0` or `priceE18 == 0`;
-reverts `PriceStale(updatedAt, maxPriceAge)` if `block.timestamp − updatedAt > maxPriceAge`.
+reverts `PriceStale(updatedAt, maxPriceAge)` unless `|block.timestamp − updatedAt| ≤ maxPriceAge` (symmetric: a
+future-dated observation is not fresh forever; no underflow).
 `usdMicro = CreditMath.usdMicro(amount, priceE18, tokenDecimals)`.
 
 Credit purchase:
@@ -156,7 +157,13 @@ Credit purchase:
 function burnForCredit(address workspace, uint256 amount) external whenNotPaused nonReentrant returns (uint256 receiptId);
 function burnForCreditWithPermit(address workspace, uint256 amount, uint256 deadline, uint8 v, bytes32 r, bytes32 s)
     external whenNotPaused nonReentrant returns (uint256 receiptId);
+/// Same as above with a credit floor: reverts SlippageExceeded(usdMicro, minUsdMicro) when the quote at inclusion
+/// time is below `minUsdMicro` (a price post can land between the client's quote and the transaction).
+function burnForCreditMin(address workspace, uint256 amount, uint256 minUsdMicro) external returns (uint256 receiptId);
+function burnForCreditWithPermitMin(address workspace, uint256 amount, uint256 minUsdMicro, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external returns (uint256 receiptId);
 ```
+Clients operated by this project (web Credits page, MCP `beagle_buy_compute`) always use the `…Min` variants with
+`minUsdMicro = quoted − ceil(quoted · toleranceBps / 10 000)` (default 100 bps); the plain variants stay for third parties.
 - `workspace == 0` → `ZeroAddress()`. `amount == 0 || amount < minBurn` → `BurnTooSmall(amount, minBurn)`.
 - `(usdMicro, priceE18, ) = quote(amount)`; `usdMicro == 0` → `QuoteTooSmall()`.
 - `token.safeTransferFrom(msg.sender, address(this), amount)`; `_burn(amount)`.
@@ -184,7 +191,11 @@ function budgetRemaining(uint256 budgetId) external view returns (uint256); // 0
 
 Burning: `_burn(amount)`: `nativeBurn ? ERC20Burnable(address(token)).burn(amount) : token.safeTransfer(DEAD, amount)`.
 
-Admin (`onlyOwner`): `setPriceSource(IPriceSource)`, `setMaxPriceAge(uint32 > 0)`, `setMinBurn(uint256)`,
+`draw` also reverts `QuoteTooSmall()` when the quoted credit is 0 (never burn tokens for no credit). `renounceOwnership()`
+is overridden to revert `RenounceDisabled()` on both the desk and `ManualPriceSource` (an owner-less desk could not be
+paused or re-parameterised). The emergency stop for a compromised poster is `setPoster(0)` + `pause()`.
+
+Admin (`onlyOwner`): `setPriceSource(IPriceSource)`, `setMaxPriceAge(uint32 > 0, else BadMaxPriceAge())`, `setMinBurn(uint256)`,
 `setOperator(address)`, `pause()`, `unpause()`, `recoverToken(IERC20 t, address to, uint256 amount)` (any token,
 including stray credit tokens; the desk never holds tokens between calls). Events: `PriceSourceSet(address)`,
 `MaxPriceAgeSet(uint32)`, `MinBurnSet(uint256)`, `OperatorSet(address)`.
@@ -198,7 +209,8 @@ event BudgetClosed(uint256 indexed budgetId, uint128 drawn);
 ```
 Errors: `ZeroAddress()`, `BadDecimals()`, `BurnTooSmall(uint256 amount, uint256 minBurn)`, `QuoteTooSmall()`,
 `PriceUnavailable()`, `PriceStale(uint256 updatedAt, uint32 maxAge)`, `NotOperator()`, `BadBudgetParams()`,
-`UnknownBudget()`, `BudgetIsClosed()`, `BudgetExpired()`, `BudgetExceeded(uint256 remaining)`, `NotBudgetOwner()`.
+`UnknownBudget()`, `BudgetIsClosed()`, `BudgetExpired()`, `BudgetExceeded(uint256 remaining)`, `NotBudgetOwner()`,
+`SlippageExceeded(uint256 usdMicro, uint256 minUsdMicro)`, `RenounceDisabled()`, `BadMaxPriceAge()`.
 
 Invariants (write as Foundry invariant tests):
 1. `totalBurned == Σ tokenAmount` over all `CreditPurchased` + `BudgetDrawn`; `totalUsdMicro == Σ usdMicro`.
@@ -224,6 +236,8 @@ round-trips within one unit), and `ManualPriceSource` bounds.
 | `OWNER`, `OPERATOR`, `POSTER` | default deployer |
 | `INITIAL_PRICE_E18` | if > 0, `forcePrice` right after deploy (bootstrap) |
 | `MAX_PRICE_AGE` (3600), `MIN_BURN` (0) | desk params |
+| `NATIVE_BURN_UNCHECKED` | `true` skips the simulated `burn(0)` probe that otherwise rejects a non-burnable `TOKEN` with `NATIVE_BURN=true` (`TokenNotBurnable()`) |
+| `WRITE_DEPLOYMENT` | `true` writes the deployment JSON even outside a broadcast; by default a dry run never overwrites `deployments/<chainId>.json` |
 
 Deploys `ManualPriceSource(owner, poster)` then `CreditDesk(token, nativeBurn, priceSource, owner, operator)`.
 When `OWNER != deployer`, ownership is transferred with `transferOwnership` (Ownable2Step; the owner accepts
@@ -233,8 +247,10 @@ later) — the script logs this. Writes `contracts/deployments/<chainId>.json` v
 ```json
 { "chainId": 31337, "token": "0x…", "tokenSymbol": "BEAGLE", "tokenDecimals": 18, "nativeBurn": true,
   "creditDesk": "0x…", "priceSource": "0x…", "priceSourceKind": "manual",
-  "deployBlock": 12, "owner": "0x…", "operator": "0x…", "poster": "0x…" }
+  "deployBlock": 12, "owner": "0x…", "pendingOwner": "0x…", "operator": "0x…", "poster": "0x…" }
 ```
+`owner` is the on-chain owner at the time of writing (the deployer until the configured `OWNER` accepts), `pendingOwner`
+the Ownable2Step pending owner (zero when none). `scripts/sync-deployments.mjs` ignores keys it does not know.
 
 `script/PostPrice.s.sol`: env `PRICE_SOURCE`, `PRICE_E18`, `POSTER_PRIVATE_KEY`; calls `post`.
 `script/GenerateFixtures.s.sol`: writes `packages/shared/fixtures/quote.json` — an array of
@@ -299,7 +315,7 @@ Default catalog (prices are µUSD per 1M tokens; snapshot 2026-10, operator-over
 | `anthropic/claude-opus-5-5` | frontier | `claude-opus-5-5` | 1,000,000 / 128,000 | 4,000,000 / 20,000,000 (200,000; write 5,000,000) | tools, vision, json, reasoning | yes |
 | `anthropic/claude-sonnet-5-5` | efficient | `claude-sonnet-5-5` | 1,000,000 / 128,000 | 2,000,000 / 10,000,000 (200,000; write 2,500,000) | all | yes |
 | `anthropic/claude-haiku-5-5` | budget | `claude-haiku-5-5` | 1,000,000 / 128,000 | 100,000 / 500,000 (10,000; write 125,000) | all | yes |
-| `anthropic/claude-fable-5-1` | frontier | `claude-fable-5-1` | 1,000,000 / 128,000 | 10,000,000 / 50,000,000 (250,000) | all | **no** (explicit only) |
+| `anthropic/claude-fable-5-1` | frontier | `claude-fable-5-1` | 1,000,000 / 128,000 | 10,000,000 / 50,000,000 (250,000; write 12,500,000) | all | **no** (explicit only) |
 | `openai/gpt-5.5` | frontier | `gpt-5.5` | 400,000 / 128,000 | 5,000,000 / 30,000,000 (500,000) | all | yes |
 | `openai/gpt-5.4-mini` | efficient | `gpt-5.4-mini` | 400,000 / 128,000 | 750,000 / 4,500,000 (75,000) | all | yes |
 | `openai/gpt-5.4-nano` | budget | `gpt-5.4-nano` | 400,000 / 128,000 | 200,000 / 1,200,000 (20,000) | tools, json, vision | yes |
@@ -330,7 +346,9 @@ base 0.25
 clamp to [0, 1]
 ```
 Input: `{ messages: {role, textLength?, text?}[], systemLength, toolCount, reasoningEffort? }`. `x-beagle-difficulty: <0..1>`
-header overrides the estimate (gateway).
+header overrides the estimate (gateway). Reading: the code/keyword checks run on user content only; the size term counts
+all messages (the system prompt has its own term); `#include` is matched at line start (`#include\b`); the result is
+rounded to 4 decimals.
 
 ### 4.6 `routing.ts` — pure policy
 
@@ -359,15 +377,19 @@ Algorithm (each step appends a reason string):
 3. **paidBy** = `'byok'` when `workspace.byok` contains the model's provider, else `'credit'`.
 4. **Credit runway** (alias requests only; applies to credit-paid candidates): `available < veryLow` → tier
    becomes `house`; else `available < low` → one tier cheaper. Explicit requests keep their model.
-5. **Provider state.** Drop `down` providers. Order within a tier: byok first; then `ok` before `degraded`;
-   then by `preference`; then cheaper `inputPerM + outputPerM`. A provider with `quotaRatio < 0.2` counts as
-   `degraded` and, for `difficulty < 0.5`, is placed after all cheaper-tier candidates ("limit running down").
+5. **Provider state.** Drop credit-paid candidates of `down` providers (BYOK candidates are kept: a platform
+   outage or spend limit does not affect the workspace's own key; they sort by their raw state). Order within a
+   tier: byok first; then `ok` before `degraded`; then by `preference`; then cheaper `inputPerM + outputPerM`. A
+   provider with `quotaRatio < 0.2` counts as `degraded` and, for `difficulty < 0.5`, its credit-paid candidates
+   are placed after all cheaper-tier candidates ("limit running down") — an explicitly requested primary is never
+   moved.
 6. **Fallback expansion.** `none` → `[primary]` (alias: first candidate of the target tier only).
    `cheaper` → remaining models of the tier, then each cheaper tier in `TIER_ORDER`, ending with `house`.
    `any` → `cheaper` plus higher tiers appended after. Alias requests default to `cheaper`.
    Only `autoEligible` models are added by expansion (an explicit non-eligible primary stays first).
 7. **Credit gate.** Remove credit-paid candidates when `available ≤ 0`. Empty list → `insufficient_credit`
-   when the only reason was credit, else `no_capable_model`.
+   when credit was the reason (including capable credit-paid models that only the step-4 runway narrowing
+   excluded), else `no_capable_model`.
 Deterministic: same input → same output; no randomness, no clock.
 
 ### 4.7 `canonical.ts`
@@ -466,7 +488,9 @@ above `2^53` are handled as `bigint` via `readBigInts`-safe access (`stmt.setRea
 
 **Balance definitions** (used by every route and by routing):
 `balance = Σ ledger.amount_micro`; `reserved = Σ reservations.amount_micro (not expired)`;
-`budgetHeadroom = Σ budgets.headroom_micro` over open, unexpired, non-stalled budgets of the workspace;
+`budgetHeadroom = Σ budgets.headroom_micro` over open, unexpired, non-stalled budgets of the workspace, where one
+owner's backing `min(allowance, balance)` is allocated once across all of that owner's open budgets (in `budget_id`
+order, each capped by `cap − drawn`) so shared allowance is never counted twice;
 `available = balance − reserved + budgetHeadroom`.
 
 ### 5.3 Authentication
@@ -498,8 +522,8 @@ Apply inside one transaction per chunk, idempotent on `(tx_hash, log_index)`:
 - `BudgetDrawn` → `credit_events(kind='draw')`; ledger credit; `budgets.drawn += amount`; `budget_draws` with the same
   `receipt_hash` → `status='confirmed', tx_hash`.
 - `BudgetClosed` → `budgets.closed = 1`.
-Store `last_block` and `last_block_hash`. **Reorg guard**: before applying, fetch the block at `last_block`; if its
-hash ≠ `last_block_hash`, rewind `R = CONFIRMATIONS + 10` blocks: delete `credit_events` with `block_number > last_block − R`
+Store `last_block` and `last_block_hash`. **Reorg guard**: before applying, fetch the block at `last_block`; an RPC
+error or missing block is logged and skipped (never treated as a reorg); if its hash ≠ `last_block_hash`, rewind `R = CONFIRMATIONS + 10` blocks: delete `credit_events` with `block_number > last_block − R`
 and their ledger rows (`ref_type='credit_event'`), reset `budgets` affected by deleted draws (recompute `drawn` from
 remaining events), set `last_block −= R`. `GET /api/status` reports `{ lastBlock, head, lagBlocks, lastEventAt }`.
 First run: `last_block = START_BLOCK − 1`.
@@ -507,7 +531,7 @@ First run: `last_block = START_BLOCK − 1`.
 **Budget headroom refresher** (`chain/budgets.ts`, every `BUDGET_HEADROOM_REFRESH_MS`): for each open, unexpired
 budget: `remainingCap = cap − drawn`, `allowance = token.allowance(owner, desk)`, `balance = token.balanceOf(owner)`
 (one `multicall` when available, else three reads); `headroom_tokens = min(remainingCap, allowance, balance)`;
-`headroom_micro = quoteUsdMicro(headroom_tokens, price)` using the desk's current `quote(1e18)`-derived price
+(allocated per owner across its budgets as defined in §5.2) `headroom_micro = quoteUsdMicro(headroom_tokens, price)` using the desk's current `quote(1e18)`-derived price
 (call `quote(10**decimals)` for `priceE18`); on `PriceStale`/`PriceUnavailable` → `headroom_micro = 0`,
 `stalled_reason = 'price'`. `headroom_tokens == 0` with `remainingCap > 0` → `stalled_reason = 'allowance'`.
 
@@ -519,14 +543,21 @@ their sum ≥ deficit (cap at 500 rows); `amountMicro = Σ charged_micro of thos
 truncate the list); `tokens = tokensForUsdMicro(amountMicro, priceE18)`; `batch: DrawBatch = { v: 1, chainId, desk,
 budgetId, workspace, usageIds, amountMicro, priceE18 }`; `receiptHash = receiptHash(batch)`; insert
 `budget_draws(status='pending')`, mark the usage rows `draw_id`; send `desk.draw(budgetId, tokens, receiptHash)`;
-on send → `status='sent', tx_hash`; wait for the receipt (`waitForTransactionReceipt`, 120 s); reverted/timeout →
-`status='failed', error`, un-mark usage rows, `budgets.stalled_reason = 'draw_failed'` (cleared on the next
-successful headroom refresh showing allowance/balance). Confirmation and the ledger credit come from the indexer
+on send → `status='sent', tx_hash`; wait for the receipt (`waitForTransactionReceipt`, 120 s); reverted →
+`status='failed', error`, un-mark its usage rows, `budgets.stalled_reason = 'draw_failed'` (cleared on the next
+successful headroom refresh showing allowance/balance); a receipt **timeout or RPC error keeps the row `sent`**
+(the transaction may still land; the indexer's `BudgetDrawn` confirms it and re-marks the usage rows). Every tick
+starts with a reconciliation of in-flight rows: `pending` without a tx older than 10 min → `failed`; `sent` →
+`getTransactionReceipt`: reverted → `failed`, mined → left for the indexer, unknown for > 60 min → `failed`.
+`usageIds` selection skips rows that do not fit the headroom instead of stopping at them, so one oversized request
+never blocks settlement of the rest. Confirmation and the ledger credit come from the indexer
 (`BudgetDrawn` with the same `receipt_hash`), never from the drawer, so the ledger has exactly one source of truth.
 
 **Price poster** (`chain/poster.ts`, optional): fetch `PRICE_FEED_URL` → `priceUsd` → `priceE18`; read
 `ManualPriceSource` bounds; clamp the step to `maxStepBps`; skip if within `minInterval` or if the change is
-< 0.5 %; `post()` with the operator key; record in `price_posts`. `DRY_RUN` → log only.
+< 0.5 % — **unless** the current observation is about to go stale (`age ≥ desk.maxPriceAge() − 2·PRICE_POST_INTERVAL`),
+in which case the same price is re-posted as a keep-alive; `post()` with the operator key; record in `price_posts`.
+`DRY_RUN` → log only.
 
 Transactions are sent with a small in-process queue (one at a time, nonce from `getTransactionCount('pending')`,
 `maxFeePerGas` from `estimateFeesPerGas`), retrying `nonce too low` once.
@@ -586,7 +617,9 @@ use `HOUSE_API_KEY` (may be empty → no header).
 **Health** (`health.ts`, persisted in `provider_health`, cached in memory): per provider a sliding window of
 failures (60 s). `≥ 3` retryable failures → `down` for `open_for_ms` (30 s, doubling to a 300 s max on
 consecutive openings); after the window → `degraded` (half-open; the first request is a trial); a success → `ok`
-and reset. Non-retryable errors (400) never affect health. BYOK 401 affects only that workspace (the key is
+and reset. Non-retryable errors (400) never affect health. **Client disconnects/aborts and any failure of a workspace's own
+BYOK credentials never affect global health** (a BYOK user cannot take a provider down for credit-paid workspaces).
+Providers without a platform key are `down` in `route()` for credit-paid candidates. BYOK 401 affects only that workspace (the key is
 flagged `invalid` in `provider_keys` via `base_url`-independent column `last_error`, shown in the UI) — not global
 health. Platform `401/403` → `down` immediately (misconfiguration).
 
@@ -597,7 +630,8 @@ health. Platform `401/403` → `down` immediately (misconfiguration).
 2. `route()`. Errors → HTTP: `unknown_model` 404 `model_not_found`, `plan_required` 403 `plan_required`,
    `no_capable_model` 503 `no_model_available`, `insufficient_credit` 402 `insufficient_credit`.
 3. For each candidate in order: credentials (`undefined` → skip with reason); if `paidBy='credit'`:
-   estimate (§5.7) and reserve; call adapter with a per-attempt `AbortSignal` (timeout) — on `retryable`
+   estimate (§5.7) and reserve; call adapter with a per-attempt `AbortSignal` (`PROVIDER_TIMEOUT_MS` = time to
+   first byte, then an idle timeout reset on every streamed chunk; the whole non-stream call for JSON) — on `retryable`
    `ProviderError`: record health failure, release the reservation, continue; on non-retryable: release, map to the
    client error format and stop. Success → settle. All candidates failed → 502 `upstream_error` with the last
    error's message; a 429 from the last candidate maps to 429 `upstream_rate_limited` with `Retry-After` when known.
@@ -612,10 +646,14 @@ health. Platform `401/403` → `down` immediately (misconfiguration).
   `estimate = applyMarkupBps(costMicroUsd({inputTokens, outputTokens}, price), MARKUP_BPS)`;
   `reserve = clamp(estimate, MIN_RESERVE, MAX_RESERVE)`.
 - **Gate**: credit-paid request requires `available ≥ MIN_RESERVE` else 402 (see error body below); then insert a
-  reservation of `min(reserve, max(available, MIN_RESERVE))`. BYOK-paid requests skip reserve/gate.
-- **Settle**: `upstreamCost = costMicroUsd(usage, price)`; `charged = paidBy==='credit' ? applyMarkupBps(upstreamCost, MARKUP_BPS) : ceilDiv(upstreamCost · BYOK_FEE_BPS, 10_000)` (BYOK default 0 → free);
+  reservation of `min(reserve, max(available, MIN_RESERVE))`. **Credit bound**: `max_tokens` is clamped so that
+  `applyMarkupBps(cost(inputTokens, maxTokens), MARKUP_BPS) ≤ max(available, MAX_RESERVE)`; when the prompt alone
+  exceeds the bound the request is a 402. BYOK-paid requests skip reserve/gate.
+- **Settle**: an upstream answer whose usage is missing or all zero is billed by the estimate (`ceil(chars/4)`
+  input, streamed/returned output tokens estimated the same way) and logged; `upstreamCost = costMicroUsd(usage, price)`; `charged = paidBy==='credit' ? applyMarkupBps(upstreamCost, MARKUP_BPS) : ceilDiv(upstreamCost · BYOK_FEE_BPS, 10_000)` (BYOK default 0 → free);
   ledger `debit −charged` (`ref_type='usage'`, `ref_id=requestId`) when `charged > 0`; delete the reservation; write
-  the `usage` row (always, also on errors: `charged` = cost of tokens actually streamed, else 0). Expired
+  the `usage` row (always, also on errors: `charged` = cost of tokens actually streamed, else 0; a client abort is
+  recorded as `error_code='client_aborted'`, `http_status=499`, and is not an upstream failure). Expired
   reservations are purged every minute.
 - **Negative balances** are allowed only through budget headroom; `available` already accounts for it.
 - **402 body** (OpenAI envelope; `/v1/messages` uses the Anthropic envelope `{ type: 'error', error: { type, message } }`):
@@ -746,7 +784,7 @@ implementation calls its services directly.
 | `beagle_quote` | `{ usd? \| tokens? }` | `QuoteDto` |
 | `beagle_complete` | `{ prompt? , messages?, system?, model? ('beagle/auto'), max_tokens?, difficulty? }` | `{ text, model, provider, paidBy, costMicro, balanceMicro, finishReason }` |
 | `beagle_usage` | `{ limit?, window? }` | rows + summary |
-| `beagle_buy_compute` | `{ usd? \| tokens?, workspace? }` | executed: `{ txHash, receiptId?, creditedMicro, balanceMicro }`; else unsigned steps |
+| `beagle_buy_compute` | `{ usd? \| tokens?, workspace?, tolerance_bps? (0..5000, default 100) }` | burns through `burnForCreditMin` with `minUsdMicro` from the quote; executed: `{ txHash, receiptId?, creditedMicro, balanceMicro, minUsdMicro, toleranceBps }`; else unsigned steps |
 | `beagle_open_budget` | `{ usd? \| tokens?, hours (≤ 720), workspace? }` | executed: `{ txHash, budgetId }`; else unsigned steps |
 | `beagle_budgets` | — | `BudgetDto[]` |
 | `beagle_upgrade` | `{ kind: 'pro'\|'warm', quantity? }` | `UpgradeDto` |
@@ -777,9 +815,10 @@ Routes:
 - `/app` **Overview** (signed in): balance card (available / reserved / budget headroom), plan, 24 h usage, latest
   requests, token price, "Buy credit" CTA.
 - `/app/credits` **Credits**: amount input (USD or BEAGLE, toggles), live quote via `readContract(desk.quote)`,
-  wallet token balance + allowance, steps **Approve → Burn** (`approve(desk, amount)` then
-  `burnForCredit(workspace, amount)`; workspace defaults to the signed-in address, editable "credit another
-  workspace"), tx progress with explorer links, then poll `/api/balance` until the ledger shows the credit
+  wallet token balance + allowance, steps **Approve → Burn** (cumulative `approve(desk, allowance + amount)` when
+  the allowance is short — open budgets of the same wallet share it — then `burnForCreditMin(workspace, amount,
+  minUsdMicro)` with a user-selectable price tolerance, default 1 %; workspace defaults to the signed-in workspace,
+  editable "credit another workspace"), tx progress with explorer links, then poll `/api/balance` until the ledger shows the credit
   (indexer lag notice). Shows `minBurn`, price staleness warnings (disable when `stale`).
 - `/app/keys`: create (shows the key once with copy), list, revoke.
 - `/app/usage`: summary tiles (window selector), by-model bars, by-day bars, table with request id → `/app/receipts/:id`.

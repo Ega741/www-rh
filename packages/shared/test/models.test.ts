@@ -66,8 +66,7 @@ describe('DEFAULT_CATALOG (SPEC §4.4)', () => {
     });
     expect(byId('anthropic/claude-sonnet-5-5').price).toEqual({ inputPerM: 2_000_000, outputPerM: 10_000_000, cacheReadPerM: 200_000, cacheWritePerM: 2_500_000 });
     expect(byId('anthropic/claude-haiku-5-5')).toMatchObject({ tier: 'budget', price: { inputPerM: 100_000, outputPerM: 500_000, cacheReadPerM: 10_000, cacheWritePerM: 125_000 } });
-    expect(byId('anthropic/claude-fable-5-1')).toMatchObject({ tier: 'frontier', autoEligible: false, price: { inputPerM: 10_000_000, outputPerM: 50_000_000, cacheReadPerM: 250_000 } });
-    expect(byId('anthropic/claude-fable-5-1').price.cacheWritePerM).toBeUndefined();
+    expect(byId('anthropic/claude-fable-5-1')).toMatchObject({ tier: 'frontier', autoEligible: false, price: { inputPerM: 10_000_000, outputPerM: 50_000_000, cacheReadPerM: 250_000, cacheWritePerM: 12_500_000 } });
     expect(byId('openai/gpt-5.5')).toMatchObject({ tier: 'frontier', upstreamId: 'gpt-5.5', contextWindow: 400_000, maxOutput: 128_000, price: { inputPerM: 5_000_000, outputPerM: 30_000_000, cacheReadPerM: 500_000 } });
     expect(byId('openai/gpt-5.4-mini')).toMatchObject({ tier: 'efficient', price: { inputPerM: 750_000, outputPerM: 4_500_000, cacheReadPerM: 75_000 } });
     expect(byId('openai/gpt-5.4-nano')).toMatchObject({ tier: 'budget', price: { inputPerM: 200_000, outputPerM: 1_200_000, cacheReadPerM: 20_000 }, capabilities: { tools: true, vision: true, json: true, reasoning: false } });
