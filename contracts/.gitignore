@@ -1,4 +1,0 @@
-# Local deployments (anvil) and dry runs are not committed.
-deployments/31337.json
-deployments/dry-run/
-broadcast/*/31337/
