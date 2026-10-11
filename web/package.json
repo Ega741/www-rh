@@ -1,0 +1,41 @@
+{
+  "name": "@beagle/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Beagle web app: landing, wallet sign-in, credits (burn), API keys, usage, BYOK providers, upgrades, agent budgets, models and docs",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc -p tsconfig.json --noEmit --noUnusedLocals --noUnusedParameters"
+  },
+  "dependencies": {
+    "@beagle/shared": "workspace:*",
+    "@tanstack/react-query": "^5.104.1",
+    "@walletconnect/ethereum-provider": "^2.26.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-router": "^7.18.4",
+    "viem": "^2.57.4",
+    "wagmi": "^3.7.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^22.19.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.3"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}

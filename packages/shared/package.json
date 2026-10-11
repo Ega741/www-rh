@@ -1,0 +1,92 @@
+{
+  "name": "@beagle/shared",
+  "version": "0.1.0",
+  "description": "Shared Beagle library: Robinhood Chain definitions, deployment addresses, contract ABIs, credit math, model catalog, routing policy, difficulty heuristic, canonical JSON hashing and API/OpenAI DTOs",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./chains": {
+      "types": "./dist/chains.d.ts",
+      "import": "./dist/chains.js",
+      "default": "./dist/chains.js"
+    },
+    "./addresses": {
+      "types": "./dist/addresses.d.ts",
+      "import": "./dist/addresses.js",
+      "default": "./dist/addresses.js"
+    },
+    "./abi": {
+      "types": "./dist/abi.d.ts",
+      "import": "./dist/abi.js",
+      "default": "./dist/abi.js"
+    },
+    "./credit": {
+      "types": "./dist/credit.d.ts",
+      "import": "./dist/credit.js",
+      "default": "./dist/credit.js"
+    },
+    "./models": {
+      "types": "./dist/models.d.ts",
+      "import": "./dist/models.js",
+      "default": "./dist/models.js"
+    },
+    "./routing": {
+      "types": "./dist/routing.d.ts",
+      "import": "./dist/routing.js",
+      "default": "./dist/routing.js"
+    },
+    "./difficulty": {
+      "types": "./dist/difficulty.d.ts",
+      "import": "./dist/difficulty.js",
+      "default": "./dist/difficulty.js"
+    },
+    "./canonical": {
+      "types": "./dist/canonical.d.ts",
+      "import": "./dist/canonical.js",
+      "default": "./dist/canonical.js"
+    },
+    "./api": {
+      "types": "./dist/api.d.ts",
+      "import": "./dist/api.js",
+      "default": "./dist/api.js"
+    },
+    "./openai": {
+      "types": "./dist/openai.d.ts",
+      "import": "./dist/openai.js",
+      "default": "./dist/openai.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "fixtures"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "viem": "^2.57.4",
+    "zod": "^4.6.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.3"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
