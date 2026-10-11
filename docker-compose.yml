@@ -1,0 +1,82 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway.Dockerfile
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8787"
+      DB_PATH: /app/data/gateway.sqlite
+    volumes:
+      - gateway-data:/app/data
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+      args:
+        VITE_CHAIN_ID: ${VITE_CHAIN_ID:-4663}
+        VITE_GATEWAY_URL: ""
+        VITE_CREDIT_DESK_ADDRESS: ${VITE_CREDIT_DESK_ADDRESS:-0x0000000000000000000000000000000000000000}
+        VITE_RPC_URL: ${VITE_RPC_URL:-}
+        VITE_WALLETCONNECT_PROJECT_ID: ${VITE_WALLETCONNECT_PROJECT_ID:-}
+        VITE_MULTICALL: ${VITE_MULTICALL:-}
+    depends_on:
+      - gateway
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+  # House model: OpenAI-compatible vLLM server (needs an NVIDIA GPU). Set HOUSE_BASE_URL=http://house:8000/v1 in .env.
+  house:
+    profiles: ["gpu"]
+    image: vllm/vllm-openai:latest
+    command: >
+      --model openai/gpt-oss-20b --served-model-name openai/gpt-oss-20b
+      --max-model-len 131072 --port 8000
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ipc: host
+    restart: unless-stopped
+
+  # Pro house model (gpt-oss-120b, one 80 GB GPU). Point HOUSE_MODEL_LARGE at it with a second base URL if split.
+  house-large:
+    profiles: ["gpu-large"]
+    image: vllm/vllm-openai:latest
+    command: >
+      --model openai/gpt-oss-120b --served-model-name openai/gpt-oss-120b
+      --max-model-len 131072 --port 8000
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "8001:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ipc: host
+    restart: unless-stopped
+
+volumes:
+  gateway-data:
+  hf-cache:
