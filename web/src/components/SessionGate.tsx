@@ -2,6 +2,7 @@
 import { NavLink, Outlet } from 'react-router';
 import { useConnection } from 'wagmi';
 import { useSession } from '../hooks/useSession.jsx';
+import { checksum } from '../lib/explorer.js';
 import { phaseLabel } from '../lib/session.js';
 import { Button, Note, Skeleton } from './ui.jsx';
 import { WalletButton } from './WalletButton.jsx';
@@ -79,7 +80,7 @@ export function AppShell() {
       {session.walletMismatch && session.me !== undefined ? (
         <div className="mb-4">
           <Note tone="warn" title="Wallet differs from the signed-in workspace">
-            You are signed in as <span className="font-mono">{session.me.workspace}</span>; the connected wallet is another account. On-chain actions will come from the connected wallet. Sign out and in again to switch workspaces.
+            You are signed in as <span className="font-mono">{checksum(session.me.workspace)}</span>; the connected wallet is another account. Credits you buy and budgets you open here still go to the signed-in workspace, paid from the connected wallet. Sign out and in again to switch workspaces.
           </Note>
         </div>
       ) : null}

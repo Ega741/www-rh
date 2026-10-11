@@ -40,15 +40,17 @@ export function toChatCompletion(resp: InternalResponse, meta: ResponseMeta): Ch
     .map((p) => p.text)
     .join('');
   const toolCalls = toolCallsOf(resp.message.content);
+  // OpenAI puts a refusal in `refusal` with `content: null` (unless tool calls are present).
+  const refused = resp.finishReason === 'content_filter';
   return buildChatCompletion({
     id: meta.id,
     created: meta.created,
     model: meta.model,
-    content: text === '' && toolCalls.length > 0 ? null : text,
+    content: (text === '' && toolCalls.length > 0) || (refused && toolCalls.length === 0) ? null : text,
     ...(toolCalls.length === 0 ? {} : { toolCalls }),
     finishReason: resp.finishReason,
     usage: resp.usage,
-    ...(resp.finishReason === 'content_filter' ? { refusal: text === '' ? 'refused' : text } : {}),
+    ...(refused ? { refusal: text === '' ? 'refused' : text } : {}),
   });
 }
 

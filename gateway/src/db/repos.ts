@@ -505,9 +505,12 @@ export class NonceRepo {
 
   /** Consumes the nonce (single use); `false` when unknown or expired. */
   consume(nonce: string, now: number): boolean {
-    const r = this.db.run('DELETE FROM siwe_nonces WHERE nonce = ? AND expires_at > ?', [nonce, now]);
-    this.db.run('DELETE FROM siwe_nonces WHERE expires_at <= ?', [now]);
-    return r.changes > 0;
+    return this.db.run('DELETE FROM siwe_nonces WHERE nonce = ? AND expires_at > ?', [nonce, now]).changes > 0;
+  }
+
+  /** Deletes expired nonces (housekeeping; indexed on `expires_at`). */
+  purgeExpired(now: number): number {
+    return this.db.run('DELETE FROM siwe_nonces WHERE expires_at <= ?', [now]).changes;
   }
 }
 
@@ -822,6 +825,20 @@ export class UsageRepo {
 
   setDrawId(ids: readonly string[], drawId: number | null): void {
     for (const id of ids) this.db.run('UPDATE usage SET draw_id = ? WHERE id = ?', [drawId, id]);
+  }
+
+  /** Un-marks `ids` that are still marked with `drawId` (a failed draw releases only its own rows). */
+  clearDrawId(ids: readonly string[], drawId: number): number {
+    let n = 0;
+    for (const id of ids) n += this.db.run('UPDATE usage SET draw_id = NULL WHERE id = ? AND draw_id = ?', [id, drawId]).changes;
+    return n;
+  }
+
+  /** Marks the unsettled rows among `ids` with `drawId` (idempotent; never steals a row from another draw). */
+  claimDrawId(ids: readonly string[], drawId: number): number {
+    let n = 0;
+    for (const id of ids) n += this.db.run('UPDATE usage SET draw_id = ? WHERE id = ? AND draw_id IS NULL', [drawId, id]).changes;
+    return n;
   }
 }
 

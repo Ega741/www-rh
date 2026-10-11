@@ -154,6 +154,35 @@ export const CREDIT_DESK_ABI = [
   },
   {
     "type": "function",
+    "name": "burnForCreditMin",
+    "inputs": [
+      {
+        "name": "workspace",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "minUsdMicro",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "receiptId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "burnForCreditWithPermit",
     "inputs": [
       {
@@ -163,6 +192,55 @@ export const CREDIT_DESK_ABI = [
       },
       {
         "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "v",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "r",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "s",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "receiptId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "burnForCreditWithPermitMin",
+    "inputs": [
+      {
+        "name": "workspace",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "minUsdMicro",
         "type": "uint256",
         "internalType": "uint256"
       },
@@ -461,7 +539,7 @@ export const CREDIT_DESK_ABI = [
     "name": "renounceOwnership",
     "inputs": [],
     "outputs": [],
-    "stateMutability": "nonpayable"
+    "stateMutability": "pure"
   },
   {
     "type": "function",
@@ -978,12 +1056,33 @@ export const CREDIT_DESK_ABI = [
   },
   {
     "type": "error",
+    "name": "RenounceDisabled",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "SafeERC20FailedOperation",
     "inputs": [
       {
         "name": "token",
         "type": "address",
         "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "SlippageExceeded",
+    "inputs": [
+      {
+        "name": "usdMicro",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "minUsdMicro",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ]
   },
@@ -1726,7 +1825,7 @@ export const MANUAL_PRICE_SOURCE_ABI = [
     "name": "renounceOwnership",
     "inputs": [],
     "outputs": [],
-    "stateMutability": "nonpayable"
+    "stateMutability": "pure"
   },
   {
     "type": "function",
@@ -1957,6 +2056,11 @@ export const MANUAL_PRICE_SOURCE_ABI = [
         "internalType": "uint256"
       }
     ]
+  },
+  {
+    "type": "error",
+    "name": "RenounceDisabled",
+    "inputs": []
   },
   {
     "type": "error",

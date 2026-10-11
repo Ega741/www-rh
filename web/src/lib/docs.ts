@@ -6,6 +6,26 @@
 /** Placeholder key used in snippets. */
 export const KEY_PLACEHOLDER = 'bgl_YOUR_API_KEY';
 
+/**
+ * Placeholder for the path of a checkout of this repository. `@beagle/mcp` and `@beagle/shared`
+ * are workspace packages, not published to npm, so the snippets run the built files in place.
+ */
+export const REPO_PLACEHOLDER = '<repo>';
+
+/** The stdio MCP binary relative to the repository root (built by `pnpm --filter @beagle/mcp build`). */
+export const MCP_BIN_PATH = 'packages/mcp/dist/bin.js';
+
+/** The canonical-JSON / receipt-hash module relative to the repository root (built by `pnpm --filter @beagle/shared build`). */
+export const SHARED_CANONICAL_PATH = 'packages/shared/dist/canonical.js';
+
+/** Build step the local MCP binary needs once. */
+export const MCP_BUILD_COMMAND = 'pnpm --filter @beagle/mcp build';
+
+/** Absolute path of the stdio MCP binary inside `repo`. */
+export function mcpBinPath(repo = REPO_PLACEHOLDER): string {
+  return `${repo}/${MCP_BIN_PATH}`;
+}
+
 /** OpenAI-compatible base URL (`<base>/v1`). */
 export function openAiBaseUrl(base: string): string {
   return `${base}/v1`;
@@ -92,13 +112,16 @@ export function anthropicPythonSnippet(base: string): string {
   ].join('\n');
 }
 
-/** MCP server config for Claude Desktop (`claude_desktop_config.json`) using the `beagle-mcp` stdio binary. */
+/**
+ * MCP server config for Claude Desktop (`claude_desktop_config.json`) launching the `beagle-mcp`
+ * stdio binary from a checkout (`node <repo>/packages/mcp/dist/bin.js`).
+ */
 export function mcpStdioConfig(base: string): string {
   const cfg = {
     mcpServers: {
       beagle: {
-        command: 'npx',
-        args: ['-y', '@beagle/mcp'],
+        command: 'node',
+        args: [mcpBinPath()],
         env: { BEAGLE_API_URL: base, BEAGLE_API_KEY: KEY_PLACEHOLDER },
       },
     },
@@ -106,13 +129,13 @@ export function mcpStdioConfig(base: string): string {
   return JSON.stringify(cfg, null, 2);
 }
 
-/** `claude mcp add` command for Claude Code (stdio binary). */
+/** `claude mcp add` command for Claude Code (stdio binary from a checkout). */
 export function claudeCodeMcpCommand(base: string): string {
   return [
     `claude mcp add beagle \\`,
     `  -e BEAGLE_API_URL=${base} \\`,
     `  -e BEAGLE_API_KEY=${KEY_PLACEHOLDER} \\`,
-    `  -- npx -y @beagle/mcp`,
+    `  -- node ${mcpBinPath()}`,
   ].join('\n');
 }
 
@@ -130,27 +153,35 @@ export function mcpHttpConfig(base: string): string {
   return JSON.stringify(cfg, null, 2);
 }
 
-/** Environment lines for running `beagle-mcp` by hand, with the optional agent wallet. */
+/** Shell lines for running `beagle-mcp` by hand from a checkout, with the optional agent wallet. */
 export function mcpEnvSnippet(base: string): string {
   return [
+    `# once, from a checkout of this repository`,
+    `${MCP_BUILD_COMMAND}`,
+    ``,
     `export BEAGLE_API_URL=${base}`,
     `export BEAGLE_API_KEY=${KEY_PLACEHOLDER}`,
     `# optional: let the agent sign approve/burn/openBudget itself`,
     `# export BEAGLE_AGENT_PRIVATE_KEY=0x...`,
     `# export BEAGLE_RPC_URL=https://rpc.mainnet.chain.robinhood.com`,
-    `beagle-mcp`,
+    `node ${MCP_BIN_PATH}`,
   ].join('\n');
 }
 
-/** Node script recomputing a usage receipt hash with `@beagle/shared`. */
+/**
+ * Node script recomputing a usage receipt hash with `@beagle/shared` from a checkout. The route
+ * returns `{ receipt, hash }` (SPEC §5.9) and `hash = receiptHash(receipt)` covers the nested
+ * receipt only, so the snippet hashes exactly that object.
+ */
 export function verifyReceiptSnippet(base: string, requestId: string): string {
   return [
-    `import { receiptHash } from "@beagle/shared/canonical";`,
+    `// pnpm --filter @beagle/shared build, then: node verify.mjs`,
+    `import { receiptHash } from "${REPO_PLACEHOLDER}/${SHARED_CANONICAL_PATH}";`,
     ``,
     `const res = await fetch("${base}/api/receipts/${requestId}", {`,
     `  headers: { Authorization: "Bearer ${KEY_PLACEHOLDER}" },`,
     `});`,
-    `const { hash, ...receipt } = await res.json();`,
+    `const { receipt, hash } = await res.json();`,
     `console.log(receiptHash(receipt) === hash ? "receipt verified" : "MISMATCH");`,
   ].join('\n');
 }
@@ -186,8 +217,9 @@ export const HEADER_DOCS: readonly HeaderDoc[] = [
   { name: 'x-beagle-provider', direction: 'response', text: 'Upstream provider: anthropic | openai | google | house.' },
   { name: 'x-beagle-paid-by', direction: 'response', text: '`credit` or `byok` (your own provider key, no credit consumed).' },
   { name: 'x-beagle-cost-micro', direction: 'response', text: 'Charged amount in µUSD (integer).' },
-  { name: 'x-beagle-balance-micro', direction: 'response', text: 'Workspace balance in µUSD after settlement. Streaming responses send it as a final SSE comment `: beagle cost=… balance=…`.' },
+  { name: 'x-beagle-balance-micro', direction: 'response', text: 'Workspace balance in µUSD after settlement. Streaming responses send it as a final SSE comment `: beagle cost=… balance=…`. Also sent on 402.' },
   { name: 'x-beagle-route', direction: 'response', text: 'Routing reasons joined by `; ` (why this model, which fallbacks were considered).' },
+  { name: 'x-beagle-credits-url', direction: 'response', text: 'On 402 `insufficient_credit`: URL of the Credits page to top up (`<web origin>/app/credits`).' },
 ];
 
 /** Alias → description rows for the docs page. */

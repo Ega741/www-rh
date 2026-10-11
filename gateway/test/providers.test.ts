@@ -1,7 +1,9 @@
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import Anthropic from '@anthropic-ai/sdk';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createAnthropicAdapter, mapAnthropicError, parseAnthropicMessage, type AnthropicClientLike } from '../src/providers/anthropic.js';
-import { createOpenAiCompatAdapter, SseParser, usageFromOpenAi } from '../src/providers/openaiCompat.js';
+import { createAnthropicAdapter, defaultAnthropicClientFactory, mapAnthropicError, parseAnthropicMessage, type AnthropicClientLike } from '../src/providers/anthropic.js';
+import { createOpenAiCompatAdapter, SseParser, streamFrameError, usageFromOpenAi } from '../src/providers/openaiCompat.js';
 import { assertSafeBaseUrl, isPrivateAddress, UnsafeBaseUrlError } from '../src/providers/registry.js';
 import { classifyStatus, ProviderError, parseRetryAfter, type Credentials } from '../src/providers/types.js';
 import { ChunkAssembler, type InternalChunk, type InternalRequest } from '../src/translate/internal.js';
@@ -255,6 +257,106 @@ describe('Anthropic adapter (fake client)', () => {
     expect(ProviderError.is(e) && e.status === 429).toBe(true);
     const s = await adapter.stream({ ...REQ, stream: true }, creds, AbortSignal.timeout(1000))[Symbol.asyncIterator]().next().catch((x: unknown) => x);
     expect(ProviderError.is(s) && s.status === 500 && s.retryable).toBe(true);
+  });
+});
+
+/** A loopback HTTP server driven by `handler`; records the requests it saw. */
+async function loopback(handler: (req: { method: string; url: string; body: string }, res: import('node:http').ServerResponse) => void): Promise<{ url: string; hits: string[]; close(): Promise<void> }> {
+  const hits: string[] = [];
+  const server: Server = createServer(async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    hits.push(`${req.method} ${req.url} ${body}`);
+    handler({ method: req.method ?? '', url: req.url ?? '', body }, res);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+  return { url: `http://127.0.0.1:${port}`, hits, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+}
+
+describe('redirects are never followed (SSRF guard, SPEC §5.9)', () => {
+  const MARKER = 'INTERNAL-BODY-MARKER-7f3a';
+  let target: Awaited<ReturnType<typeof loopback>>;
+  let redirector: Awaited<ReturnType<typeof loopback>>;
+  beforeAll(async () => {
+    target = await loopback((_req, res) => {
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end(`${MARKER}: nothing here`);
+    });
+    redirector = await loopback((req, res) => {
+      res.writeHead(req.url.includes('303') ? 303 : 307, { location: `${target.url}/internal/endpoint` });
+      res.end();
+    });
+  });
+  afterAll(async () => {
+    await target.close();
+    await redirector.close();
+  });
+
+  it('OpenAI-compatible adapter: complete and stream refuse a 3xx without following it or echoing the body', async () => {
+    const adapter = createOpenAiCompatAdapter({ provider: 'openai' });
+    const creds: Credentials = { kind: 'byok', key: 'sk-user', baseUrl: `${redirector.url}/v1` };
+    const e = await adapter.complete(REQ, creds, AbortSignal.timeout(5000)).catch((x: unknown) => x);
+    expect(ProviderError.is(e)).toBe(true);
+    if (ProviderError.is(e)) {
+      expect(e.retryable).toBe(false);
+      expect(e.code).toBe('upstream_error');
+      expect(e.message).toContain('redirect');
+      expect(e.message).not.toContain(MARKER);
+      expect(e.message).not.toContain(target.url);
+    }
+    const s = await adapter.stream({ ...REQ, stream: true }, creds, AbortSignal.timeout(5000))[Symbol.asyncIterator]().next().catch((x: unknown) => x);
+    expect(ProviderError.is(s) && !s.retryable && !s.message.includes(MARKER)).toBe(true);
+    const e303 = await adapter.complete(REQ, { ...creds, baseUrl: `${redirector.url}/303` }, AbortSignal.timeout(5000)).catch((x: unknown) => x);
+    expect(ProviderError.is(e303) && !e303.retryable).toBe(true);
+    expect(target.hits).toEqual([]);
+    expect(redirector.hits.length).toBe(3);
+  });
+
+  it('Anthropic adapter (real SDK client): a 3xx from the base URL is refused and never followed', async () => {
+    const adapter = createAnthropicAdapter({ timeoutMs: 5000, clientFactory: defaultAnthropicClientFactory(5000) });
+    const creds: Credentials = { kind: 'byok', key: 'sk-ant-user', baseUrl: redirector.url };
+    const e = await adapter.complete({ ...REQ, upstreamModel: 'claude-haiku-5-5' }, creds, AbortSignal.timeout(5000)).catch((x: unknown) => x);
+    expect(ProviderError.is(e)).toBe(true);
+    if (ProviderError.is(e)) {
+      expect(e.retryable).toBe(false);
+      expect(e.message).toContain('redirect');
+      expect(e.message).not.toContain(MARKER);
+    }
+    expect(target.hits).toEqual([]);
+    const mapped = mapAnthropicError(Anthropic.APIError.generate(307, {}, 'redirect', new Headers({ location: 'https://evil.example/' })), 'byok');
+    expect(mapped).toMatchObject({ retryable: false, code: 'upstream_error' });
+    expect(mapped.message).not.toContain('evil.example');
+  });
+});
+
+describe('in-band SSE error frames', () => {
+  it('are retryable before the first byte or when server-side, non-retryable after content', () => {
+    expect(streamFrameError('house', { message: 'engine overloaded', type: 'server_error' }, false)).toMatchObject({ retryable: true, status: 502 });
+    expect(streamFrameError('house', { message: 'engine overloaded', type: 'server_error' }, true)).toMatchObject({ retryable: true, status: 502 });
+    expect(streamFrameError('openai', { message: 'slow down', type: 'rate_limit_error' }, true)).toMatchObject({ retryable: true, status: 429, code: 'rate_limited' });
+    expect(streamFrameError('house', { message: 'bad prompt', type: 'invalid_request_error' }, false)).toMatchObject({ retryable: true });
+    expect(streamFrameError('house', { message: 'bad prompt', type: 'invalid_request_error' }, true)).toMatchObject({ retryable: false, code: 'stream_error' });
+  });
+
+  it('a first-frame server error from a compat stream yields a retryable error chunk', async () => {
+    const upstream = await loopback((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end('data: {"error":{"message":"engine overloaded","type":"server_error"}}\n\n');
+    });
+    try {
+      const adapter = createOpenAiCompatAdapter({ provider: 'house' });
+      const chunks = await collect(adapter.stream({ ...REQ, stream: true }, { kind: 'platform', key: '', baseUrl: `${upstream.url}/v1` }, AbortSignal.timeout(5000)));
+      expect(chunks).toHaveLength(1);
+      const first = chunks[0];
+      expect(first?.type).toBe('error');
+      if (first?.type === 'error') {
+        expect(first.error.retryable).toBe(true);
+        expect(first.error.message).toContain('engine overloaded');
+      }
+    } finally {
+      await upstream.close();
+    }
   });
 });
 

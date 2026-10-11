@@ -44,6 +44,10 @@ describe('estimateDifficulty (SPEC §4.5)', () => {
     expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'classy functional importance' }] }))).toBeCloseTo(0.25, 3);
     expect(CODE_PATTERN.test('import os')).toBe(true);
     expect(CODE_PATTERN.test('important')).toBe(false);
+    // chosen reading of §4.5 (module JSDoc): `#include` matches at line start, which the literal
+    // `\b(…|#include)\b` of the spec text never could
+    expect(CODE_PATTERN.test('#include <x>')).toBe(true);
+    expect(/\b(?:function|class|def |import |SELECT |#include)\b/.test('#include <x>')).toBe(false);
   });
 
   it('adds 0.15 for tools, 0.10 for a long system prompt, 0.10 for > 8 messages', () => {

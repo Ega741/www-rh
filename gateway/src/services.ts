@@ -161,7 +161,13 @@ export function createServices(config: Config, deps: ServiceDeps = {}): Services
       logger,
     );
     if (config.poster.enabled && config.poster.feedUrl !== undefined) {
-      poster = new PricePoster(repos, chain.reader, chain.writer, { feedUrl: config.poster.feedUrl, dryRun: config.operator.dryRun, now, ...(deps.fetch === undefined ? {} : { fetch: (i: string, init?: RequestInit) => deps.fetch!(i, init ?? {}) }) }, logger);
+      poster = new PricePoster(
+        repos,
+        chain.reader,
+        chain.writer,
+        { feedUrl: config.poster.feedUrl, dryRun: config.operator.dryRun, postIntervalMs: config.poster.intervalMs, now, ...(deps.fetch === undefined ? {} : { fetch: (i: string, init?: RequestInit) => deps.fetch!(i, init ?? {}) }) },
+        logger,
+      );
     }
   }
 

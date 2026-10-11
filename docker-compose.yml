@@ -3,11 +3,19 @@ services:
     build:
       context: .
       dockerfile: docker/gateway.Dockerfile
-    env_file: .env
+    # The whole .env is injected (one shared file, docs/SPEC.md §5.1); `environment` wins over `env_file`, so the
+    # deploy-only key below is blanked instead of reaching the gateway container. Keep other deploy-only secrets
+    # out of the .env used by compose (docs/DEPLOY.md §3). `required: false` lets `docker compose config` validate
+    # a fresh checkout that has no .env yet (`cp .env.example .env`, docs/DEPLOY.md §3); the image runs with
+    # NODE_ENV=production, so a gateway started without the file refuses to boot (SESSION_SECRET is required).
+    env_file:
+      - path: .env
+        required: false
     environment:
       HOST: 0.0.0.0
       PORT: "8787"
       DB_PATH: /app/data/gateway.sqlite
+      DEPLOYER_PRIVATE_KEY: ""
     volumes:
       - gateway-data:/app/data
     ports:
@@ -54,7 +62,11 @@ services:
     ipc: host
     restart: unless-stopped
 
-  # Pro house model (gpt-oss-120b, one 80 GB GPU). Point HOUSE_MODEL_LARGE at it with a second base URL if split.
+  # Pro house model (gpt-oss-120b, one 80 GB GPU). The gateway has ONE house endpoint (HOUSE_BASE_URL) and requests
+  # both HOUSE_MODEL_SMALL and HOUSE_MODEL_LARGE from it, while each vLLM process serves one model: with
+  # HOUSE_BASE_URL=http://house:8000/v1 the 120b model 404s, with http://house-large:8000/v1 the 20b model does.
+  # To offer both, put an OpenAI-compatible router in front of the two services and point HOUSE_BASE_URL at it;
+  # otherwise run only one of them and drop the other model from the catalog (docs/DEPLOY.md §3).
   house-large:
     profiles: ["gpu-large"]
     image: vllm/vllm-openai:latest

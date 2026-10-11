@@ -149,8 +149,25 @@ describe('route: scenarios of SPEC §4.6', () => {
   });
 
   it('BYOK candidates come first within a tier and survive a down provider', () => {
+    // Deliberate reading of §4.6 step 5: `down` describes the platform's credentials with the provider, so
+    // only credit-paid candidates are dropped; the workspace's own key is still tried first.
     const d = route(input({ workspace: { availableMicroUsd: RICH, plan: 'free', byok: ['google'] }, providers: { ...ok(), google: { state: 'down' } } }));
     expect(paid(d).slice(0, 3)).toEqual(['google/gemini-3.1-pro:byok', 'anthropic/claude-opus-5-5:credit', 'openai/gpt-5.5:credit']);
+    expect(d.kind === 'ok' && d.reasons.some((r) => r.includes('google down (credit-paid dropped)'))).toBe(true);
+    // the same provider without a BYOK key contributes nothing
+    const credit = route(input({ providers: { ...ok(), google: { state: 'down' } } }));
+    expect(ids(credit).some((id) => id.startsWith('google/'))).toBe(false);
+  });
+
+  it('platform quota does not reorder BYOK candidates, a degraded provider state still does', () => {
+    const byok2 = { availableMicroUsd: RICH, plan: 'free' as const, byok: ['openai', 'google'] as Provider[] };
+    // openai quota is the platform's limit, not the workspace key's: preference order holds
+    const quota = route(input({ difficulty: 0.3, providers: { ...ok(), openai: { state: 'ok', quotaRatio: 0.1 } }, workspace: byok2 }));
+    expect(paid(quota).slice(0, 3)).toEqual(['openai/gpt-5.4-nano:byok', 'google/gemini-3.1-flash-lite:byok', 'anthropic/claude-haiku-5-5:credit']);
+    expect(quota.kind === 'ok' && quota.reasons.some((r) => r.startsWith('quota:'))).toBe(false);
+    // half-open (degraded) is about the upstream itself and applies to BYOK too
+    const degraded = route(input({ difficulty: 0.3, providers: { ...ok(), openai: { state: 'degraded' } }, workspace: byok2 }));
+    expect(paid(degraded).slice(0, 2)).toEqual(['google/gemini-3.1-flash-lite:byok', 'openai/gpt-5.4-nano:byok']);
   });
 
   it('(e) explicit model with fallback none / cheaper / any', () => {
@@ -308,6 +325,106 @@ describe('route: scenarios of SPEC §4.6', () => {
   it('all providers down → no_capable_model (not insufficient_credit)', () => {
     const d = route(input({ providers: { anthropic: { state: 'down' }, openai: { state: 'down' }, google: { state: 'down' }, house: { state: 'down' } } }));
     expect(d).toMatchObject({ kind: 'error', code: 'no_capable_model' });
+  });
+
+  it('(l) zero credit when the house tier cannot serve → insufficient_credit, not no_capable_model', () => {
+    const broke = { availableMicroUsd: 0n, plan: 'free' as const, byok: [] };
+    const small = { tools: false, vision: false, json: false, contextTokens: 10, maxOutputTokens: 10 };
+    const wide = { ...small, contextTokens: 40_000, maxOutputTokens: 100 };
+    const expect402 = (d: RoutingDecision, label: string): void => {
+      expect(d, label).toMatchObject({ kind: 'error', code: 'insufficient_credit', message: INSUFFICIENT_CREDIT_MESSAGE });
+      expect(d.reasons.some((r) => r.startsWith('result: insufficient_credit (credit runway excluded')), label).toBe(true);
+    };
+    // free plan, > 32K context: house dropped (house_context_pro) while opus/sonnet/haiku would serve with credit
+    for (const requested of ['beagle/auto', 'beagle/cheap', 'beagle/best']) {
+      expect402(route(input({ requested, needs: wide, workspace: broke })), requested);
+    }
+    // vision: the house has none
+    expect402(route(input({ needs: { ...small, vision: true }, workspace: broke })), 'vision');
+    // house provider down
+    expect402(route(input({ workspace: broke, providers: { ...ok(), house: { state: 'down' } } })), 'house down');
+    // negative balance and positive-but-very-low credit classify the same way: credit is the only blocker
+    expect402(route(input({ needs: wide, workspace: { ...broke, availableMicroUsd: -5n } })), 'negative');
+    expect402(route(input({ needs: wide, workspace: { ...broke, availableMicroUsd: 50_000n } })), 'very low');
+    // the classification does not depend on the fallback header
+    expect402(route(input({ needs: wide, workspace: broke, fallback: 'none' })), 'none');
+    expect(route(input({ needs: wide, workspace: broke, fallback: 'any' }))).toMatchObject({ kind: 'error', code: 'insufficient_credit' });
+
+    // counterfactuals: with credit the request is served; when the house fits, the gate alone answers
+    expect(ids(route(input({ needs: wide })))[0]).toBe('anthropic/claude-opus-5-5');
+    const pro = route(input({ needs: wide, workspace: { ...broke, plan: 'pro' } }));
+    expect(pro).toMatchObject({ kind: 'error', code: 'insufficient_credit' });
+    expect(pro.reasons).toContain('result: insufficient_credit');
+    // a BYOK key still serves at $0 even though the house cannot
+    expect(paid(route(input({ needs: wide, workspace: { ...broke, byok: ['openai'] as Provider[] } })))).toEqual(['openai/gpt-5.5:byok', 'openai/gpt-5.4-mini:byok', 'openai/gpt-5.4-nano:byok']);
+
+    // genuinely unservable requests stay no_capable_model, credit or not
+    expect(route(input({ needs: { ...small, contextTokens: 2_000_000 }, workspace: broke }))).toMatchObject({ kind: 'error', code: 'no_capable_model' });
+    const allDown = { anthropic: { state: 'down' as const }, openai: { state: 'down' as const }, google: { state: 'down' as const }, house: { state: 'down' as const } };
+    expect(route(input({ workspace: broke, providers: allDown }))).toMatchObject({ kind: 'error', code: 'no_capable_model' });
+    expect(route(input({ requested: 'beagle/house', needs: wide, workspace: broke }))).toMatchObject({ kind: 'error', code: 'no_capable_model' });
+  });
+
+  it('alias with fallback any at very low credit: house first, then the pricier tiers', () => {
+    const d = route(input({ fallback: 'any', workspace: { availableMicroUsd: 50_000n, plan: 'free', byok: [] } }));
+    expect(d.kind === 'ok' && d.tier).toBe('house');
+    expect(ids(d)).toEqual([
+      'house/gpt-oss-20b',
+      'anthropic/claude-haiku-5-5',
+      'openai/gpt-5.4-nano',
+      'google/gemini-3.1-flash-lite',
+      'anthropic/claude-sonnet-5-5',
+      'openai/gpt-5.4-mini',
+      'google/gemini-3-flash',
+      'anthropic/claude-opus-5-5',
+      'openai/gpt-5.5',
+      'google/gemini-3.1-pro',
+    ]);
+    expect(route(input({ fallback: 'any', workspace: { availableMicroUsd: 0n, plan: 'free', byok: [] } }))).toMatchObject({ kind: 'error', code: 'insufficient_credit' });
+  });
+
+  it('(m) an explicit primary is never demoted by its provider quota; only its fallbacks are', () => {
+    const anthropicLow = { ...ok(), anthropic: { state: 'ok' as const, quotaRatio: 0.1 } };
+    // non-eligible primary (§4.6 step 6: "an explicit non-eligible primary stays first")
+    const fable = route(input({ requested: 'anthropic/claude-fable-5-1', difficulty: 0.3, providers: anthropicLow }));
+    expect(fable.kind === 'ok' && fable.tier).toBe('frontier');
+    expect(ids(fable)).toEqual([
+      'anthropic/claude-fable-5-1',
+      'openai/gpt-5.5',
+      'google/gemini-3.1-pro',
+      'openai/gpt-5.4-mini',
+      'google/gemini-3-flash',
+      'openai/gpt-5.4-nano',
+      'google/gemini-3.1-flash-lite',
+      'house/gpt-oss-20b',
+      'anthropic/claude-haiku-5-5',
+      'anthropic/claude-sonnet-5-5',
+      'anthropic/claude-opus-5-5',
+    ]);
+    expect(fable.kind === 'ok' && fable.reasons.some((r) => r.startsWith('quota:'))).toBe(true);
+
+    // eligible primary (§0: explicit ids are honoured)
+    const openaiLow = { ...ok(), openai: { state: 'ok' as const, quotaRatio: 0.1 } };
+    const mini = route(input({ requested: 'openai/gpt-5.4-mini', difficulty: 0.3, providers: openaiLow }));
+    expect(ids(mini)).toEqual([
+      'openai/gpt-5.4-mini',
+      'anthropic/claude-sonnet-5-5',
+      'google/gemini-3-flash',
+      'anthropic/claude-haiku-5-5',
+      'google/gemini-3.1-flash-lite',
+      'house/gpt-oss-20b',
+      'openai/gpt-5.4-nano',
+    ]);
+    expect(mini.kind === 'ok' && mini.tier).toBe('efficient');
+
+    // fallback none: a single candidate cannot move, and no quota reason is recorded
+    const none = route(input({ requested: 'openai/gpt-5.4-mini', difficulty: 0.3, providers: openaiLow, fallback: 'none' }));
+    expect(ids(none)).toEqual(['openai/gpt-5.4-mini']);
+    expect(none.kind === 'ok' && none.reasons.some((r) => r.startsWith('quota:'))).toBe(false);
+    // hard requests are untouched by the demotion either way
+    expect(ids(route(input({ requested: 'openai/gpt-5.4-mini', difficulty: 0.9, providers: openaiLow })))[0]).toBe('openai/gpt-5.4-mini');
+    // the alias path still demotes the whole provider (contrast with test (h))
+    expect(ids(route(input({ difficulty: 0.3, providers: openaiLow })))).toEqual(['anthropic/claude-haiku-5-5', 'google/gemini-3.1-flash-lite', 'house/gpt-oss-20b', 'openai/gpt-5.4-nano']);
   });
 
   it('honours a custom preference and price ordering within a tier', () => {

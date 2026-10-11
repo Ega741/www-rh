@@ -2,7 +2,7 @@
  * Pure configuration loader for the web app (SPEC §7 env). `loadConfig` reads a plain record so
  * it can be unit-tested; `src/config.ts` evaluates it against `import.meta.env`.
  */
-import type { Chain } from 'viem';
+import { getAddress, type Address, type Chain } from 'viem';
 import { anvilChain, chainById, withMulticall3 } from '@beagle/shared/chains';
 import { resolveDeployment, type ResolvedDeployment } from '@beagle/shared/addresses';
 
@@ -107,4 +107,39 @@ export function loadConfig(env: WebEnv, opts: { dev: boolean }): AppConfig {
 /** The gateway URL users should call directly: `gatewayUrl` when set, else the page origin. */
 export function publicGatewayUrl(cfg: Pick<AppConfig, 'gatewayUrl'>, pageOrigin: string): string {
   return cfg.gatewayUrl !== '' ? cfg.gatewayUrl : stripSlash(pageOrigin);
+}
+
+/** Where the web app will send burns and budgets, reconciled with the desk the gateway indexes. */
+export interface DeskResolution {
+  /** The desk to call, `undefined` when unknown or when the two sources disagree. */
+  desk: Address | undefined;
+  /** Human-readable explanation when the committed/`VITE_CREDIT_DESK_ADDRESS` desk and the gateway's differ. */
+  mismatch: string | undefined;
+}
+
+/** Checksummed address or `undefined` for null/invalid input. */
+export function asAddress(s: string | null | undefined): Address | undefined {
+  if (s === null || s === undefined) return undefined;
+  try {
+    return getAddress(s);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Picks the CreditDesk address. The committed deployment (with `VITE_CREDIT_DESK_ADDRESS`) wins
+ * only when the gateway agrees or reports none: a burn against a desk the gateway's indexer does
+ * not watch would never be credited, so a disagreement disables the flows instead of proceeding.
+ */
+export function reconcileDesk(committed: Address | undefined, fromGateway: string | null | undefined): DeskResolution {
+  const gateway = asAddress(fromGateway);
+  if (committed === undefined) return { desk: gateway, mismatch: undefined };
+  if (gateway !== undefined && gateway.toLowerCase() !== committed.toLowerCase()) {
+    return {
+      desk: undefined,
+      mismatch: `This web build targets CreditDesk ${committed} but the gateway indexes ${gateway}. Burns and budgets are disabled until the two agree (check VITE_CREDIT_DESK_ADDRESS / deployments.generated.ts against the gateway's CREDIT_DESK_ADDRESS).`,
+    };
+  }
+  return { desk: committed, mismatch: undefined };
 }

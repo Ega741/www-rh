@@ -37,17 +37,18 @@ abstract contract CreditDeskInvariantBase is Test {
         }
         initialSupply = token.totalSupply();
 
-        bytes4[] memory selectors = new bytes4[](10);
+        bytes4[] memory selectors = new bytes4[](11);
         selectors[0] = DeskHandler.burn.selector;
         selectors[1] = DeskHandler.burnWithPermit.selector;
         selectors[2] = DeskHandler.openBudget.selector;
         selectors[3] = DeskHandler.draw.selector;
         selectors[4] = DeskHandler.closeBudget.selector;
         selectors[5] = DeskHandler.warp.selector;
-        selectors[6] = DeskHandler.setPrice.selector;
-        selectors[7] = DeskHandler.breakPrice.selector;
-        selectors[8] = DeskHandler.setPaused.selector;
-        selectors[9] = DeskHandler.setMinBurn.selector;
+        selectors[6] = DeskHandler.warpPastDeadline.selector;
+        selectors[7] = DeskHandler.setPrice.selector;
+        selectors[8] = DeskHandler.breakPrice.selector;
+        selectors[9] = DeskHandler.setPaused.selector;
+        selectors[10] = DeskHandler.setMinBurn.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
@@ -93,7 +94,15 @@ abstract contract CreditDeskInvariantBase is Test {
         console.log("permit ok/revert: %d / %d", handler.nPermitOk(), handler.nPermitRevert());
         console.log("draw ok/revert:   %d / %d", handler.nDrawOk(), handler.nDrawRevert());
         console.log("open / close:     %d / %d", handler.nOpenOk(), handler.nCloseOk());
-        console.log("attempts paused / bad price: %d / %d", handler.nAttemptsPaused(), handler.nAttemptsBadPrice());
+        console.log(
+            "attempts paused / stale / unavailable: %d / %d / %d",
+            handler.nAttemptsPaused(),
+            handler.nAttemptsStale(),
+            handler.nAttemptsUnavailable()
+        );
+        console.log(
+            "floor rejects / expired-fresh draws: %d / %d", handler.nFloorRejects(), handler.nDrawExpiredFresh()
+        );
     }
 }
 

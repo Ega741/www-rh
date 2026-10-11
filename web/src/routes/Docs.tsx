@@ -6,12 +6,15 @@ import {
   ALIAS_DOCS,
   HEADER_DOCS,
   INSUFFICIENT_CREDIT_BODY,
+  MCP_BUILD_COMMAND,
+  REPO_PLACEHOLDER,
   anthropicNodeSnippet,
   anthropicPythonSnippet,
   claudeCodeMcpCommand,
   curlMessagesSnippet,
   curlSnippet,
   mcpEnvSnippet,
+  mcpBinPath,
   mcpHttpConfig,
   mcpStdioConfig,
   nodeOpenAiSnippet,
@@ -94,7 +97,10 @@ export function Docs() {
 
         <h2 id="mcp">MCP for agents</h2>
         <p>
-          The <span className="font-mono">beagle-mcp</span> server (package <span className="font-mono">@beagle/mcp</span>) gives agents balance, models, quotes, inference, usage, compute purchase and budgets. It reads <span className="font-mono">BEAGLE_API_URL</span> and <span className="font-mono">BEAGLE_API_KEY</span>; with an optional <span className="font-mono">BEAGLE_AGENT_PRIVATE_KEY</span> (+ <span className="font-mono">BEAGLE_RPC_URL</span>) the wallet tools execute approve → burn / openBudget themselves, otherwise they return unsigned transactions.
+          The <span className="font-mono">beagle-mcp</span> server (workspace package <span className="font-mono">@beagle/mcp</span> of this repository, not published to npm) gives agents balance, models, quotes, inference, usage, compute purchase and budgets. It reads <span className="font-mono">BEAGLE_API_URL</span> and <span className="font-mono">BEAGLE_API_KEY</span>; with an optional <span className="font-mono">BEAGLE_AGENT_PRIVATE_KEY</span> (+ <span className="font-mono">BEAGLE_RPC_URL</span>) the wallet tools execute approve → burn / openBudget themselves, otherwise they return unsigned transactions.
+        </p>
+        <p>
+          Run it from a checkout: build once with <span className="font-mono text-fg">{MCP_BUILD_COMMAND}</span>, then launch <span className="font-mono text-fg">node {mcpBinPath()}</span>, replacing <span className="font-mono">{REPO_PLACEHOLDER}</span> with the path of the checkout. Without a checkout, use the Streamable HTTP config below: the gateway serves the same tools.
         </p>
         <h3>Claude Desktop</h3>
         <Code code={mcpStdioConfig(base)} lang="json" title="claude_desktop_config.json" />
@@ -156,7 +162,7 @@ export function Docs() {
           <Link className="link" to="/app/budgets">
             open a budget
           </Link>
-          . Each request has a verifiable receipt at <span className="font-mono">/api/receipts/&lt;request id&gt;</span>; its hash is <span className="font-mono">sha256(canonicalJson(receipt))</span> and can be recomputed with <span className="font-mono">@beagle/shared</span>.
+          . Each request has a verifiable receipt at <span className="font-mono">/api/receipts/&lt;request id&gt;</span> returning <span className="font-mono">{'{ receipt, hash }'}</span>; <span className="font-mono">hash = sha256(canonicalJson(receipt))</span> and can be recomputed with <span className="font-mono">receiptHash</span> from <span className="font-mono">@beagle/shared/canonical</span> in this repository (every receipt page shows the script).
         </p>
       </article>
     </div>

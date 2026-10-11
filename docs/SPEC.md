@@ -413,15 +413,20 @@ test/…                 vitest; in-memory SQLite; mock providers via injected f
 
 ### 5.1 Configuration (env; `.env.example` at the repo root documents every key)
 
+The gateway reads `process.env` only (no `.env` loader of its own): bare-metal runs pass the file with
+`node --env-file=.env …` or export it in the shell, docker compose injects it through `env_file`, Vite reads
+the `VITE_*` keys from the repo-root file itself.
+
 | Group | Keys (default) |
 |---|---|
+| runtime | `NODE_ENV` (development; `production` → `SESSION_SECRET` required and CLI `credit` needs `--force`; set by the Docker image) |
 | chain | `CHAIN_ID` (31337), `RPC_URL`, `CREDIT_DESK_ADDRESS` (override; zero = unset), `START_BLOCK` (deployment block from `deployments` when unset), `CONFIRMATIONS` (0), `POLL_INTERVAL_MS` (2000), `LOG_CHUNK_BLOCKS` (2000) |
 | operator | `OPERATOR_PRIVATE_KEY` (`0x`/empty → draws and posts disabled), `DRY_RUN` (true) |
 | price poster | `PRICE_POSTER_ENABLED` (false), `PRICE_SOURCE_ADDRESS` (from deployments), `PRICE_FEED_URL` (http JSON `{ "priceUsd": number }`), `PRICE_POST_INTERVAL_MS` (300000) |
 | budgets | `DRAW_THRESHOLD_USD` (1), `DRAW_INTERVAL_MS` (30000), `BUDGET_HEADROOM_REFRESH_MS` (15000) |
-| server | `PORT` (8787), `HOST` (0.0.0.0), `PUBLIC_URL` (http://localhost:8787; SIWE domain/uri), `PUBLIC_WEB_ORIGIN` (http://localhost:5173; CORS, comma list), `DB_PATH` (./data/gateway.sqlite), `MAX_BODY_BYTES` (2000000), `TRUST_PROXY` (false), `LOG_LEVEL` (info), `LOG_PROMPTS` (false) |
+| server | `PORT` (8787), `HOST` (0.0.0.0), `PUBLIC_URL` (http://localhost:8787; SIWE domain/uri), `PUBLIC_WEB_ORIGIN` (http://localhost:5173; CORS, comma list), `DB_PATH` (./data/gateway.sqlite), `MAX_BODY_BYTES` (2000000), `TRUST_PROXY` (false; reserved, not honoured yet), `LOG_LEVEL` (info), `LOG_PROMPTS` (false) |
 | secrets | `SESSION_SECRET` (required in prod; dev default with a warning), `KEYRING_MASTER_KEY` (32-byte hex; required when BYOK enabled), `ADMIN_TOKEN` (empty = admin routes disabled) |
-| providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` (https://api.openai.com/v1), `GOOGLE_API_KEY`, `GOOGLE_BASE_URL` (https://generativelanguage.googleapis.com/v1beta/openai), `HOUSE_BASE_URL` (empty = house disabled), `HOUSE_API_KEY`, `HOUSE_MODEL_SMALL` (openai/gpt-oss-20b), `HOUSE_MODEL_LARGE` (openai/gpt-oss-120b), `PROVIDER_TIMEOUT_MS` (120000), `MODEL_CATALOG_FILE` |
+| providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` (https://api.openai.com/v1), `GOOGLE_API_KEY`, `GOOGLE_BASE_URL` (https://generativelanguage.googleapis.com/v1beta/openai), `HOUSE_BASE_URL` (empty = house disabled; the single endpoint both house models are requested from), `HOUSE_API_KEY`, `HOUSE_MODEL_SMALL` (openai/gpt-oss-20b), `HOUSE_MODEL_LARGE` (openai/gpt-oss-120b), `PROVIDER_TIMEOUT_MS` (120000), `MODEL_CATALOG_FILE` |
 | economics | `MARKUP_BPS` (1000), `BYOK_FEE_BPS` (0), `LOW_CREDIT_USD` (1), `VERY_LOW_CREDIT_USD` (0.1), `MIN_RESERVE_USD` (0.01), `MAX_RESERVE_USD` (5), `RESERVATION_TTL_MS` (600000), `PRO_PRICE_USD` (20), `PRO_DAYS` (30), `WARM_HOUR_PRICE_USD` (2), `RATE_LIMIT_RPM` (60), `RATE_LIMIT_RPM_PRO` (300), `WARM_DRIVER` (log \| ollama \| http), `WARM_WEBHOOK_URL`, `WARM_PING_INTERVAL_MS` (240000) |
 
 Platform keys absent → that provider is `down` for credit-paid routing (BYOK still works). `HOUSE_BASE_URL`
@@ -710,11 +715,13 @@ logged unless `LOG_PROMPTS=true`. Provider keys, API keys, session ids never app
 
 ### 6.1 Transports
 
-- `bin/beagle-mcp` (stdio): env `BEAGLE_API_URL` (default `https://localhost:8787` → document), `BEAGLE_API_KEY`
+- `bin/beagle-mcp` (stdio): env `BEAGLE_API_URL` (default `http://localhost:8787` → document), `BEAGLE_API_KEY`
   (required), optional `BEAGLE_AGENT_PRIVATE_KEY` (hex) + `BEAGLE_RPC_URL`. With an agent key the wallet tools
   **execute** transactions (approve → burn/openBudget, wait for receipt, then poll `/api/balance` up to 60 s until
-  the credit appears); without it they return `{ unsigned: true, chainId, to, data, value: '0', description }` for
-  each step so a wallet-capable agent can sign.
+  the credit appears); without it they return one object
+  `{ unsigned: true, chainId, steps: [{ to, data, value: '0', description }] }` (approve first, then
+  `burnForCredit` / `openBudget`) so a wallet-capable agent can sign each step. The package is not published to
+  npm: docs reference the local build (`node packages/mcp/dist/bin.js`) or the gateway's HTTP transport.
 - Library: `createBeagleMcpServer(api: BeagleApi, opts: { wallet?: WalletExecutor }) → McpServer` (used by the gateway
   with the HTTP transport).
 
@@ -806,13 +813,18 @@ wagmi/query; components are presentational.
   and `/api/budgets` shows `drawn > 0` with a confirmed draw whose `receiptHash` recomputes → MCP HTTP:
   `tools/list` and `beagle_balance` via `curl` JSON-RPC → exit 0. Timeouts fail loudly; cleanup via `trap`.
 - CI (`.github/workflows/ci.yml`): job `contracts` (foundry-toolchain stable: `forge fmt --check`, `forge build --sizes`,
-  `forge test -vvv`, fixtures diff); job `node` (pnpm 10, Node 22: install, `forge build`, `abi:sync --check`,
+  `forge test -vvv`, fixtures diff); job `node` (pnpm 10 taken from `packageManager` in the root package.json —
+  `pnpm/action-setup@v4` gets no `version` input, Node 22: install, `forge build`, `abi:sync --check`,
   build, typecheck, test, `anvil:e2e`).
-- Docker: `docker/gateway.Dockerfile` (node:22-alpine, pnpm, workspace build, `node gateway/dist/main.js`),
-  `docker/web.Dockerfile` (build → nginx; `docker/nginx.conf` proxies `/api`, `/v1`, `/mcp`, `/healthz` to
-  `gateway:8787` with SSE-friendly `proxy_buffering off`), `docker-compose.yml`: `gateway`, `web`, profile `gpu`:
-  `house` (`vllm/vllm-openai`, `--model openai/gpt-oss-20b --served-model-name openai/gpt-oss-20b`, NVIDIA
-  device reservation) and `house-large` (`gpt-oss-120b`). `HOUSE_BASE_URL=http://house:8000/v1` in the compose env.
+- Docker: `docker/gateway.Dockerfile` (node:22-alpine, pnpm, workspace build, `NODE_ENV=production`,
+  `node gateway/dist/main.js`), `docker/web.Dockerfile` (build → nginx; `docker/nginx.conf` proxies `/api`,
+  `/v1`, `/mcp`, `/healthz` to `gateway:8787` with SSE-friendly `proxy_buffering off`), a root `.dockerignore`
+  (host `node_modules`, `dist`, `.env*` except `.env.example`, `gateway/data`, `*.sqlite*`, foundry outputs never
+  enter the build context), `docker-compose.yml`: `gateway` (`env_file: .env`, `DEPLOYER_PRIVATE_KEY` blanked),
+  `web`, profile `gpu`: `house` (`vllm/vllm-openai`, `--model openai/gpt-oss-20b --served-model-name
+  openai/gpt-oss-20b`, NVIDIA device reservation), profile `gpu-large`: `house-large` (`gpt-oss-120b`).
+  `HOUSE_BASE_URL=http://house:8000/v1` in the compose env; the gateway has a single house endpoint, so serving
+  both house models needs an OpenAI-compatible router in front of the two services (DEPLOY §3).
 
 ## 9. Security and trust model
 
@@ -826,7 +838,8 @@ wagmi/query; components are presentational.
 - **Prompts** are not persisted (only token counts and costs) unless `LOG_PROMPTS=true`.
 - **Fallback never silently upgrades price class** beyond the request: `cheaper` is the default; `any` is opt-in.
 - **Known gaps**: provider price snapshots must be maintained by the operator; the house model is only as
-  available as the GPU behind `HOUSE_BASE_URL`; the Manual price source trusts the poster within bounds —
+  available as the GPU behind `HOUSE_BASE_URL`, and that single endpoint must serve both `HOUSE_MODEL_SMALL`
+  and `HOUSE_MODEL_LARGE` (no per-model base URL yet); the Manual price source trusts the poster within bounds —
   use `ChainlinkPriceSource` when a feed exists.
 
 ## 10. Addresses

@@ -1,10 +1,12 @@
 /**
  * `/app/credits`: amount in USD or tokens, live on-chain quote, wallet balance/allowance,
- * Approve → Burn with progress + explorer links, then poll `/api/balance` until the credit lands.
+ * Approve → Burn with progress + explorer links, then poll `/api/receipts` and `/api/balance`
+ * until the credit lands. The credit goes to the signed-in workspace by default (SPEC §7), even
+ * when the connected wallet that pays the burn is another account.
  */
 import { useEffect, useRef, useState } from 'react';
 import { useConnection, useWriteContract } from 'wagmi';
-import { getAddress } from 'viem';
+import type { Hex } from 'viem';
 import { CREDIT_DESK_ABI, ERC20_ABI } from '@beagle/shared/abi';
 import { AmountInput } from '../../components/AmountInput.jsx';
 import { AddressText, TxLink } from '../../components/Hash.jsx';
@@ -21,7 +23,8 @@ import { useTokenAccount } from '../../hooks/useTokenAccount.js';
 import { useTxFlow } from '../../hooks/useTxFlow.js';
 import { convertAmount, fmtPrice, fmtTokens, fmtUsd, parseAmount, type AmountMode } from '../../lib/amounts.js';
 import { sameAddress } from '../../lib/explorer.js';
-import { IDLE_WATCH, observeBalance, startWatch, type WatchState } from '../../lib/poll.js';
+import { IDLE_WATCH, WATCH_POLL_MS, observeBalance, observeEvents, restartWatch, startWatch, type WatchState } from '../../lib/poll.js';
+import { defaultTargetWorkspace } from '../../lib/session.js';
 import { describeBlocker, planBurn } from '../../lib/steps.js';
 import { ageSeconds, formatDuration, formatUnixSeconds } from '../../lib/time.js';
 import { parseAddressInput } from '../../lib/validate.js';
@@ -54,7 +57,7 @@ export function Credits() {
   const quote = useQuote(desk, tokens);
   const account = useTokenAccount(token?.address, address, desk);
 
-  const defaultWorkspace = address ?? (me === undefined ? undefined : getAddress(me.workspace));
+  const defaultWorkspace = defaultTargetWorkspace(me?.workspace, address);
   const workspace = otherWorkspace ? parseAddressInput(workspaceInput) : defaultWorkspace;
   const creditsOwnWorkspace = workspace !== undefined && me !== undefined && sameAddress(workspace, me.workspace);
 
@@ -83,28 +86,41 @@ export function Credits() {
   const [watch, setWatch] = useState<WatchState>(IDLE_WATCH);
   const watchRef = useRef(watch);
   watchRef.current = watch;
-  const balance = useBalance(watch.status === 'watching' ? 2000 : undefined);
-  const events = useCreditEvents(10);
+  const watching = watch.status === 'watching';
+  const balance = useBalance(watching ? WATCH_POLL_MS : undefined);
+  const events = useCreditEvents(10, watching ? WATCH_POLL_MS : undefined);
+
+  const settle = (next: WatchState, w: WatchState) => {
+    if (next !== w) setWatch(next);
+    if (next.status === 'landed') {
+      toast.push({ kind: 'success', title: 'Credit landed', message: balance.data === undefined ? 'The ledger shows the purchase.' : `Balance is now ${fmtUsd(balance.data.balanceMicro)}` });
+      void invalidateBalances(client);
+    } else if (next.status === 'timeout') {
+      toast.push({ kind: 'warning', title: 'Still waiting for the indexer', message: 'The burn is confirmed on chain; the ledger will update once the indexer catches up.' });
+    }
+  };
 
   useEffect(() => {
     const w = watchRef.current;
     const data = balance.data;
     if (w.status !== 'watching' || data === undefined) return;
-    const next = observeBalance(w, data.balanceMicro);
-    if (next !== w) setWatch(next);
-    if (next.status === 'landed') {
-      toast.push({ kind: 'success', title: 'Credit landed', message: `Balance is now ${fmtUsd(data.balanceMicro)}` });
-      void invalidateBalances(client);
-    } else if (next.status === 'timeout') {
-      toast.push({ kind: 'warning', title: 'Still waiting for the indexer', message: 'The burn is confirmed on chain; the ledger will update once the indexer catches up.' });
-    }
+    settle(observeBalance(w, data.balanceMicro), w);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [balance.dataUpdatedAt]);
+
+  useEffect(() => {
+    const w = watchRef.current;
+    const rows = events.data?.rows;
+    if (w.status !== 'watching' || rows === undefined) return;
+    settle(observeEvents(w, rows), w);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [events.dataUpdatedAt]);
 
   const onBurn = async () => {
     if (!plan.canRun || tokens === undefined || workspace === undefined || desk === undefined || token === undefined) return;
     const before = balance.data?.balanceMicro ?? me?.balanceMicro ?? 0n;
     const expected = quote.usdMicro;
+    let burnHash: Hex | undefined;
     setWatch(IDLE_WATCH);
     const ok = await flow.run([
       {
@@ -117,12 +133,15 @@ export function Credits() {
       {
         id: 'burn',
         label: `Burn ${fmtTokens(tokens, decimals, symbol)}${expected === undefined ? '' : ` for ${fmtUsd(expected)}`} of credit`,
-        write: () => write.mutateAsync({ abi: CREDIT_DESK_ABI, address: desk, functionName: 'burnForCredit', args: [workspace, tokens], chainId: config.chainId }),
+        write: async () => {
+          burnHash = await write.mutateAsync({ abi: CREDIT_DESK_ABI, address: desk, functionName: 'burnForCredit', args: [workspace, tokens], chainId: config.chainId });
+          return burnHash;
+        },
         onConfirmed: () => Promise.all([account.refetch(), client.invalidateQueries({ queryKey: ['receipts'] })]),
       },
     ]);
     if (ok) {
-      if (creditsOwnWorkspace) setWatch(startWatch(before, expected));
+      if (creditsOwnWorkspace) setWatch(startWatch(before, expected, burnHash));
       else toast.push({ kind: 'success', title: 'Burn confirmed', message: 'The credited workspace will see the balance once the indexer processes the event.' });
       setInput('');
     }
@@ -134,7 +153,7 @@ export function Credits() {
     <div className="space-y-6">
       <PageHeader title="Credits" lead={`Burn ${symbol} through the CreditDesk contract. The contract quotes the burn in USD from the on-chain price and the gateway credits your workspace exactly the emitted amount.`} />
 
-      {deskError !== undefined ? <Note tone="err" title="Contracts not configured">{deskError}</Note> : null}
+      {deskError !== undefined ? <Note tone="err" title="Credit desk unavailable">{deskError}</Note> : null}
 
       <div className="grid gap-4 lg:grid-cols-[1.3fr_1fr]">
         <Card title="Buy credit">
@@ -209,7 +228,15 @@ export function Credits() {
                   </div>
                 ) : (
                   <p className="mt-1 text-xs text-muted">
-                    Credits go to {workspace === undefined ? 'your workspace' : <AddressText address={workspace} />}.
+                    Credits go to {workspace === undefined ? 'your workspace' : <AddressText address={workspace} />}
+                    {session.walletMismatch && address !== undefined ? (
+                      <>
+                        {' '}
+                        (your signed-in workspace); the tokens are burned from the connected wallet <AddressText address={address} />.
+                      </>
+                    ) : (
+                      '.'
+                    )}
                   </p>
                 )}
               </div>
@@ -246,15 +273,23 @@ export function Credits() {
 
               {watch.status === 'watching' ? (
                 <Note tone="info" title="Waiting for the indexer to credit the burn…">
-                  Polling your balance every 2 s (attempt {watch.attempts + 1}). Indexer lag shows on the landing page.
+                  Polling your credit events and balance every {WATCH_POLL_MS / 1000} s (attempt {watch.attempts + 1}). Indexer lag shows on the landing page.
                 </Note>
               ) : watch.status === 'landed' ? (
                 <Note tone="ok" title="Credit landed">
                   Balance: <span className="font-mono">{balance.data === undefined ? '—' : fmtUsd(balance.data.balanceMicro)}</span>
                 </Note>
               ) : watch.status === 'timeout' ? (
-                <Note tone="warn" title="Indexer is lagging">
-                  The burn is final on chain. The ledger credit appears as soon as the gateway indexes the block.
+                <Note
+                  tone="warn"
+                  title="Indexer is lagging"
+                  actions={
+                    <Button size="sm" onClick={() => setWatch(restartWatch(watch))}>
+                      Check again
+                    </Button>
+                  }
+                >
+                  The burn is final on chain{watch.txHash === undefined ? '' : <> (<TxLink hash={watch.txHash} />)</>}. The ledger credit appears as soon as the gateway indexes the block.
                 </Note>
               ) : null}
             </div>

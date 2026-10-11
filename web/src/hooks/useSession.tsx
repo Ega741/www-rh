@@ -2,14 +2,14 @@
  * Session state: restore via `GET /api/me`, SIWE sign-in (`nonce → createSiweMessage →
  * signMessage → verify`), logout. Exposed through a context so the whole app shares one query.
  */
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useConnection, useSignMessage } from 'wagmi';
 import type { MeDto } from '@beagle/shared/api';
 import { api, isApiError, sessionToken } from '../api.js';
 import { config, publicGatewayUrl } from '../config.js';
 import { describeError } from '../lib/errors.js';
-import { sessionStatus, signInBlocker, walletMismatch, type SessionStatus, type SignInPhase } from '../lib/session.js';
+import { sessionStatus, shouldResetWorkspaceCache, signInBlocker, walletMismatch, type SessionStatus, type SignInPhase } from '../lib/session.js';
 import { buildSiweMessage } from '../lib/siwe.js';
 import { clearWorkspaceQueries, qk } from '../queries.js';
 import { useToast } from './useToast.js';
@@ -58,6 +58,13 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     retry: 1,
   });
 
+  /** Workspace of the last authenticated session, kept across an expiry so a sign-in with another wallet drops its cached data. */
+  const lastWorkspace = useRef<string | undefined>(undefined);
+  const meWorkspace = meQuery.data?.workspace;
+  useEffect(() => {
+    if (meWorkspace !== undefined) lastWorkspace.current = meWorkspace;
+  }, [meWorkspace]);
+
   const signIn = useCallback(async () => {
     if (!isConnected || address === undefined) {
       toast.push({ kind: 'warning', title: 'Connect a wallet first' });
@@ -77,8 +84,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       });
       const signature = await signMessageAsync({ message });
       setPhase('verifying');
-      const { token } = await api.verify(message, signature);
+      const { token, workspace } = await api.verify(message, signature);
       if (token !== '') sessionToken.set(token);
+      if (shouldResetWorkspaceCache(lastWorkspace.current, workspace)) clearWorkspaceQueries(client);
       await client.invalidateQueries({ queryKey: qk.me });
       toast.push({ kind: 'success', title: 'Signed in' });
     } catch (e) {

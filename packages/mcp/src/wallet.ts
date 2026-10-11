@@ -3,9 +3,11 @@
  * implementation that signs with an agent private key, and {@link buildUnsignedSteps} for agents
  * that hold their own wallet and only need calldata.
  *
- * Both purchase paths are two-step: `token.approve(desk, amount)` (skipped by the executor when the
- * allowance already covers it) followed by `desk.burnForCredit(workspace, amount)` or
- * `desk.openBudget(workspace, cap, deadline)`.
+ * Both purchase paths are two-step: `token.approve(desk, …)` followed by `desk.burnForCredit(workspace, amount)`
+ * or `desk.openBudget(workspace, cap, deadline)`. The executor approves **cumulatively**
+ * (`allowance + amount`): the same `allowance(owner, desk)` backs every open budget of the wallet
+ * (headroom = min(cap − drawn, allowance, balance)) and a burn spends it, so approving exactly `amount`
+ * would silently shrink or stall those budgets. Only an effectively unlimited allowance is left alone.
  *
  * @module wallet
  */
@@ -13,6 +15,7 @@ import { CREDIT_DESK_ABI, ERC20_ABI } from '@beagle/shared/abi';
 import { chainById } from '@beagle/shared/chains';
 import { formatTokenAmount } from '@beagle/shared/credit';
 import {
+  ChainMismatchError,
   createPublicClient,
   createWalletClient,
   decodeEventLog,
@@ -44,6 +47,13 @@ export interface BuyComputeResult {
   txHash: Hex;
   /** `receiptId` of the `CreditPurchased` event when it could be decoded from the receipt. */
   receiptId?: bigint;
+  /**
+   * `usdMicro` emitted by `CreditPurchased`: the exact credit the gateway will book (SPEC §0, §9).
+   * Present when the event could be decoded.
+   */
+  usdMicro?: bigint;
+  /** `priceE18` the contract read for this burn, from the same event. */
+  priceE18?: bigint;
   /** Hash of the `approve` transaction when one was needed. */
   approveTxHash?: Hex;
 }
@@ -87,7 +97,10 @@ export interface WalletDeployment {
 /** Thrown by the executor and the step builder for invalid input or failed transactions. */
 export class WalletError extends Error {
   override readonly name = 'WalletError';
-  /** `invalid_address`, `tx_reverted`, `event_missing`, `invalid_amount`, `chain_mismatch`, `rpc_error`. */
+  /**
+   * `invalid_address`, `invalid_amount`, `chain_mismatch`, `rpc_error`, `simulation_failed`, `tx_failed`,
+   * `tx_reverted`, `event_missing`, `wallet_unavailable` (a lazy executor could not be set up).
+   */
   readonly code: string;
   readonly txHash?: Hex;
 
@@ -107,6 +120,7 @@ function assertPositive(label: string, value: bigint): void {
   if (typeof value !== 'bigint' || value <= 0n) throw new WalletError('invalid_amount', `${label} must be a positive bigint (got ${String(value)})`);
 }
 
+const UINT256_MAX = (1n << 256n) - 1n;
 const UINT128_MAX = (1n << 128n) - 1n;
 const UINT64_MAX = (1n << 64n) - 1n;
 
@@ -148,8 +162,9 @@ export type UnsignedStepsInput =
 
 /**
  * Encodes `approve` + `burnForCredit` or `approve` + `openBudget` as calldata for an external
- * wallet. The approve step is always included (the builder cannot read the allowance); a wallet
- * that already holds a sufficient allowance may skip it.
+ * wallet. The approve step is always included (the builder cannot read the allowance) and approves
+ * exactly `amount`; a wallet with open budgets should approve `current allowance + amount` instead,
+ * because the budgets' headroom is bounded by that same allowance and a burn spends it.
  */
 export function buildUnsignedSteps(input: UnsignedStepsInput): UnsignedTransactionRequest {
   const desk = checksum('deployment.creditDesk', input.deployment.creditDesk);
@@ -165,7 +180,7 @@ export function buildUnsignedSteps(input: UnsignedStepsInput): UnsignedTransacti
     to: token,
     data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [desk, amount] }),
     value: '0',
-    description: `approve ${human} for the CreditDesk ${desk} (skip if your allowance already covers it)`,
+    description: `approve ${human} for the CreditDesk ${desk} (if this wallet has open budgets, approve your current allowance + ${human} instead: budgets draw from the same allowance and a burn spends it)`,
   };
 
   if (input.action === 'buyCompute') {
@@ -231,13 +246,54 @@ function decodeDeskEvent<N extends 'CreditPurchased' | 'BudgetOpened'>(
   for (const log of receipt.logs) {
     if (log.address.toLowerCase() !== desk.toLowerCase()) continue;
     try {
-      const decoded = decodeEventLog({ abi: CREDIT_DESK_ABI, data: log.data, topics: log.topics, eventName });
+      // `eventName` only narrows viem's types; the decoder picks the event by topic, so compare the name.
+      const decoded = decodeEventLog({ abi: CREDIT_DESK_ABI, data: log.data, topics: log.topics });
+      if (decoded.eventName !== eventName) continue;
       return { args: decoded.args as Record<string, unknown> };
     } catch {
-      // not the event we want; keep scanning
+      // not a desk event we know; keep scanning
     }
   }
   return undefined;
+}
+
+/** Options of {@link createLazyWalletExecutor}. */
+export interface LazyWalletExecutorOptions {
+  /** The signing address, known up front (e.g. from `privateKeyToAccount`) without any network call. */
+  address: Address;
+  /**
+   * Builds the real executor; called on the first wallet operation and again on every later
+   * operation until one build succeeds. Its failures surface as `WalletError('wallet_unavailable')`.
+   */
+  build: () => Promise<WalletExecutor>;
+}
+
+/**
+ * A {@link WalletExecutor} that defers building the real one until a wallet tool is called, so a
+ * stdio server can connect its transport before the gateway is reachable and recover from a
+ * gateway that is down at startup. `address` is available immediately for workspace defaulting.
+ */
+export function createLazyWalletExecutor(options: LazyWalletExecutorOptions): WalletExecutor {
+  const address = checksum('address', options.address);
+  let inner: WalletExecutor | undefined;
+  async function resolve(): Promise<WalletExecutor> {
+    if (inner !== undefined) return inner;
+    try {
+      inner = await options.build();
+    } catch (error) {
+      throw new WalletError(
+        'wallet_unavailable',
+        `the agent wallet could not be set up (${errorMessage(error)}); the purchase was not attempted. Retry once the gateway is reachable, or sign the unsigned steps yourself.`,
+        { cause: error },
+      );
+    }
+    return inner;
+  }
+  return {
+    address,
+    buyCompute: async (params) => (await resolve()).buyCompute(params),
+    openBudget: async (params) => (await resolve()).openBudget(params),
+  };
 }
 
 /**
@@ -255,6 +311,26 @@ export function createViemWalletExecutor(options: ViemWalletExecutorOptions): Wa
   const walletClient: WalletClient<Transport, Chain, PrivateKeyAccount> = createWalletClient({ account, chain, transport });
   const receiptTimeout = options.receiptTimeoutMs ?? 120_000;
 
+  /**
+   * viem signs with `chain.id` without asking the node, so a node on another chain (a wrong
+   * `BEAGLE_RPC_URL`) would only surface as an opaque rejection of the raw transaction. Check once,
+   * before the first transaction, and remember a match.
+   */
+  let chainVerified = false;
+  async function assertChain(): Promise<void> {
+    if (chainVerified) return;
+    let actual: number;
+    try {
+      actual = await publicClient.getChainId();
+    } catch (error) {
+      throw new WalletError('rpc_error', `reading the chain id failed: ${errorMessage(error)}`, { cause: error });
+    }
+    if (actual !== options.chainId) {
+      throw new WalletError('chain_mismatch', `the RPC node is on chain ${actual} but the gateway's CreditDesk is on chain ${options.chainId}; check BEAGLE_RPC_URL`);
+    }
+    chainVerified = true;
+  }
+
   async function waitMined(hash: Hex, label: string): Promise<TransactionReceipt> {
     let receipt: TransactionReceipt;
     try {
@@ -266,6 +342,11 @@ export function createViemWalletExecutor(options: ViemWalletExecutorOptions): Wa
     return receipt;
   }
 
+  /**
+   * Approves `allowance + amount` so the pre-existing allowance (which every open budget of this
+   * wallet draws from) survives the burn / stays available next to the new budget's cap. Skipped
+   * only when the allowance is effectively unlimited (the sum would not fit `uint256`).
+   */
   async function ensureAllowance(amount: bigint): Promise<Hex | undefined> {
     let allowance: bigint;
     try {
@@ -273,9 +354,10 @@ export function createViemWalletExecutor(options: ViemWalletExecutorOptions): Wa
     } catch (error) {
       throw new WalletError('rpc_error', `reading allowance failed: ${errorMessage(error)}`, { cause: error });
     }
-    if (allowance >= amount) return undefined;
+    const target = allowance + amount;
+    if (target > UINT256_MAX) return undefined;
     const hash = await send(() =>
-      walletClient.writeContract({ address: token, abi: ERC20_ABI, functionName: 'approve', args: [desk, amount] }),
+      walletClient.writeContract({ address: token, abi: ERC20_ABI, functionName: 'approve', args: [desk, target] }),
       'approve',
     );
     await waitMined(hash, 'approve');
@@ -286,6 +368,9 @@ export function createViemWalletExecutor(options: ViemWalletExecutorOptions): Wa
     try {
       return await write();
     } catch (error) {
+      if (error instanceof ChainMismatchError || (error instanceof Error && error.name === 'ChainMismatchError')) {
+        throw new WalletError('chain_mismatch', `${label}: ${errorMessage(error)}`, { cause: error });
+      }
       throw new WalletError('tx_failed', `${label} failed: ${errorMessage(error)}`, { cause: error });
     }
   }
@@ -296,6 +381,7 @@ export function createViemWalletExecutor(options: ViemWalletExecutorOptions): Wa
     async buyCompute({ workspace, tokens }) {
       const ws = checksum('workspace', workspace);
       assertPositive('tokens', tokens);
+      await assertChain();
       const approveTxHash = await ensureAllowance(tokens);
       const { request } = await simulate(
         () => publicClient.simulateContract({ account, address: desk, abi: CREDIT_DESK_ABI, functionName: 'burnForCredit', args: [ws, tokens] }),
@@ -305,9 +391,13 @@ export function createViemWalletExecutor(options: ViemWalletExecutorOptions): Wa
       const receipt = await waitMined(txHash, 'burnForCredit');
       const event = decodeDeskEvent(receipt, desk, 'CreditPurchased');
       const receiptId = event?.args['receiptId'];
+      const usdMicro = event?.args['usdMicro'];
+      const priceE18 = event?.args['priceE18'];
       return {
         txHash,
         ...(typeof receiptId === 'bigint' ? { receiptId } : {}),
+        ...(typeof usdMicro === 'bigint' ? { usdMicro } : {}),
+        ...(typeof priceE18 === 'bigint' ? { priceE18 } : {}),
         ...(approveTxHash === undefined ? {} : { approveTxHash }),
       };
     },
@@ -317,6 +407,7 @@ export function createViemWalletExecutor(options: ViemWalletExecutorOptions): Wa
       assertPositive('cap', cap);
       if (cap > UINT128_MAX) throw new WalletError('invalid_amount', 'cap exceeds uint128');
       if (deadline <= 0n || deadline > UINT64_MAX) throw new WalletError('invalid_amount', 'deadline must fit uint64 and be > 0');
+      await assertChain();
       const approveTxHash = await ensureAllowance(cap);
       const { request } = await simulate(
         () => publicClient.simulateContract({ account, address: desk, abi: CREDIT_DESK_ABI, functionName: 'openBudget', args: [ws, cap, deadline] }),

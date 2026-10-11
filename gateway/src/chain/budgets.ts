@@ -1,9 +1,14 @@
 /**
  * Budget headroom refresher (SPEC §5.4): for every open, unexpired budget reads
- * `remainingCap = cap − drawn`, `allowance(owner, desk)` and `balanceOf(owner)`, computes
- * `headroom_tokens = min(remainingCap, allowance, balance)` and `headroom_micro` at the desk's
- * current price; stalls on `PriceStale`/`PriceUnavailable` (`price`) or zero headroom with cap left
- * (`allowance`), and clears `draw_failed` once headroom is back.
+ * `remainingCap = cap − drawn`, `allowance(owner, desk)` and `balanceOf(owner)`, and computes
+ * `headroom_tokens` and `headroom_micro` at the desk's current price; stalls on
+ * `PriceStale`/`PriceUnavailable` (`price`) or zero headroom with cap left (`allowance`), and clears
+ * `draw_failed` once headroom is back.
+ *
+ * Allowance and balance are one number per owner, so an owner's backing
+ * `min(allowance, balance)` is **allocated across** that owner's open budgets in `budget_id` order
+ * (each capped by its `remainingCap`) instead of being counted once per budget: Σ headroom over an
+ * owner's budgets never exceeds what a draw could actually move.
  *
  * @module chain/budgets
  */
@@ -19,13 +24,30 @@ export interface HeadroomOptions {
   now?: () => number;
 }
 
-/** Pure headroom computation. */
-export function computeHeadroom(budget: Pick<BudgetRow, 'cap' | 'drawn'>, allowance: bigint, balance: bigint): { remainingCap: bigint; headroomTokens: bigint } {
-  const remainingCap = budget.cap > budget.drawn ? budget.cap - budget.drawn : 0n;
-  let headroomTokens = remainingCap;
-  if (allowance < headroomTokens) headroomTokens = allowance;
-  if (balance < headroomTokens) headroomTokens = balance;
-  return { remainingCap, headroomTokens };
+/** Per-budget result of {@link allocateHeadroom}. */
+export interface HeadroomAllocation {
+  remainingCap: bigint;
+  headroomTokens: bigint;
+}
+
+/**
+ * Pure allocation of one owner's backing `min(allowance, balance)` across `budgets` (in the order
+ * given, i.e. `budget_id` ascending): each budget takes `min(remainingCap, backing left)`.
+ */
+export function allocateHeadroom(budgets: readonly Pick<BudgetRow, 'cap' | 'drawn'>[], allowance: bigint, balance: bigint): HeadroomAllocation[] {
+  let backing = allowance < balance ? allowance : balance;
+  if (backing < 0n) backing = 0n;
+  return budgets.map((budget) => {
+    const remainingCap = budget.cap > budget.drawn ? budget.cap - budget.drawn : 0n;
+    const headroomTokens = remainingCap < backing ? remainingCap : backing;
+    backing -= headroomTokens;
+    return { remainingCap, headroomTokens };
+  });
+}
+
+/** Pure headroom computation for a single budget (`min(remainingCap, allowance, balance)`). */
+export function computeHeadroom(budget: Pick<BudgetRow, 'cap' | 'drawn'>, allowance: bigint, balance: bigint): HeadroomAllocation {
+  return allocateHeadroom([budget], allowance, balance)[0] as HeadroomAllocation;
 }
 
 /** Refreshes `budgets.headroom_*`. */
@@ -53,22 +75,36 @@ export class HeadroomRefresher {
     } catch (e) {
       priceError = e instanceof PriceError ? e : new PriceError('rpc', e instanceof Error ? e.message : String(e), { cause: e });
     }
-    let n = 0;
+    const byOwner = new Map<string, BudgetRow[]>();
     for (const budget of budgets) {
+      const list = byOwner.get(budget.owner) ?? [];
+      list.push(budget);
+      byOwner.set(budget.owner, list);
+    }
+    let n = 0;
+    for (const [owner, owned] of byOwner) {
+      let allowance: bigint;
+      let balance: bigint;
       try {
-        await this.refreshOne(budget, price, priceError);
-        n++;
+        [allowance, balance] = await Promise.all([this.reader.allowance(owner as Address), this.reader.balanceOf(owner as Address)]);
       } catch (e) {
-        this.logger.warn('headroom refresh failed', { budgetId: budget.budgetId, error: e });
+        this.logger.warn('headroom refresh failed', { owner, budgetIds: owned.map((b) => b.budgetId), error: e });
+        continue;
       }
+      const allocations = allocateHeadroom(owned, allowance, balance);
+      owned.forEach((budget, i) => {
+        try {
+          this.refreshOne(budget, allocations[i] as HeadroomAllocation, price, priceError);
+          n++;
+        } catch (e) {
+          this.logger.warn('headroom refresh failed', { budgetId: budget.budgetId, error: e });
+        }
+      });
     }
     return n;
   }
 
-  private async refreshOne(budget: BudgetRow, price: { priceE18: bigint } | undefined, priceError: PriceError | undefined): Promise<void> {
-    const owner = budget.owner as Address;
-    const [allowance, balance] = await Promise.all([this.reader.allowance(owner), this.reader.balanceOf(owner)]);
-    const { remainingCap, headroomTokens } = computeHeadroom(budget, allowance, balance);
+  private refreshOne(budget: BudgetRow, { remainingCap, headroomTokens }: HeadroomAllocation, price: { priceE18: bigint } | undefined, priceError: PriceError | undefined): void {
     const now = this.now();
     if (price === undefined) {
       // Keep tokens current, but the budget cannot back credit without a price.

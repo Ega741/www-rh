@@ -1,6 +1,9 @@
-/** `/app/receipts/:id`: receipt fields, canonical JSON, hash check, verify-locally snippet. */
+/**
+ * `/app/receipts/:id`: receipt fields, canonical JSON, hash check, verify-locally snippet.
+ * The DTO is `{ receipt, hash }` (SPEC §5.9) and `hash = receiptHash(receipt)` over the nested
+ * receipt alone, so the check below hashes `dto.receipt` as-is.
+ */
 import { Link, useParams } from 'react-router';
-import type { ReceiptDto } from '@beagle/shared/api';
 import { canonicalJson, receiptHash } from '@beagle/shared/canonical';
 import { HashText } from '../../components/Hash.jsx';
 import { QueryGuard } from '../../components/QueryGuard.jsx';
@@ -10,11 +13,6 @@ import { fmtCount, fmtPerMillion, fmtUsd } from '../../lib/amounts.js';
 import { verifyReceiptSnippet } from '../../lib/docs.js';
 import { formatDateTime } from '../../lib/time.js';
 import { useReceipt } from '../../queries.js';
-
-function stripHash(r: ReceiptDto): Omit<ReceiptDto, 'hash'> {
-  const { hash: _hash, ...rest } = r;
-  return rest;
-}
 
 /** Receipt page. */
 export function Receipt() {
@@ -38,11 +36,11 @@ export function Receipt() {
         }
       />
       <QueryGuard query={receipt}>
-        {(r) => {
-          const body = stripHash(r);
-          const canonical = canonicalJson(body);
-          const recomputed = receiptHash(body);
-          const ok = recomputed.toLowerCase() === r.hash.toLowerCase();
+        {(dto) => {
+          const r = dto.receipt;
+          const canonical = canonicalJson(r);
+          const recomputed = receiptHash(r);
+          const ok = recomputed.toLowerCase() === dto.hash.toLowerCase();
           return (
             <div className="grid gap-4 lg:grid-cols-2">
               <Card title="Receipt">
@@ -91,7 +89,7 @@ export function Receipt() {
                     </ul>
                   </Row>
                   <Row label="Hash" mono>
-                    <HashText hash={r.hash} />
+                    <HashText hash={dto.hash} />
                   </Row>
                 </dl>
               </Card>
@@ -111,7 +109,7 @@ export function Receipt() {
                   <Code code={canonical} lang="json" title="RFC 8785-style, sorted keys, bigint as strings" />
                 </Card>
                 <Card title="Verify locally">
-                  <Code code={verifyReceiptSnippet(base, r.requestId)} lang="typescript" title="node (npm i @beagle/shared)" />
+                  <Code code={verifyReceiptSnippet(base, r.requestId)} lang="typescript" title="verify.mjs · node ≥ 22, from a checkout of this repository" />
                 </Card>
               </div>
             </div>

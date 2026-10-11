@@ -116,9 +116,14 @@ export function useUsageList(filters: Omit<UsageListParams, 'before'> = {}) {
   });
 }
 
-/** `GET /api/receipts` (credit events). */
-export function useCreditEvents(limit = 20) {
-  return useQuery({ queryKey: [...qk.receipts, limit], queryFn: () => api.receipts.list({ limit }), staleTime: 10_000 });
+/** `GET /api/receipts` (credit events); `pollMs` enables polling (post-burn watcher). */
+export function useCreditEvents(limit = 20, pollMs?: number) {
+  return useQuery({
+    queryKey: [...qk.receipts, limit],
+    queryFn: () => api.receipts.list({ limit }),
+    staleTime: 10_000,
+    ...(pollMs === undefined ? {} : { refetchInterval: pollMs }),
+  });
 }
 
 /** `GET /api/receipts/:requestId`. */

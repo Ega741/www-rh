@@ -149,6 +149,13 @@ describe('applyMarkupBps', () => {
     expect(() => applyMarkupBps(-1n, 10)).toThrow(RangeError);
     expect(() => applyMarkupBps(1n, -10)).toThrow(RangeError);
   });
+  it('rejects a fractional, NaN, infinite or unsafe bps with its own RangeError', () => {
+    for (const bps of [1.5, 12.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2 ** 53]) {
+      expect(() => applyMarkupBps(1n, bps), String(bps)).toThrow(/bps must be a non-negative safe integer/);
+    }
+    expect(applyMarkupBps(1n, 0)).toBe(1n);
+    expect(applyMarkupBps(1n, 2 ** 53 - 1)).toBe(1n + ceilDiv(BigInt(2 ** 53 - 1), 10_000n));
+  });
 });
 
 describe('formatUsdMicro', () => {
@@ -173,9 +180,30 @@ describe('formatUsdMicro', () => {
     expect(formatUsdMicro(2_500_000n, { minFractionDigits: 3 })).toBe('$2.500');
     expect(formatUsdMicro(2_500_000n, { maxFractionDigits: 0, minFractionDigits: 0 })).toBe('$3');
   });
+  it('caps the default minimum at maxFractionDigits', () => {
+    expect(formatUsdMicro(2_500_000n, { maxFractionDigits: 0 })).toBe('$3');
+    expect(formatUsdMicro(2_400_000n, { maxFractionDigits: 0 })).toBe('$2');
+    expect(formatUsdMicro(2_500_000n, { maxFractionDigits: 1 })).toBe('$2.5');
+    expect(formatUsdMicro(2_560_000n, { maxFractionDigits: 1 })).toBe('$2.6');
+    expect(formatUsdMicro(3_000_000n, { maxFractionDigits: 1 })).toBe('$3.0');
+    expect(formatUsdMicro(2_500_000n, { maxFractionDigits: 2 })).toBe('$2.50');
+    expect(formatPriceE18(1_234_567_890_123_456_789n, { maxFractionDigits: 0 })).toBe('$1');
+    expect(formatPriceE18(1_234_567_890_123_456_789n, { maxFractionDigits: 1 })).toBe('$1.2');
+  });
+  it('prints negative dust that rounds to zero without a sign', () => {
+    expect(formatUsdMicro(-49n)).toBe('$0.00');
+    expect(formatUsdMicro(-50n)).toBe('-$0.0001');
+    expect(formatUsdMicro(-49n, { maxFractionDigits: 6 })).toBe('-$0.000049');
+    expect(formatUsdMicro(-1n, { maxFractionDigits: 0 })).toBe('$0');
+    expect(formatUsdMicro(-499_999n, { maxFractionDigits: 0 })).toBe('$0');
+    expect(formatUsdMicro(-500_000n, { maxFractionDigits: 0 })).toBe('-$1');
+    expect(parseUsdToMicro(formatUsdMicro(-49n))).toBe(0n);
+  });
   it('rejects bad options', () => {
     expect(() => formatUsdMicro(1n, { maxFractionDigits: -1 })).toThrow(RangeError);
     expect(() => formatUsdMicro(1n, { minFractionDigits: 1.5 })).toThrow(RangeError);
+    expect(() => formatUsdMicro(1n, { maxFractionDigits: 0, minFractionDigits: 2 })).toThrow(/minFractionDigits \(2\) must not exceed maxFractionDigits \(0\)/);
+    expect(() => formatPriceE18(1n, { maxFractionDigits: 1, minFractionDigits: 4 })).toThrow(RangeError);
   });
 });
 
@@ -218,6 +246,13 @@ describe('formatTokenAmount / parseTokenAmount', () => {
     expect(formatTokenAmount(42n, 0)).toBe('42');
     expect(formatTokenAmount(0n, 18)).toBe('0');
     expect(formatTokenAmount(999_999_999_999_999_999n, 18)).toBe('0.9999');
+  });
+  it('prints negative dust that truncates to zero without a sign', () => {
+    expect(formatTokenAmount(-1n, 18)).toBe('0');
+    expect(formatTokenAmount(-(10n ** 14n - 1n), 18)).toBe('0');
+    expect(formatTokenAmount(-(10n ** 14n), 18)).toBe('-0.0001');
+    expect(formatTokenAmount(-1n, 18, 18)).toBe('-0.000000000000000001');
+    expect(formatTokenAmount(-5n, 6, 0)).toBe('0');
   });
   it('parses decimal strings into raw units', () => {
     expect(parseTokenAmount('1000.5', 18)).toBe(10_005n * 10n ** 17n);

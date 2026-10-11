@@ -19,10 +19,17 @@ import {
   type Tier,
 } from './models.js';
 
-/** Health of one provider as seen by the gateway (SPEC §5.6). */
+/**
+ * Health of one provider as seen by the gateway (SPEC §5.6).
+ *
+ * Both fields describe the **platform's** credentials with that provider, so they bind credit-paid
+ * candidates only: a `down` provider drops its credit-paid models, while BYOK candidates (the
+ * workspace's own key, which a platform `401/403` or spend limit does not affect) are kept and
+ * sort by the raw `state` alone, without the quota-derived demotion.
+ */
 export interface ProviderState {
   state: 'ok' | 'degraded' | 'down';
-  /** Remaining share of a known rate/spend limit in `[0, 1]`; `< 0.2` counts as degraded. */
+  /** Remaining share of a known rate/spend limit in `[0, 1]`; `< 0.2` counts as degraded (credit-paid only). */
   quotaRatio?: number;
 }
 
@@ -173,6 +180,15 @@ function describe(c: Candidate): string {
  * Routes a request (SPEC §4.6). Steps, each appending a reason:
  * 1 resolve · 2 capability filter · 3 paidBy · 4 credit runway (aliases) · 5 provider state ·
  * 6 fallback expansion · 7 credit gate.
+ *
+ * Step 7 answers `insufficient_credit` whenever credit is the only thing standing between the
+ * request and a capable model: either the gate removed every candidate, or the step-4 runway
+ * narrowing (very low credit → house tier) excluded capable, non-down, credit-paid models and the
+ * house tier itself cannot serve (vision, `house_context_pro`, house down). `no_capable_model` is
+ * reserved for requests nothing could serve regardless of credit.
+ *
+ * The "limit running down" demotion (step 5) never moves an explicit primary: an explicit id is
+ * honoured first (§0, step 6), its provider's quota only reorders the fallbacks behind it.
  */
 export function route(input: RoutingInput): RoutingDecision {
   const reasons: string[] = [];
@@ -267,16 +283,29 @@ export function route(input: RoutingInput): RoutingDecision {
 
   // 6. Fallback expansion.
   const pool: Scored[] = [];
+  // Capable, non-down, credit-paid models that only the step-4 runway narrowing kept out.
+  let creditNarrowed = 0;
   for (const model of capable) {
     const isPrimary = model === primary;
     if (!isPrimary && !model.autoEligible) continue;
     const paidBy = paidByOf(model);
-    const state = effectiveState(model.provider);
+    // Platform quota does not apply to the workspace's own key: BYOK sorts by the raw state.
+    const state = paidBy === 'byok' ? stateOf(model.provider).state : effectiveState(model.provider);
     if (paidBy === 'credit' && state === 'down') continue;
     const base = paidBy === 'byok' ? targetTier : creditTier;
     const seq = isPrimary ? -1 : sequence(model.tier, base, fallback);
-    if (seq === undefined) continue;
-    pool.push({ model, paidBy, seq, stateRank: STATE_RANK[state], quotaLimited: paidBy === 'credit' && quotaLimited(model.provider) });
+    if (seq === undefined) {
+      if (paidBy === 'credit' && sequence(model.tier, targetTier, fallback) !== undefined) creditNarrowed++;
+      continue;
+    }
+    pool.push({
+      model,
+      paidBy,
+      seq,
+      stateRank: STATE_RANK[state],
+      // An explicit primary is never demoted by its provider's quota (only its fallbacks are).
+      quotaLimited: paidBy === 'credit' && !isPrimary && quotaLimited(model.provider),
+    });
   }
   const prefIndex = (p: Provider): number => {
     const i = preference.indexOf(p);
@@ -311,8 +340,9 @@ export function route(input: RoutingInput): RoutingDecision {
       }
       kept.splice(at, 0, demoted);
     }
+    const moved = kept.some((c, i) => c !== ordered[i]);
     ordered = kept;
-    reasons.push(`quota: difficulty ${difficulty.toFixed(2)} < ${QUOTA_DEMOTION_DIFFICULTY} → quota-limited providers placed after cheaper tiers`);
+    if (moved) reasons.push(`quota: difficulty ${difficulty.toFixed(2)} < ${QUOTA_DEMOTION_DIFFICULTY} → quota-limited providers placed after cheaper tiers`);
   }
   reasons.push(
     `fallback ${fallback}: ${ordered.length} candidate${ordered.length === 1 ? '' : 's'}` +
@@ -329,6 +359,12 @@ export function route(input: RoutingInput): RoutingDecision {
   if (ordered.length === 0) {
     if (beforeGate > 0) {
       reasons.push('result: insufficient_credit');
+      return fail('insufficient_credit', INSUFFICIENT_CREDIT_MESSAGE);
+    }
+    if (creditNarrowed > 0) {
+      // Nothing survived step 6, but only because very low credit confined credit-paid candidates to
+      // a house tier that cannot serve this request: with credit, `creditNarrowed` models would.
+      reasons.push(`result: insufficient_credit (credit runway excluded ${creditNarrowed} capable credit-paid model${creditNarrowed === 1 ? '' : 's'})`);
       return fail('insufficient_credit', INSUFFICIENT_CREDIT_MESSAGE);
     }
     reasons.push('result: no_capable_model');

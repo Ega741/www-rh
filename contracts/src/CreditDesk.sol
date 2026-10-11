@@ -111,6 +111,8 @@ contract CreditDesk is Ownable2Step, Pausable, ReentrancyGuard {
     error BudgetExceeded(uint256 remaining);
     error NotBudgetOwner();
     error BadMaxPriceAge();
+    error SlippageExceeded(uint256 usdMicro, uint256 minUsdMicro);
+    error RenounceDisabled();
 
     // ─── Construction ─────────────────────────────────────────────────────────────────────────────────
 
@@ -142,7 +144,8 @@ contract CreditDesk is Ownable2Step, Pausable, ReentrancyGuard {
 
     /// @notice Quote a raw token amount in µUSD at the current, fresh price.
     /// @dev Reverts `PriceUnavailable` when no source is set or it reports 0, and `PriceStale` when the
-    ///      observation is older than {maxPriceAge}.
+    ///      observation is more than {maxPriceAge} seconds away from `block.timestamp` (in either direction:
+    ///      a far-future-dated observation is rejected too, without underflow).
     /// @param amount Raw token units.
     /// @return usdMicro `floor(amount * priceE18 / 10**(tokenDecimals + 12))`.
     /// @return priceE18 Price used, USD per whole token scaled by 1e18.
@@ -165,7 +168,24 @@ contract CreditDesk is Ownable2Step, Pausable, ReentrancyGuard {
         nonReentrant
         returns (uint256 receiptId)
     {
-        return _purchase(workspace, amount);
+        return _purchase(workspace, amount, 0);
+    }
+
+    /// @notice {burnForCredit} with a credit floor: reverts `SlippageExceeded` when the quote at inclusion
+    ///         time is below `minUsdMicro` (a price post landing between the UI quote and the transaction
+    ///         would otherwise silently credit less; the burn is final once it succeeds).
+    /// @dev A distinct name rather than an overload keeps every ABI consumer unambiguous.
+    /// @param workspace Workspace (wallet) to credit; non-zero.
+    /// @param amount Raw token units; `> 0` and `>= minBurn`.
+    /// @param minUsdMicro Minimum µUSD the burn must credit; `0` disables the floor.
+    /// @return receiptId Strictly increasing receipt id shared with budget draws.
+    function burnForCreditMin(address workspace, uint256 amount, uint256 minUsdMicro)
+        external
+        whenNotPaused
+        nonReentrant
+        returns (uint256 receiptId)
+    {
+        return _purchase(workspace, amount, minUsdMicro);
     }
 
     /// @notice Same as {burnForCredit} but first applies an EIP-2612 permit for the caller.
@@ -185,7 +205,29 @@ contract CreditDesk is Ownable2Step, Pausable, ReentrancyGuard {
         returns (uint256 receiptId)
     {
         try IERC20Permit(address(token)).permit(msg.sender, address(this), amount, deadline, v, r, s) {} catch {}
-        return _purchase(workspace, amount);
+        return _purchase(workspace, amount, 0);
+    }
+
+    /// @notice {burnForCreditWithPermit} with a credit floor (see {burnForCreditMin}).
+    /// @param workspace Workspace (wallet) to credit; non-zero.
+    /// @param amount Raw token units; `> 0` and `>= minBurn`; also the permit value.
+    /// @param minUsdMicro Minimum µUSD the burn must credit; `0` disables the floor.
+    /// @param deadline Permit deadline.
+    /// @param v Signature v.
+    /// @param r Signature r.
+    /// @param s Signature s.
+    /// @return receiptId Strictly increasing receipt id shared with budget draws.
+    function burnForCreditWithPermitMin(
+        address workspace,
+        uint256 amount,
+        uint256 minUsdMicro,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external whenNotPaused nonReentrant returns (uint256 receiptId) {
+        try IERC20Permit(address(token)).permit(msg.sender, address(this), amount, deadline, v, r, s) {} catch {}
+        return _purchase(workspace, amount, minUsdMicro);
     }
 
     // ─── Budgets ──────────────────────────────────────────────────────────────────────────────────────
@@ -322,14 +364,21 @@ contract CreditDesk is Ownable2Step, Pausable, ReentrancyGuard {
         t.safeTransfer(to, amount);
     }
 
+    /// @notice Disabled: an ownerless desk could never be paused, re-parameterised or have its operator
+    ///         rotated. Ownership only moves through the two-step `transferOwnership` / `acceptOwnership`.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
+    }
+
     // ─── Internals ────────────────────────────────────────────────────────────────────────────────────
 
-    /// @dev Shared purchase path: checks → effects → interactions → event.
-    function _purchase(address workspace, uint256 amount) private returns (uint256 receiptId) {
+    /// @dev Shared purchase path: checks → effects → interactions → event. `minUsdMicro == 0` disables the floor.
+    function _purchase(address workspace, uint256 amount, uint256 minUsdMicro) private returns (uint256 receiptId) {
         if (workspace == address(0)) revert ZeroAddress();
         if (amount == 0 || amount < minBurn) revert BurnTooSmall(amount, minBurn);
         (uint256 usdMicro, uint256 priceE18,) = quote(amount);
         if (usdMicro == 0) revert QuoteTooSmall();
+        if (usdMicro < minUsdMicro) revert SlippageExceeded(usdMicro, minUsdMicro);
 
         receiptId = nextReceiptId++;
         totalBurned += amount;
@@ -346,16 +395,15 @@ contract CreditDesk is Ownable2Step, Pausable, ReentrancyGuard {
         else token.safeTransfer(DEAD, amount);
     }
 
-    /// @dev Reads and validates the current price.
+    /// @dev Reads and validates the current price: fresh iff `|block.timestamp − updatedAt| <= maxPriceAge`.
+    ///      The symmetric form never underflows and rejects a source whose clock is far ahead of the chain.
     function _price() private view returns (uint256 priceE18, uint256 updatedAt) {
         IPriceSource src = priceSource;
         if (address(src) == address(0)) revert PriceUnavailable();
         (priceE18, updatedAt) = src.latestPrice();
         if (priceE18 == 0) revert PriceUnavailable();
-        // A future-dated observation is treated as fresh (no underflow).
-        if (block.timestamp > updatedAt && block.timestamp - updatedAt > maxPriceAge) {
-            revert PriceStale(updatedAt, maxPriceAge);
-        }
+        uint256 age = block.timestamp >= updatedAt ? block.timestamp - updatedAt : updatedAt - block.timestamp;
+        if (age > maxPriceAge) revert PriceStale(updatedAt, maxPriceAge);
     }
 
     /// @dev Used in the base-constructor argument so a zero owner reverts `ZeroAddress` (not OZ's error).

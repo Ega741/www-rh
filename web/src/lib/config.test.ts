@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { envFlag, loadConfig, publicGatewayUrl, stripSlash } from './config.js';
+import { asAddress, envFlag, loadConfig, publicGatewayUrl, reconcileDesk, stripSlash } from './config.js';
+
+const DESK = '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0';
+const OTHER_DESK = '0x000000000000000000000000000000000000dEaD';
 
 describe('loadConfig', () => {
   it('defaults to anvil with the committed deployment', () => {
@@ -46,6 +49,19 @@ describe('helpers', () => {
   it('publicGatewayUrl prefers the configured URL', () => {
     expect(publicGatewayUrl({ gatewayUrl: '' }, 'http://localhost:5173/')).toBe('http://localhost:5173');
     expect(publicGatewayUrl({ gatewayUrl: 'http://localhost:8787' }, 'http://localhost:5173')).toBe('http://localhost:8787');
+  });
+  it('reconcileDesk disables the flows when the build and the gateway disagree on the desk', () => {
+    expect(reconcileDesk(DESK, DESK.toLowerCase())).toEqual({ desk: DESK, mismatch: undefined });
+    expect(reconcileDesk(DESK, null)).toEqual({ desk: DESK, mismatch: undefined });
+    expect(reconcileDesk(DESK, undefined)).toEqual({ desk: DESK, mismatch: undefined });
+    expect(reconcileDesk(undefined, OTHER_DESK.toLowerCase())).toEqual({ desk: OTHER_DESK, mismatch: undefined });
+    expect(reconcileDesk(undefined, null)).toEqual({ desk: undefined, mismatch: undefined });
+    const mismatch = reconcileDesk(DESK, OTHER_DESK);
+    expect(mismatch.desk).toBeUndefined();
+    expect(mismatch.mismatch).toContain(DESK);
+    expect(mismatch.mismatch).toContain(OTHER_DESK);
+    expect(asAddress('nope')).toBeUndefined();
+    expect(asAddress(DESK.toLowerCase())).toBe(DESK);
   });
   it('envFlag and stripSlash', () => {
     expect(envFlag('1')).toBe(true);

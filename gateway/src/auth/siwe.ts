@@ -69,6 +69,11 @@ export class SiweService {
     return nonce;
   }
 
+  /** Drops expired nonces (called by the housekeeping loop so an unauthenticated flood cannot grow the table). */
+  purgeExpired(): number {
+    return this.nonces.purgeExpired(this.now());
+  }
+
   /** Parses and verifies a signed SIWE message; consumes its nonce. */
   async verify(message: string, signature: Hex): Promise<SiweVerifyResult> {
     let parsed: ReturnType<typeof parseSiweMessage>;

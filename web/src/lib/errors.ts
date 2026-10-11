@@ -13,7 +13,7 @@ const REVERT_TEXT: Record<string, string> = {
   PriceStale: 'Token price is stale; wait for a fresh price post',
   EnforcedPause: 'The credit desk is paused',
   ZeroAddress: 'Workspace address must not be zero',
-  BadBudgetParams: 'Invalid budget: cap must be > 0 and the deadline within 30 days',
+  BadBudgetParams: 'Invalid budget: cap must be > 0 and the deadline at most 30 days after the block timestamp; try a shorter duration',
   UnknownBudget: 'Unknown budget id',
   BudgetIsClosed: 'This budget is already closed',
   BudgetExpired: 'This budget has expired',

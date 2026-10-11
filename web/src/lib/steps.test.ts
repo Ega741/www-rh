@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { EMPTY_FLOW, activeStep, budgetDeadline, createFlow, describeBlocker, planBudget, planBurn, reduceFlow } from './steps.js';
+import { DEADLINE_SAFETY_SECONDS, EMPTY_FLOW, MAX_BUDGET_HOURS, activeStep, budgetDeadline, createFlow, describeBlocker, planBudget, planBurn, reduceFlow } from './steps.js';
 
 const HASH = `0x${'1'.repeat(64)}` as const;
 
@@ -66,6 +66,17 @@ describe('planBudget', () => {
   });
   it('deadline in unix seconds', () => {
     expect(budgetDeadline(1_760_000_000_000, 2)).toBe(1_760_000_000n + 7200n);
+    expect(budgetDeadline(1_760_000_000_999, 719)).toBe(1_760_000_000n + 719n * 3600n);
+  });
+  it('keeps the maximum duration below the desk limit so a lagging block timestamp cannot revert it', () => {
+    const nowMs = 1_760_000_000_000;
+    const maxSeconds = BigInt(MAX_BUDGET_HOURS * 3600);
+    const deadline = budgetDeadline(nowMs, MAX_BUDGET_HOURS);
+    expect(deadline).toBe(1_760_000_000n + maxSeconds - BigInt(DEADLINE_SAFETY_SECONDS));
+    // block.timestamp up to DEADLINE_SAFETY_SECONDS behind the browser clock still satisfies deadline <= block.timestamp + 30 days
+    const laggingBlock = 1_760_000_000n - BigInt(DEADLINE_SAFETY_SECONDS);
+    expect(deadline <= laggingBlock + maxSeconds).toBe(true);
+    expect(deadline > 1_760_000_000n).toBe(true);
   });
 });
 

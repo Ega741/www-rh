@@ -100,9 +100,12 @@ export function costMicroUsd(usage: UsageTokens, price: ModelPrice): bigint {
   );
 }
 
-/** `cost + ceilDiv(cost · bps, 10_000)` (SPEC §1). `bps` may be 0. */
+/** `cost + ceilDiv(cost · bps, 10_000)` (SPEC §1). `bps` may be 0; a `number` must be a safe integer. */
 export function applyMarkupBps(cost: bigint, bps: number | bigint): bigint {
   assertNonNegative('cost', cost);
+  if (typeof bps === 'number' && !Number.isSafeInteger(bps)) {
+    throw new RangeError(`bps must be a non-negative safe integer (got ${bps})`);
+  }
   const b = typeof bps === 'bigint' ? bps : BigInt(bps);
   if (b < 0n) throw new RangeError(`bps must be ≥ 0 (got ${b})`);
   if (cost === 0n || b === 0n) return cost;
@@ -113,7 +116,11 @@ export function applyMarkupBps(cost: bigint, bps: number | bigint): bigint {
 export interface FormatOptions {
   /** Fraction digits to show at most (extra digits are rounded or truncated, see each formatter). */
   maxFractionDigits?: number;
-  /** Fraction digits to show at least (padded with zeros). */
+  /**
+   * Fraction digits to show at least (padded with zeros). Defaults to the formatter's usual
+   * minimum capped at `maxFractionDigits`, so `{ maxFractionDigits: 0 }` alone yields whole
+   * dollars. Passing both with `min > max` throws.
+   */
   minFractionDigits?: number;
 }
 
@@ -124,7 +131,8 @@ export interface FormatOptions {
 function formatScaled(abs: bigint, scale: number, max: number, min: number, round: boolean): string {
   if (!Number.isInteger(max) || max < 0) throw new RangeError('maxFractionDigits must be a non-negative integer');
   if (!Number.isInteger(min) || min < 0) throw new RangeError('minFractionDigits must be a non-negative integer');
-  const digits = Math.min(Math.max(max, min), scale);
+  if (min > max) throw new RangeError(`minFractionDigits (${min}) must not exceed maxFractionDigits (${max})`);
+  const digits = Math.min(max, scale);
   const drop = scale - digits;
   let q = abs;
   if (drop > 0) {
@@ -140,15 +148,21 @@ function formatScaled(abs: bigint, scale: number, max: number, min: number, roun
   return frac === '' ? whole : `${whole}.${frac}`;
 }
 
+/** `true` when a formatted decimal body is zero (`"0"`, `"0.00"`): a sign would be noise. */
+function isZeroBody(body: string): boolean {
+  return /^0(?:\.0*)?$/.test(body);
+}
+
 /**
  * Formats µUSD as a dollar string: `2_500_000n` → `"$2.50"`, `-150_000n` → `"-$0.15"`,
- * `2_500_100n` → `"$2.5001"`. Shows at least `minFractionDigits` (2) and at most
- * `maxFractionDigits` (4) decimals, rounding half up.
+ * `2_500_100n` → `"$2.5001"`. Shows at least `minFractionDigits` (2, capped at the maximum) and
+ * at most `maxFractionDigits` (4) decimals, rounding half up. Negative dust that rounds to zero
+ * prints unsigned (`-49n` → `"$0.00"`).
  */
 export function formatUsdMicro(x: bigint, options: FormatOptions = {}): string {
-  const { maxFractionDigits = 4, minFractionDigits = 2 } = options;
-  const negative = x < 0n;
-  const body = formatScaled(negative ? -x : x, 6, maxFractionDigits, minFractionDigits, true);
+  const { maxFractionDigits = 4, minFractionDigits = Math.min(2, maxFractionDigits) } = options;
+  const body = formatScaled(x < 0n ? -x : x, 6, maxFractionDigits, minFractionDigits, true);
+  const negative = x < 0n && !isZeroBody(body);
   return `${negative ? '-' : ''}$${body}`;
 }
 
@@ -168,13 +182,13 @@ export function parseUsdToMicro(input: string): bigint {
 
 /**
  * Formats raw token units as a decimal string (`1000e18, 18` → `"1000"`, `15e17, 18` → `"1.5"`),
- * truncating (not rounding) to `maxFractionDigits` (4) and trimming trailing zeros.
+ * truncating (not rounding) to `maxFractionDigits` (4) and trimming trailing zeros. Negative dust
+ * that truncates to zero prints unsigned (`-1n, 18` → `"0"`).
  */
 export function formatTokenAmount(raw: bigint, decimals: number, maxFractionDigits = 4): string {
   assertDecimals(decimals);
-  const negative = raw < 0n;
-  const body = formatScaled(negative ? -raw : raw, decimals, maxFractionDigits, 0, false);
-  return negative ? `-${body}` : body;
+  const body = formatScaled(raw < 0n ? -raw : raw, decimals, maxFractionDigits, 0, false);
+  return raw < 0n && !isZeroBody(body) ? `-${body}` : body;
 }
 
 /**
@@ -196,11 +210,12 @@ export function parseTokenAmount(input: string, decimals: number): bigint {
 
 /**
  * Formats `priceE18` (USD per whole token × 1e18) as a dollar string: `2_500_000_000_000_000n` →
- * `"$0.0025"`. Rounds half up to `maxFractionDigits` (6), shows at least `minFractionDigits` (2).
+ * `"$0.0025"`. Rounds half up to `maxFractionDigits` (6), shows at least `minFractionDigits`
+ * (2, capped at the maximum).
  */
 export function formatPriceE18(priceE18: bigint, options: FormatOptions = {}): string {
   assertNonNegative('priceE18', priceE18);
-  const { maxFractionDigits = 6, minFractionDigits = 2 } = options;
+  const { maxFractionDigits = 6, minFractionDigits = Math.min(2, maxFractionDigits) } = options;
   return `$${formatScaled(priceE18, 18, maxFractionDigits, minFractionDigits, true)}`;
 }
 

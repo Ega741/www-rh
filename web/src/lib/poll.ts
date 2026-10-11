@@ -1,4 +1,11 @@
-/** Pure helpers for "wait until the indexer credits the burn" polling (SPEC §7, Credits page). */
+/**
+ * Pure helpers for "wait until the indexer credits the burn" polling (SPEC §7, Credits page).
+ * The landing is detected from two signals: the indexed `purchase` credit event of the burn
+ * transaction (`GET /api/receipts`, authoritative) and the workspace balance growing by at least
+ * the quoted amount (`GET /api/balance`, a hint that fails when a concurrent debit or a lower
+ * execution price shrinks the delta).
+ */
+import type { Hex } from 'viem';
 
 /**
  * `true` once the ledger reflects a purchase: the balance grew by at least `expectedMicro`
@@ -9,29 +16,45 @@ export function creditLanded(beforeMicro: bigint, afterMicro: bigint, expectedMi
   return afterMicro - beforeMicro >= expectedMicro;
 }
 
-/** Poll delay in ms for attempt `n` (0-based): 1.5 s, 2 s, 3 s, 4 s, capped at 5 s. */
-export function pollDelayMs(attempt: number): number {
-  const base = 1500;
-  return Math.min(5000, base + Math.max(0, attempt) * 750);
+/** A credit event row as far as the watcher cares (`CreditEventDto`). */
+export interface PurchaseLike {
+  kind: string;
+  txHash: string;
 }
 
-/** Give up after this many attempts (~2 minutes). */
-export const MAX_POLL_ATTEMPTS = 30;
+/** `true` when the indexed credit events contain the `purchase` of `txHash`. */
+export function purchaseIndexed(rows: readonly PurchaseLike[], txHash: Hex): boolean {
+  const h = txHash.toLowerCase();
+  return rows.some((r) => r.kind === 'purchase' && r.txHash.toLowerCase() === h);
+}
+
+/** Interval in ms between balance / credit-event polls while watching. */
+export const WATCH_POLL_MS = 2000;
+
+/** Give up after this many balance polls (60 × 2 s ≈ 2 minutes). */
+export const MAX_POLL_ATTEMPTS = 60;
 
 /** State of the post-burn watcher. */
 export interface WatchState {
   status: 'idle' | 'watching' | 'landed' | 'timeout';
   beforeMicro: bigint;
   expectedMicro: bigint | undefined;
+  /** The burn transaction whose indexed `CreditPurchased` event marks the landing, when known. */
+  txHash: Hex | undefined;
   attempts: number;
 }
 
 /** Initial watcher state. */
-export const IDLE_WATCH: WatchState = { status: 'idle', beforeMicro: 0n, expectedMicro: undefined, attempts: 0 };
+export const IDLE_WATCH: WatchState = { status: 'idle', beforeMicro: 0n, expectedMicro: undefined, txHash: undefined, attempts: 0 };
 
-/** Starts watching from `beforeMicro` for `expectedMicro`. */
-export function startWatch(beforeMicro: bigint, expectedMicro: bigint | undefined): WatchState {
-  return { status: 'watching', beforeMicro, expectedMicro, attempts: 0 };
+/** Starts watching from `beforeMicro` for `expectedMicro`, landing on the `purchase` event of `txHash` when given. */
+export function startWatch(beforeMicro: bigint, expectedMicro: bigint | undefined, txHash?: Hex): WatchState {
+  return { status: 'watching', beforeMicro, expectedMicro, txHash, attempts: 0 };
+}
+
+/** Restarts a timed-out watch with the same targets ("check again"). */
+export function restartWatch(state: WatchState): WatchState {
+  return startWatch(state.beforeMicro, state.expectedMicro, state.txHash);
 }
 
 /** Feeds a fresh balance into the watcher; returns the next state. */
@@ -41,4 +64,10 @@ export function observeBalance(state: WatchState, balanceMicro: bigint): WatchSt
   const attempts = state.attempts + 1;
   if (attempts >= MAX_POLL_ATTEMPTS) return { ...state, attempts, status: 'timeout' };
   return { ...state, attempts };
+}
+
+/** Feeds the latest indexed credit events into the watcher; lands when the burn tx is among them. */
+export function observeEvents(state: WatchState, rows: readonly PurchaseLike[]): WatchState {
+  if (state.status !== 'watching' || state.txHash === undefined) return state;
+  return purchaseIndexed(rows, state.txHash) ? { ...state, status: 'landed' } : state;
 }

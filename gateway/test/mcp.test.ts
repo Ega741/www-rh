@@ -1,5 +1,17 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { GatewayError } from '../src/api/errors.js';
+import { toApiError } from '../src/api/mcp.js';
 import { jsonRequest, makeHarness, WS1, type Harness } from './helpers.js';
+
+describe('MCP error mapping', () => {
+  it('masks internal errors like the /v1 envelopes and keeps gateway codes', () => {
+    const internal = toApiError(new Error('SQLITE_CONSTRAINT: usage.id /var/lib/beagle/gateway.sqlite'));
+    expect(internal).toMatchObject({ status: 500, code: 'internal_error', message: 'Internal error.' });
+    expect(internal.message).not.toContain('SQLITE');
+    expect(toApiError(new TypeError("Cannot read properties of undefined (reading 'x')")).message).toBe('Internal error.');
+    expect(toApiError(new GatewayError('model_not_found', 'Unknown model "x".'))).toMatchObject({ status: 404, code: 'model_not_found', message: 'Unknown model "x".' });
+  });
+});
 
 describe('MCP over HTTP (stateless Streamable HTTP, JSON responses)', () => {
   let h: Harness;

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { parseArgs, runCli } from '../src/cli.js';
+import { MIGRATIONS } from '../src/db/schema.js';
 import { WS1 } from './helpers.js';
 
 describe('cli', () => {
@@ -19,7 +20,7 @@ describe('cli', () => {
     const out: string[] = [];
     const err: string[] = [];
     expect(await runCli(['migrate'], env, (s) => out.push(s), (s) => err.push(s))).toBe(0);
-    expect(out[0]).toMatch(/schema 0 → 1/);
+    expect(out[0]).toMatch(new RegExp(`schema 0 → ${MIGRATIONS.length}$`));
     out.length = 0;
     expect(await runCli(['create-key', '--workspace', WS1, '--name', 'e2e-1'], env, (s) => out.push(s), (s) => err.push(s))).toBe(0);
     expect(out).toHaveLength(1);

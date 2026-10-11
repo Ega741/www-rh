@@ -175,9 +175,21 @@ export function planBudget(input: BudgetPlanInput): Plan {
   return { canRun: blockers.length === 0, blockers, needsApprove };
 }
 
-/** Unix-seconds deadline for a budget of `hours` opened at `nowMs` (as `bigint` for `uint64`). */
+/**
+ * Seconds kept below the desk's `MAX_BUDGET_DURATION` (30 days). The desk checks
+ * `deadline <= block.timestamp + 30 days` against the inclusion block, so a deadline computed as
+ * exactly now + 30 days on the browser clock reverts `BadBudgetParams` whenever that block's
+ * timestamp is behind the browser clock.
+ */
+export const DEADLINE_SAFETY_SECONDS = 300;
+
+/**
+ * Unix-seconds deadline for a budget of `hours` opened at `nowMs` (as `bigint` for `uint64`).
+ * The maximum duration is shortened by {@link DEADLINE_SAFETY_SECONDS}.
+ */
 export function budgetDeadline(nowMs: number, hours: number): bigint {
-  return BigInt(Math.floor(nowMs / 1000) + hours * 3600);
+  const seconds = Math.min(hours * 3600, MAX_BUDGET_HOURS * 3600 - DEADLINE_SAFETY_SECONDS);
+  return BigInt(Math.floor(nowMs / 1000) + seconds);
 }
 
 /** Context for {@link describeBlocker}. */

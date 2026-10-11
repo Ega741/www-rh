@@ -194,6 +194,9 @@ export const MIGRATIONS: readonly string[] = [
     value TEXT NOT NULL
   );
   `,
+  `
+  CREATE INDEX siwe_nonces_expires ON siwe_nonces(expires_at);
+  `,
 ];
 
 /** Applies pending migrations. Idempotent; safe to call from the CLI while the gateway runs. */

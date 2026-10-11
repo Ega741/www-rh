@@ -11,6 +11,7 @@ import { resolveDeployment, type ResolvedDeployment } from '@beagle/shared/addre
 import { chainById, explorerBaseUrl } from '@beagle/shared/chains';
 import {
   BaseError,
+  BlockNotFoundError,
   ContractFunctionRevertedError,
   createPublicClient,
   createWalletClient,
@@ -20,6 +21,7 @@ import {
   type Chain,
   type Hex,
   type PublicClient,
+  TransactionReceiptNotFoundError,
   type WalletClient,
 } from 'viem';
 import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
@@ -56,11 +58,20 @@ export class PriceError extends Error {
   }
 }
 
+/** Receipt facts the drawer's reconciliation needs. */
+export interface ReceiptInfo {
+  status: 'success' | 'reverted';
+  blockNumber: bigint;
+}
+
 /** Read-only chain access used by the indexer, the headroom refresher, the drawer and the price service. */
 export interface ChainReader {
   getBlockNumber(): Promise<bigint>;
+  /** The header of `number`, or `undefined` only when the node has no such block (transport errors throw). */
   getBlock(number: bigint): Promise<BlockInfo | undefined>;
   getLogs(fromBlock: bigint, toBlock: bigint): Promise<DeskLog[]>;
+  /** The receipt of `hash`, or `undefined` when the transaction is not (yet) mined (transport errors throw). */
+  getTransactionReceipt(hash: Hex): Promise<ReceiptInfo | undefined>;
   /** `desk.quote(amount)`; throws {@link PriceError} on `PriceStale` / `PriceUnavailable`. */
   quote(amount: bigint): Promise<{ usdMicro: bigint; priceE18: bigint; updatedAt: number }>;
   /** `priceSource.latestPrice()` (zeros before the first post). */
@@ -183,8 +194,20 @@ export function createViemReader(publicClient: PublicClient, creditDesk: Address
       try {
         const b = await publicClient.getBlock({ blockNumber: number });
         return { number: b.number, hash: b.hash, timestamp: b.timestamp };
-      } catch {
-        return undefined;
+      } catch (e) {
+        // Only "no such block" is an answer; a transport failure must not look like a missing block
+        // (the indexer's reorg guard would otherwise rewind on every RPC hiccup).
+        if (e instanceof BaseError && e.walk((err) => err instanceof BlockNotFoundError) instanceof BlockNotFoundError) return undefined;
+        throw e;
+      }
+    },
+    async getTransactionReceipt(hash) {
+      try {
+        const r = await publicClient.getTransactionReceipt({ hash });
+        return { status: r.status, blockNumber: r.blockNumber };
+      } catch (e) {
+        if (e instanceof BaseError && e.walk((err) => err instanceof TransactionReceiptNotFoundError) instanceof TransactionReceiptNotFoundError) return undefined;
+        throw e;
       }
     },
     async getLogs(fromBlock, toBlock) {

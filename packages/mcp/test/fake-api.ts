@@ -43,6 +43,8 @@ export interface FakeApi extends BeagleApi {
   state: FakeApiState;
   /** Credits `micro` to the balance once `balance()` has been called `afterCalls` more times. */
   scheduleCredit(micro: bigint, afterCalls: number): void;
+  /** Debits `micro` from the balance once `balance()` has been called `afterCalls` more times (a concurrent completion settling). */
+  scheduleDebit(micro: bigint, afterCalls: number): void;
   callsTo(method: keyof BeagleApi): number;
 }
 
@@ -179,7 +181,7 @@ export function createFakeApi(overrides: Partial<FakeApiState> = {}): FakeApi {
     calls: [],
     ...overrides,
   };
-  let pendingCredit: { micro: bigint; remaining: number } | undefined;
+  const pending: Array<{ micro: bigint; remaining: number }> = [];
   let completions = 0;
 
   function record(method: keyof BeagleApi, args: unknown[]): void {
@@ -209,7 +211,10 @@ export function createFakeApi(overrides: Partial<FakeApiState> = {}): FakeApi {
   const api: FakeApi = {
     state,
     scheduleCredit(micro, afterCalls) {
-      pendingCredit = { micro, remaining: afterCalls };
+      pending.push({ micro, remaining: afterCalls });
+    },
+    scheduleDebit(micro, afterCalls) {
+      pending.push({ micro: -micro, remaining: afterCalls });
     },
     callsTo(method) {
       return state.calls.filter((c) => c.method === method).length;
@@ -217,11 +222,12 @@ export function createFakeApi(overrides: Partial<FakeApiState> = {}): FakeApi {
 
     async balance() {
       record('balance', []);
-      if (pendingCredit !== undefined) {
-        pendingCredit.remaining -= 1;
-        if (pendingCredit.remaining <= 0) {
-          state.balanceMicro += pendingCredit.micro;
-          pendingCredit = undefined;
+      for (let i = pending.length - 1; i >= 0; i--) {
+        const p = pending[i]!;
+        p.remaining -= 1;
+        if (p.remaining <= 0) {
+          state.balanceMicro += p.micro;
+          pending.splice(i, 1);
         }
       }
       return balance();

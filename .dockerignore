@@ -1,0 +1,34 @@
+# Build context for docker/gateway.Dockerfile and docker/web.Dockerfile (docker-compose.yml: context .).
+# The Dockerfiles install and build inside the image, so nothing generated on the host may leak in:
+# `pnpm deploy` (gateway image) packs everything under gateway/ that is not excluded here.
+.git
+.github
+docs
+
+# host installs and builds
+node_modules
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+**/.vite
+**/coverage
+**/*.log
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# gateway data (dev DB created by `pnpm dev:gateway`: API-key hashes, sessions, BYOK ciphertext, ledger)
+gateway/data
+**/*.sqlite
+**/*.sqlite-journal
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/*.db
+
+# foundry (not copied by any Dockerfile; keeps the context small)
+contracts/out
+contracts/cache
+contracts/broadcast
+contracts/lib

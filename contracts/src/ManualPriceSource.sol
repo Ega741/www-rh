@@ -35,6 +35,7 @@ contract ManualPriceSource is Ownable2Step, IPriceSource {
     error PriceStepTooLarge(uint256 oldPrice, uint256 newPrice);
     error PostTooSoon(uint256 nextAllowedAt);
     error BadBounds();
+    error RenounceDisabled();
 
     /// @param owner_ Initial owner (Ownable2Step); must be non-zero.
     /// @param poster_ Initial poster; may be zero (posting disabled until {setPoster}).
@@ -65,6 +66,9 @@ contract ManualPriceSource is Ownable2Step, IPriceSource {
 
     /// @notice Set the price ignoring the bounds (bootstrap or emergency). Only the owner.
     /// @dev `0` marks the price unavailable, which makes the desk refuse quotes until the next post/force.
+    ///      It is NOT a stop switch against the poster: with no price set the rails do not apply (SPEC §3.3),
+    ///      so the poster's next {post} re-seeds the price at any value. To halt quoting against a
+    ///      compromised poster use {setPoster}(0) and/or `CreditDesk.pause()`.
     /// @param newPriceE18 New price, USD per whole token scaled by 1e18.
     function forcePrice(uint256 newPriceE18) external onlyOwner {
         priceE18 = newPriceE18;
@@ -87,6 +91,12 @@ contract ManualPriceSource is Ownable2Step, IPriceSource {
         maxStepBps = maxStepBps_;
         minInterval = minInterval_;
         emit BoundsSet(maxStepBps_, minInterval_);
+    }
+
+    /// @notice Disabled: an ownerless source could never rotate a compromised poster or retune the rails.
+    ///         Ownership only moves through the two-step `transferOwnership` / `acceptOwnership`.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     /// @inheritdoc IPriceSource

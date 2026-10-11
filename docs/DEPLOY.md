@@ -48,24 +48,47 @@ Post-deploy checklist:
 
 ## 3. Gateway
 
+The gateway reads **`process.env` only** — it never opens `.env` itself (docker compose injects the file through
+`env_file`; Vite reads it for the web build). On bare metal hand the file to Node with `--env-file`, export it
+in the shell (`set -a; source .env; set +a`) or use `EnvironmentFile=/srv/beagle/.env` in the systemd unit.
+Set `NODE_ENV=production` on every real deployment (the Docker image does): it makes `SESSION_SECRET` mandatory
+and makes `beagle-gateway credit` refuse without `--force`; without it an empty secret only logs a warning.
+
 ```bash
 cp .env.example .env         # CHAIN_ID, RPC_URL, OPERATOR_PRIVATE_KEY, DRY_RUN=false, SESSION_SECRET, KEYRING_MASTER_KEY,
-                             # ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY, HOUSE_BASE_URL, PUBLIC_URL, PUBLIC_WEB_ORIGIN
+                             # ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY, HOUSE_BASE_URL, PUBLIC_URL, PUBLIC_WEB_ORIGIN,
+                             # NODE_ENV=production
 pnpm install && pnpm -r build
-node gateway/dist/cli.js migrate
-node gateway/dist/main.js    # http://0.0.0.0:8787
+NODE_ENV=production node --env-file=.env gateway/dist/cli.js migrate
+NODE_ENV=production node --env-file=.env gateway/dist/main.js    # http://0.0.0.0:8787
 ```
+
+(`NODE_ENV=production` on the command line is redundant once it is in `.env`; a variable already in the
+environment wins over the file.) If the startup log says `RPC_URL is unset` or `SESSION_SECRET is unset: using
+the development default`, the file was not loaded.
 
 Secrets: `SESSION_SECRET` (≥ 32 random bytes), `KEYRING_MASTER_KEY` (`openssl rand -hex 32`), `ADMIN_TOKEN`
 (optional). Keep `OPERATOR_PRIVATE_KEY` funded with a little ETH for draws and price posts; it can only draw
-within budget caps and post prices within `maxStepBps`.
+within budget caps and post prices within `maxStepBps`. `DEPLOYER_PRIVATE_KEY` and the other keys of the
+"contracts deploy" section are for `forge script` only (§2): keep them out of the `.env` the gateway is started
+with — compose blanks `DEPLOYER_PRIVATE_KEY` in the gateway container, `--env-file` would not.
 
-House model: run vLLM with an OpenAI-compatible API and set `HOUSE_BASE_URL` (e.g. `http://house:8000/v1`):
+House model: run vLLM with an OpenAI-compatible API and set `HOUSE_BASE_URL` (e.g. `http://house:8000/v1`).
+The gateway has **one** house endpoint: both catalog models (`HOUSE_MODEL_SMALL` = `openai/gpt-oss-20b` and
+`HOUSE_MODEL_LARGE` = `openai/gpt-oss-120b`, Pro plan) are requested from `HOUSE_BASE_URL`, while a vLLM
+process serves a single model, so the two compose services are alternatives, not a pair:
 
 ```bash
-docker compose --profile gpu up -d house          # openai/gpt-oss-20b (one 24 GB+ GPU)
-docker compose --profile gpu-large up -d house-large   # openai/gpt-oss-120b (one 80 GB GPU, Pro plan)
+docker compose --profile gpu up -d house                 # openai/gpt-oss-20b (one 24 GB+ GPU)
+docker compose --profile gpu-large up -d house-large     # openai/gpt-oss-120b (one 80 GB GPU)
 ```
+
+- One GPU (`house`, `HOUSE_BASE_URL=http://house:8000/v1`): remove the model it does not serve from the catalog so
+  Pro workspaces are not offered a `house/gpt-oss-120b` that 404s — `MODEL_CATALOG_FILE=/app/data/catalog.json`
+  with `[{ "id": "house/gpt-oss-120b", "remove": true }]` (the reverse for `house-large`, which then leaves only a
+  Pro-gated house model, so free workspaces lose the house fallback).
+- Both models: put an OpenAI-compatible router (LiteLLM, a vLLM router, …) in front of `house` and `house-large`
+  and point `HOUSE_BASE_URL` at it; a second base URL for the large model is not supported yet.
 
 Without a GPU, leave `HOUSE_BASE_URL` empty (the house tier disappears from routing) or point it at Ollama
 (`http://127.0.0.1:11434/v1`, `HOUSE_MODEL_SMALL=gpt-oss:20b`).
@@ -77,7 +100,9 @@ VITE_CHAIN_ID=4663 VITE_GATEWAY_URL= pnpm --filter @beagle/web build   # same-or
 ```
 
 `docker compose up -d gateway web` builds both images; nginx serves the SPA on `:8080` and proxies
-`/api`, `/v1`, `/mcp`, `/healthz` to the gateway with buffering disabled (SSE).
+`/api`, `/v1`, `/mcp`, `/healthz` to the gateway with buffering disabled (SSE). The root `.dockerignore` keeps
+host `node_modules`, builds, `.env` and `gateway/data` (the dev SQLite) out of the build context — build from a
+checkout that has no other secrets lying around anyway.
 
 ## 5. Smoke test
 

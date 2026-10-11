@@ -21,11 +21,13 @@ export {
 } from './api.js';
 export {
   buildUnsignedSteps,
+  createLazyWalletExecutor,
   createViemWalletExecutor,
   errorMessage,
   WalletError,
   type BuyComputeParams,
   type BuyComputeResult,
+  type LazyWalletExecutorOptions,
   type OpenBudgetParams,
   type OpenBudgetResult,
   type UnsignedStep,
@@ -43,6 +45,7 @@ export {
   MAX_BUDGET_HOURS,
   MCP_SERVER_INFO,
   modelsMarkdown,
+  numberToDecimalString,
   quickstartMarkdown,
   tokenInputToRaw,
   toolErrorInfo,
@@ -53,4 +56,4 @@ export {
   type BeagleToolName,
   type ToolErrorInfo,
 } from './server.js';
-export { ConfigError, DEFAULT_API_URL, main, readBinConfig, type BinConfig } from './cli.js';
+export { ConfigError, createAgentWallet, DEFAULT_API_URL, main, readBinConfig, type AgentWalletOptions, type BinConfig } from './cli.js';

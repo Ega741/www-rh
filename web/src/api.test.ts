@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { UsageReceiptWire } from '@beagle/shared/api';
+import { receiptHash } from '@beagle/shared/canonical';
 import { ApiError, api, queryString } from './api.js';
 
 type FetchCall = { url: string; init: RequestInit };
@@ -80,6 +82,37 @@ describe('api client', () => {
       throw new TypeError('fetch failed');
     });
     await expect(api.status()).rejects.toMatchObject({ status: 0, code: 'network_error' });
+  });
+
+  it('parses GET /api/receipts/:id into the nested { receipt, hash } and the hash recomputes over receipt alone', async () => {
+    const receipt: UsageReceiptWire = {
+      v: 1,
+      requestId: 'req_1',
+      workspace: '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266',
+      createdAt: 1_760_000_000_000,
+      endpoint: '/v1/chat/completions',
+      requestedModel: 'beagle/auto',
+      servedModel: 'house/gpt-oss-20b',
+      provider: 'house',
+      paidBy: 'credit',
+      usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      price: { inputPerM: 100_000, outputPerM: 400_000 },
+      upstreamCostMicro: '3',
+      markupBps: 2000,
+      chargedMicro: '4',
+      routeReasons: ['alias:auto'],
+    };
+    const hash = receiptHash(receipt);
+    const calls: FetchCall[] = [];
+    // the gateway also spreads the receipt into the envelope; the client must ignore those copies
+    stubFetch(200, { receipt, hash, ...receipt }, calls);
+    const dto = await api.receipts.get('req_1');
+    expect(calls[0]?.url).toBe('/api/receipts/req_1');
+    expect(Object.keys(dto).sort()).toEqual(['hash', 'receipt']);
+    expect(dto.hash).toBe(hash);
+    expect(dto.receipt.chargedMicro).toBe(4n);
+    expect(dto.receipt.requestId).toBe('req_1');
+    expect(receiptHash(dto.receipt)).toBe(hash);
   });
 
   it('rejects malformed DTOs', async () => {

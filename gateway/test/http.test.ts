@@ -2,6 +2,8 @@ import { receiptHash } from '@beagle/shared/canonical';
 import { privateKeyToAccount } from 'viem/accounts';
 import { createSiweMessage } from 'viem/siwe';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { MAX_ACTIVE_KEYS } from '../src/api/dashboard.js';
+import { headerSafe } from '../src/api/inference.js';
 import { jsonRequest, makeHarness, parseSse, WS1, WS2, type Harness } from './helpers.js';
 
 describe('HTTP flows (house model via mock provider)', () => {
@@ -65,6 +67,7 @@ describe('HTTP flows (house model via mock provider)', () => {
     const receipt = await h.app.request(`/api/receipts/${body.id}`, { headers: { authorization: `Bearer ${key1}` } });
     expect(receipt.status).toBe(200);
     const r = (await receipt.json()) as { receipt: Record<string, unknown>; hash: string };
+    expect(Object.keys(r).sort()).toEqual(['hash', 'receipt']); // ReceiptDto = { receipt, hash }, nothing flattened
     expect(r.hash).toHaveLength(66);
     expect(receiptHash(r.receipt)).toBe(r.hash);
     expect(r.receipt).toMatchObject({ v: 1, requestId: body.id, workspace: WS1, servedModel: 'house/gpt-oss-20b', provider: 'house', paidBy: 'credit', chargedMicro: cost.toString(), markupBps: 1000 });
@@ -191,6 +194,29 @@ describe('HTTP flows (house model via mock provider)', () => {
     expect(((await one.json()) as { id: string }).id).toBe('house/gpt-oss-20b');
     const missing = await h.app.request('/v1/models/nope', { headers: { authorization: `Bearer ${key1}` } });
     expect(missing.status).toBe(404);
+    const percent = await h.app.request('/v1/models/a%25', { headers: { authorization: `Bearer ${key1}` } });
+    expect(percent.status).toBe(404);
+    expect(await percent.json()).toMatchObject({ error: { code: 'model_not_found' } });
+  });
+
+  it('control characters in the model id yield 404 with sanitized headers, not 500', async () => {
+    for (const model of ['nope\u0000x', 'bad\u0001model', 'bad\u007fmodel', 'crlf\r\nx-injected: 1']) {
+      const res = await h.app.request(jsonRequest('POST', '/v1/chat/completions', { model, messages: [{ role: 'user', content: 'x' }] }, { authorization: `Bearer ${key1}` }));
+      expect(res.status).toBe(404);
+      expect(await res.json()).toMatchObject({ error: { code: 'model_not_found' } });
+      const route = res.headers.get('x-beagle-route') ?? '';
+      expect([...route].every((ch) => (ch.codePointAt(0) ?? 0) >= 0x20 && (ch.codePointAt(0) ?? 0) !== 0x7f && (ch.codePointAt(0) ?? 0) <= 0xff)).toBe(true);
+      expect(res.headers.get('x-injected')).toBeNull();
+    }
+    expect(headerSafe('a\u0000b\tc\u007fd\r\ne')).toBe('a b\tc d  e');
+  });
+
+  it('GET /api/usage accepts empty filter values (the canonical URL of SPEC §5.9)', async () => {
+    const res = await h.app.request('/api/usage?limit=50&model=&status=', { headers: { authorization: `Bearer ${key1}` } });
+    expect(res.status).toBe(200);
+    const list = (await res.json()) as { rows: unknown[] };
+    expect(list.rows.length).toBeGreaterThan(0);
+    expect((await h.app.request('/api/usage?limit=50&status=bogus', { headers: { authorization: `Bearer ${key1}` } })).status).toBe(400);
   });
 
   it('413 when the body exceeds MAX_BODY_BYTES', async () => {
@@ -305,6 +331,17 @@ describe('dashboard with session auth', () => {
     expect((await h.app.request('/api/balance', { headers: { authorization: `Bearer ${c.key}` } })).status).toBe(401);
   });
 
+  it('keys: at most MAX_ACTIVE_KEYS active keys per workspace', async () => {
+    const auth = { authorization: `Bearer ${h.session(WS2)}` };
+    for (let i = h.services.repos.apiKeys.countByWorkspace(WS2); i < MAX_ACTIVE_KEYS; i++) h.services.apiKeys.create(WS2, `k${i}`);
+    const over = await h.app.request(jsonRequest('POST', '/api/keys', { name: 'one too many' }, auth));
+    expect(over.status).toBe(400);
+    expect(await over.json()).toMatchObject({ error: { code: 'too_many_keys' } });
+    const victim = h.services.repos.apiKeys.listByWorkspace(WS2)[0]!;
+    expect((await h.app.request(`/api/keys/${victim.id}`, { method: 'DELETE', headers: auth })).status).toBe(200);
+    expect((await h.app.request(jsonRequest('POST', '/api/keys', { name: 'fits again' }, auth))).status).toBe(201);
+  });
+
   it('ledger, receipts list, usage summary, budgets (empty), upgrades prices', async () => {
     const auth = { authorization: `Bearer ${h.session(ws)}` };
     h.credit(ws, 123n);
@@ -350,6 +387,18 @@ describe('dashboard with session auth', () => {
     const short = await h.app.request(jsonRequest('POST', '/api/upgrades', { kind: 'pro', quantity: 1 }, auth));
     expect(short.status).toBe(402);
     expect(await short.json()).toMatchObject({ error: { code: 'insufficient_credit' } });
+    // Budget headroom is not prepaid credit: an upgrade bought on it could never be drawn → 402.
+    const nowMs = h.services.now();
+    h.services.repos.budgets.upsertOpened({ budgetId: 9, owner: ws, workspace: ws, cap: 10n ** 24n, deadline: Math.floor(nowMs / 1000) + 7200, openedBlock: 1, now: nowMs });
+    h.services.repos.budgets.setHeadroom(9, 10n ** 24n, 25_000_000n, null, nowMs);
+    expect(h.services.ledger.snapshot(ws).available).toBeGreaterThanOrEqual(25_000_000n);
+    for (const kind of ['pro', 'warm'] as const) {
+      const onHeadroom = await h.app.request(jsonRequest('POST', '/api/upgrades', { kind, quantity: 1 }, auth));
+      expect(onHeadroom.status).toBe(402);
+    }
+    expect(h.services.ledger.balance(ws)).toBe(123n);
+    expect(((await (await h.app.request('/api/me', { headers: auth })).json()) as { plan: string }).plan).toBe('free');
+    h.services.repos.budgets.setClosed(9, true, nowMs);
     h.credit(ws, 30_000_000n);
     const pro = await h.app.request(jsonRequest('POST', '/api/upgrades', { kind: 'pro', quantity: 1 }, auth));
     expect(pro.status).toBe(201);

@@ -2,10 +2,11 @@ import { DrawBatchSchema } from '@beagle/shared/api';
 import { receiptHash } from '@beagle/shared/canonical';
 import { tokensForUsdMicro } from '@beagle/shared/credit';
 import { describe, expect, it } from 'vitest';
-import { computeHeadroom, HeadroomRefresher } from '../src/chain/budgets.js';
+import { allocateHeadroom, computeHeadroom, HeadroomRefresher } from '../src/chain/budgets.js';
+import type { BlockInfo } from '../src/chain/clients.js';
 import { BudgetDrawer, selectBatch } from '../src/chain/drawer.js';
 import { Indexer } from '../src/chain/indexer.js';
-import { clampStep, PricePoster, usdStringToPriceE18, usdToPriceE18 } from '../src/chain/poster.js';
+import { clampStep, needsKeepAlive, PricePoster, usdStringToPriceE18, usdToPriceE18 } from '../src/chain/poster.js';
 import { PriceService } from '../src/chain/price.js';
 import { Repos, type UsageRow } from '../src/db/repos.js';
 import { migrate } from '../src/db/schema.js';
@@ -104,6 +105,60 @@ describe('indexer', () => {
   });
 });
 
+describe('indexer robustness', () => {
+  it('never rewinds when the block cannot be fetched (RPC failure is not a reorg)', async () => {
+    const r = repos();
+    const chain = new FakeChain();
+    const ix = indexer(r, chain, 2);
+    chain.mine([purchase(WS1, 10_000_000n, 1)]);
+    chain.mine();
+    chain.mine();
+    await ix.step();
+    expect(r.ledger.balance(WS1)).toBe(10_000_000n);
+    expect(ix.lastBlock()).toBe(1);
+    // Partial outage: eth_blockNumber works, eth_getBlockByNumber / eth_getLogs do not.
+    const getBlock = chain.getBlock.bind(chain);
+    chain.getBlock = async () => undefined;
+    chain.getLogs = async () => {
+      throw new Error('HTTP 429');
+    };
+    expect(await ix.checkReorg()).toBe(false);
+    expect(await ix.step()).toBeUndefined(); // the chunk is deferred, nothing is rewound
+    expect(r.ledger.balance(WS1)).toBe(10_000_000n);
+    expect(ix.lastBlock()).toBe(1);
+    chain.getBlock = async () => {
+      throw new Error('ECONNRESET');
+    };
+    expect(await ix.checkReorg()).toBe(false);
+    chain.mine(); // block 2 becomes confirmed → there is a chunk to fetch
+    await expect(ix.step()).rejects.toThrow('ECONNRESET');
+    expect(r.ledger.balance(WS1)).toBe(10_000_000n);
+    expect(ix.lastBlock()).toBe(1);
+    chain.getBlock = getBlock;
+    chain.getLogs = FakeChain.prototype.getLogs.bind(chain);
+    expect(await ix.step()).toMatchObject({ events: 0 });
+    expect(await ix.checkReorg()).toBe(false);
+    expect(r.ledger.balance(WS1)).toBe(10_000_000n);
+  });
+
+  it('discards a chunk whose logs do not match the block headers (reorg between the two calls)', async () => {
+    const r = repos();
+    const chain = new FakeChain();
+    const ix = new Indexer(r, chain, { creditDesk: DESK, startBlock: 1, confirmations: 0, chunkBlocks: 100, now: () => 1 }, silentLogger);
+    chain.mine([purchase(WS1, 100n, 1)]);
+    // The logs still carry the orphaned block's hash while the header is already the canonical one.
+    const canonical: BlockInfo = { number: 1n, hash: `0x${'e'.repeat(64)}`, timestamp: 1_700_000_001n };
+    const getBlock = chain.getBlock.bind(chain);
+    chain.getBlock = async (n) => (n === 1n ? canonical : getBlock(n));
+    expect(await ix.step()).toBeUndefined();
+    expect(r.ledger.balance(WS1)).toBe(0n);
+    expect(ix.lastBlock()).toBe(0);
+    chain.getBlock = getBlock;
+    expect(await ix.step()).toEqual({ from: 1, to: 1, events: 1 });
+    expect(r.ledger.balance(WS1)).toBe(100n);
+  });
+});
+
 describe('headroom refresher', () => {
   it('computes min(remainingCap, allowance, balance) and quotes it; stalls on allowance and price', async () => {
     const r = repos();
@@ -126,6 +181,44 @@ describe('headroom refresher', () => {
     await refresher.refreshAll();
     expect(r.budgets.get(1)?.stalledReason).toBeNull();
     expect(computeHeadroom({ cap: 10n, drawn: 4n }, 100n, 5n)).toEqual({ remainingCap: 6n, headroomTokens: 5n });
+  });
+
+  it('allocates one owner\'s backing across its budgets instead of counting it once per budget', async () => {
+    const r = repos();
+    const chain = new FakeChain();
+    const nowMs = 1_700_000_000_000;
+    const deadline = 1_700_000_000 + 3600;
+    const E = 10n ** 18n;
+    // Two budgets for WS2 and one for WS1, all funded by WS2's wallet (100 tokens allowance, 100 balance).
+    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 100n * E, deadline, openedBlock: 1, now: nowMs });
+    r.budgets.upsertOpened({ budgetId: 2, owner: WS2, workspace: WS2, cap: 100n * E, deadline, openedBlock: 1, now: nowMs });
+    r.budgets.upsertOpened({ budgetId: 3, owner: WS2, workspace: WS1, cap: 100n * E, deadline, openedBlock: 1, now: nowMs });
+    chain.allowances.set(WS2, 100n * E);
+    chain.balances.set(WS2, 100n * E);
+    const refresher = new HeadroomRefresher(r, chain, { decimals: 18, now: () => nowMs }, silentLogger);
+    expect(await refresher.refreshAll()).toBe(3);
+    expect(r.budgets.get(1)).toMatchObject({ headroomTokens: 100n * E, headroomMicro: 1_000_000n, stalledReason: null });
+    expect(r.budgets.get(2)).toMatchObject({ headroomTokens: 0n, headroomMicro: 0n, stalledReason: 'allowance' });
+    expect(r.budgets.get(3)).toMatchObject({ headroomTokens: 0n, headroomMicro: 0n, stalledReason: 'allowance' });
+    // Σ headroom over the owner's budgets never exceeds quote(min(allowance, balance)).
+    expect(r.ledger.budgetHeadroom(WS2, 1_700_000_000) + r.ledger.budgetHeadroom(WS1, 1_700_000_000)).toBe(1_000_000n);
+    // A partially drawn first budget leaves the remainder to the next one.
+    r.budgets.setDrawn(1, 70n * E, nowMs);
+    await refresher.refreshAll();
+    expect(r.budgets.get(1)?.headroomTokens).toBe(30n * E);
+    expect(r.budgets.get(2)?.headroomTokens).toBe(70n * E);
+    expect(r.budgets.get(3)?.headroomTokens).toBe(0n);
+    expect(r.ledger.budgetHeadroom(WS2, 1_700_000_000)).toBe(1_000_000n);
+    // More backing than caps: everybody is fully backed.
+    chain.allowances.set(WS2, 1000n * E);
+    chain.balances.set(WS2, 1000n * E);
+    await refresher.refreshAll();
+    expect(r.budgets.get(2)?.headroomTokens).toBe(100n * E);
+    expect(r.budgets.get(3)?.headroomTokens).toBe(100n * E);
+    expect(allocateHeadroom([{ cap: 10n, drawn: 0n }, { cap: 10n, drawn: 5n }], 12n, 50n)).toEqual([
+      { remainingCap: 10n, headroomTokens: 10n },
+      { remainingCap: 5n, headroomTokens: 2n },
+    ]);
   });
 });
 
@@ -168,6 +261,10 @@ describe('budget drawer', () => {
     expect(selectBatch(rows, 100n, 8n)).toEqual({ usageIds: ['a', 'b'], amountMicro: 7n });
     expect(selectBatch(rows, 100n, 2n)).toBeUndefined();
     expect(selectBatch([], 1n, 100n)).toBeUndefined();
+    // An oversized oldest row is skipped, not a stop: the smaller rows behind it still settle.
+    const oversize = [usageRow('big', 10n, 1), usageRow('b', 2n, 2), usageRow('c', 3n, 3)];
+    expect(selectBatch(oversize, 100n, 5n)).toEqual({ usageIds: ['b', 'c'], amountMicro: 5n });
+    expect(selectBatch(oversize, 100n, 4n)).toEqual({ usageIds: ['b'], amountMicro: 2n });
   });
 
   it('draws for a workspace in deficit, records pending → sent, and the indexer confirms it', async () => {
@@ -251,6 +348,122 @@ describe('budget drawer', () => {
     expect(b?.status).toBe('failed');
     expect(b?.error).toBe('transaction reverted');
   });
+
+  it('a receipt timeout keeps the draw sent; the indexer confirms it later and the rows are never drawn twice', async () => {
+    const r = repos();
+    const chain = new FakeChain();
+    const nowMs = 1_700_000_000_000;
+    r.workspaces.ensure(WS2, nowMs);
+    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 10n ** 21n, deadline: 1_700_000_000 + 7200, openedBlock: 1, now: nowMs });
+    r.budgets.setHeadroom(1, 10n ** 21n, 5_000_000n, null, nowMs);
+    r.usage.insert(usageRow('u1', 2n, nowMs - 2));
+    r.usage.insert(usageRow('u2', 1n, nowMs - 1));
+    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -3n, refType: 'usage', refId: 'u1', memo: null, createdAt: nowMs });
+    chain.failReceipt = new Error('Timed out while waiting for transaction');
+    const drawer = new BudgetDrawer(r, chain, chain, { chainId: 31337, creditDesk: DESK, decimals: 18, thresholdMicro: 1n, dryRun: false, now: () => nowMs }, silentLogger);
+    const [a] = await drawer.tick();
+    expect(a?.status).toBe('sent');
+    expect(a?.error).toContain('Timed out');
+    const draw = r.budgetDraws.get(a!.drawId!)!;
+    expect(draw.status).toBe('sent');
+    expect(draw.error).toContain('Timed out');
+    expect(r.usage.get('u1')?.drawId).toBe(draw.id);
+    expect(r.usage.get('u2')?.drawId).toBe(draw.id);
+    expect(r.budgets.get(1)?.stalledReason).toBeNull();
+    expect(chain.draws).toHaveLength(1);
+    // While in flight nothing else is drawn for the workspace.
+    r.usage.insert(usageRow('u3', 2n, nowMs));
+    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -2n, refType: 'usage', refId: 'u3', memo: null, createdAt: nowMs });
+    expect(await drawer.tick()).toEqual([]);
+    // The transaction lands: the indexer confirms the draw and keeps the rows marked.
+    chain.mine([drawn(1, 1, WS2, a!.tokens, 3n, draw.receiptHash)]);
+    const ix = new Indexer(r, chain, { creditDesk: DESK, startBlock: 1, confirmations: 0, chunkBlocks: 10, now: () => nowMs }, silentLogger);
+    await ix.step();
+    expect(r.budgetDraws.get(draw.id)?.status).toBe('confirmed');
+    expect(r.ledger.balance(WS2)).toBe(-2n);
+    expect(r.usage.get('u1')?.drawId).toBe(draw.id);
+    expect(r.usage.get('u2')?.drawId).toBe(draw.id);
+    // The next draw covers u3 only — u1/u2 are settled.
+    chain.failReceipt = undefined;
+    const [c] = await drawer.tick();
+    expect(c?.status).toBe('sent');
+    expect(r.budgetDraws.get(c!.drawId!)?.usageIds).toEqual(['u3']);
+    expect(chain.draws).toHaveLength(2);
+  });
+
+  it('a draw confirmed by the indexer while the drawer still waits is never flipped to failed', async () => {
+    const r = repos();
+    const nowMs = 1_700_000_000_000;
+    const ix = { current: undefined as Indexer | undefined };
+    class RacyChain extends FakeChain {
+      override async waitForReceipt(): Promise<{ status: 'success' | 'reverted'; blockNumber: bigint }> {
+        // The event is indexed before the receipt wait gives up.
+        const d = r.budgetDraws.listInFlight()[0]!;
+        this.mine([drawn(1, 1, WS2, d.tokenAmount, d.usdMicro, d.receiptHash)]);
+        await ix.current!.step();
+        throw new Error('receipt wait timed out');
+      }
+    }
+    const chain = new RacyChain();
+    ix.current = new Indexer(r, chain, { creditDesk: DESK, startBlock: 1, confirmations: 0, chunkBlocks: 10, now: () => nowMs }, silentLogger);
+    r.workspaces.ensure(WS2, nowMs);
+    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 10n ** 21n, deadline: 1_700_000_000 + 7200, openedBlock: 1, now: nowMs });
+    r.budgets.setHeadroom(1, 10n ** 21n, 5_000_000n, null, nowMs);
+    r.usage.insert(usageRow('u1', 3n, nowMs));
+    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -3n, refType: 'usage', refId: 'u1', memo: null, createdAt: nowMs });
+    const drawer = new BudgetDrawer(r, chain, chain, { chainId: 31337, creditDesk: DESK, decimals: 18, thresholdMicro: 1n, dryRun: false, now: () => nowMs }, silentLogger);
+    const [a] = await drawer.tick();
+    expect(a?.status).toBe('confirmed');
+    expect(r.budgetDraws.get(a!.drawId!)?.status).toBe('confirmed');
+    expect(r.usage.get('u1')?.drawId).toBe(a!.drawId);
+    expect(r.ledger.balance(WS2)).toBe(0n);
+    expect(await drawer.tick()).toEqual([]);
+    expect(chain.draws).toHaveLength(1);
+  });
+
+  it('reconciles in-flight rows left by a crash: stale pending → failed, reverted → failed, mined → kept, unknown → failed after the grace', async () => {
+    const r = repos();
+    const chain = new FakeChain();
+    let nowMs = 1_700_000_000_000;
+    r.workspaces.ensure(WS2, nowMs);
+    r.workspaces.ensure(WS1, nowMs);
+    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 10n ** 21n, deadline: 1_700_000_000 + 7200, openedBlock: 1, now: nowMs });
+    r.budgets.setHeadroom(1, 10n ** 21n, 5_000_000n, null, nowMs);
+    r.usage.insert(usageRow('u1', 5n, nowMs));
+    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -5n, refType: 'usage', refId: 'u1', memo: null, createdAt: nowMs });
+    // An orphaned pending row (insert happened, the process died before `draw` was sent).
+    const orphan = r.budgetDraws.insert({ budgetId: 1, workspace: WS2, tokenAmount: 500n, usdMicro: 5n, receiptHash: '0x01', usageIds: ['u1'], batchJson: '{}', txHash: null, status: 'pending', error: null, createdAt: nowMs - 1000, updatedAt: nowMs - 1000 });
+    r.usage.setDrawId(['u1'], orphan);
+    const drawer = new BudgetDrawer(r, chain, chain, { chainId: 31337, creditDesk: DESK, decimals: 18, thresholdMicro: 1n, dryRun: false, pendingGraceMs: 60_000, sentGraceMs: 600_000, now: () => nowMs }, silentLogger);
+    expect(await drawer.tick()).toEqual([]); // blocked while the orphan is young
+    nowMs += 61_000;
+    const attempts = await drawer.tick(); // orphan fails and releases u1, then a fresh draw goes out
+    expect(r.budgetDraws.get(orphan)).toMatchObject({ status: 'failed' });
+    expect(r.budgetDraws.get(orphan)?.error).toContain('no transaction sent');
+    expect(attempts).toEqual([]); // the budget is stalled (draw_failed) until the next headroom refresh
+    expect(r.budgets.get(1)?.stalledReason).toBe('draw_failed');
+    expect(r.usage.get('u1')?.drawId).toBeNull();
+    r.budgets.setStalled(1, null, nowMs);
+    const [fresh] = await drawer.tick();
+    expect(fresh?.status).toBe('sent');
+    expect(r.usage.get('u1')?.drawId).toBe(fresh!.drawId);
+    // Sent rows of another workspace: reverted → failed; mined → untouched; unknown → failed after the grace.
+    r.budgets.upsertOpened({ budgetId: 2, owner: WS1, workspace: WS1, cap: 10n ** 21n, deadline: 1_700_000_000 + 7200, openedBlock: 1, now: nowMs });
+    const reverted = r.budgetDraws.insert({ budgetId: 2, workspace: WS1, tokenAmount: 1n, usdMicro: 1n, receiptHash: '0x02', usageIds: ['x1'], batchJson: '{}', txHash: '0xaa', status: 'sent', error: null, createdAt: nowMs, updatedAt: nowMs });
+    const mined = r.budgetDraws.insert({ budgetId: 2, workspace: WS1, tokenAmount: 1n, usdMicro: 1n, receiptHash: '0x03', usageIds: ['x2'], batchJson: '{}', txHash: '0xbb', status: 'sent', error: null, createdAt: nowMs, updatedAt: nowMs });
+    const unknown = r.budgetDraws.insert({ budgetId: 2, workspace: WS1, tokenAmount: 1n, usdMicro: 1n, receiptHash: '0x04', usageIds: ['x3'], batchJson: '{}', txHash: '0xcc', status: 'sent', error: null, createdAt: nowMs, updatedAt: nowMs });
+    chain.receipts.set('0xaa', { status: 'reverted', blockNumber: 1n });
+    chain.receipts.set('0xbb', { status: 'success', blockNumber: 1n });
+    await drawer.reconcile();
+    expect(r.budgetDraws.get(reverted)?.status).toBe('failed');
+    expect(r.budgetDraws.get(mined)?.status).toBe('sent');
+    expect(r.budgetDraws.get(unknown)?.status).toBe('sent');
+    nowMs += 600_001;
+    await drawer.reconcile();
+    expect(r.budgetDraws.get(mined)?.status).toBe('sent');
+    expect(r.budgetDraws.get(unknown)?.status).toBe('failed');
+    expect(r.budgetDraws.get(unknown)?.error).toContain('not seen by the node');
+  });
 });
 
 describe('price service and poster', () => {
@@ -298,5 +511,31 @@ describe('price service and poster', () => {
     const dry = new PricePoster(r, chain, undefined, { feedUrl: 'x', dryRun: true, fetch: fetchImpl, now: () => (nowSec + 100) * 1000 }, silentLogger);
     feed = 0.014;
     expect((await dry.tick()).action).toBe('dry_run');
+  });
+
+  it('poster re-posts a flat price before the on-chain quote goes stale (keep-alive)', async () => {
+    const r = repos();
+    const chain = new FakeChain(); // maxPriceAge 3600, price $0.01
+    let nowSec = 1_700_000_000;
+    const fetchImpl = async (): Promise<Response> => new Response(JSON.stringify({ priceUsd: 0.01 }), { status: 200 });
+    const poster = new PricePoster(r, chain, chain, { feedUrl: 'https://feed.example/price', dryRun: false, fetch: fetchImpl, postIntervalMs: 300_000, now: () => nowSec * 1000 }, silentLogger);
+    // Fresh quote, identical feed price → the 0.5 % band skips.
+    chain.priceUpdatedAt = nowSec - 2999;
+    expect(await poster.tick()).toEqual({ action: 'skipped', reason: 'change below 0.5%' });
+    // Within two post intervals of maxPriceAge → posted even though nothing changed.
+    chain.priceUpdatedAt = nowSec - 3000;
+    const posted = await poster.tick();
+    expect(posted).toMatchObject({ action: 'posted', priceE18: 10n ** 16n, keepAlive: true });
+    expect(r.pricePosts.latest()).toMatchObject({ priceE18: 10n ** 16n, status: 'sent' });
+    // Already stale (> maxPriceAge) → still posted.
+    chain.priceUpdatedAt = nowSec - 3700;
+    expect(await poster.tick()).toMatchObject({ action: 'posted', keepAlive: true });
+    // The keep-alive never bypasses minInterval (the contract would revert).
+    chain.priceUpdatedAt = nowSec - 30;
+    expect(await poster.tick()).toEqual({ action: 'skipped', reason: 'within minInterval' });
+    expect(needsKeepAlive(1000, 0, 3600, 300_000)).toBe(false);
+    expect(needsKeepAlive(4000, 1000, 3600, 300_000)).toBe(true);
+    expect(needsKeepAlive(3999, 1000, 3600, 300_000)).toBe(false);
+    nowSec += 1;
   });
 });

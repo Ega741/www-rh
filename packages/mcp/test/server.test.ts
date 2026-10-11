@@ -2,24 +2,26 @@ import { CREDIT_DESK_ABI, ERC20_ABI } from '@beagle/shared/abi';
 import { tokensForUsdMicro } from '@beagle/shared/credit';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js';
+import { McpError, type CallToolResult, type Progress } from '@modelcontextprotocol/sdk/types.js';
 import { decodeFunctionData, getAddress, type Hex } from 'viem';
 import { afterEach, describe, expect, it } from 'vitest';
-import { BeagleApiError } from '../src/api.js';
-import { BEAGLE_TOOL_NAMES, createBeagleMcpServer, type BeagleMcpServerOptions } from '../src/server.js';
-import { WalletError, type WalletExecutor } from '../src/wallet.js';
-import { createFakeApi, DESK, NOW_MS, PRICE_E18, TOKEN, WORKSPACE, type FakeApi } from './fake-api.js';
+import { BeagleApiError, type BeagleApi } from '../src/api.js';
+import { BEAGLE_TOOL_NAMES, createBeagleMcpServer, numberToDecimalString, tokenInputToRaw, type BeagleMcpServerOptions } from '../src/server.js';
+import { createLazyWalletExecutor, WalletError, type WalletExecutor } from '../src/wallet.js';
+import { createFakeApi, DESK, NOW_MS, PRICE_E18, sampleBudget, TOKEN, WORKSPACE, type FakeApi } from './fake-api.js';
 
 const TX = `0x${'ab'.repeat(32)}` as Hex;
 const APPROVE_TX = `0x${'cd'.repeat(32)}` as Hex;
 const AGENT = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC';
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const closers: Array<() => Promise<void>> = [];
 afterEach(async () => {
   while (closers.length > 0) await closers.pop()!();
 });
 
-async function connect(api: FakeApi, opts: BeagleMcpServerOptions = {}) {
+async function connect(api: BeagleApi, opts: BeagleMcpServerOptions = {}) {
   const server = createBeagleMcpServer(api, { now: () => NOW_MS, ...opts });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'beagle-mcp-test', version: '0.0.0' });
@@ -31,8 +33,8 @@ async function connect(api: FakeApi, opts: BeagleMcpServerOptions = {}) {
   return client;
 }
 
-async function call(client: Client, name: string, args: Record<string, unknown> = {}): Promise<CallToolResult> {
-  return (await client.callTool({ name, arguments: args })) as CallToolResult;
+async function call(client: Client, name: string, args: Record<string, unknown> = {}, options?: RequestOptions): Promise<CallToolResult> {
+  return (await client.callTool({ name, arguments: args }, undefined, options)) as CallToolResult;
 }
 
 function structured(result: CallToolResult): Record<string, unknown> {
@@ -61,7 +63,8 @@ function fakeWallet(overrides: Partial<WalletExecutor> = {}): WalletExecutor & {
     address: AGENT,
     async buyCompute(params) {
       calls.push({ buyCompute: params });
-      return { txHash: TX, receiptId: 42n, approveTxHash: APPROVE_TX };
+      // what a decoded CreditPurchased event carries: the exact credit and the price the contract read
+      return { txHash: TX, receiptId: 42n, usdMicro: 5_000_000n, priceE18: PRICE_E18, approveTxHash: APPROVE_TX };
     },
     async openBudget(params) {
       calls.push({ openBudget: params });
@@ -145,6 +148,29 @@ describe('read-only tools', () => {
     expect(byUsdString['usdMicro']).toBe('250000');
   });
 
+  it('takes numeric token amounts at their shortest decimal form, without float noise', () => {
+    expect(tokenInputToRaw(0.1, 18)).toBe(10n ** 17n);
+    expect(tokenInputToRaw(0.3, 18)).toBe(3n * 10n ** 17n);
+    expect(tokenInputToRaw(1.005, 18)).toBe(1_005n * 10n ** 15n);
+    expect(tokenInputToRaw(123.456, 18)).toBe(123_456n * 10n ** 15n);
+    expect(tokenInputToRaw(1e21, 18)).toBe(10n ** 39n);
+    expect(tokenInputToRaw(1.5e-7, 18)).toBe(15n * 10n ** 10n);
+    expect(tokenInputToRaw('1000.5', 18)).toBe(10_005n * 10n ** 17n);
+    expect(() => tokenInputToRaw(Number.NaN, 18)).toThrow(/tokens/);
+    expect(() => tokenInputToRaw(1e-19, 18)).toThrow(/fraction digits/);
+    expect(numberToDecimalString(2.5e22)).toBe('25000000000000000000000');
+    expect(numberToDecimalString(-1.25e-3)).toBe('-0.00125');
+    expect(numberToDecimalString(42)).toBe('42');
+  });
+
+  it('beagle_quote prices a fractional numeric token amount exactly', async () => {
+    const client = await connect(createFakeApi());
+    const data = structured(await call(client, 'beagle_quote', { tokens: 0.3 }));
+    expect(data['tokens']).toBe((3n * 10n ** 17n).toString());
+    expect(data['tokensFormatted']).toBe('0.3 BEAGLE');
+    expect(data['usdMicro']).toBe('3000');
+  });
+
   it('beagle_quote needs exactly one of usd / tokens', async () => {
     const client = await connect(createFakeApi());
     expect(errorOf(await call(client, 'beagle_quote', {})).code).toBe('invalid_request');
@@ -177,14 +203,46 @@ describe('read-only tools', () => {
     expect((budgets[0]!['draws'] as unknown[]).length).toBe(1);
     expect(data['headroomMicro']).toBe('4000000');
     expect(data['headroom']).toBe('$4.00');
+    expect(budgets[0]!['active']).toBe(true);
+    expect(budgets[0]!['countsAsHeadroom']).toBe(true);
   });
 
-  it('beagle_status returns the status DTO', async () => {
+  it('beagle_budgets excludes expired and stalled budgets from the total, like /api/balance does', async () => {
+    const api = createFakeApi();
+    api.state.budgets = [
+      sampleBudget(),
+      // expired: the gateway refresher skips it, so its stale headroom_micro stays in the row
+      sampleBudget({ budgetId: 4, deadline: Math.floor(NOW_MS / 1000) - 60, headroomMicro: 4_000_000n }),
+      sampleBudget({ budgetId: 5, stalledReason: 'allowance', headroomMicro: 0n, headroomTokens: 0n }),
+    ];
+    const client = await connect(api);
+    const data = structured(await call(client, 'beagle_budgets'));
+    const rows = data['budgets'] as Array<Record<string, unknown>>;
+    expect(rows.length).toBe(3);
+    expect(rows[1]!['active']).toBe(false);
+    expect(rows[1]!['countsAsHeadroom']).toBe(false);
+    expect(rows[2]!['active']).toBe(true);
+    expect(rows[2]!['countsAsHeadroom']).toBe(false);
+    expect(data['headroomMicro']).toBe('4000000');
+  });
+
+  it('beagle_status returns the status DTO plus the upgrade prices', async () => {
     const client = await connect(createFakeApi());
     const data = structured(await call(client, 'beagle_status'));
     expect(data['chainId']).toBe(31337);
     expect(data['creditDesk']).toBe(DESK);
     expect((data['providers'] as Record<string, { state: string }>)['google']?.state).toBe('down');
+    expect(data['upgradePrices']).toEqual({
+      pro: { priceMicro: '20000000', price: '$20.00', days: 30 },
+      warm: { hourPriceMicro: '2000000', hourPrice: '$2.00' },
+    });
+  });
+
+  it('beagle_status still answers when config() fails', async () => {
+    const client = await connect(createFakeApi({ failures: { config: new BeagleApiError(500, 'internal_error', 'nope') } }));
+    const data = structured(await call(client, 'beagle_status'));
+    expect(data['chainId']).toBe(31337);
+    expect(data['upgradePrices']).toBeNull();
   });
 });
 
@@ -310,6 +368,9 @@ describe('beagle_buy_compute without a wallet', () => {
     expect(data['tokens']).toBe(expectedTokens.toString());
     expect(data['usdMicro']).toBe('5000000');
     expect(data['workspace']).toBe(getAddress(WORKSPACE));
+    expect(data['workspaceSource']).toBe('input');
+    expect(data['note']).not.toMatch(/Warning/);
+    expect(data['note']).toMatch(/current allowance \+ the amount/);
     const steps = data['steps'] as Array<{ to: string; data: Hex; value: string; description: string }>;
     expect(steps.length).toBe(2);
     expect(steps.every((s) => s.value === '0')).toBe(true);
@@ -336,6 +397,8 @@ describe('beagle_buy_compute without a wallet', () => {
     expect(data['tokens']).toBe((250n * 10n ** 18n).toString());
     expect(data['usdMicro']).toBe('2500000');
     expect(data['workspace']).toBe(getAddress(WORKSPACE));
+    expect(data['workspaceSource']).toBe('configured');
+    expect(data['note']).not.toMatch(/Warning/);
   });
 
   it('needs a workspace when none can be inferred', async () => {
@@ -374,24 +437,54 @@ describe('beagle_buy_compute with a wallet', () => {
     expect(data['receiptId']).toBe('42');
     expect(data['credited']).toBe(true);
     expect(data['creditedMicro']).toBe('5000000');
+    expect(data['priceE18']).toBe(PRICE_E18.toString());
     expect(data['balanceMicro']).toBe((12_340_000n + 5_000_000n).toString());
     expect(data['workspace']).toBe(AGENT); // defaults to the agent wallet
+    expect(data['workspaceSource']).toBe('agent_wallet');
     expect(data['explorerTxUrl']).toBeNull();
     expect(wallet.calls).toEqual([{ buyCompute: { workspace: AGENT, tokens: 500n * 10n ** 18n } }]);
     // one balance read before the burn, then polling until credited (visible on the third call overall)
     expect(api.callsTo('balance')).toBe(3);
-    expect(data['note']).toBe('Credited $5.00.');
+    expect(data['note']).toMatch(/^Credited \$5\.00\./);
+    // the agent-wallet default is a guess about the key's workspace: say so
+    expect(data['note']).toMatch(/Warning: workspace defaulted to the agent wallet/);
+    expect(typeof data['elapsedMs']).toBe('number');
   });
 
-  it('reports a pending credit when the indexer has not caught up in time', async () => {
+  it('reports a pending credit (with the emitted amount) when the indexer has not caught up in time', async () => {
     const api = createFakeApi();
     const client = await connect(api, { wallet: fakeWallet(), pollIntervalMs: 1, creditWaitMs: 15, now: () => Date.now() });
     const data = structured(await call(client, 'beagle_buy_compute', { tokens: 10, workspace: WORKSPACE }));
     expect(data['executed']).toBe(true);
     expect(data['credited']).toBe(false);
-    expect(data['creditedMicro']).toBeNull();
+    expect(data['creditedMicro']).toBe('5000000'); // from the CreditPurchased event, not the balance delta
     expect(data['note']).toMatch(/not visible/);
+    expect(data['note']).toMatch(/Do not burn again/);
     expect(api.callsTo('balance')).toBeGreaterThan(1);
+  });
+
+  it('falls back to the balance delta when the executor decoded no event', async () => {
+    const api = createFakeApi();
+    api.scheduleCredit(4_000_000n, 2);
+    const wallet = fakeWallet({ buyCompute: async () => ({ txHash: TX }) });
+    const client = await connect(api, { wallet, pollIntervalMs: 1, creditWaitMs: 5_000, now: () => Date.now() });
+    const data = structured(await call(client, 'beagle_buy_compute', { usd: 4, workspace: WORKSPACE }));
+    expect(data['credited']).toBe(true);
+    expect(data['creditedMicro']).toBe('4000000');
+    expect(data['receiptId']).toBeUndefined();
+  });
+
+  it('sees the credit even when a concurrent debit lands while polling', async () => {
+    const api = createFakeApi();
+    api.scheduleDebit(6_000_000n, 2); // a completion settles −$6.00 on the second poll…
+    api.scheduleCredit(5_000_000n, 3); // …and the +$5.00 credit is indexed on the third: balance never exceeds `before`
+    const client = await connect(api, { wallet: fakeWallet(), pollIntervalMs: 1, creditWaitMs: 5_000, now: () => Date.now() });
+    const data = structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE }));
+    expect(data['credited']).toBe(true);
+    expect(data['creditedMicro']).toBe('5000000');
+    expect(data['balanceMicro']).toBe((12_340_000n - 6_000_000n + 5_000_000n).toString());
+    // before-read, the poll that saw the debit, the poll that saw the credit
+    expect(api.callsTo('balance')).toBe(3);
   });
 
   it('skips polling when waitForCredit is false', async () => {
@@ -400,7 +493,107 @@ describe('beagle_buy_compute with a wallet', () => {
     const data = structured(await call(client, 'beagle_buy_compute', { usd: 1 }));
     expect(data['executed']).toBe(true);
     expect(data['credited']).toBe(false);
+    expect(data['creditedMicro']).toBe('5000000');
+    expect(data['note']).toMatch(/Do not burn again/);
     expect(api.callsTo('balance')).toBe(1);
+  });
+
+  it('returns within the call budget even when the credit never shows and balance() is slow', async () => {
+    const api = createFakeApi();
+    let reads = 0;
+    const slowApi: BeagleApi = {
+      ...api,
+      async balance() {
+        reads += 1;
+        if (reads > 1) await sleep(400); // every poll is longer than the whole budget: it must not extend the call
+        return api.balance();
+      },
+    };
+    let burnedAt = 0;
+    const wallet = fakeWallet({
+      async buyCompute() {
+        await sleep(30); // receipt wait
+        burnedAt = Date.now();
+        return { txHash: TX, receiptId: 1n, usdMicro: 1_000_000n };
+      },
+    });
+    const client = await connect(slowApi, { wallet, pollIntervalMs: 5, creditWaitMs: 60_000, callBudgetMs: 120, now: () => Date.now() });
+    const started = Date.now();
+    const data = structured(await call(client, 'beagle_buy_compute', { usd: 1, workspace: WORKSPACE }));
+    const elapsed = Date.now() - started;
+    expect(data['executed']).toBe(true);
+    expect(data['txHash']).toBe(TX);
+    expect(data['credited']).toBe(false);
+    expect(data['creditedMicro']).toBe('1000000');
+    expect(burnedAt).toBeGreaterThan(0);
+    // ≈ 120 ms budget (+ scheduling slack), far below creditWaitMs and the slow balance()
+    expect(elapsed).toBeLessThan(350);
+    expect(data['elapsedMs'] as number).toBeLessThan(350);
+  });
+
+  it('sends progress notifications while waiting so clients that reset their timeout on progress survive a long purchase', async () => {
+    const api = createFakeApi();
+    api.scheduleCredit(5_000_000n, 15); // visible on the 15th balance() call: ~14 polls of 10 ms
+    const client = await connect(api, { wallet: fakeWallet(), pollIntervalMs: 10, creditWaitMs: 5_000, callBudgetMs: 5_000, now: () => Date.now() });
+    const progress: Progress[] = [];
+    const data = structured(
+      await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE }, { timeout: 60, resetTimeoutOnProgress: true, onprogress: (p) => progress.push(p) }),
+    );
+    expect(data['credited']).toBe(true);
+    expect(progress.length).toBeGreaterThanOrEqual(10);
+    expect(progress[0]!.message).toMatch(/burning 500 BEAGLE/);
+    expect(progress[1]!.message).toMatch(/burn mined \(tx 0xabab/);
+    expect(progress.map((p) => p.progress)).toEqual(progress.map((_, i) => i + 1));
+  });
+
+  it('is dropped by a default client (no reset on progress) when its timeout is shorter than the wait; the burn still happened', async () => {
+    const api = createFakeApi();
+    const wallet = fakeWallet();
+    const client = await connect(api, { wallet, pollIntervalMs: 10, creditWaitMs: 5_000, callBudgetMs: 5_000, now: () => Date.now() });
+    const error = await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE }, { timeout: 60 }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(McpError);
+    expect((error as McpError).message).toMatch(/timed out/i);
+    expect(wallet.calls.length).toBe(1);
+  });
+
+  it('sends no progress notifications when the client did not ask for them', async () => {
+    const api = createFakeApi();
+    api.scheduleCredit(5_000_000n, 2);
+    const client = await connect(api, { wallet: fakeWallet(), pollIntervalMs: 1, creditWaitMs: 5_000, now: () => Date.now() });
+    let notifications = 0;
+    client.fallbackNotificationHandler = async () => {
+      notifications += 1;
+    };
+    structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE }));
+    expect(notifications).toBe(0);
+  });
+
+  it('reports wallet_unavailable from a lazy wallet whose setup fails, then executes once it recovers', async () => {
+    let gatewayUp = false;
+    const inner = fakeWallet();
+    const wallet = createLazyWalletExecutor({
+      address: AGENT,
+      build: async () => {
+        if (!gatewayUp) throw new Error('request to GET /api/config failed: fetch failed');
+        return inner;
+      },
+    });
+    const api = createFakeApi();
+    api.scheduleCredit(5_000_000n, 3); // before-read of attempt 1, before-read of attempt 2, first poll
+    const client = await connect(api, { wallet, pollIntervalMs: 1, creditWaitMs: 5_000, now: () => Date.now() });
+    const { tools } = await client.listTools();
+    expect(tools.find((t) => t.name === 'beagle_buy_compute')?.description).toMatch(/signs and sends with the agent wallet/);
+
+    const error = errorOf(await call(client, 'beagle_buy_compute', { usd: 5 }));
+    expect(error.code).toBe('wallet_unavailable');
+    expect(error.message).toMatch(/fetch failed/);
+    expect(inner.calls.length).toBe(0);
+
+    gatewayUp = true;
+    const data = structured(await call(client, 'beagle_buy_compute', { usd: 5 }));
+    expect(data['executed']).toBe(true);
+    expect(data['workspace']).toBe(AGENT); // the lazy wallet knows its address before any network call
+    expect(inner.calls.length).toBe(1);
   });
 
   it('builds an explorer link from the gateway config', async () => {
@@ -441,6 +634,8 @@ describe('beagle_open_budget', () => {
     const open = decodeFunctionData({ abi: CREDIT_DESK_ABI, data: steps[1]!.data });
     expect(open.functionName).toBe('openBudget');
     expect(open.args).toEqual([getAddress(WORKSPACE), cap, deadline]);
+    expect(data['workspaceSource']).toBe('input');
+    expect(data['note']).toMatch(/shared by every budget/);
   });
 
   it('keeps a safety margin at the 720 h maximum and rejects longer budgets', async () => {
@@ -459,9 +654,22 @@ describe('beagle_open_budget', () => {
     expect(data['txHash']).toBe(TX);
     expect(data['budgetId']).toBe('7');
     expect(data['workspace']).toBe(AGENT);
+    expect(data['workspaceSource']).toBe('agent_wallet');
+    expect(data['note']).toMatch(/Budget 7 opened\./); // no approve was sent, so no "allowance raised" claim
+    expect(data['note']).toMatch(/Warning: workspace defaulted to the agent wallet/);
     expect(wallet.calls).toEqual([
       { openBudget: { workspace: AGENT, cap: 200n * 10n ** 18n, deadline: BigInt(Math.floor(NOW_MS / 1000) + 3600) } },
     ]);
+  });
+
+  it('mentions the raised allowance when an approve was part of the execution', async () => {
+    const wallet = fakeWallet({ openBudget: async () => ({ txHash: TX, budgetId: 8n, approveTxHash: APPROVE_TX }) });
+    const client = await connect(createFakeApi(), { wallet, workspace: WORKSPACE });
+    const data = structured(await call(client, 'beagle_open_budget', { usd: 2, hours: 1 }));
+    expect(data['approveTxHash']).toBe(APPROVE_TX);
+    expect(data['workspaceSource']).toBe('configured');
+    expect(data['note']).toMatch(/Budget 8 opened \(allowance raised by the cap on top of what was there\)\./);
+    expect(data['note']).not.toMatch(/Warning/);
   });
 });
 

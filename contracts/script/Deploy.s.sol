@@ -2,7 +2,9 @@
 pragma solidity 0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {BeagleToken} from "../src/BeagleToken.sol";
 import {CreditDesk} from "../src/CreditDesk.sol";
@@ -13,9 +15,14 @@ import {ManualPriceSource} from "../src/ManualPriceSource.sol";
 ///         `deployments/<chainId>.json`. Environment (SPEC §3.5):
 ///         DEPLOYER_PRIVATE_KEY (or `--private-key`), TOKEN, TOKEN_RECIPIENT, NATIVE_BURN, OWNER, OPERATOR,
 ///         POSTER, INITIAL_PRICE_E18, MAX_PRICE_AGE, MIN_BURN.
+///         Guards: with an existing TOKEN and NATIVE_BURN=true the token must expose a working `burn(uint256)`
+///         (`TokenNotBurnable()` otherwise; NATIVE_BURN_UNCHECKED=true skips the probe). The deployment file is
+///         written only when broadcasting (`--broadcast` / `--resume`) or when WRITE_DEPLOYMENT=true, so a dry
+///         run never overwrites a live deployment record with simulated addresses.
 contract Deploy is Script {
     error NativeBurnRequired();
     error BadMaxPriceAge();
+    error TokenNotBurnable();
 
     struct Config {
         address deployer;
@@ -34,6 +41,14 @@ contract Deploy is Script {
         uint256 pk = vm.envOr("DEPLOYER_PRIVATE_KEY", uint256(0));
         Config memory c = _config(pk != 0 ? vm.addr(pk) : msg.sender);
         uint256 deployBlock = block.number;
+        // Simulated (not broadcast) probe: `nativeBurn` is immutable, so a token without `burn` would yield a
+        // desk on which every purchase and draw reverts forever. OZ `ERC20Burnable` accepts a zero burn.
+        if (c.token != address(0) && c.nativeBurn && !_envBool("NATIVE_BURN_UNCHECKED")) {
+            try ERC20Burnable(c.token).burn(0) {}
+            catch {
+                revert TokenNotBurnable();
+            }
+        }
 
         if (pk != 0) vm.startBroadcast(pk);
         else vm.startBroadcast();
@@ -68,7 +83,14 @@ contract Deploy is Script {
         console.log("owner/operator/poster:", c.owner, c.operator, c.poster);
         console.log("deployBlock:      ", deployBlock);
 
-        _writeDeployment(c, token, desk, priceSource, deployBlock);
+        if (_shouldWriteDeployment()) _writeDeployment(c, token, desk, priceSource, deployBlock);
+        else console.log("dry run: deployments/<chainId>.json not written (broadcast or set WRITE_DEPLOYMENT=true)");
+    }
+
+    /// @dev Only a broadcast (or resumed) run, or an explicit WRITE_DEPLOYMENT=true, may touch the deployment file.
+    function _shouldWriteDeployment() internal view returns (bool) {
+        return vm.isContext(VmSafe.ForgeContext.ScriptBroadcast) || vm.isContext(VmSafe.ForgeContext.ScriptResume)
+            || _envBool("WRITE_DEPLOYMENT");
     }
 
     function _config(address deployer) internal view returns (Config memory c) {
@@ -112,7 +134,9 @@ contract Deploy is Script {
         vm.serializeAddress(k, "priceSource", address(priceSource));
         vm.serializeString(k, "priceSourceKind", "manual");
         vm.serializeUint(k, "deployBlock", deployBlock);
-        vm.serializeAddress(k, "owner", c.owner);
+        // `owner` is the on-chain owner at deploy time; `pendingOwner` is non-zero until OWNER accepts (Ownable2Step).
+        vm.serializeAddress(k, "owner", desk.owner());
+        vm.serializeAddress(k, "pendingOwner", desk.pendingOwner());
         vm.serializeAddress(k, "operator", c.operator);
         string memory json = vm.serializeAddress(k, "poster", c.poster);
         string memory path = string.concat(vm.projectRoot(), "/deployments/", vm.toString(block.chainid), ".json");
@@ -133,5 +157,10 @@ contract Deploy is Script {
     function _envUint(string memory name, uint256 dflt) internal view returns (uint256) {
         string memory s = _envString(name);
         return bytes(s).length == 0 ? dflt : vm.parseUint(s);
+    }
+
+    function _envBool(string memory name) internal view returns (bool) {
+        string memory s = _envString(name);
+        return bytes(s).length != 0 && vm.parseBool(s);
     }
 }

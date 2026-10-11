@@ -6,12 +6,22 @@ mounts at `/mcp` (Streamable HTTP). Spec: `docs/SPEC.md` §6.
 
 ## Quick start (Claude Desktop / Claude Code)
 
+The package is **not published to npm** (it is a workspace package built to `dist/`), so run the local build.
+Build it once from the repository root, then point your MCP client at `dist/bin.js` with an **absolute** path
+(MCP clients spawn the server from their own working directory, so a relative path breaks):
+
+```sh
+pnpm --filter @beagle/mcp build      # → <repo>/packages/mcp/dist/bin.js
+```
+
+Claude Desktop (`claude_desktop_config.json`) or any client that takes the same shape:
+
 ```json
 {
   "mcpServers": {
     "beagle": {
-      "command": "npx",
-      "args": ["-y", "@beagle/mcp"],
+      "command": "node",
+      "args": ["/abs/path/to/www-rh/packages/mcp/dist/bin.js"],
       "env": {
         "BEAGLE_API_URL": "https://beagle.example.com",
         "BEAGLE_API_KEY": "bgl_…"
@@ -21,8 +31,15 @@ mounts at `/mcp` (Streamable HTTP). Spec: `docs/SPEC.md` §6.
 }
 ```
 
-Inside this repository: `pnpm --filter @beagle/mcp build` and point `command` at `node`,
-`args` at `packages/mcp/dist/bin.js`. Claude Code: `claude mcp add beagle -e BEAGLE_API_KEY=bgl_… -- node packages/mcp/dist/bin.js`.
+Claude Code:
+
+```sh
+claude mcp add beagle -e BEAGLE_API_URL=https://beagle.example.com -e BEAGLE_API_KEY=bgl_… \
+  -- node /abs/path/to/www-rh/packages/mcp/dist/bin.js
+```
+
+Once the package is published, `"command": "npx", "args": ["-y", "@beagle/mcp"]` will work as well; until then
+`npx @beagle/mcp` fails with E404, and an unpublished scoped name is nothing to hand your API key to.
 
 Alternatively connect to the gateway's HTTP transport directly: `https://beagle.example.com/mcp` with
 `Authorization: Bearer bgl_…` (no local process; wallet tools then return unsigned transaction steps).
@@ -33,12 +50,16 @@ Alternatively connect to the gateway's HTTP transport directly: `https://beagle.
 |---|---|
 | `BEAGLE_API_KEY` | **required** — `bgl_…` API key (Keys page or `beagle-gateway create-key`). Missing → exit code 2. |
 | `BEAGLE_API_URL` | gateway origin; default `http://localhost:8787` |
-| `BEAGLE_AGENT_PRIVATE_KEY` | optional `0x` private key of the agent wallet. With it `beagle_buy_compute` / `beagle_open_budget` sign and send (`approve` → `burnForCredit` / `openBudget`), wait for the receipt and poll the balance until the credit lands (≤ 60 s). Without it they return unsigned steps. |
-| `BEAGLE_RPC_URL` | optional JSON-RPC URL for the agent wallet; default: the chain's public RPC from `@beagle/shared/chains` |
-| `BEAGLE_WORKSPACE` | optional default workspace (0x address) for the wallet tools; otherwise the agent wallet address, otherwise the tool call must pass `workspace` |
+| `BEAGLE_AGENT_PRIVATE_KEY` | optional `0x` private key of the agent wallet. With it `beagle_buy_compute` / `beagle_open_budget` sign and send (`approve` → `burnForCredit` / `openBudget`), wait for the receipt and poll the balance until the credit lands (see *Timing*). Without it they return unsigned steps. |
+| `BEAGLE_RPC_URL` | optional JSON-RPC URL for the agent wallet; default: the chain's public RPC from `@beagle/shared/chains`. The executor checks the node's chain id against the gateway's before sending anything (`chain_mismatch`). |
+| `BEAGLE_WORKSPACE` | optional default workspace (0x address) for the wallet tools. Without it the tools fall back to the **agent wallet address**, which is only a guess at your API key's workspace: results then carry `workspaceSource: "agent_wallet"` and a warning. Set it (or pass `workspace`) when the key's workspace is not the agent wallet. |
 
-Chain id and the CreditDesk / token addresses come from the gateway (`GET /api/config`). All logging goes to
-stderr; stdout is the MCP channel.
+Chain id and the CreditDesk / token addresses come from the gateway (`GET /api/config`). The stdio binary
+connects its transport **before** talking to the gateway: the agent wallet's address is derived from the key
+immediately, and the chain / desk details are fetched on the first wallet-tool call and retried on each call
+until that succeeds. A gateway that is down or slow when the client spawns the binary therefore neither delays
+the MCP handshake nor downgrades the session; the affected call returns `isError` with code `wallet_unavailable`
+(nothing was sent) and the next call tries again. All logging goes to stderr; stdout is the MCP channel.
 
 ## Tools
 
@@ -49,17 +70,48 @@ stderr; stdout is the MCP channel.
 | `beagle_quote` | `{ usd? \| tokens? }` | tokens ↔ µUSD at the desk's on-chain price |
 | `beagle_complete` | `{ prompt? \| messages?, system?, model? (beagle/auto), max_tokens?, difficulty? }` | `{ text, model, provider, paidBy, costMicro, balanceMicro, finishReason, requestId, usage }` — **costs credit** |
 | `beagle_usage` | `{ limit?, window? (24h\|7d\|30d) }` | rows + summary |
-| `beagle_buy_compute` | `{ usd? \| tokens?, workspace? }` | with a wallet: `{ executed, txHash, receiptId?, creditedMicro, balanceMicro, … }`; else `{ unsigned: true, chainId, steps: [{ to, data, value: '0', description }] }` — **burns tokens** |
-| `beagle_open_budget` | `{ usd? \| tokens?, hours (1–720), workspace? }` | with a wallet: `{ executed, txHash, budgetId, … }`; else unsigned steps |
-| `beagle_budgets` | — | `BudgetDto[]` with formatted amounts and total headroom |
-| `beagle_upgrade` | `{ kind: 'pro' \| 'warm', quantity? }` | `UpgradeDto` — **costs credit** |
-| `beagle_status` | — | chain, indexer, provider health, house model, operator |
+| `beagle_buy_compute` | `{ usd? \| tokens?, workspace? }` | with a wallet: `{ executed, txHash, receiptId?, creditedMicro, credited, balanceMicro, workspaceSource, elapsedMs, … }`; else `{ unsigned: true, chainId, steps: [{ to, data, value: '0', description }] }` — **burns tokens** |
+| `beagle_open_budget` | `{ usd? \| tokens?, hours (1–720), workspace? }` | with a wallet: `{ executed, txHash, budgetId, workspaceSource, … }`; else unsigned steps |
+| `beagle_budgets` | — | `BudgetDto[]` with formatted amounts, `active` / `countsAsHeadroom` per row and the total headroom (open, unexpired, not stalled — the same predicate as `/api/balance`) |
+| `beagle_upgrade` | `{ kind: 'pro' \| 'warm', quantity? }` | `UpgradeDto` — **costs credit**; prices are in `beagle_status.upgradePrices` |
+| `beagle_status` | — | chain, indexer, provider health, house model, operator, `upgradePrices` |
+
+Amounts: `usd` and `tokens` accept numbers or decimal strings; numbers are read at their shortest decimal
+form, so `tokens: 0.1` is exactly `0.1 BEAGLE` (`1e17` raw), never `0.100000000000000006`.
 
 Every result is JSON text plus `structuredContent` (bigints as decimal strings). Failures are `isError`
 results with `{ error: { code, message, status? } }`, `code` being the gateway error code
-(`insufficient_credit`, `invalid_api_key`, `rate_limited`, …) or `invalid_request` / `internal_error`.
+(`insufficient_credit`, `invalid_api_key`, `rate_limited`, …), `invalid_request` / `internal_error`, or a
+wallet code (`wallet_unavailable`, `chain_mismatch`, `simulation_failed`, `tx_failed`, `tx_reverted`, …).
 
 Resources: `beagle://models` (markdown table), `beagle://quickstart`.
+
+### Purchases, allowances and budgets
+
+`beagle_buy_compute` with a wallet approves **current allowance + amount**, not `amount`: the desk's
+`allowance(owner, desk)` is shared by every open budget of the wallet (headroom = min(cap − drawn, allowance,
+balance)) and `burnForCredit` spends it, so an exact approve would silently shrink or stall those budgets.
+`beagle_open_budget` adds its cap on top of the existing allowance for the same reason. Only an effectively
+unlimited allowance is left untouched. The unsigned steps approve exactly the amount; their descriptions tell
+a wallet with open budgets to add to its allowance instead.
+
+`creditedMicro` is the `usdMicro` from the decoded `CreditPurchased` event (the exact amount the gateway
+books), `credited` tells whether it is visible on the key's workspace yet; the balance poll compares against
+the lowest balance seen, so a completion settling concurrently does not hide the credit.
+
+### Timing and timeouts
+
+MCP clients drop a tool call after their request timeout (the SDK default is 60 s; Claude Desktop uses the
+same). A purchase is approve receipt + burn receipt + indexer lag, so `beagle_buy_compute` keeps its total
+time under a budget (`callBudgetMs`, default 45 s, measured from the call start): once the burn is mined it
+polls `/api/balance` only until that budget or `creditWaitMs` (60 s, SPEC §6.1) runs out, whichever is
+first, and returns `executed: true, credited: false` with the `txHash` rather than letting the client time
+out. While waiting it sends `notifications/progress` for clients that reset their timeout on progress.
+
+If a call still times out on the client side, **the burn may have gone through**: check `beagle_balance`,
+`beagle_usage` or the explorer link before retrying — never retry a purchase blindly. The same holds for
+`beagle_complete`: a request the client gave up on may still have been served and charged; `beagle_usage`
+lists it.
 
 ## Library
 
@@ -70,13 +122,16 @@ const api = createRestBeagleApi({ baseUrl: 'http://localhost:8787', apiKey: 'bgl
 const server = createBeagleMcpServer(api, {
   wallet: createViemWalletExecutor({ privateKey, chainId: 31337, deployment: { creditDesk, token } }), // optional
   workspace: '0x…', // optional default for the wallet tools
+  callBudgetMs: 45_000, // optional: total time budget of beagle_buy_compute
 });
 await server.connect(transport);
 ```
 
 `BeagleApi` (SPEC §6.2) is the only dependency of the tools; the gateway passes an in-process implementation
 bound to the key's workspace. `complete(req, options?)` may attach `beagle` metadata (cost, balance, provider,
-paidBy) to the completion; the tools fall back to `balance()` when it is absent.
+paidBy) to the completion; the tools fall back to `balance()` when it is absent. `createLazyWalletExecutor`
+wraps a wallet whose construction needs the network (what the binary does); `createAgentWallet(api, config)`
+is the binary's own wiring.
 
 ## Development
 

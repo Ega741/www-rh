@@ -30,7 +30,8 @@ cleanup() {
   # restore the committed anvil reference deployment (the deploy script rewrites it on every run)
   [ -f "$WORK/deploy.bak" ] && cp "$WORK/deploy.bak" "$DEPLOY_FILE" && cp "$WORK/gen.bak" "$GEN_FILE" && \
     (pnpm --filter @beagle/shared build >/dev/null 2>&1 || true)
-  rm -rf contracts/broadcast/31337 "$WORK"
+  # forge writes broadcasts to contracts/broadcast/<Script>.s.sol/<chainId>/run-*.json
+  rm -rf contracts/broadcast/Deploy.s.sol/31337 "$WORK"
 }
 trap cleanup EXIT
 mkdir -p "$(dirname "$DEPLOY_FILE")"

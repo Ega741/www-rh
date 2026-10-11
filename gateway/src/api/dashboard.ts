@@ -35,6 +35,14 @@ import { ApiError } from './errors.js';
 
 void AdminCreditRequestSchema;
 
+/** Active API keys a workspace may hold (`POST /api/keys` → 400 `too_many_keys` beyond it). */
+export const MAX_ACTIVE_KEYS = 50;
+
+/** Drops empty-string query values (`?model=&status=`), which mean "no filter" (SPEC §5.9). */
+export function nonEmptyQuery(query: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(query).filter(([, v]) => v !== ''));
+}
+
 async function readJson(c: Context<AppEnv>): Promise<unknown> {
   try {
     return await c.req.json();
@@ -97,7 +105,11 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
   app.post('/api/keys', requireSession(services), async (c) => {
     const raw = c.req.header('content-length') === '0' || c.req.header('content-type') === undefined ? {} : await readJson(c);
     const body = parseOr400(CreateApiKeyRequestSchema, raw ?? {});
-    const created = services.apiKeys.create(principalOf(c).workspace, body.name);
+    const workspace = principalOf(c).workspace;
+    if (services.repos.apiKeys.countByWorkspace(workspace) >= MAX_ACTIVE_KEYS) {
+      throw new ApiError(400, 'too_many_keys', `a workspace may hold at most ${MAX_ACTIVE_KEYS} active API keys; revoke one first`);
+    }
+    const created = services.apiKeys.create(workspace, body.name);
     return c.json({ id: created.id, key: created.key, prefix: created.prefix, name: created.name, createdAt: created.createdAt, lastUsedAt: null }, 201);
   });
 
@@ -109,7 +121,7 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
 
   // ---- usage / ledger / receipts -------------------------------------------------------------
   app.get('/api/usage', requireSession(services, true), (c) => {
-    const q = parseOr400(UsageQuerySchema, c.req.query());
+    const q = parseOr400(UsageQuerySchema, nonEmptyQuery(c.req.query()));
     return c.json(
       usageListDto(services, principalOf(c).workspace, {
         limit: q.limit,
@@ -126,14 +138,14 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
   });
 
   app.get('/api/ledger', requireSession(services), (c) => {
-    const q = parseOr400(CursorQuerySchema, c.req.query());
+    const q = parseOr400(CursorQuerySchema, nonEmptyQuery(c.req.query()));
     const rows = services.repos.ledger.list(principalOf(c).workspace, q.limit, q.before);
     const last = rows[rows.length - 1];
     return c.json({ rows: rows.map(ledgerRowDto), nextBefore: rows.length === q.limit && last !== undefined ? last.createdAt : null });
   });
 
   app.get('/api/receipts', requireSession(services), (c) => {
-    const q = parseOr400(CursorQuerySchema, c.req.query());
+    const q = parseOr400(CursorQuerySchema, nonEmptyQuery(c.req.query()));
     const rows = services.repos.creditEvents.list(principalOf(c).workspace, q.limit, q.before);
     const last = rows[rows.length - 1];
     return c.json({ rows: rows.map((r) => creditEventDto(services, r)), nextBefore: rows.length === q.limit && last !== undefined ? last.blockNumber : null });
@@ -144,7 +156,7 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
     if (row === undefined) throw new ApiError(404, 'not_found', 'unknown request id');
     const built = buildReceipt(row);
     if (built === undefined) throw new ApiError(404, 'receipt_unavailable', 'this request was not served by a model, so it has no receipt');
-    return c.json({ receipt: built.receipt, hash: built.hash, ...built.receipt });
+    return c.json({ receipt: built.receipt, hash: built.hash });
   });
 
   // ---- BYOK providers ------------------------------------------------------------------------

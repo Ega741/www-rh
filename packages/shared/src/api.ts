@@ -237,6 +237,10 @@ export const ApiKeyDtoSchema = z.object({
 });
 export type ApiKeyDto = z.output<typeof ApiKeyDtoSchema>;
 
+/** `GET /api/keys`: a bare array (SPEC §5.9, unpaginated lists). */
+export const ApiKeyListDtoSchema = z.array(ApiKeyDtoSchema);
+export type ApiKeyListDto = z.output<typeof ApiKeyListDtoSchema>;
+
 /** Body of `POST /api/keys`. */
 export const CreateApiKeyRequestSchema = z.object({ name: z.string().trim().min(1).max(64).default('default') });
 export type CreateApiKeyRequest = z.output<typeof CreateApiKeyRequestSchema>;
@@ -390,8 +394,12 @@ export const UsageReceiptSchema = z.object({
 export type UsageReceipt = z.output<typeof UsageReceiptSchema>;
 export type UsageReceiptWire = z.input<typeof UsageReceiptSchema>;
 
-/** `GET /api/receipts/:requestId`: the receipt plus its hash. */
-export const ReceiptDtoSchema = UsageReceiptSchema.extend({ hash: Bytes32Schema });
+/**
+ * `GET /api/receipts/:requestId` (SPEC §5.7, §5.9): `{ receipt, hash }` with
+ * `hash = receiptHash(receipt)`. The receipt is nested, never spread into the envelope, so
+ * `receiptHash(dto.receipt)` recomputes the hash from the parsed or the wire form alike.
+ */
+export const ReceiptDtoSchema = z.object({ receipt: UsageReceiptSchema, hash: Bytes32Schema });
 export type ReceiptDto = z.output<typeof ReceiptDtoSchema>;
 export type ReceiptDtoWire = z.input<typeof ReceiptDtoSchema>;
 
@@ -422,6 +430,10 @@ export const ProviderKeyDtoSchema = z.object({
   lastError: z.string().nullable(),
 });
 export type ProviderKeyDto = z.output<typeof ProviderKeyDtoSchema>;
+
+/** `GET /api/providers`: a bare array (SPEC §5.9). */
+export const ProviderKeyListDtoSchema = z.array(ProviderKeyDtoSchema);
+export type ProviderKeyListDto = z.output<typeof ProviderKeyListDtoSchema>;
 
 /** Body of `PUT /api/providers/:provider` (`baseUrl` must be https; SSRF checks happen in the gateway). */
 export const PutProviderKeyRequestSchema = z.object({
@@ -455,6 +467,11 @@ export const BudgetDrawDtoSchema = z.object({
 export type BudgetDrawDto = z.output<typeof BudgetDrawDtoSchema>;
 export type BudgetDrawDtoWire = z.input<typeof BudgetDrawDtoSchema>;
 
+/** `GET /api/budgets/:id/draws`: a bare array (SPEC §5.9). */
+export const BudgetDrawListDtoSchema = z.array(BudgetDrawDtoSchema);
+export type BudgetDrawListDto = z.output<typeof BudgetDrawListDtoSchema>;
+export type BudgetDrawListDtoWire = z.input<typeof BudgetDrawListDtoSchema>;
+
 /** `GET /api/budgets[/:id]`. `deadline` is unix seconds (on-chain). */
 export const BudgetDtoSchema = z.object({
   budgetId: UintSchema,
@@ -473,6 +490,11 @@ export const BudgetDtoSchema = z.object({
 export type BudgetDto = z.output<typeof BudgetDtoSchema>;
 export type BudgetDtoWire = z.input<typeof BudgetDtoSchema>;
 
+/** `GET /api/budgets`: a bare array (SPEC §5.9). */
+export const BudgetListDtoSchema = z.array(BudgetDtoSchema);
+export type BudgetListDto = z.output<typeof BudgetListDtoSchema>;
+export type BudgetListDtoWire = z.input<typeof BudgetListDtoSchema>;
+
 // ---------------------------------------------------------------------------------------------
 // Upgrades
 
@@ -489,6 +511,11 @@ export const UpgradeDtoSchema = z.object({
 });
 export type UpgradeDto = z.output<typeof UpgradeDtoSchema>;
 export type UpgradeDtoWire = z.input<typeof UpgradeDtoSchema>;
+
+/** `GET /api/upgrades`: a bare array (SPEC §5.9). */
+export const UpgradeListDtoSchema = z.array(UpgradeDtoSchema);
+export type UpgradeListDto = z.output<typeof UpgradeListDtoSchema>;
+export type UpgradeListDtoWire = z.input<typeof UpgradeListDtoSchema>;
 
 /** `GET /api/upgrades/prices`. */
 export const UpgradePricesDtoSchema = z.object({ pro: ProPriceDtoSchema, warmHourPriceMicro: MicroSchema });

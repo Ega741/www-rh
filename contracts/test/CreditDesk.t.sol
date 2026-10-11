@@ -176,10 +176,20 @@ contract CreditDeskTest is Test, PermitSigner {
         desk.quote(1e18);
     }
 
-    function test_quote_futureTimestampIsFresh() public {
-        ps.set(PRICE, block.timestamp + 1 days);
+    function test_quote_futureTimestampWithinMaxAgeIsFresh() public {
+        ps.set(PRICE, block.timestamp + 3600); // a source clock slightly ahead of the chain is tolerated
         (uint256 usd,,) = desk.quote(1e18);
         assertEq(usd, 10_000);
+    }
+
+    function test_quote_farFutureTimestampIsStale() public {
+        // Freshness is symmetric: |now − updatedAt| ≤ maxPriceAge. A far-future observation cannot bypass it.
+        ps.set(PRICE, block.timestamp + 3601);
+        vm.expectRevert(abi.encodeWithSelector(CreditDesk.PriceStale.selector, T0 + 3601, uint32(3600)));
+        desk.quote(1e18);
+        ps.set(PRICE, type(uint256).max);
+        vm.expectRevert(abi.encodeWithSelector(CreditDesk.PriceStale.selector, type(uint256).max, uint32(3600)));
+        desk.quote(1e18);
     }
 
     function test_quote_sixDecimalToken() public {
@@ -279,6 +289,72 @@ contract CreditDeskTest is Test, PermitSigner {
         assertEq(bytes4(evil.lastRevert()), ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
         assertEq(d.totalBurned(), 10e18);
         assertEq(d.nextReceiptId(), 2);
+    }
+
+    // ─── burnForCreditMin (credit floor) ──────────────────────────────────────────────────────────────
+
+    function test_burnForCreditMin_floorRespected() public {
+        // 1000 BEAGLE at $0.01 = $10.00: a floor one µUSD above the quote reverts, the exact quote passes.
+        vm.expectRevert(abi.encodeWithSelector(CreditDesk.SlippageExceeded.selector, 10_000_000, 10_000_001));
+        vm.prank(bob);
+        desk.burnForCreditMin(ws, 1000e18, 10_000_001);
+        assertEq(token.balanceOf(bob), 1_000_000e18); // nothing burned
+        vm.expectEmit();
+        emit CreditDesk.CreditPurchased(1, ws, bob, 1000e18, 10_000_000, PRICE);
+        vm.prank(bob);
+        uint256 id = desk.burnForCreditMin(ws, 1000e18, 10_000_000);
+        assertEq(id, 1);
+        assertEq(desk.totalUsdMicro(), 10_000_000);
+        assertEq(desk.totalBurned(), 1000e18);
+    }
+
+    function test_burnForCreditMin_priceMovedBetweenQuoteAndInclusion() public {
+        (uint256 quoted,,) = desk.quote(1000e18); // the UI quote at $0.01
+        ps.set(PRICE * 3 / 4, block.timestamp); // a −25 % post (within the poster's bounds) lands first
+        vm.expectRevert(abi.encodeWithSelector(CreditDesk.SlippageExceeded.selector, 7_500_000, quoted));
+        vm.prank(bob);
+        desk.burnForCreditMin(ws, 1000e18, quoted);
+        vm.prank(bob);
+        desk.burnForCreditMin(ws, 1000e18, 0); // 0 disables the floor: same as burnForCredit
+        assertEq(desk.totalUsdMicro(), 7_500_000);
+        assertEq(token.balanceOf(bob), 1_000_000e18 - 1000e18);
+    }
+
+    function test_burnForCreditMin_samePathChecks() public {
+        vm.startPrank(bob);
+        vm.expectRevert(CreditDesk.ZeroAddress.selector);
+        desk.burnForCreditMin(address(0), 1e18, 0);
+        vm.expectRevert(abi.encodeWithSelector(CreditDesk.BurnTooSmall.selector, 0, 0));
+        desk.burnForCreditMin(ws, 0, 0);
+        vm.expectRevert(CreditDesk.QuoteTooSmall.selector); // a zero quote is QuoteTooSmall, not slippage
+        desk.burnForCreditMin(ws, 1e13, 1);
+        vm.stopPrank();
+        vm.prank(owner);
+        desk.pause();
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vm.prank(bob);
+        desk.burnForCreditMin(ws, 1e18, 0);
+    }
+
+    function test_permitMin_floorRespected() public {
+        uint256 deadline = block.timestamp + 1 hours;
+        (uint8 v, bytes32 r, bytes32 s) = signPermit(token, ALICE_PK, address(desk), 500e18, deadline);
+        vm.expectRevert(abi.encodeWithSelector(CreditDesk.SlippageExceeded.selector, 5_000_000, 5_000_001));
+        vm.prank(alice);
+        desk.burnForCreditWithPermitMin(ws, 500e18, 5_000_001, deadline, v, r, s);
+        assertEq(token.nonces(alice), 0); // the whole call reverted, permit included: the signature is reusable
+        vm.expectEmit();
+        emit CreditDesk.CreditPurchased(1, ws, alice, 500e18, 5_000_000, PRICE);
+        vm.prank(alice);
+        uint256 id = desk.burnForCreditWithPermitMin(ws, 500e18, 5_000_000, deadline, v, r, s);
+        assertEq(id, 1);
+        assertEq(token.nonces(alice), 1);
+        assertEq(token.allowance(alice, address(desk)), 0);
+        vm.prank(owner);
+        desk.pause();
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vm.prank(alice);
+        desk.burnForCreditWithPermitMin(ws, 1e18, 0, deadline, v, r, s);
     }
 
     // ─── burnForCreditWithPermit ──────────────────────────────────────────────────────────────────────
@@ -655,6 +731,18 @@ contract CreditDeskTest is Test, PermitSigner {
         assertEq(desk.owner(), newOwner);
         vm.prank(newOwner);
         desk.setMinBurn(1);
+    }
+
+    function test_admin_renounceOwnershipDisabled() public {
+        vm.expectRevert(CreditDesk.RenounceDisabled.selector);
+        vm.prank(owner);
+        desk.renounceOwnership();
+        vm.expectRevert(CreditDesk.RenounceDisabled.selector);
+        vm.prank(stranger);
+        desk.renounceOwnership();
+        assertEq(desk.owner(), owner);
+        vm.prank(owner);
+        desk.pause(); // still governable
     }
 
     // ─── Pause ────────────────────────────────────────────────────────────────────────────────────────

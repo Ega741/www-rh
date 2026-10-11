@@ -14,7 +14,10 @@ import {PermitSigner} from "../utils/PermitSigner.sol";
 /// @notice Invariant-test handler for `CreditDesk`. Every action predicts whether the desk call must succeed,
 ///         asserts the prediction, and keeps ghost accounting from the *emitted events* (not from return values),
 ///         so the invariants compare contract state against what an indexer would see.
-/// @dev Designed to never revert itself (`invariant.fail_on_revert = true`).
+/// @dev Designed to never revert itself (`invariant.fail_on_revert = true`). The success oracle for pricing is
+///      computed here from the price source, `maxPriceAge` and `block.timestamp` (SPEC §1 / §3.4) and never
+///      from `desk.quote()`, so a regression in the desk's staleness, zero-price or rounding logic breaks a
+///      prediction instead of being mirrored by the oracle.
 contract DeskHandler is Test, PermitSigner {
     CreditDesk public immutable desk;
     IERC20 public immutable token;
@@ -50,7 +53,10 @@ contract DeskHandler is Test, PermitSigner {
     uint256 public nDrawRevert;
     uint256 public nCloseOk;
     uint256 public nAttemptsPaused; // burn/permit/draw attempts made while paused
-    uint256 public nAttemptsBadPrice; // … while the price was unavailable or stale
+    uint256 public nAttemptsStale; // … while the price was stale (judged here, not by the desk)
+    uint256 public nAttemptsUnavailable; // … while the price was 0
+    uint256 public nFloorRejects; // burns that must fail only because of the `minUsdMicro` floor
+    uint256 public nDrawExpiredFresh; // draws blocked only by the budget's expiry (fresh price, live amount)
 
     constructor(CreditDesk desk_, MockPriceSource ps_, address owner_, address operator_, bool native_) {
         desk = desk_;
@@ -80,19 +86,28 @@ contract DeskHandler is Test, PermitSigner {
 
     // ─── Actions ──────────────────────────────────────────────────────────────────────────────────────
 
+    /// @dev Half of the calls use `burnForCreditMin`: floor exactly at the predicted quote (must pass) or one
+    ///      µUSD above it (must fail with `SlippageExceeded`).
     function burn(uint256 actorSeed, uint256 wsSeed, uint256 amount) external {
         address actor = _actor(actorSeed);
         amount = _amount(amount, Math.min(token.balanceOf(actor), MAX_BURN));
         _ensureAllowance(actor, amount);
-        bool expectOk = _purchaseShouldSucceed(actor, amount);
+        (bool expectOk, uint256 expectUsd) = _predictPurchase(actor, amount);
+        (bytes memory data, bool floorRejects) =
+            _purchaseCall(actorSeed, _workspace(wsSeed), amount, expectUsd, expectOk);
+        if (floorRejects) expectOk = false;
         vm.recordLogs();
         vm.prank(actor);
-        try desk.burnForCredit(_workspace(wsSeed), amount) returns (uint256 rid) {
+        (bool ok, bytes memory ret) = address(desk).call(data);
+        if (ok) {
             assertTrue(expectOk, "burn succeeded unexpectedly");
-            _onReceipt(rid, CreditDesk.CreditPurchased.selector);
+            _onReceipt(abi.decode(ret, (uint256)), CreditDesk.CreditPurchased.selector, amount, expectUsd);
             nBurnOk++;
-        } catch {
+        } else {
             assertFalse(expectOk, "burn reverted unexpectedly");
+            if (floorRejects) assertEq(bytes4(ret), CreditDesk.SlippageExceeded.selector, "floor: wrong error");
+            bytes4 priceErr = _priceError(amount);
+            if (priceErr != 0) assertEq(bytes4(ret), priceErr, "price: wrong error");
             nBurnRevert++;
         }
         _snapshotBudgets();
@@ -112,12 +127,12 @@ contract DeskHandler is Test, PermitSigner {
             (v, r, s) = (27, bytes32(amount + 1), bytes32(uint256(1)));
             _ensureAllowance(actor, amount);
         }
-        bool expectOk = _purchaseShouldSucceed(actor, amount);
+        (bool expectOk, uint256 expectUsd) = _predictPurchase(actor, amount);
         vm.recordLogs();
         vm.prank(actor);
         try desk.burnForCreditWithPermit(_workspace(wsSeed), amount, deadline, v, r, s) returns (uint256 rid) {
             assertTrue(expectOk, "permit burn succeeded unexpectedly");
-            _onReceipt(rid, CreditDesk.CreditPurchased.selector);
+            _onReceipt(rid, CreditDesk.CreditPurchased.selector, amount, expectUsd);
             nPermitOk++;
         } catch {
             assertFalse(expectOk, "permit burn reverted unexpectedly");
@@ -129,7 +144,7 @@ contract DeskHandler is Test, PermitSigner {
     function openBudget(uint256 actorSeed, uint256 wsSeed, uint128 cap, uint64 duration) external {
         address actor = _actor(actorSeed);
         cap = uint128(bound(_rand(cap), 1e15, 1e23)); // $0.01 … $1M at the default price
-        duration = uint64(bound(_rand(duration), 30 minutes, 3 days));
+        duration = uint64(bound(_rand(duration), 1 minutes, 3 days)); // short budgets expire within a run
         uint64 deadline = uint64(block.timestamp) + duration;
         bool expectOk = !desk.paused();
         vm.prank(actor);
@@ -151,16 +166,20 @@ contract DeskHandler is Test, PermitSigner {
         uint256 headroom = b.cap - b.drawn;
         amount = _amount(amount, headroom); // edges: exactly the headroom, or one above it
         _ensureAllowance(b.owner, amount);
-        bool wasFrozen = b.closed || block.timestamp > b.deadline;
-        _countBlockers(amount);
-        bool expectOk = !desk.paused() && !wasFrozen && amount > 0 && amount <= headroom
-            && amount <= token.balanceOf(b.owner) && _quoteOk(amount);
+        bool expired = !b.closed && block.timestamp > b.deadline;
+        bool wasFrozen = b.closed || expired;
+        _countBlockers();
+        (bool quoteOk, uint256 expectUsd) = _predictQuote(amount);
+        bool otherwiseOk = !desk.paused() && amount > 0 && amount <= headroom && amount <= token.balanceOf(b.owner)
+            && quoteOk && expectUsd > 0;
+        if (expired && otherwiseOk) nDrawExpiredFresh++; // only `BudgetExpired` stands between this draw and success
+        bool expectOk = otherwiseOk && !wasFrozen;
         vm.recordLogs();
         vm.prank(operator);
         try desk.draw(id, amount, receiptHash) returns (uint256 rid) {
             assertTrue(expectOk, "draw succeeded unexpectedly");
             assertFalse(wasFrozen, "draw on closed/expired budget");
-            _onReceipt(rid, CreditDesk.BudgetDrawn.selector);
+            _onReceipt(rid, CreditDesk.BudgetDrawn.selector, amount, expectUsd);
             assertEq(_budget(id).drawn, b.drawn + amount, "drawn not increased by amount");
             nDrawOk++;
         } catch {
@@ -191,6 +210,16 @@ contract DeskHandler is Test, PermitSigner {
     function warp(uint256 secs, bool refreshPrice) external {
         vm.warp(block.timestamp + bound(_rand(secs), 1, 90 minutes)); // may cross maxPriceAge (1 h)
         if (refreshPrice) _refreshPrice();
+        _snapshotBudgets();
+    }
+
+    /// @dev Expires one (preferably live) budget — warp to `deadline + 1` — and refreshes the price, so that
+    ///      draws on an expired budget with a fresh price and a live amount really happen (invariant 3).
+    function warpPastDeadline(uint256 budgetSeed) external {
+        if (_budgetIds.length == 0) return;
+        CreditDesk.Budget memory b = _budget(_pickBudget(budgetSeed));
+        if (block.timestamp <= b.deadline) vm.warp(uint256(b.deadline) + 1);
+        _refreshPrice();
         _snapshotBudgets();
     }
 
@@ -284,26 +313,59 @@ contract DeskHandler is Test, PermitSigner {
         }
     }
 
-    function _quoteOk(uint256 amount) internal view returns (bool) {
-        try desk.quote(amount) returns (uint256 usd, uint256, uint256) {
-            return usd > 0;
-        } catch {
-            return false;
-        }
+    /// @dev SPEC §3.4 freshness, judged independently of the desk: `|now − updatedAt| <= maxPriceAge`.
+    function _fresh(uint256 updatedAt) internal view returns (bool) {
+        uint256 now_ = block.timestamp;
+        uint256 age = now_ >= updatedAt ? now_ - updatedAt : updatedAt - now_;
+        return age <= desk.maxPriceAge();
     }
 
-    function _purchaseShouldSucceed(address actor, uint256 amount) internal returns (bool) {
-        _countBlockers(amount);
-        return !desk.paused() && amount > 0 && amount >= desk.minBurn() && amount <= token.balanceOf(actor)
-            && _quoteOk(amount);
+    /// @dev Independent quote (SPEC §1, 18-decimal token): `amount * price / 1e30` in plain arithmetic.
+    ///      `amount <= ~1e23` and `price <= 9e24` here, so the product cannot overflow.
+    function _predictQuote(uint256 amount) internal view returns (bool ok, uint256 usd) {
+        (uint256 price, uint256 updatedAt) = ps.latestPrice();
+        if (price == 0 || !_fresh(updatedAt)) return (false, 0);
+        return (true, amount * price / 1e30);
     }
 
-    function _countBlockers(uint256 amount) internal {
+    function _predictPurchase(address actor, uint256 amount) internal returns (bool ok, uint256 usd) {
+        _countBlockers();
+        (bool quoteOk, uint256 q) = _predictQuote(amount);
+        ok = !desk.paused() && amount > 0 && amount >= desk.minBurn() && amount <= token.balanceOf(actor) && quoteOk
+            && q > 0;
+        usd = q;
+    }
+
+    /// @dev Calldata for the purchase: plain `burnForCredit` or `burnForCreditMin` with the floor at the predicted
+    ///      quote (passes) or one above it (`floorRejects`, must fail). The floor only matters on an otherwise
+    ///      successful burn; a doomed burn stays on the plain path so its blocker is what gets exercised.
+    function _purchaseCall(uint256 seed, address workspace, uint256 amount, uint256 expectUsd, bool otherwiseOk)
+        internal
+        returns (bytes memory data, bool floorRejects)
+    {
+        uint256 mode = (_rand(seed) >> 128) % 4; // 0,1: no floor; 2: floor == quote; 3: floor == quote + 1
+        if (mode < 2 || !otherwiseOk) return (abi.encodeCall(desk.burnForCredit, (workspace, amount)), false);
+        floorRejects = mode == 3;
+        if (floorRejects) nFloorRejects++;
+        data = abi.encodeCall(desk.burnForCreditMin, (workspace, amount, expectUsd + (floorRejects ? 1 : 0)));
+    }
+
+    /// @dev The revert a purchase must produce when the price is its first blocker (the desk checks pause,
+    ///      amount and `minBurn` before quoting, and quotes before touching the allowance): `PriceUnavailable`
+    ///      for a zero price, `PriceStale` for an old or far-future one, zero when something else fails first.
+    function _priceError(uint256 amount) internal view returns (bytes4) {
+        if (desk.paused() || amount == 0 || amount < desk.minBurn()) return bytes4(0);
+        (uint256 price, uint256 updatedAt) = ps.latestPrice();
+        if (price == 0) return CreditDesk.PriceUnavailable.selector;
+        if (!_fresh(updatedAt)) return CreditDesk.PriceStale.selector;
+        return bytes4(0);
+    }
+
+    function _countBlockers() internal {
         if (desk.paused()) nAttemptsPaused++;
-        try desk.quote(amount) returns (uint256, uint256, uint256) {}
-        catch {
-            nAttemptsBadPrice++;
-        }
+        (uint256 price, uint256 updatedAt) = ps.latestPrice();
+        if (price == 0) nAttemptsUnavailable++;
+        else if (!_fresh(updatedAt)) nAttemptsStale++;
     }
 
     function _refreshPrice() internal {
@@ -311,24 +373,30 @@ contract DeskHandler is Test, PermitSigner {
         ps.set(p == 0 ? 1e16 : p, block.timestamp);
     }
 
-    /// @dev Receipt ids must be sequential; ghost totals come from exactly one desk event per call.
-    function _onReceipt(uint256 rid, bytes32 topic) internal {
+    /// @dev Receipt ids must be sequential; ghost totals come from exactly one desk event per call, and the
+    ///      event's amount, µUSD and price must match the independent prediction.
+    function _onReceipt(uint256 rid, bytes32 topic, uint256 amount, uint256 expectUsd) internal {
         assertEq(rid, lastReceiptId + 1, "receipt id not sequential");
         lastReceiptId = rid;
         ghostReceipts++;
         Vm.Log[] memory logs = vm.getRecordedLogs();
+        (uint256 sourcePrice,) = ps.latestPrice();
         uint256 found;
         for (uint256 i = 0; i < logs.length; i++) {
             if (logs[i].emitter != address(desk) || logs[i].topics[0] != topic) continue;
             uint256 amt;
             uint256 usd;
+            uint256 price;
             if (topic == CreditDesk.CreditPurchased.selector) {
                 assertEq(uint256(logs[i].topics[1]), rid, "event receipt id");
-                (amt, usd,) = abi.decode(logs[i].data, (uint256, uint256, uint256));
+                (amt, usd, price) = abi.decode(logs[i].data, (uint256, uint256, uint256));
             } else {
                 assertEq(uint256(logs[i].topics[2]), rid, "event receipt id");
-                (amt, usd,,) = abi.decode(logs[i].data, (uint256, uint256, uint256, bytes32));
+                (amt, usd, price,) = abi.decode(logs[i].data, (uint256, uint256, uint256, bytes32));
             }
+            assertEq(amt, amount, "event tokenAmount != amount");
+            assertEq(usd, expectUsd, "event usdMicro != independent quote");
+            assertEq(price, sourcePrice, "event priceE18 != source price");
             ghostBurned += amt;
             ghostUsd += usd;
             found++;

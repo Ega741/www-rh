@@ -3,6 +3,10 @@
  * the `ManualPriceSource` bounds, clamps the step to `maxStepBps`, skips within `minInterval` or when
  * the change is below 0.5 %, posts with the operator key and records the post. `DRY_RUN` logs only.
  *
+ * Keep-alive: the desk rejects quotes older than `maxPriceAge`, so a flat price is re-posted anyway
+ * once the on-chain quote is within two post intervals of going stale (the band only skips posts
+ * that are not needed for liveness).
+ *
  * @module chain/poster
  */
 import { parseUsdToMicro } from '@beagle/shared/credit';
@@ -19,6 +23,8 @@ export interface PosterOptions {
   now?: () => number;
   /** Minimum relative change to post (bps; default 50 = 0.5 %). */
   minChangeBps?: number;
+  /** `PRICE_POST_INTERVAL_MS` (default 300 000): the keep-alive posts when `age ≥ maxPriceAge − 2·interval`. */
+  postIntervalMs?: number;
 }
 
 /** Converts a USD price (number) into `priceE18` (18-decimal fixed point) without float drift beyond 1e-12. */
@@ -42,9 +48,19 @@ export function clampStep(current: bigint, next: bigint, maxStepBps: number): bi
 /** Result of one {@link PricePoster.tick}. */
 export type PosterResult =
   | { action: 'skipped'; reason: string }
-  | { action: 'dry_run'; priceE18: bigint }
-  | { action: 'posted'; priceE18: bigint; txHash: Hex }
+  | { action: 'dry_run'; priceE18: bigint; keepAlive: boolean }
+  | { action: 'posted'; priceE18: bigint; txHash: Hex; keepAlive: boolean }
   | { action: 'failed'; error: string };
+
+/**
+ * `true` when the on-chain quote (last updated at `updatedAt`, seconds) will be older than
+ * `maxPriceAge` before two more post intervals pass — i.e. it must be refreshed now even if unchanged.
+ */
+export function needsKeepAlive(nowSec: number, updatedAt: number, maxPriceAge: number, postIntervalMs: number): boolean {
+  if (updatedAt <= 0 || maxPriceAge <= 0) return false;
+  const lead = 2 * Math.ceil(postIntervalMs / 1000);
+  return nowSec - updatedAt >= Math.max(0, maxPriceAge - lead);
+}
 
 /** The poster. */
 export class PricePoster {
@@ -84,8 +100,9 @@ export class PricePoster {
     }
     let current: { priceE18: bigint; updatedAt: number };
     let bounds: { maxStepBps: number; minInterval: number };
+    let maxPriceAge: number;
     try {
-      [current, bounds] = await Promise.all([this.reader.latestPrice(), this.reader.priceSourceBounds()]);
+      [current, bounds, maxPriceAge] = await Promise.all([this.reader.latestPrice(), this.reader.priceSourceBounds(), this.reader.maxPriceAge()]);
     } catch (e) {
       const error = e instanceof Error ? e.message : String(e);
       return { action: 'failed', error };
@@ -93,20 +110,22 @@ export class PricePoster {
     const nowSec = Math.floor(this.now() / 1000);
     if (current.priceE18 !== 0n && nowSec < current.updatedAt + bounds.minInterval) return { action: 'skipped', reason: 'within minInterval' };
     const next = clampStep(current.priceE18, target, bounds.maxStepBps);
-    if (current.priceE18 !== 0n) {
+    const keepAlive = current.priceE18 !== 0n && needsKeepAlive(nowSec, current.updatedAt, maxPriceAge, this.options.postIntervalMs ?? 300_000);
+    if (current.priceE18 !== 0n && !keepAlive) {
       const delta = next > current.priceE18 ? next - current.priceE18 : current.priceE18 - next;
       if (delta * 10_000n < current.priceE18 * BigInt(this.options.minChangeBps ?? 50)) return { action: 'skipped', reason: 'change below 0.5%' };
     }
+    if (keepAlive) this.logger.info('poster: keep-alive post (on-chain quote about to go stale)', { updatedAt: current.updatedAt, maxPriceAge, priceE18: next });
     if (this.writer === undefined || this.options.dryRun) {
-      this.logger.info('poster: dry run', { priceE18: next, target, current: current.priceE18 });
-      return { action: 'dry_run', priceE18: next };
+      this.logger.info('poster: dry run', { priceE18: next, target, current: current.priceE18, keepAlive });
+      return { action: 'dry_run', priceE18: next, keepAlive };
     }
     const id = this.repos.pricePosts.insert({ priceE18: next, source: this.options.feedUrl, txHash: null, status: 'pending', createdAt: this.now() });
     try {
       const txHash = await this.writer.postPrice(next);
       this.repos.pricePosts.setStatus(id, 'sent', txHash);
-      this.logger.info('poster: price posted', { priceE18: next, txHash });
-      return { action: 'posted', priceE18: next, txHash };
+      this.logger.info('poster: price posted', { priceE18: next, txHash, keepAlive });
+      return { action: 'posted', priceE18: next, txHash, keepAlive };
     } catch (e) {
       const error = e instanceof Error ? e.message : String(e);
       this.repos.pricePosts.setStatus(id, `failed: ${error.slice(0, 200)}`, null);

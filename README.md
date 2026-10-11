@@ -91,8 +91,9 @@ anvil --block-time 1 &
 (cd contracts && DEPLOYER_PRIVATE_KEY=$K OPERATOR=$OP POSTER=$OP INITIAL_PRICE_E18=10000000000000000 \
    forge script script/Deploy.s.sol --rpc-url http://127.0.0.1:8545 --broadcast --private-key $K)
 node scripts/sync-deployments.mjs && node scripts/sync-abi.mjs && pnpm -r build
+set -a; source .env; set +a   # шлюз читает только process.env и сам .env не открывает (иначе: node --env-file=.env gateway/dist/main.js)
 pnpm dev:gateway              # http://localhost:8787
-pnpm dev:web                  # http://localhost:5173
+pnpm dev:web                  # http://localhost:5173 (Vite читает .env сам)
 ```
 
 ## Использование
@@ -111,10 +112,17 @@ client.chat.completions.create(model="beagle/best", messages=[{"role": "user", "
 ```
 
 ```json
-// Claude Desktop / Claude Code: MCP-сервер для агента
-{ "mcpServers": { "beagle": { "command": "npx", "args": ["-y", "@beagle/mcp"],
+// Claude Desktop / Claude Code: MCP-сервер для агента — локальная сборка (`pnpm --filter @beagle/mcp build`,
+// затем `node packages/mcp/dist/bin.js`; в конфиге клиента путь к bin.js должен быть абсолютным).
+// Пакет @beagle/mcp в npm не опубликован: `npx -y @beagle/mcp` не работает, и чужому пакету с таким именем
+// нельзя отдавать BEAGLE_API_KEY / BEAGLE_AGENT_PRIVATE_KEY.
+{ "mcpServers": { "beagle": { "command": "node", "args": ["/abs/path/to/beagle/packages/mcp/dist/bin.js"],
   "env": { "BEAGLE_API_URL": "http://localhost:8787", "BEAGLE_API_KEY": "bgl_…" } } } }
 ```
+
+Claude Code: `claude mcp add beagle -e BEAGLE_API_URL=http://localhost:8787 -e BEAGLE_API_KEY=bgl_… -- node $PWD/packages/mcp/dist/bin.js`.
+Без локального процесса — транспорт Streamable HTTP шлюза: `http://localhost:8787/mcp` с заголовком
+`Authorization: Bearer bgl_…` (кошельковые инструменты тогда возвращают неподписанные шаги).
 
 Инструменты MCP: `beagle_balance`, `beagle_models`, `beagle_quote`, `beagle_complete`, `beagle_usage`,
 `beagle_buy_compute`, `beagle_open_budget`, `beagle_budgets`, `beagle_upgrade`, `beagle_status`. С
@@ -127,10 +135,13 @@ client.chat.completions.create(model="beagle/best", messages=[{"role": "user", "
 
 ## Переменные окружения
 
-Все — в `.env.example` (один файл на контракты, шлюз и веб). Ключевые:
+Все — в `.env.example` (один файл на контракты, шлюз и веб). Шлюз читает только `process.env` и сам `.env` не
+открывает: на голом железе `node --env-file=.env gateway/dist/main.js` (или `set -a; source .env; set +a`), в
+docker compose файл подключён через `env_file`, Vite читает `VITE_*` сам. Ключевые:
 
 | Переменная | Назначение |
 |---|---|
+| `NODE_ENV` | `production` включает защитные проверки: обязательный `SESSION_SECRET`, `credit` только с `--force` (Docker-образ ставит его сам) |
 | `CHAIN_ID`, `RPC_URL`, `CREDIT_DESK_ADDRESS`, `START_BLOCK`, `CONFIRMATIONS` | сеть и адрес `CreditDesk` (по умолчанию из `contracts/deployments`) |
 | `OPERATOR_PRIVATE_KEY`, `DRY_RUN` | ключ оператора (draw бюджетов, публикация цены); `DRY_RUN=true` — без транзакций |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `HOUSE_BASE_URL` | платформенные ключи провайдеров и адрес house-модели (vLLM) |
@@ -156,7 +167,10 @@ client.chat.completions.create(model="beagle/best", messages=[{"role": "user", "
 
 - Из среды сборки RPC Robinhood Chain недоступны: контракты проверены локально (Foundry unit/fuzz/invariant +
   anvil e2e); деплой в сеть — по `docs/DEPLOY.md`.
-- Доступность house-модели равна доступности GPU за `HOUSE_BASE_URL`; в репозитории — compose-профиль с vLLM.
+- Доступность house-модели равна доступности GPU за `HOUSE_BASE_URL`; в репозитории — compose-профили с vLLM.
+  Endpoint у шлюза один: обе house-модели (`HOUSE_MODEL_SMALL`, `HOUSE_MODEL_LARGE` для Pro) запрашиваются с
+  `HOUSE_BASE_URL`, а vLLM обслуживает одну модель на процесс — для обеих нужен OpenAI-совместимый роутер перед
+  `house`/`house-large`, иначе вторую модель уберите из каталога (`MODEL_CATALOG_FILE`, `docs/DEPLOY.md` §3).
 - Цена токена для начислений берётся из `ManualPriceSource` (оператор в границах) — при появлении
   Chainlink-фида используйте `ChainlinkPriceSource`. TWAP-оракул по пулу Uniswap/Pons — будущая работа.
 - `/v1/messages` покрывает основное подмножество Anthropic Messages API (текст, картинки, инструменты); экзотика

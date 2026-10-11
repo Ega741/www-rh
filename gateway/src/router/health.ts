@@ -2,7 +2,8 @@
  * Provider health / circuit breaker (SPEC §5.6): a 60 s sliding window of retryable failures per
  * provider; ≥ 3 → `down` for `open_for_ms` (30 s, doubling to 300 s on consecutive openings);
  * after the window → `degraded` (half-open); a success → `ok` and reset. Non-retryable errors never
- * affect health; a platform 401/403 opens the breaker immediately. Persisted in `provider_health`.
+ * affect health; a platform 401/403 opens the breaker immediately; failures seen through a
+ * workspace's own BYOK key never count. Persisted in `provider_health`.
  *
  * @module router/health
  */
@@ -91,12 +92,18 @@ export class HealthStore {
     this.persist(p, e);
   }
 
-  /** Records a provider failure. Only retryable errors (and platform auth failures) count. */
+  /**
+   * Records a provider failure. Only retryable errors (and platform auth failures) count, and only
+   * those seen through **platform** credentials: a workspace's own BYOK key (its quota, its custom
+   * base URL) says nothing about the provider's availability for everyone else, so BYOK failures of
+   * any kind never touch the shared breaker (SPEC §5.6).
+   */
   recordFailure(provider: Provider, error: ProviderError, credentialKind: 'byok' | 'platform'): void {
+    if (credentialKind === 'byok') return;
     const e = this.entry(provider);
     this.refresh(provider, e);
     if (error.authFailure) {
-      if (credentialKind === 'platform') this.open(provider, e);
+      this.open(provider, e);
       return;
     }
     if (!error.retryable) return;

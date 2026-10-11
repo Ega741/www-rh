@@ -166,10 +166,16 @@ contract ManualPriceSourceTest is Test {
         ps.forcePrice(0);
         (uint256 p,) = ps.latestPrice();
         assertEq(p, 0);
-        // With no price set, the next post is unconstrained.
+        // With no price set, the next post is unconstrained (SPEC §3.3): forcePrice(0) is NOT a stop switch
+        // against the poster …
         _post(P0 * 100);
         (p,) = ps.latestPrice();
         assertEq(p, P0 * 100);
+        // … setPoster(0) is.
+        vm.prank(owner);
+        ps.setPoster(address(0));
+        vm.expectRevert(ManualPriceSource.NotPoster.selector);
+        _post(P0);
     }
 
     // ─── setPoster / setBounds ────────────────────────────────────────────────────────────────────────
@@ -222,6 +228,15 @@ contract ManualPriceSourceTest is Test {
     }
 
     // ─── Ownable2Step ─────────────────────────────────────────────────────────────────────────────────
+
+    function test_renounceOwnershipDisabled() public {
+        vm.expectRevert(ManualPriceSource.RenounceDisabled.selector);
+        vm.prank(owner);
+        ps.renounceOwnership();
+        assertEq(ps.owner(), owner);
+        vm.prank(owner);
+        ps.setPoster(stranger); // still governable
+    }
 
     function test_ownershipTwoStep() public {
         address newOwner = makeAddr("newOwner");

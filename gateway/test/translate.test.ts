@@ -78,6 +78,14 @@ describe('toOpenAI', () => {
     expect(c.usage).toEqual({ prompt_tokens: 13, completion_tokens: 4, total_tokens: 17, prompt_tokens_details: { cached_tokens: 3 } });
   });
 
+  it('puts a refusal in `refusal` with `content: null`', () => {
+    const refused = toChatCompletion({ ...resp, message: { role: 'assistant', content: [{ type: 'text', text: "I can't help with that" }] }, finishReason: 'content_filter' }, { id: 'req_1', created: 1, model: 'm' });
+    expect(refused.choices[0]?.message).toMatchObject({ content: null, refusal: "I can't help with that" });
+    expect(refused.choices[0]?.finish_reason).toBe('content_filter');
+    const plain = toChatCompletion({ ...resp, message: { role: 'assistant', content: [{ type: 'text', text: 'sure' }] }, finishReason: 'stop' }, { id: 'req_1', created: 1, model: 'm' });
+    expect(plain.choices[0]?.message).toMatchObject({ content: 'sure', refusal: null });
+  });
+
   it('streams chunks with a role on the first delta and reassembles', () => {
     const enc = new OpenAiChunkEncoder({ id: 'req_1', created: 1, model: 'house/gpt-oss-20b' }, true);
     const chunks: InternalChunk[] = [
@@ -181,10 +189,17 @@ describe('upstream request bodies', () => {
     }),
   );
 
-  it('OpenAI-compatible body mirrors the request; reasoning_effort only for openai', () => {
+  it('OpenAI-compatible body mirrors the request; reasoning_effort and max_completion_tokens only for openai', () => {
     const body = buildOpenAiBody({ ...base, upstreamModel: 'gpt-5.5', metadata: META }, 'openai');
     expect(body['model']).toBe('gpt-5.5');
     expect(body['reasoning_effort']).toBe('low');
+    expect(body['max_completion_tokens']).toBe(12);
+    expect(body['max_tokens']).toBeUndefined();
+    for (const provider of ['google', 'house'] as const) {
+      const other = buildOpenAiBody({ ...base, upstreamModel: 'g', metadata: META }, provider);
+      expect(other['max_tokens']).toBe(12);
+      expect(other['max_completion_tokens']).toBeUndefined();
+    }
     expect(body['tool_choice']).toBe('required');
     expect(body['response_format']).toEqual({ type: 'json_schema', json_schema: { name: 'S', schema: { type: 'object' } } });
     const msgs = body['messages'] as Record<string, unknown>[];
@@ -212,5 +227,11 @@ describe('upstream request bodies', () => {
     expect(p.messages[2]?.role).toBe('user');
     expect(p.messages[2]?.content).toEqual([{ type: 'tool_result', tool_use_id: 'c1', content: 'out' }]);
     expect(p.metadata).toEqual({ user_id: META.workspace });
+  });
+
+  it('Anthropic params clamp an OpenAI-range temperature to [0, 1]', () => {
+    expect(buildAnthropicParams({ ...base, upstreamModel: 'claude-sonnet-5-5', metadata: META, temperature: 1.3 }).temperature).toBe(1);
+    expect(buildAnthropicParams({ ...base, upstreamModel: 'claude-sonnet-5-5', metadata: META, temperature: 0.4 }).temperature).toBe(0.4);
+    expect(buildAnthropicParams({ ...base, upstreamModel: 'claude-sonnet-5-5', metadata: META, topP: 0.9 }).top_p).toBe(0.9);
   });
 });

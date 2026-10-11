@@ -41,9 +41,9 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
+      # No `version:` input: the action reads `packageManager` (pnpm@10.28.0) from package.json; passing a
+      # different `version` alongside it makes pnpm/action-setup@v4 fail with "Multiple versions of pnpm specified".
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: 22

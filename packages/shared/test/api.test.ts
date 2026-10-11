@@ -3,8 +3,11 @@ import { receiptHash } from '../src/canonical.js';
 import {
   AdminCreditRequestSchema,
   ApiKeyDtoSchema,
+  ApiKeyListDtoSchema,
   BalanceDtoSchema,
+  BudgetDrawListDtoSchema,
   BudgetDtoSchema,
+  BudgetListDtoSchema,
   ConfigDtoSchema,
   CreateApiKeyRequestSchema,
   CreditEventDtoSchema,
@@ -20,6 +23,7 @@ import {
   NonceDtoSchema,
   PriceDtoSchema,
   ProviderKeyDtoSchema,
+  ProviderKeyListDtoSchema,
   PutProviderKeyRequestSchema,
   QuoteDtoSchema,
   QuoteQuerySchema,
@@ -27,6 +31,7 @@ import {
   StatusDtoSchema,
   UintStringSchema,
   UpgradeDtoSchema,
+  UpgradeListDtoSchema,
   UpgradePricesDtoSchema,
   UpgradeRequestSchema,
   UsageListDtoSchema,
@@ -42,6 +47,7 @@ import {
   type CreditEventDtoWire,
   type MeDtoWire,
   type PriceDtoWire,
+  type ReceiptDtoWire,
   type StatusDtoWire,
   type UsageReceiptWire,
   type UsageRowDtoWire,
@@ -185,14 +191,23 @@ describe('workspace DTOs', () => {
     expect(row.key).toBeUndefined();
     const created = ApiKeyDtoSchema.parse({ id: 'k1', prefix: 'bgl_abcdefgh', name: 'ci', createdAt: 1, lastUsedAt: null, key: 'bgl_' + 'x'.repeat(43) });
     expect(created.key).toHaveLength(47);
+    // GET /api/keys is a bare array (SPEC §5.9)
+    expect(ApiKeyListDtoSchema.parse([])).toEqual([]);
+    expect(ApiKeyListDtoSchema.parse([row, created])).toHaveLength(2);
+    expect(ApiKeyListDtoSchema.safeParse({ keys: [row] }).success).toBe(false);
     expect(CreateApiKeyRequestSchema.parse({ name: '  ci  ' })).toEqual({ name: 'ci' });
     expect(CreateApiKeyRequestSchema.parse({})).toEqual({ name: 'default' });
     expect(CreateApiKeyRequestSchema.safeParse({ name: 'x'.repeat(65) }).success).toBe(false);
   });
 
   it('ProviderKeyDto and PUT body (https only)', () => {
-    expect(ProviderKeyDtoSchema.parse({ provider: 'openai', last4: 'abcd', baseUrl: null, createdAt: 1, lastError: null }).provider).toBe('openai');
-    expect(ProviderKeyDtoSchema.safeParse({ provider: 'house', last4: 'abcd', baseUrl: null, createdAt: 1, lastError: null }).success).toBe(false);
+    const key = { provider: 'openai', last4: 'abcd', baseUrl: null, createdAt: 1, lastError: null };
+    expect(ProviderKeyDtoSchema.parse(key).provider).toBe('openai');
+    expect(ProviderKeyDtoSchema.safeParse({ ...key, provider: 'house' }).success).toBe(false);
+    // GET /api/providers is a bare array (SPEC §5.9)
+    expect(ProviderKeyListDtoSchema.parse([key, { ...key, provider: 'google', lastError: 'invalid key' }])).toHaveLength(2);
+    expect(ProviderKeyListDtoSchema.safeParse([{ ...key, provider: 'house' }]).success).toBe(false);
+    expect(ProviderKeyListDtoSchema.safeParse({ providers: [] }).success).toBe(false);
     expect(PutProviderKeyRequestSchema.parse({ apiKey: '  sk-12345678  ', baseUrl: 'https://api.example.com/v1' })).toEqual({ apiKey: 'sk-12345678', baseUrl: 'https://api.example.com/v1' });
     expect(PutProviderKeyRequestSchema.safeParse({ apiKey: 'sk-12345678', baseUrl: 'http://api.example.com' }).success).toBe(false);
     expect(PutProviderKeyRequestSchema.safeParse({ apiKey: 'short' }).success).toBe(false);
@@ -314,9 +329,25 @@ describe('receipts and draw batches', () => {
     const parsed = UsageReceiptSchema.parse(receipt);
     expect(parsed.chargedMicro).toBe(6n);
     expect(receiptHash(parsed)).toBe(receiptHash(receipt));
-    const dto = ReceiptDtoSchema.parse({ ...receipt, hash: receiptHash(receipt) });
-    expect(dto.hash).toBe(receiptHash(receipt));
     expect(UsageReceiptSchema.safeParse({ ...receipt, v: 2 }).success).toBe(false);
+  });
+
+  it('ReceiptDto is the nested { receipt, hash } envelope of SPEC §5.7 / §5.9', () => {
+    const hash = receiptHash(receipt);
+    const wire: ReceiptDtoWire = { receipt, hash };
+    const dto = ReceiptDtoSchema.parse(wire);
+    expect(Object.keys(dto).sort()).toEqual(['hash', 'receipt']);
+    expect(dto.hash).toBe(hash);
+    expect(dto.receipt.chargedMicro).toBe(6n);
+    // the hash recomputes from the nested payload, parsed (bigint) or wire (string) alike
+    expect(receiptHash(dto.receipt)).toBe(hash);
+    expect(receiptHash(wire.receipt)).toBe(hash);
+    // the flat form (receipt fields spread beside `hash`) is not a ReceiptDto
+    expect(ReceiptDtoSchema.safeParse({ ...receipt, hash }).success).toBe(false);
+    // a hybrid body `{ receipt, hash, ...receipt }` parses to the same nested value (extra keys are stripped)
+    expect(ReceiptDtoSchema.parse({ receipt, hash, ...receipt })).toEqual(dto);
+    expect(ReceiptDtoSchema.safeParse({ receipt, hash: '0x12' }).success).toBe(false);
+    expect(ReceiptDtoSchema.safeParse({ receipt: { ...receipt, v: 2 }, hash }).success).toBe(false);
   });
 
   it('DrawBatch', () => {
@@ -365,11 +396,26 @@ describe('budgets and upgrades', () => {
     expect(parsed.draws[0]?.usdMicro).toBe(2500n);
     expect(BudgetDtoSchema.safeParse({ ...budget, stalledReason: 'other' }).success).toBe(false);
     expect(BudgetDtoSchema.parse({ ...budget, stalledReason: 'allowance' }).stalledReason).toBe('allowance');
+    // GET /api/budgets and GET /api/budgets/:id/draws are bare arrays (SPEC §5.9)
+    const budgets = BudgetListDtoSchema.parse([budget, { ...budget, budgetId: 2, draws: [] }]);
+    expect(budgets.map((b) => b.budgetId)).toEqual([1, 2]);
+    expect(budgets[0]?.headroomMicro).toBe(1_247_500n);
+    expect(BudgetListDtoSchema.safeParse({ budgets: [budget] }).success).toBe(false);
+    const draws = BudgetDrawListDtoSchema.parse(budget.draws);
+    expect(draws).toHaveLength(1);
+    expect(draws[0]?.usdMicro).toBe(2500n);
+    expect(BudgetDrawListDtoSchema.safeParse([{ ...budget.draws[0], status: 'lost' }]).success).toBe(false);
   });
 
   it('UpgradeDto, prices and request', () => {
-    const parsed = UpgradeDtoSchema.parse({ id: 'u1', workspace: WS, kind: 'warm', quantity: 3, amountMicro: '6000000', startsAt: 1, endsAt: 2, createdAt: 1 });
+    const upgrade = { id: 'u1', workspace: WS, kind: 'warm', quantity: 3, amountMicro: '6000000', startsAt: 1, endsAt: 2, createdAt: 1 };
+    const parsed = UpgradeDtoSchema.parse(upgrade);
     expect(parsed.amountMicro).toBe(6_000_000n);
+    // GET /api/upgrades is a bare array (SPEC §5.9)
+    const list = UpgradeListDtoSchema.parse([upgrade, { ...upgrade, id: 'u2', kind: 'pro', quantity: 1, amountMicro: '20000000' }]);
+    expect(list.map((u) => u.amountMicro)).toEqual([6_000_000n, 20_000_000n]);
+    expect(UpgradeListDtoSchema.safeParse({ rows: [upgrade] }).success).toBe(false);
+    expect(UpgradeListDtoSchema.safeParse([{ ...upgrade, kind: 'gold' }]).success).toBe(false);
     expect(UpgradePricesDtoSchema.parse({ pro: { priceMicro: '20000000', days: 30 }, warmHourPriceMicro: '2000000' }).pro.priceMicro).toBe(20_000_000n);
     expect(UpgradeRequestSchema.parse({ kind: 'pro' })).toEqual({ kind: 'pro', quantity: 1 });
     expect(UpgradeRequestSchema.parse({ kind: 'warm', quantity: 168 }).quantity).toBe(168);

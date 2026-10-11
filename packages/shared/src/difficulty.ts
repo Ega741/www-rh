@@ -70,6 +70,15 @@ export function clampDifficulty(x: number): number {
  * clamp to [0, 1]
  * ```
  * The result is rounded to four decimals so equal inputs compare exactly.
+ *
+ * Reading of §4.5 (where the prose leaves room, this is the normative behaviour):
+ * - `#include` matches at the start of a line: the literal `\b(…|#include)\b` would need a word
+ *   character before `#`, which never happens in C source, so {@link CODE_PATTERN} anchors it with
+ *   a trailing `\b` only.
+ * - Both the code check and the reasoning-keyword bonus look at **user** messages only; assistant
+ *   and system turns never raise the score through their wording.
+ * - The size term and the message count cover `messages` only; the system prompt arrives
+ *   separately as `systemLength` and contributes through its own `> 2_000` term alone.
  */
 export function estimateDifficulty(req: DifficultyInput): number {
   const messages = req.messages ?? [];

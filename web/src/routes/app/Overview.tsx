@@ -4,6 +4,7 @@ import { QueryGuard } from '../../components/QueryGuard.jsx';
 import { Badge, Card, PageHeader, Stat, TableWrap } from '../../components/ui.jsx';
 import { useSession } from '../../hooks/useSession.jsx';
 import { fmtCompact, fmtCount, fmtPrice, fmtUsd } from '../../lib/amounts.js';
+import { checksum } from '../../lib/explorer.js';
 import { formatDateTime, relativeTime } from '../../lib/time.js';
 import { useBalance, useUsageList, useUsageSummary } from '../../queries.js';
 
@@ -20,7 +21,7 @@ export function Overview() {
     <div className="space-y-6">
       <PageHeader
         title="Overview"
-        lead={me === undefined ? undefined : <span className="font-mono">{me.workspace}</span>}
+        lead={me === undefined ? undefined : <span className="font-mono">{checksum(me.workspace)}</span>}
         actions={
           <Link to="/app/credits" className="btn-primary">
             Buy credit

@@ -4,7 +4,7 @@ import { TIER_ORDER, type Tier } from '@beagle/shared/models';
 import { QueryGuard } from '../components/QueryGuard.jsx';
 import { Badge, Card, Dot, PageHeader, TableWrap } from '../components/ui.jsx';
 import { fmtContext, fmtPerMillion } from '../lib/amounts.js';
-import { useModels } from '../queries.js';
+import { useGatewayConfig, useModels } from '../queries.js';
 
 const TIER_TONE: Record<Tier, 'accent' | 'info' | 'ok' | 'neutral'> = { frontier: 'accent', efficient: 'info', budget: 'ok', house: 'neutral' };
 
@@ -20,9 +20,12 @@ function caps(m: ModelDto): string {
 /** Models & pricing page. */
 export function Models() {
   const models = useModels();
+  const gw = useGatewayConfig();
+  const markupBps = gw.data?.markupBps;
+  const markupText = markupBps === undefined ? 'the platform markup (markupBps from /api/config)' : `a ${markupBps} bps (${(markupBps / 100).toFixed(2).replace(/\.?0+$/, '')}%) platform markup`;
   return (
     <div>
-      <PageHeader title="Models & pricing" lead="Prices are what the gateway charges per 1M tokens (upstream snapshot plus the platform markup, µUSD rounded up per component). Availability reflects live provider health and your plan." />
+      <PageHeader title="Models & pricing" lead={`Prices are the upstream snapshot per 1M tokens, before markup: credit-paid requests are charged this cost plus ${markupText}, µUSD rounded up per component; requests through your own provider keys consume no credit. Availability reflects live provider health and your plan.`} />
       <QueryGuard query={models}>
         {(data) => (
           <div className="space-y-6">

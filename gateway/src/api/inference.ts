@@ -23,12 +23,12 @@ import { modelAvailability, openAiModelList } from './dto.js';
 import { GatewayError } from './errors.js';
 import { rateLimit } from './ratelimit.js';
 
-/** Sanitizes a header value: Latin-1 only, no CR/LF, ≤ `max` chars. */
+/** Sanitizes a header value: Latin-1 only, no control characters (C0 except tab, DEL), ≤ `max` chars. */
 export function headerSafe(value: string, max = 512): string {
   let out = '';
   for (const ch of value) {
     const code = ch.codePointAt(0) ?? 0;
-    if (code === 10 || code === 13) out += ' ';
+    if ((code < 0x20 && code !== 0x09) || code === 0x7f) out += ' ';
     else if (code > 0xff) out += '-';
     else out += ch;
   }
@@ -199,7 +199,7 @@ export function mountInference(app: Hono<AppEnv>, services: Services): void {
 
   app.get('/v1/models/:id{.+}', requireApiKey(services), (c) => {
     const principal = principalOf(c);
-    const id = decodeURIComponent(c.req.param('id'));
+    const id = c.req.param('id'); // Hono already percent-decodes path params
     const created = Math.floor(services.now() / 1000);
     if (isAlias(id)) {
       const alias: OpenAiModel = { id, object: 'model', created, owned_by: 'beagle', beagle: { tier: null, price: null, available: true, requiresPlan: null, alias: true } };

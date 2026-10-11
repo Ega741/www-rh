@@ -10,7 +10,7 @@ import type { IndexerStatusDto } from '@beagle/shared/api';
 import type { Address, Hex } from 'viem';
 import type { Repos } from '../db/repos.js';
 import type { Logger } from '../log.js';
-import type { ChainReader, DeskLog } from './clients.js';
+import type { BlockInfo, ChainReader, DeskLog } from './clients.js';
 
 /** Options of {@link Indexer}. */
 export interface IndexerOptions {
@@ -84,10 +84,22 @@ export class Indexer {
     const last = this.lastBlock();
     const hash = this.lastHash();
     if (last < 0 || hash === undefined) return false;
-    const block = await this.reader.getBlock(BigInt(last));
-    if (block !== undefined && block.hash.toLowerCase() === hash.toLowerCase()) return false;
+    let block: BlockInfo | undefined;
+    try {
+      block = await this.reader.getBlock(BigInt(last));
+    } catch (e) {
+      this.logger.warn('reorg check skipped: block fetch failed', { lastBlock: last, error: e });
+      return false;
+    }
+    if (block === undefined) {
+      // A block at or below the confirmed head always exists on the canonical chain; an unfetchable
+      // one is an RPC problem (lagging / load-balanced node), not a hash mismatch → never rewind on it.
+      this.logger.warn('reorg check skipped: block not available from the node', { lastBlock: last });
+      return false;
+    }
+    if (block.hash.toLowerCase() === hash.toLowerCase()) return false;
     const rewindTo = Math.max(this.options.startBlock - 1, last - (this.options.confirmations + REORG_EXTRA_BLOCKS));
-    this.logger.warn('reorg detected; rewinding', { lastBlock: last, expectedHash: hash, actualHash: block?.hash ?? null, rewindTo });
+    this.logger.warn('reorg detected; rewinding', { lastBlock: last, expectedHash: hash, actualHash: block.hash, rewindTo });
     this.rewind(rewindTo);
     return true;
   }
@@ -130,21 +142,45 @@ export class Indexer {
     let total = 0;
     while (from <= target) {
       const to = Math.min(target, from + this.options.chunkBlocks - 1);
+      // The tip header is fetched *before* the logs and every log's block hash is checked against the
+      // headers: a reorg between the two RPC calls (possible with CONFIRMATIONS=0) would otherwise
+      // store the canonical hash next to orphaned events and slip past the next reorg check.
+      const tip = await this.reader.getBlock(BigInt(to));
+      if (tip === undefined) {
+        this.logger.warn('indexer: chunk tip not available from the node; retrying next poll', { to });
+        break;
+      }
       const logs = await this.reader.getLogs(BigInt(from), BigInt(to));
+      const headers = new Map<string, BlockInfo>([[tip.number.toString(), tip]]);
+      let consistent = true;
+      for (const log of logs) {
+        const key = log.blockNumber.toString();
+        let header = headers.get(key);
+        if (header === undefined) {
+          header = await this.reader.getBlock(log.blockNumber);
+          if (header !== undefined) headers.set(key, header);
+        }
+        if (header === undefined || header.hash.toLowerCase() !== log.blockHash.toLowerCase()) {
+          consistent = false;
+          break;
+        }
+      }
+      if (!consistent) {
+        this.logger.warn('indexer: logs and headers disagree (reorg in flight); retrying next poll', { from, to });
+        break;
+      }
       const blockTimes = new Map<string, number>();
       for (const log of logs) {
-        const key = log.blockHash.toLowerCase();
-        if (blockTimes.has(key)) continue;
-        const block = await this.reader.getBlock(log.blockNumber);
-        blockTimes.set(key, block === undefined ? Math.floor(this.now() / 1000) : Number(block.timestamp));
+        const header = headers.get(log.blockNumber.toString());
+        if (header !== undefined) blockTimes.set(log.blockHash.toLowerCase(), Number(header.timestamp));
       }
-      const tip = await this.reader.getBlock(BigInt(to));
-      const applied = this.applyChunk(logs, blockTimes, to, tip?.hash);
+      const applied = this.applyChunk(logs, blockTimes, to, tip.hash);
       total += applied;
       if (applied > 0) this.logger.info('indexed events', { from, to, events: applied });
       from = to + 1;
     }
-    return { from: first, to: target, events: total };
+    if (from === first) return undefined; // nothing applied this poll (chunk deferred)
+    return { from: first, to: from - 1, events: total };
   }
 
   /** Applies one chunk in a transaction and advances the cursor. Returns the number of new events. */
@@ -241,7 +277,12 @@ export class Indexer {
         }
         this.repos.budgets.addDrawn(budgetId, tokenAmount, now);
         const draw = this.repos.budgetDraws.byReceiptHash(receiptHash);
-        if (draw !== undefined && draw.status !== 'confirmed') this.repos.budgetDraws.setStatus(draw.id, 'confirmed', now, { txHash, error: null });
+        if (draw !== undefined) {
+          if (draw.status !== 'confirmed') this.repos.budgetDraws.setStatus(draw.id, 'confirmed', now, { txHash, error: null });
+          // The draw settled exactly these rows: (re-)mark them so a draw the drawer had given up on
+          // (receipt timeout, restart) can never be selected and drawn a second time.
+          this.repos.usage.claimDrawId(draw.usageIds, draw.id);
+        }
         return true;
       }
       case 'BudgetClosed': {

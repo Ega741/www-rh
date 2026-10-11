@@ -7,7 +7,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Address, Hex } from 'viem';
 import { createApp } from '../src/api/server.js';
-import type { BlockInfo, ChainContext, ChainReader, ChainWriter, DeskLog } from '../src/chain/clients.js';
+import type { BlockInfo, ChainContext, ChainReader, ChainWriter, DeskLog, ReceiptInfo } from '../src/chain/clients.js';
 import { testConfig, type Config } from '../src/config.js';
 import { silentLogger } from '../src/log.js';
 import { createServices, type ServiceDeps, type Services } from '../src/services.js';
@@ -155,7 +155,11 @@ export class FakeChain implements ChainReader, ChainWriter {
   balances = new Map<string, bigint>();
   draws: { budgetId: bigint; tokens: bigint; receiptHash: Hex; txHash: Hex }[] = [];
   receiptStatus: 'success' | 'reverted' = 'success';
+  /** Receipts `getTransactionReceipt` answers with (tests populate it; absent = not mined). */
+  receipts = new Map<string, ReceiptInfo>();
   failDraw: Error | undefined;
+  /** When set, `waitForReceipt` rejects with it (RPC failure / timeout). */
+  failReceipt: Error | undefined;
   readonly address: Address = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
   private nextTx = 1;
 
@@ -188,6 +192,9 @@ export class FakeChain implements ChainReader, ChainWriter {
   }
   async getLogs(fromBlock: bigint, toBlock: bigint): Promise<DeskLog[]> {
     return this.logs.filter((l) => l.blockNumber >= fromBlock && l.blockNumber <= toBlock);
+  }
+  async getTransactionReceipt(hash: Hex): Promise<ReceiptInfo | undefined> {
+    return this.receipts.get(hash.toLowerCase());
   }
   async quote(amount: bigint): Promise<{ usdMicro: bigint; priceE18: bigint; updatedAt: number }> {
     if (this.priceFailure !== undefined) {
@@ -222,6 +229,7 @@ export class FakeChain implements ChainReader, ChainWriter {
     return this.txHash();
   }
   async waitForReceipt(): Promise<{ status: 'success' | 'reverted'; blockNumber: bigint }> {
+    if (this.failReceipt) throw this.failReceipt;
     return { status: this.receiptStatus, blockNumber: this.head };
   }
 

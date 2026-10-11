@@ -123,6 +123,18 @@ describe('database', () => {
     db.close();
   });
 
+  it('expired SIWE nonces are purged by housekeeping, not only on verify', () => {
+    const { db, repos } = open();
+    repos.nonces.insert('fresh', 1_000, 601_000);
+    repos.nonces.insert('old', 0, 500);
+    expect(repos.nonces.purgeExpired(1_000)).toBe(1);
+    expect(repos.nonces.consume('old', 1_000)).toBe(false);
+    expect(repos.nonces.consume('fresh', 1_000)).toBe(true);
+    expect(repos.nonces.consume('fresh', 1_000)).toBe(false); // single use
+    expect(db.all(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'siwe_nonces_expires'`)).toHaveLength(1);
+    db.close();
+  });
+
   it('rate limit windows roll over', () => {
     const { db, repos } = open();
     expect(repos.rateLimits.hit('k', 60_000, 60_000)).toEqual({ count: 1, windowStart: 60_000 });

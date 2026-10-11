@@ -22,6 +22,7 @@ import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/
 import type { Hono } from 'hono';
 import { z } from 'zod';
 import { uuid } from '../auth/crypto.js';
+import type { Logger } from '../log.js';
 import { InsufficientCreditError } from '../metering/reserve.js';
 import type { Services } from '../services.js';
 import { fromOpenAI } from '../translate/fromOpenAI.js';
@@ -32,28 +33,50 @@ import { balanceDto, budgetDto, configDto, modelsDto, statusDto, usageListDto, u
 import { ApiError, GatewayError } from './errors.js';
 import { checkRateLimit } from './ratelimit.js';
 
+/** Thrown when a DTO fails its own schema (a gateway bug; details go to the log, not the caller). */
+class InvalidResponseError extends Error {
+  override readonly name = 'InvalidResponseError';
+  constructor(
+    readonly what: string,
+    readonly details: string,
+  ) {
+    super(`${what}: response failed validation`);
+  }
+}
+
 function parse<S extends z.ZodType>(schema: S, value: unknown, what: string): z.output<S> {
   const r = schema.safeParse(value);
-  if (!r.success) throw new BeagleApiError(500, 'invalid_response', `${what}: ${z.prettifyError(r.error)}`);
+  if (!r.success) throw new InvalidResponseError(what, z.prettifyError(r.error));
   return r.data;
 }
 
-function toApiError(e: unknown): BeagleApiError {
+/**
+ * Maps a thrown value onto the tool-result error. Like `GatewayError.from`, unknown errors (SQLite
+ * text, TypeErrors, DTO validation paths) are masked as `Internal error.` and logged with the
+ * request context instead of being serialised to the API-key holder.
+ */
+export function toApiError(e: unknown, logger?: Logger): BeagleApiError {
   if (BeagleApiError.is(e)) return e;
   if (GatewayError.is(e)) return new BeagleApiError(e.status, e.code, e.message);
   if (ApiError.is(e)) return new BeagleApiError(e.status, e.code, e.message);
   if (e instanceof InsufficientCreditError) return new BeagleApiError(402, 'insufficient_credit', e.message);
   if (e instanceof UpgradeInputError) return new BeagleApiError(400, 'invalid_request', e.message);
-  return new BeagleApiError(500, 'internal_error', e instanceof Error ? e.message : String(e));
+  if (e instanceof InvalidResponseError) {
+    logger?.error('mcp: response failed validation', { what: e.what, details: e.details });
+    return new BeagleApiError(500, 'invalid_response', 'Internal error.');
+  }
+  logger?.error('mcp: unhandled error', { error: e });
+  return new BeagleApiError(500, 'internal_error', 'Internal error.');
 }
 
 /** Builds the in-process `BeagleApi` for `workspace` (SPEC §6.2, calling the services directly). */
 export function createInProcessBeagleApi(services: Services, workspace: string, apiKeyId: string | null, plan: 'free' | 'pro'): BeagleApi {
+  const log = services.logger.child({ workspace });
   const guard = async <T>(fn: () => Promise<T> | T): Promise<T> => {
     try {
       return await fn();
     } catch (e) {
-      throw toApiError(e);
+      throw toApiError(e, log);
     }
   };
   return {

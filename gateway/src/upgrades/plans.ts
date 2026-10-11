@@ -1,7 +1,11 @@
 /**
  * Upgrades (SPEC §5.11): `pro` (`PRO_PRICE_USD` per `PRO_DAYS`) and `warm` hours
- * (`WARM_HOUR_PRICE_USD` each, 1–168). `purchase` charges `ledger(kind='upgrade')` (402 when
- * `available < amount`), inserts the `upgrades` row and applies the plan / warm window.
+ * (`WARM_HOUR_PRICE_USD` each, 1–168). `purchase` charges `ledger(kind='upgrade')`, inserts the
+ * `upgrades` row and applies the plan / warm window.
+ *
+ * Upgrades are **prepaid from credit**: the gate is `balance − reserved ≥ amount` (402 otherwise).
+ * Budget headroom does not count — the drawer only ever settles usage rows (§5.4, §9), so an upgrade
+ * paid from headroom could never be drawn from the owner's wallet.
  *
  * @module upgrades/plans
  */
@@ -50,7 +54,7 @@ export class UpgradeService {
     const row = this.repos.transaction(() => {
       const ws = this.repos.workspaces.ensure(workspace, now);
       const snap = this.repos.ledger.snapshot(workspace, now);
-      if (snap.available < amount) throw new InsufficientCreditError(snap.available, snap.balance);
+      if (snap.balance - snap.reserved < amount) throw new InsufficientCreditError(snap.available, snap.balance);
       const id = `upg_${uuid()}`;
       if (amount > 0n) {
         this.repos.ledger.insert({ workspace, kind: 'upgrade', amountMicro: -amount, refType: 'upgrade', refId: id, memo: `${kind} x${quantity}`, createdAt: now });

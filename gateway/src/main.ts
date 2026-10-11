@@ -50,6 +50,7 @@ export function startWorkers(services: Services): () => void {
       async () => {
         services.ledger.purgeExpiredReservations();
         services.sessions.purgeExpired();
+        services.siwe.purgeExpired();
         await services.warm.ensureWarm();
       },
       services,

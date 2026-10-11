@@ -41,7 +41,9 @@ export function defaultAnthropicClientFactory(timeoutMs: number): AnthropicClien
     const id = sha256Hex(`${creds.key}|${baseURL}`);
     let client = cache.get(id);
     if (client === undefined) {
-      client = new Anthropic({ apiKey: creds.key, baseURL, maxRetries: 0, timeout: timeoutMs });
+      // `redirect: 'manual'`: a BYOK base URL must not bounce the request past the SSRF guard (SPEC §5.9);
+      // the resulting 3xx surfaces as an `APIError` that `mapAnthropicError` refuses.
+      client = new Anthropic({ apiKey: creds.key, baseURL, maxRetries: 0, timeout: timeoutMs, fetchOptions: { redirect: 'manual' } });
       if (cache.size > 256) cache.clear();
       cache.set(id, client);
     }
@@ -140,7 +142,8 @@ export function buildAnthropicParams(req: InternalRequest): MessageCreateParamsB
   if (req.responseFormat?.type === 'json_schema') outputConfig.format = { type: 'json_schema', schema: req.responseFormat.schema };
   if (Object.keys(outputConfig).length > 0) params.output_config = outputConfig;
   if (systemLines.length > 0) params.system = systemLines.join('\n\n');
-  if (req.temperature !== undefined) params.temperature = req.temperature;
+  // OpenAI-style requests allow temperature up to 2; Anthropic rejects > 1 with a non-retryable 400.
+  if (req.temperature !== undefined) params.temperature = Math.min(1, Math.max(0, req.temperature));
   else if (req.topP !== undefined) params.top_p = req.topP;
   if (req.stop !== undefined && req.stop.length > 0) params.stop_sequences = req.stop;
   params.metadata = { user_id: req.metadata.workspace };
@@ -202,6 +205,9 @@ export function mapAnthropicError(e: unknown, kind: Credentials['kind']): Provid
   }
   if (e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError) {
     return new ProviderError({ provider, status: e.status, code: 'auth', message: `anthropic: ${e.message}`, retryable: kind === 'platform', authFailure: true, cause: e });
+  }
+  if (e instanceof Anthropic.APIError && e.status !== undefined && e.status >= 300 && e.status < 400) {
+    return new ProviderError({ provider, status: 502, code: 'upstream_error', message: `anthropic: upstream answered with a redirect (${e.status}), which the gateway does not follow`, retryable: false, cause: e });
   }
   if (e instanceof Anthropic.BadRequestError || e instanceof Anthropic.NotFoundError || e instanceof Anthropic.UnprocessableEntityError) {
     return new ProviderError({ provider, status: e.status, code: 'bad_request', message: e.message, retryable: false, cause: e });

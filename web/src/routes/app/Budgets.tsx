@@ -1,11 +1,11 @@
 /**
  * `/app/budgets`: open a budget (cap in USD/tokens + hours; Approve cap → openBudget), list with
- * cap / drawn / headroom / deadline / stalled reason, draws with tx links, close.
+ * cap / drawn / headroom / deadline / stalled reason, draws with tx links, close. The budget is
+ * opened for the signed-in workspace (SPEC §7), paid from the connected wallet.
  */
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useConnection, useWriteContract } from 'wagmi';
-import { getAddress } from 'viem';
 import type { BudgetDto } from '@beagle/shared/api';
 import { CREDIT_DESK_ABI, ERC20_ABI } from '@beagle/shared/abi';
 import { AmountInput } from '../../components/AmountInput.jsx';
@@ -23,6 +23,7 @@ import { useTokenAccount } from '../../hooks/useTokenAccount.js';
 import { useTxFlow } from '../../hooks/useTxFlow.js';
 import { convertAmount, fmtTokens, fmtUsd, parseAmount, type AmountMode } from '../../lib/amounts.js';
 import { sameAddress } from '../../lib/explorer.js';
+import { defaultTargetWorkspace } from '../../lib/session.js';
 import { MAX_BUDGET_HOURS, budgetDeadline, describeBlocker, planBudget } from '../../lib/steps.js';
 import { formatDateTime, formatDuration, formatUnixSeconds, secondsUntil } from '../../lib/time.js';
 import { parseHours } from '../../lib/validate.js';
@@ -69,7 +70,7 @@ export function Budgets() {
   const converted = parsedCap.ok && priceE18 !== undefined ? convertAmount(mode, parsedCap.value, priceE18, decimals) : undefined;
   const cap = converted?.tokens;
   const hours = parseHours(hoursInput, MAX_BUDGET_HOURS);
-  const workspace = address ?? (me === undefined ? undefined : getAddress(me.workspace));
+  const workspace = defaultTargetWorkspace(me?.workspace, address);
 
   const plan = planBudget({
     connected: isConnected,
@@ -132,7 +133,7 @@ export function Budgets() {
     <div className="space-y-6">
       <PageHeader title="Budgets" lead={`A budget authorises the operator to burn up to a cap of ${symbol} from your wallet as usage accrues, until a deadline (≤ 30 days). You approve the cap; the desk draws only what your requests cost, never above the cap, and each draw carries a receipt hash of the usage it settles.`} />
 
-      {deskError !== undefined ? <Note tone="err" title="Contracts not configured">{deskError}</Note> : null}
+      {deskError !== undefined ? <Note tone="err" title="Credit desk unavailable">{deskError}</Note> : null}
 
       <Card title="Open a budget">
         {deskLoading ? (
@@ -155,12 +156,19 @@ export function Budgets() {
                 converted={converted === undefined ? (priceE18 === undefined ? 'Waiting for the on-chain price…' : undefined) : mode === 'usd' ? `≈ ${fmtTokens(converted.tokens, decimals, symbol)} cap at today's price` : `≈ ${fmtUsd(converted.usdMicro)} at today's price`}
                 disabled={flow.running}
               />
-              <Field label="Duration (hours)" error={hoursInput.trim() !== '' && !hours.ok ? hours.error : undefined} hint={`1–${MAX_BUDGET_HOURS} h · deadline ${hours.ok ? formatDateTime(nowMs + hours.hours * 3600_000) : '—'}`} htmlFor="budget-hours">
+              <Field label="Duration (hours)" error={hoursInput.trim() !== '' && !hours.ok ? hours.error : undefined} hint={`1–${MAX_BUDGET_HOURS} h · deadline ${hours.ok ? formatDateTime(Number(budgetDeadline(nowMs, hours.hours)) * 1000) : '—'}`} htmlFor="budget-hours">
                 <Input id="budget-hours" mono inputMode="numeric" value={hoursInput} onChange={(e) => setHoursInput(e.target.value)} disabled={flow.running} />
               </Field>
             </div>
             <p className="text-xs text-muted">
-              Wallet: {account.balance === undefined ? '—' : fmtTokens(account.balance, decimals, symbol)} · allowance → desk {account.allowance === undefined ? '—' : fmtTokens(account.allowance, decimals, symbol)}. Draws are quoted at the price of the moment they happen; the cap is in tokens.
+              Budget for {workspace === undefined ? 'your workspace' : <AddressText address={workspace} />}
+              {session.walletMismatch && address !== undefined ? (
+                <>
+                  {' '}
+                  (your signed-in workspace); the cap is approved and drawn from the connected wallet <AddressText address={address} />
+                </>
+              ) : null}
+              . Wallet: {account.balance === undefined ? '—' : fmtTokens(account.balance, decimals, symbol)} · allowance → desk {account.allowance === undefined ? '—' : fmtTokens(account.allowance, decimals, symbol)}. Draws are quoted at the price of the moment they happen; the cap is in tokens.
             </p>
             {params.paused === true ? (
               <Note tone="err" title="Credit desk paused">

@@ -4,13 +4,21 @@
  * largest headroom: `DrawBatch` → `receiptHash` → `budget_draws(pending)` → `desk.draw(...)` →
  * `sent` → wait for the receipt. Confirmation and the ledger credit come from the indexer only.
  *
+ * Two liveness rules keep the row state honest about the chain:
+ * - A receipt **timeout** (or RPC failure while waiting) is not a failure: the transaction is still in
+ *   the mempool, so the row stays `sent` with its usage rows marked and the indexer confirms it when
+ *   it lands. Only a definitive revert (or a failed send) marks the row `failed` and un-marks rows.
+ * - `reconcile()` runs at the start of every tick (so also on boot): a `pending` row without a tx
+ *   hash left by a crash fails after a grace period; a `sent` row is checked against the chain —
+ *   reverted → failed, mined → left for the indexer, unknown for a long time → failed.
+ *
  * @module chain/drawer
  */
 import type { DrawBatchWire } from '@beagle/shared/api';
 import { receiptHash } from '@beagle/shared/canonical';
 import { tokensForUsdMicro } from '@beagle/shared/credit';
 import type { Address, Hex } from 'viem';
-import type { BudgetRow, Repos, UsageRow } from '../db/repos.js';
+import type { BudgetDrawRow, BudgetRow, Repos, UsageRow } from '../db/repos.js';
 import type { Logger } from '../log.js';
 import type { ChainReader, ChainWriter } from './clients.js';
 
@@ -27,9 +35,18 @@ export interface DrawerOptions {
   receiptTimeoutMs?: number;
   /** Max usage rows per batch (default 500). */
   maxRows?: number;
+  /** A `pending` row without a tx hash older than this is a crash leftover → failed (default 10 min). */
+  pendingGraceMs?: number;
+  /** A `sent` row whose transaction the node has not seen for this long → failed (default 60 min). */
+  sentGraceMs?: number;
   dryRun: boolean;
   now?: () => number;
 }
+
+/** Default {@link DrawerOptions.pendingGraceMs}. */
+export const PENDING_GRACE_MS = 10 * 60_000;
+/** Default {@link DrawerOptions.sentGraceMs}. */
+export const SENT_GRACE_MS = 60 * 60_000;
 
 /** What one tick did for one workspace. */
 export interface DrawAttempt {
@@ -43,13 +60,17 @@ export interface DrawAttempt {
   error?: string;
 }
 
-/** Picks the usage rows of one batch (oldest first until `Σ ≥ deficit`, capped by headroom). */
+/**
+ * Picks the usage rows of one batch: oldest first until `Σ ≥ deficit`, never above `headroomMicro`.
+ * A row that does not fit the remaining headroom is skipped (not a stop), so one oversized row never
+ * shadows the smaller rows behind it.
+ */
 export function selectBatch(rows: readonly UsageRow[], deficit: bigint, headroomMicro: bigint): { usageIds: string[]; amountMicro: bigint } | undefined {
   const usageIds: string[] = [];
   let amount = 0n;
   for (const row of rows) {
     if (amount >= deficit) break;
-    if (amount + row.chargedMicro > headroomMicro) break;
+    if (amount + row.chargedMicro > headroomMicro) continue;
     usageIds.push(row.id);
     amount += row.chargedMicro;
   }
@@ -72,11 +93,12 @@ export class BudgetDrawer {
     this.now = options.now ?? (() => Date.now());
   }
 
-  /** One pass over all workspaces in deficit. */
+  /** One pass: reconcile leftovers, then draw for every workspace in deficit. */
   async tick(): Promise<DrawAttempt[]> {
     if (this.running) return [];
     this.running = true;
     try {
+      await this.reconcile();
       const now = this.now();
       const nowSec = Math.floor(now / 1000);
       const out: DrawAttempt[] = [];
@@ -92,6 +114,51 @@ export class BudgetDrawer {
       return out;
     } finally {
       this.running = false;
+    }
+  }
+
+  /**
+   * Marks `draw` failed and releases its usage rows — unless the indexer confirmed it in the meantime
+   * (a confirmed draw is never rewritten). Returns whether the row changed.
+   */
+  private fail(draw: Pick<BudgetDrawRow, 'id' | 'budgetId' | 'usageIds' | 'workspace'>, error: string): boolean {
+    const t = this.now();
+    return this.repos.transaction(() => {
+      const current = this.repos.budgetDraws.get(draw.id);
+      if (current === undefined || (current.status !== 'pending' && current.status !== 'sent')) return false;
+      this.repos.budgetDraws.setStatus(draw.id, 'failed', t, { error });
+      this.repos.usage.clearDrawId(draw.usageIds, draw.id);
+      this.repos.budgets.setStalled(draw.budgetId, 'draw_failed', t);
+      this.logger.error('drawer: draw failed', { workspace: draw.workspace, budgetId: draw.budgetId, drawId: draw.id, error });
+      return true;
+    });
+  }
+
+  /**
+   * Resolves `pending`/`sent` rows this process is not waiting on (crash leftovers, interrupted
+   * receipt waits, dropped transactions). Public for tests; `tick()` calls it first.
+   */
+  async reconcile(): Promise<void> {
+    const now = this.now();
+    for (const draw of this.repos.budgetDraws.listInFlight()) {
+      const age = now - draw.updatedAt;
+      if (draw.txHash === null) {
+        if (age > (this.options.pendingGraceMs ?? PENDING_GRACE_MS)) this.fail(draw, `no transaction sent within ${Math.round(age / 1000)} s (gateway restarted?)`);
+        continue;
+      }
+      let receipt: Awaited<ReturnType<ChainReader['getTransactionReceipt']>>;
+      try {
+        receipt = await this.reader.getTransactionReceipt(draw.txHash as Hex);
+      } catch (e) {
+        this.logger.warn('drawer: receipt lookup failed', { drawId: draw.id, txHash: draw.txHash, error: e });
+        continue;
+      }
+      if (receipt === undefined) {
+        if (age > (this.options.sentGraceMs ?? SENT_GRACE_MS)) this.fail(draw, `transaction ${draw.txHash} not seen by the node after ${Math.round(age / 1000)} s`);
+        continue;
+      }
+      if (receipt.status === 'reverted') this.fail(draw, 'transaction reverted');
+      // Mined successfully: the indexer confirms it (and credits the ledger) when it reaches the block.
     }
   }
 
@@ -155,29 +222,30 @@ export class BudgetDrawer {
       this.repos.usage.setDrawId(batchRows.usageIds, id);
       return id;
     });
-    const fail = (error: string): DrawAttempt => {
-      const t = this.now();
-      this.repos.transaction(() => {
-        this.repos.budgetDraws.setStatus(drawId, 'failed', t, { error });
-        this.repos.usage.setDrawId(batchRows.usageIds, null);
-        this.repos.budgets.setStalled(budget.budgetId, 'draw_failed', t);
-      });
-      this.logger.error('drawer: draw failed', { workspace, budgetId: budget.budgetId, drawId, error });
+    const draw = { id: drawId, budgetId: budget.budgetId, usageIds: batchRows.usageIds, workspace };
+    const failed = (error: string): DrawAttempt => {
+      this.fail(draw, error);
       return { ...base, drawId, status: 'failed', error };
     };
     let txHash: Hex;
     try {
       txHash = await this.writer.draw(BigInt(budget.budgetId), tokens, hash);
     } catch (e) {
-      return fail(e instanceof Error ? e.message.slice(0, 500) : String(e));
+      return failed(e instanceof Error ? e.message.slice(0, 500) : String(e));
     }
     this.repos.budgetDraws.setStatus(drawId, 'sent', this.now(), { txHash });
     this.logger.info('drawer: draw sent', { workspace, budgetId: budget.budgetId, drawId, txHash, amountMicro: batchRows.amountMicro, tokens });
     try {
       const receipt = await this.writer.waitForReceipt(txHash, this.options.receiptTimeoutMs ?? 120_000);
-      if (receipt.status !== 'success') return { ...fail('transaction reverted'), txHash };
+      if (receipt.status !== 'success') return { ...failed('transaction reverted'), txHash };
     } catch (e) {
-      return { ...fail(`receipt timeout: ${e instanceof Error ? e.message : String(e)}`), txHash };
+      // Still in the mempool as far as we know: keep `sent` (rows stay marked); the indexer confirms it
+      // when it lands and `reconcile()` fails it only once the node reports a revert or forgets it.
+      const error = `receipt wait failed: ${e instanceof Error ? e.message : String(e)}`.slice(0, 500);
+      const current = this.repos.budgetDraws.get(drawId);
+      if (current?.status === 'sent') this.repos.budgetDraws.setStatus(drawId, 'sent', this.now(), { error });
+      this.logger.warn('drawer: receipt wait failed; leaving the draw sent for reconciliation', { workspace, budgetId: budget.budgetId, drawId, txHash, error });
+      return { ...base, drawId, status: current?.status === 'confirmed' ? 'confirmed' : 'sent', txHash, error };
     }
     const current = this.repos.budgetDraws.get(drawId);
     return { ...base, drawId, status: current?.status === 'confirmed' ? 'confirmed' : 'sent', txHash };

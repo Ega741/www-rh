@@ -61,7 +61,14 @@ export function buildOpenAiBody(req: InternalRequest, provider: Provider): Recor
         break;
     }
   }
-  const body: Record<string, unknown> = { model: req.upstreamModel, messages, max_tokens: req.maxTokens, stream: req.stream };
+  // OpenAI's reasoning models (the whole `openai/*` catalog) reject `max_tokens` with a non-retryable
+  // 400 and want `max_completion_tokens`; other compat servers (Gemini, vLLM, Ollama) take `max_tokens`.
+  const body: Record<string, unknown> = {
+    model: req.upstreamModel,
+    messages,
+    ...(provider === 'openai' ? { max_completion_tokens: req.maxTokens } : { max_tokens: req.maxTokens }),
+    stream: req.stream,
+  };
   if (req.stream) body['stream_options'] = { include_usage: true };
   if (req.temperature !== undefined) body['temperature'] = req.temperature;
   if (req.topP !== undefined) body['top_p'] = req.topP;
@@ -237,6 +244,21 @@ async function* textChunks(body: ReadableStream<Uint8Array>, signal: AbortSignal
   }
 }
 
+/**
+ * Classifies an in-band SSE error frame (`data: {"error": …}`) like an HTTP status would be: server /
+ * overload / rate-limit errors are retryable (and so are all frames seen before any content, since
+ * nothing was delivered yet), request errors after the first byte are not.
+ */
+export function streamFrameError(provider: Provider, error: NonNullable<OaiChunk['error']>, delivered: boolean): ProviderError {
+  const kind = `${error.type ?? ''} ${error.code ?? ''}`.toLowerCase();
+  const rateLimited = /rate_limit|rate limit|quota|too_many|429/.test(kind);
+  const serverSide = /server_error|internal|overloaded|unavailable|timeout|5\d\d/.test(kind);
+  const message = `${provider}: ${error.message ?? 'stream error'}`;
+  if (rateLimited) return new ProviderError({ provider, status: 429, code: 'rate_limited', message, retryable: true });
+  if (serverSide || !delivered) return new ProviderError({ provider, status: 502, code: 'stream_error', message, retryable: true });
+  return new ProviderError({ provider, status: 502, code: 'stream_error', message, retryable: false });
+}
+
 async function readErrorMessage(res: Response): Promise<string> {
   let text = '';
   try {
@@ -265,9 +287,14 @@ export function createOpenAiCompatAdapter(options: OpenAiCompatOptions): Provide
     if (creds.key !== '') headers['authorization'] = `Bearer ${creds.key}`;
     let res: Response;
     try {
-      res = await fetchImpl(url, { method: 'POST', headers, body: JSON.stringify(buildOpenAiBody(req, provider)), signal });
+      // `redirect: 'manual'`: a validated BYOK base URL must not be able to bounce the request (and
+      // its body) to another host, scheme or private address behind the SSRF guard (SPEC §5.9).
+      res = await fetchImpl(url, { method: 'POST', headers, body: JSON.stringify(buildOpenAiBody(req, provider)), signal, redirect: 'manual' });
     } catch (e) {
       throw networkError(provider, e);
+    }
+    if (res.status >= 300 && res.status < 400) {
+      throw new ProviderError({ provider, status: 502, code: 'upstream_error', message: `${provider}: upstream answered with a redirect (${res.status}), which the gateway does not follow`, retryable: false });
     }
     if (!res.ok) {
       const message = await readErrorMessage(res);
@@ -298,6 +325,8 @@ export function createOpenAiCompatAdapter(options: OpenAiCompatOptions): Provide
       let finishReason: FinishReason | undefined;
       let usage: Usage | undefined;
       let done = false;
+      let delivered = false;
+      let errored = false;
       const toolIds = new Map<number, string>();
       const handle = function* (ev: SseEvent): Generator<InternalChunk> {
         if (ev.data.trim() === '[DONE]') {
@@ -311,21 +340,26 @@ export function createOpenAiCompatAdapter(options: OpenAiCompatOptions): Provide
           return;
         }
         if (chunk.error !== undefined) {
-          yield {
-            type: 'error',
-            error: new ProviderError({ provider, status: 502, code: 'stream_error', message: `${provider}: ${chunk.error.message ?? 'stream error'}`, retryable: false }),
-          };
+          yield { type: 'error', error: streamFrameError(provider, chunk.error, delivered) };
           done = true;
+          errored = true;
           return;
         }
         if (chunk.usage !== undefined && chunk.usage !== null) usage = usageFromOpenAi(chunk.usage);
         for (const choice of chunk.choices ?? []) {
           const delta = choice.delta ?? {};
-          if (typeof delta.content === 'string' && delta.content !== '') yield { type: 'text', delta: delta.content };
-          if (typeof delta.refusal === 'string' && delta.refusal !== '') yield { type: 'text', delta: delta.refusal };
+          if (typeof delta.content === 'string' && delta.content !== '') {
+            delivered = true;
+            yield { type: 'text', delta: delta.content };
+          }
+          if (typeof delta.refusal === 'string' && delta.refusal !== '') {
+            delivered = true;
+            yield { type: 'text', delta: delta.refusal };
+          }
           for (const call of delta.tool_calls ?? []) {
             const index = call.index ?? 0;
             if (call.id !== undefined) toolIds.set(index, call.id);
+            delivered = true;
             yield {
               type: 'tool_call',
               index,
@@ -347,6 +381,8 @@ export function createOpenAiCompatAdapter(options: OpenAiCompatOptions): Provide
         yield { type: 'error', error: networkError(provider, e) };
         return;
       }
+      if (errored) return;
+      // No `usage` frame at all → zeros; the executor charges the estimate for delivered content.
       yield { type: 'finish', finishReason: finishReason ?? 'stop', usage: usage ?? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } };
     },
   };
