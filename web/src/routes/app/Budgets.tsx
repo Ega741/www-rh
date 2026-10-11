@@ -1,11 +1,12 @@
 /**
- * `/app/budgets`: open a budget (cap in USD/tokens + hours; Approve cap → openBudget), list with
- * cap / drawn / headroom / deadline / stalled reason, draws with tx links, close. The budget is
- * opened for the signed-in workspace (SPEC §7), paid from the connected wallet.
+ * `/app/budgets`: open a budget (cap in USD/tokens + hours; Approve allowance + cap → openBudget),
+ * list with cap / drawn / headroom / deadline / stalled reason, draws with tx links, close. The
+ * budget is opened for the signed-in workspace (SPEC §7), paid from the connected wallet. The
+ * approve is cumulative because every open budget of the wallet draws from the same allowance.
  */
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { useConnection, useWriteContract } from 'wagmi';
+import { useConnection, usePublicClient, useWriteContract } from 'wagmi';
 import type { BudgetDto } from '@beagle/shared/api';
 import { CREDIT_DESK_ABI, ERC20_ABI } from '@beagle/shared/abi';
 import { AmountInput } from '../../components/AmountInput.jsx';
@@ -24,7 +25,7 @@ import { useTxFlow } from '../../hooks/useTxFlow.js';
 import { convertAmount, fmtTokens, fmtUsd, parseAmount, type AmountMode } from '../../lib/amounts.js';
 import { sameAddress } from '../../lib/explorer.js';
 import { defaultTargetWorkspace } from '../../lib/session.js';
-import { MAX_BUDGET_HOURS, budgetDeadline, describeBlocker, planBudget } from '../../lib/steps.js';
+import { MAX_BUDGET_HOURS, SHARED_ALLOWANCE_NOTE, approveLabel, budgetDeadline, describeBlocker, planBudget } from '../../lib/steps.js';
 import { formatDateTime, formatDuration, formatUnixSeconds, secondsUntil } from '../../lib/time.js';
 import { parseHours } from '../../lib/validate.js';
 import { qk, useBudgets, usePrice } from '../../queries.js';
@@ -89,21 +90,25 @@ export function Budgets() {
   const flow = useTxFlow();
   const closeFlow = useTxFlow();
   const write = useWriteContract();
+  const publicClient = usePublicClient({ chainId: config.chainId });
 
   const onOpen = async () => {
     if (!plan.canRun || cap === undefined || !hours.ok || workspace === undefined || desk === undefined || token === undefined) return;
     const deadline = budgetDeadline(Date.now(), hours.hours);
+    // Set whenever the approve step runs: `canRun` excludes `allowance_unknown`.
+    const approveAmount = plan.approveAmount ?? cap;
     const ok = await flow.run([
       {
         id: 'approve',
-        label: `Approve ${fmtTokens(cap, decimals, symbol)} for the credit desk`,
+        label: approveLabel(approveAmount, account.allowance, cap, decimals, symbol),
         skip: !plan.needsApprove,
-        write: () => write.mutateAsync({ abi: ERC20_ABI, address: token.address, functionName: 'approve', args: [desk, cap], chainId: config.chainId }),
+        write: () => write.mutateAsync({ abi: ERC20_ABI, address: token.address, functionName: 'approve', args: [desk, approveAmount], chainId: config.chainId }),
         onConfirmed: () => account.refetch(),
       },
       {
         id: 'open',
         label: `Open a ${fmtTokens(cap, decimals, symbol)} budget for ${formatDuration(hours.hours * 3600)}`,
+        simulate: publicClient === undefined ? undefined : () => publicClient.simulateContract({ account: address, abi: CREDIT_DESK_ABI, address: desk, functionName: 'openBudget', args: [workspace, cap, deadline] }),
         write: () => write.mutateAsync({ abi: CREDIT_DESK_ABI, address: desk, functionName: 'openBudget', args: [workspace, cap, deadline], chainId: config.chainId }),
         onConfirmed: () => client.invalidateQueries({ queryKey: qk.budgets }),
       },
@@ -179,13 +184,14 @@ export function Budgets() {
               <Button variant="primary" busy={flow.running} disabled={!plan.canRun} reason={firstBlocker === undefined ? undefined : describeBlocker(firstBlocker, blockerCtx)} onClick={() => void onOpen()}>
                 {plan.needsApprove ? 'Approve cap → Open budget' : 'Open budget'}
               </Button>
-              {firstBlocker !== undefined ? <span className="text-xs text-muted">{describeBlocker(firstBlocker, blockerCtx)}</span> : null}
+              {firstBlocker !== undefined ? <span className="text-xs text-muted">{describeBlocker(firstBlocker, blockerCtx)}</span> : plan.needsApprove ? <span className="text-xs text-muted">Two wallet confirmations: approve (your current allowance + the cap), then open.</span> : null}
               {guard.wrongChain ? (
                 <Button size="sm" busy={guard.switching} onClick={() => void guard.switchToAppChain().catch(() => undefined)}>
                   Switch chain
                 </Button>
               ) : null}
             </div>
+            {plan.canRun && !plan.needsApprove ? <p className="text-xs text-muted">{SHARED_ALLOWANCE_NOTE}</p> : null}
             <StepList flow={flow.state} />
             {flow.state.status === 'failed' || flow.state.status === 'done' ? (
               <Button size="sm" variant="ghost" onClick={flow.reset}>

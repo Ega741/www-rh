@@ -59,6 +59,8 @@ export interface Quote {
   loading: boolean;
   error: string | undefined;
   revert: string | undefined;
+  /** Re-reads the quote now (the "Re-quote" action after `SlippageExceeded`). */
+  refetch(): Promise<unknown>;
 }
 
 /** `desk.quote(amount)`; disabled for zero amounts. */
@@ -79,5 +81,6 @@ export function useQuote(desk: Address | undefined, amount: bigint | undefined):
     loading: enabled && q.isPending,
     error: enabled && q.error ? describeError(q.error) : undefined,
     revert: enabled && q.error ? revertName(q.error) : undefined,
+    refetch: () => q.refetch(),
   };
 }

@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 import { BaseError, ContractFunctionRevertedError, UserRejectedRequestError, encodeErrorResult } from 'viem';
 import { CREDIT_DESK_ABI } from '@beagle/shared/abi';
 import { ApiError } from './apiError.js';
-import { describeError, isUserRejection, revertName } from './errors.js';
+import { describeError, describeRevert, describeSlippage, isUserRejection, revertInfo, revertName } from './errors.js';
 
-function reverted(errorName: 'PriceStale' | 'BurnTooSmall' | 'EnforcedPause', args: readonly unknown[]): ContractFunctionRevertedError {
+type DeskError = 'PriceStale' | 'BurnTooSmall' | 'EnforcedPause' | 'SlippageExceeded' | 'RenounceDisabled' | 'BadMaxPriceAge';
+
+function reverted(errorName: DeskError, args: readonly unknown[]): ContractFunctionRevertedError {
   const data = encodeErrorResult({ abi: CREDIT_DESK_ABI, errorName, args: args as never });
-  return new ContractFunctionRevertedError({ abi: CREDIT_DESK_ABI, functionName: 'quote', data });
+  return new ContractFunctionRevertedError({ abi: CREDIT_DESK_ABI, functionName: 'burnForCreditMin', data });
 }
 
 describe('describeError', () => {
@@ -17,10 +19,39 @@ describe('describeError', () => {
     expect(describeError(reverted('BurnTooSmall', [1n, 2n]))).toBe('Amount is below the minimum burn');
     expect(describeError(reverted('EnforcedPause', []))).toBe('The credit desk is paused');
   });
+  it('decodes SlippageExceeded with both amounts', () => {
+    const err = reverted('SlippageExceeded', [2_400_000n, 2_475_000n]);
+    expect(revertName(err)).toBe('SlippageExceeded');
+    expect(revertInfo(err)).toEqual({ name: 'SlippageExceeded', args: [2_400_000n, 2_475_000n] });
+    const text = describeError(err);
+    expect(text).toContain('$2.40');
+    expect(text).toContain('$2.475');
+    expect(text).toMatch(/price moved/i);
+    expect(text).toMatch(/re-quote/i);
+    expect(text).toMatch(/nothing was burned/i);
+    // wrapped by a wallet / wagmi layer: still decoded
+    expect(describeError(new BaseError('wrapped', { cause: err }))).toBe(text);
+  });
+  it('falls back to a generic slippage sentence without decoded arguments', () => {
+    expect(describeSlippage(undefined)).toMatch(/less than your floor/);
+    expect(describeSlippage([])).toMatch(/less than your floor/);
+    expect(describeSlippage(['1', 2])).toMatch(/less than your floor/);
+    expect(describeRevert({ name: 'SlippageExceeded', args: undefined })).toBe(describeSlippage(undefined));
+  });
+  it('has text for the refinement errors (RenounceDisabled, BadMaxPriceAge, TokenNotBurnable)', () => {
+    expect(describeError(reverted('RenounceDisabled', []))).toMatch(/renounce/i);
+    expect(describeError(reverted('BadMaxPriceAge', []))).toMatch(/price age/i);
+    // TokenNotBurnable is raised by the deploy script, not by the desk ABI, so it is matched by name
+    expect(describeRevert({ name: 'TokenNotBurnable', args: undefined })).toMatch(/burn\(\)/);
+    expect(describeRevert({ name: 'SomethingNew', args: undefined })).toBe('Contract reverted: SomethingNew');
+  });
   it('walks wrapped errors', () => {
     const inner = reverted('PriceStale', [1n, 3600]);
     const outer = new BaseError('wrapped', { cause: inner });
     expect(revertName(outer)).toBe('PriceStale');
+    expect(revertInfo(outer)?.args).toEqual([1n, 3600]);
+    expect(revertInfo(new Error('plain'))).toBeUndefined();
+    expect(revertName(new BaseError('no revert inside'))).toBeUndefined();
   });
   it('user rejection', () => {
     const err = new UserRejectedRequestError(new Error('denied'));

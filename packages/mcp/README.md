@@ -50,7 +50,7 @@ Alternatively connect to the gateway's HTTP transport directly: `https://beagle.
 |---|---|
 | `BEAGLE_API_KEY` | **required** — `bgl_…` API key (Keys page or `beagle-gateway create-key`). Missing → exit code 2. |
 | `BEAGLE_API_URL` | gateway origin; default `http://localhost:8787` |
-| `BEAGLE_AGENT_PRIVATE_KEY` | optional `0x` private key of the agent wallet. With it `beagle_buy_compute` / `beagle_open_budget` sign and send (`approve` → `burnForCredit` / `openBudget`), wait for the receipt and poll the balance until the credit lands (see *Timing*). Without it they return unsigned steps. |
+| `BEAGLE_AGENT_PRIVATE_KEY` | optional `0x` private key of the agent wallet. With it `beagle_buy_compute` / `beagle_open_budget` sign and send (`approve` → `burnForCreditMin` / `openBudget`), wait for the receipt and poll the balance until the credit lands (see *Timing*). Without it they return unsigned steps. |
 | `BEAGLE_RPC_URL` | optional JSON-RPC URL for the agent wallet; default: the chain's public RPC from `@beagle/shared/chains`. The executor checks the node's chain id against the gateway's before sending anything (`chain_mismatch`). |
 | `BEAGLE_WORKSPACE` | optional default workspace (0x address) for the wallet tools. Without it the tools fall back to the **agent wallet address**, which is only a guess at your API key's workspace: results then carry `workspaceSource: "agent_wallet"` and a warning. Set it (or pass `workspace`) when the key's workspace is not the agent wallet. |
 
@@ -70,7 +70,7 @@ the MCP handshake nor downgrades the session; the affected call returns `isError
 | `beagle_quote` | `{ usd? \| tokens? }` | tokens ↔ µUSD at the desk's on-chain price |
 | `beagle_complete` | `{ prompt? \| messages?, system?, model? (beagle/auto), max_tokens?, difficulty? }` | `{ text, model, provider, paidBy, costMicro, balanceMicro, finishReason, requestId, usage }` — **costs credit** |
 | `beagle_usage` | `{ limit?, window? (24h\|7d\|30d) }` | rows + summary |
-| `beagle_buy_compute` | `{ usd? \| tokens?, workspace? }` | with a wallet: `{ executed, txHash, receiptId?, creditedMicro, credited, balanceMicro, workspaceSource, elapsedMs, … }`; else `{ unsigned: true, chainId, steps: [{ to, data, value: '0', description }] }` — **burns tokens** |
+| `beagle_buy_compute` | `{ usd? \| tokens?, workspace?, tolerance_bps? (0–5000, default 100) }` | with a wallet: `{ executed, txHash, receiptId?, creditedMicro, credited, balanceMicro, minUsdMicro, toleranceBps, workspaceSource, elapsedMs, … }`; else `{ unsigned: true, chainId, steps: [{ to, data, value: '0', description }], minUsdMicro, toleranceBps, … }` — **burns tokens**, with a credit floor (see below) |
 | `beagle_open_budget` | `{ usd? \| tokens?, hours (1–720), workspace? }` | with a wallet: `{ executed, txHash, budgetId, workspaceSource, … }`; else unsigned steps |
 | `beagle_budgets` | — | `BudgetDto[]` with formatted amounts, `active` / `countsAsHeadroom` per row and the total headroom (open, unexpired, not stalled — the same predicate as `/api/balance`) |
 | `beagle_upgrade` | `{ kind: 'pro' \| 'warm', quantity? }` | `UpgradeDto` — **costs credit**; prices are in `beagle_status.upgradePrices` |
@@ -82,18 +82,44 @@ form, so `tokens: 0.1` is exactly `0.1 BEAGLE` (`1e17` raw), never `0.1000000000
 Every result is JSON text plus `structuredContent` (bigints as decimal strings). Failures are `isError`
 results with `{ error: { code, message, status? } }`, `code` being the gateway error code
 (`insufficient_credit`, `invalid_api_key`, `rate_limited`, …), `invalid_request` / `internal_error`, or a
-wallet code (`wallet_unavailable`, `chain_mismatch`, `simulation_failed`, `tx_failed`, `tx_reverted`, …).
+wallet code (`wallet_unavailable`, `chain_mismatch`, `simulation_failed`, `slippage_exceeded`, `tx_failed`,
+`tx_reverted`, …).
 
 Resources: `beagle://models` (markdown table), `beagle://quickstart`.
+
+### Credit floor (`tolerance_bps`)
+
+A burn is final, and the desk credits the USD value **at the price it reads when the transaction is mined**, not
+the one the quote showed: a price post can land in between. Every burn this package initiates therefore goes
+through `burnForCreditMin(workspace, amount, minUsdMicro)` with
+
+```
+minUsdMicro = quotedUsdMicro − ceil(quotedUsdMicro · tolerance_bps / 10 000)      (default tolerance_bps = 100, i.e. 1 %)
+```
+
+The contract reverts with `SlippageExceeded(usdMicro, minUsdMicro)` instead of crediting less than the floor;
+a reverted burn costs only gas and burns nothing (the approve, if one was sent, stays in place and is reused by
+the retry). `tolerance_bps` is an integer `0–5000`: `0` demands exactly the quoted amount, larger values accept
+more slippage. The result carries `minUsdMicro`, `minUsd` and `toleranceBps`; the unsigned steps encode the floor
+in the `burnForCreditMin` calldata and spell it out in the step description.
+
+With a wallet the executor simulates first, so a stale quote surfaces as `isError` code `slippage_exceeded`
+(message with both numbers) before anything is sent. If the price moves between the simulation and inclusion,
+the mined transaction reverts; the executor replays the call at the receipt's block to tell `SlippageExceeded`
+apart (`slippage_exceeded` with the `txHash`) from any other revert (`tx_reverted`). In either case re-quote and
+retry, or pass a larger `tolerance_bps`. Plain `burnForCredit` (no floor) is left to third parties and to the
+library's `buildUnsignedSteps` / `buyCompute` when called without `minUsdMicro`; the tool always has a quote and
+always sets a floor. `creditFloor(quotedUsdMicro, toleranceBps?)` is exported for callers that build their own
+transactions.
 
 ### Purchases, allowances and budgets
 
 `beagle_buy_compute` with a wallet approves **current allowance + amount**, not `amount`: the desk's
 `allowance(owner, desk)` is shared by every open budget of the wallet (headroom = min(cap − drawn, allowance,
-balance)) and `burnForCredit` spends it, so an exact approve would silently shrink or stall those budgets.
+balance)) and `burnForCreditMin` spends it, so an exact approve would silently shrink or stall those budgets.
 `beagle_open_budget` adds its cap on top of the existing allowance for the same reason. Only an effectively
-unlimited allowance is left untouched. The unsigned steps approve exactly the amount; their descriptions tell
-a wallet with open budgets to add to its allowance instead.
+unlimited allowance is left untouched (adding to it would overflow `uint256`). The unsigned steps approve exactly
+the amount; their descriptions tell a wallet with open budgets to add to its allowance instead.
 
 `creditedMicro` is the `usdMicro` from the decoded `CreditPurchased` event (the exact amount the gateway
 books), `credited` tells whether it is visible on the key's workspace yet; the balance poll compares against
@@ -131,7 +157,10 @@ await server.connect(transport);
 bound to the key's workspace. `complete(req, options?)` may attach `beagle` metadata (cost, balance, provider,
 paidBy) to the completion; the tools fall back to `balance()` when it is absent. `createLazyWalletExecutor`
 wraps a wallet whose construction needs the network (what the binary does); `createAgentWallet(api, config)`
-is the binary's own wiring.
+is the binary's own wiring. `WalletExecutor.buyCompute({ workspace, tokens, minUsdMicro? })` and
+`buildUnsignedSteps({ action: 'buyCompute', …, minUsdMicro? })` use `burnForCreditMin` when a floor is given
+and plain `burnForCredit` otherwise; `creditFloor`, `DEFAULT_TOLERANCE_BPS` (100) and `MAX_TOLERANCE_BPS`
+(5000) implement the policy above.
 
 ## Development
 

@@ -3,21 +3,28 @@
  * implementation that signs with an agent private key, and {@link buildUnsignedSteps} for agents
  * that hold their own wallet and only need calldata.
  *
- * Both purchase paths are two-step: `token.approve(desk, …)` followed by `desk.burnForCredit(workspace, amount)`
- * or `desk.openBudget(workspace, cap, deadline)`. The executor approves **cumulatively**
- * (`allowance + amount`): the same `allowance(owner, desk)` backs every open budget of the wallet
- * (headroom = min(cap − drawn, allowance, balance)) and a burn spends it, so approving exactly `amount`
- * would silently shrink or stall those budgets. Only an effectively unlimited allowance is left alone.
+ * Both purchase paths are two-step: `token.approve(desk, …)` followed by `desk.burnForCreditMin(workspace,
+ * amount, minUsdMicro)` (or plain `burnForCredit` when no quote is at hand) or `desk.openBudget(workspace, cap,
+ * deadline)`. The executor approves **cumulatively** (`allowance + amount`): the same `allowance(owner, desk)`
+ * backs every open budget of the wallet (headroom = min(cap − drawn, allowance, balance)) and a burn spends it,
+ * so approving exactly `amount` would silently shrink or stall those budgets. Only an effectively unlimited
+ * allowance is left alone.
+ *
+ * **Credit floor.** A burn is final, and a price post can land between the quote shown to the caller and the
+ * transaction. Every burn our own clients initiate therefore carries `minUsdMicro` ({@link creditFloor}:
+ * `quote − ceil(quote · toleranceBps / 10 000)`, default 100 bps): the desk reverts `SlippageExceeded(usdMicro,
+ * minUsdMicro)` instead of crediting less, and a reverted burn costs only gas. `0` disables the floor on chain.
  *
  * @module wallet
  */
 import { CREDIT_DESK_ABI, ERC20_ABI } from '@beagle/shared/abi';
 import { chainById } from '@beagle/shared/chains';
-import { formatTokenAmount } from '@beagle/shared/credit';
+import { BPS_DENOMINATOR, ceilDiv, formatTokenAmount, formatUsdMicro } from '@beagle/shared/credit';
 import {
   ChainMismatchError,
   createPublicClient,
   createWalletClient,
+  decodeErrorResult,
   decodeEventLog,
   defineChain,
   encodeFunctionData,
@@ -31,6 +38,7 @@ import {
   type Transport,
   type TransactionReceipt,
   type WalletClient,
+  type WriteContractParameters,
 } from 'viem';
 import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
 
@@ -40,6 +48,33 @@ export interface BuyComputeParams {
   workspace: Address;
   /** Raw token units to burn. */
   tokens: bigint;
+  /**
+   * Credit floor in µUSD (see {@link creditFloor}). When set the executor calls `burnForCreditMin`, which
+   * reverts `SlippageExceeded` (surfaced as `WalletError('slippage_exceeded')`, nothing burned) if the desk's
+   * quote at inclusion is below it; `0` keeps the call but disables the floor. Omitted → plain `burnForCredit`.
+   */
+  minUsdMicro?: bigint;
+}
+
+/** Default slippage tolerance of the credit floor, in basis points (1 %). */
+export const DEFAULT_TOLERANCE_BPS = 100;
+/** Largest tolerance a caller may pick (50 %): beyond that the floor stops meaning anything. */
+export const MAX_TOLERANCE_BPS = 5000;
+
+/**
+ * The credit floor for a burn quoted at `quotedUsdMicro`:
+ * `quotedUsdMicro − ceil(quotedUsdMicro · toleranceBps / 10 000)` (the tolerance is rounded *up*, so the
+ * floor is never stricter than the stated percentage). `toleranceBps` is an integer in
+ * `[0, MAX_TOLERANCE_BPS]`, default {@link DEFAULT_TOLERANCE_BPS}; `0` means "exactly the quote".
+ */
+export function creditFloor(quotedUsdMicro: bigint, toleranceBps: number = DEFAULT_TOLERANCE_BPS): bigint {
+  if (typeof quotedUsdMicro !== 'bigint' || quotedUsdMicro < 0n) {
+    throw new WalletError('invalid_amount', `quotedUsdMicro must be a non-negative bigint (got ${String(quotedUsdMicro)})`);
+  }
+  if (!Number.isInteger(toleranceBps) || toleranceBps < 0 || toleranceBps > MAX_TOLERANCE_BPS) {
+    throw new WalletError('invalid_tolerance', `toleranceBps must be an integer in [0, ${MAX_TOLERANCE_BPS}] (got ${String(toleranceBps)})`);
+  }
+  return quotedUsdMicro - ceilDiv(quotedUsdMicro * BigInt(toleranceBps), BPS_DENOMINATOR);
 }
 
 /** Result of {@link WalletExecutor.buyCompute}. */
@@ -82,7 +117,7 @@ export interface OpenBudgetResult {
 export interface WalletExecutor {
   /** The signing account, if the executor knows it. */
   readonly address?: Address;
-  /** `approve` (if short) + `burnForCredit`; resolves after the burn is mined. */
+  /** `approve` (if short) + `burnForCreditMin` (`burnForCredit` without `minUsdMicro`); resolves after the burn is mined. */
   buyCompute(params: BuyComputeParams): Promise<BuyComputeResult>;
   /** `approve` (if short) + `openBudget`; resolves after the budget is mined. */
   openBudget(params: OpenBudgetParams): Promise<OpenBudgetResult>;
@@ -98,8 +133,9 @@ export interface WalletDeployment {
 export class WalletError extends Error {
   override readonly name = 'WalletError';
   /**
-   * `invalid_address`, `invalid_amount`, `chain_mismatch`, `rpc_error`, `simulation_failed`, `tx_failed`,
-   * `tx_reverted`, `event_missing`, `wallet_unavailable` (a lazy executor could not be set up).
+   * `invalid_address`, `invalid_amount`, `invalid_tolerance`, `chain_mismatch`, `rpc_error`,
+   * `simulation_failed`, `slippage_exceeded` (the desk's quote fell below the credit floor; nothing burned),
+   * `tx_failed`, `tx_reverted`, `event_missing`, `wallet_unavailable` (a lazy executor could not be set up).
    */
   readonly code: string;
   readonly txHash?: Hex;
@@ -157,14 +193,24 @@ interface UnsignedStepsBase {
 
 /** Input of {@link buildUnsignedSteps}. */
 export type UnsignedStepsInput =
-  | (UnsignedStepsBase & { action: 'buyCompute'; tokens: bigint })
+  | (UnsignedStepsBase & {
+      action: 'buyCompute';
+      tokens: bigint;
+      /** Credit floor in µUSD (see {@link creditFloor}); with it the burn step is `burnForCreditMin`, without it plain `burnForCredit`. */
+      minUsdMicro?: bigint;
+    })
   | (UnsignedStepsBase & { action: 'openBudget'; cap: bigint; deadline: bigint });
 
+function assertUint256(label: string, value: bigint): void {
+  if (typeof value !== 'bigint' || value < 0n || value > UINT256_MAX) throw new WalletError('invalid_amount', `${label} must be a bigint that fits uint256 (got ${String(value)})`);
+}
+
 /**
- * Encodes `approve` + `burnForCredit` or `approve` + `openBudget` as calldata for an external
- * wallet. The approve step is always included (the builder cannot read the allowance) and approves
- * exactly `amount`; a wallet with open budgets should approve `current allowance + amount` instead,
- * because the budgets' headroom is bounded by that same allowance and a burn spends it.
+ * Encodes `approve` + `burnForCreditMin` (or `burnForCredit` when no `minUsdMicro` is given, i.e. no
+ * quote was available) or `approve` + `openBudget` as calldata for an external wallet. The approve step
+ * is always included (the builder cannot read the allowance) and approves exactly `amount`; a wallet with
+ * open budgets should approve `current allowance + amount` instead, because the budgets' headroom is
+ * bounded by that same allowance and a burn spends it.
  */
 export function buildUnsignedSteps(input: UnsignedStepsInput): UnsignedTransactionRequest {
   const desk = checksum('deployment.creditDesk', input.deployment.creditDesk);
@@ -184,12 +230,26 @@ export function buildUnsignedSteps(input: UnsignedStepsInput): UnsignedTransacti
   };
 
   if (input.action === 'buyCompute') {
-    const burn: UnsignedStep = {
-      to: desk,
-      data: encodeFunctionData({ abi: CREDIT_DESK_ABI, functionName: 'burnForCredit', args: [workspace, amount] }),
-      value: '0',
-      description: `burnForCredit: burn ${human} and credit workspace ${workspace} with its USD value`,
-    };
+    const credit = `burn ${human} and credit workspace ${workspace} with its USD value at the price the contract reads when mined`;
+    let burn: UnsignedStep;
+    if (input.minUsdMicro === undefined) {
+      burn = {
+        to: desk,
+        data: encodeFunctionData({ abi: CREDIT_DESK_ABI, functionName: 'burnForCredit', args: [workspace, amount] }),
+        value: '0',
+        description: `burnForCredit: ${credit} (no credit floor: the burn is final at whatever that price is)`,
+      };
+    } else {
+      assertUint256('minUsdMicro', input.minUsdMicro);
+      burn = {
+        to: desk,
+        data: encodeFunctionData({ abi: CREDIT_DESK_ABI, functionName: 'burnForCreditMin', args: [workspace, amount, input.minUsdMicro] }),
+        value: '0',
+        description:
+          `burnForCreditMin: ${credit}, with a credit floor of ${formatUsdMicro(input.minUsdMicro)} (${input.minUsdMicro.toString()} µUSD): ` +
+          'if a price change lands first and the burn would credit less, the transaction reverts with SlippageExceeded and costs only gas (nothing is burned); re-quote and send a new one',
+      };
+    }
     return { unsigned: true, chainId: input.chainId, steps: [approve, burn] };
   }
 
@@ -331,14 +391,22 @@ export function createViemWalletExecutor(options: ViemWalletExecutorOptions): Wa
     chainVerified = true;
   }
 
-  async function waitMined(hash: Hex, label: string): Promise<TransactionReceipt> {
+  /**
+   * Waits for `hash` and returns the receipt. A reverted transaction throws `tx_reverted`, unless
+   * `diagnoseRevert` (which may replay the call at the receipt's block to learn the reason) returns a
+   * more specific error; its own failures are ignored.
+   */
+  async function waitMined(hash: Hex, label: string, diagnoseRevert?: (receipt: TransactionReceipt) => Promise<WalletError | undefined>): Promise<TransactionReceipt> {
     let receipt: TransactionReceipt;
     try {
       receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: receiptTimeout, pollingInterval });
     } catch (error) {
       throw new WalletError('rpc_error', `${label}: waiting for receipt ${hash} failed: ${errorMessage(error)}`, { txHash: hash, cause: error });
     }
-    if (receipt.status !== 'success') throw new WalletError('tx_reverted', `${label} reverted (tx ${hash})`, { txHash: hash });
+    if (receipt.status !== 'success') {
+      const diagnosed = diagnoseRevert === undefined ? undefined : await diagnoseRevert(receipt).catch(() => undefined);
+      throw diagnosed ?? new WalletError('tx_reverted', `${label} reverted (tx ${hash})`, { txHash: hash });
+    }
     return receipt;
   }
 
@@ -378,17 +446,42 @@ export function createViemWalletExecutor(options: ViemWalletExecutorOptions): Wa
   return {
     address: account.address,
 
-    async buyCompute({ workspace, tokens }) {
+    async buyCompute({ workspace, tokens, minUsdMicro }) {
       const ws = checksum('workspace', workspace);
       assertPositive('tokens', tokens);
+      if (minUsdMicro !== undefined) assertUint256('minUsdMicro', minUsdMicro);
       await assertChain();
       const approveTxHash = await ensureAllowance(tokens);
-      const { request } = await simulate(
-        () => publicClient.simulateContract({ account, address: desk, abi: CREDIT_DESK_ABI, functionName: 'burnForCredit', args: [ws, tokens] }),
-        'burnForCredit',
-      );
-      const txHash = await send(() => walletClient.writeContract(request), 'burnForCredit');
-      const receipt = await waitMined(txHash, 'burnForCredit');
+      // Plain `burnForCredit` only when the caller has no quote to protect; our own tools always pass a floor.
+      // (Two literal calls rather than one with a spread union: viem's overloads need the exact arg tuple.)
+      const label = minUsdMicro === undefined ? 'burnForCredit' : 'burnForCreditMin';
+      const simulateBurn = async (blockNumber?: bigint): Promise<{ request: WriteContractParameters }> => {
+        const at = blockNumber === undefined ? {} : { blockNumber };
+        if (minUsdMicro === undefined) {
+          const { request } = await publicClient.simulateContract({ account, address: desk, abi: CREDIT_DESK_ABI, functionName: 'burnForCredit', args: [ws, tokens], ...at });
+          return { request };
+        }
+        const { request } = await publicClient.simulateContract({ account, address: desk, abi: CREDIT_DESK_ABI, functionName: 'burnForCreditMin', args: [ws, tokens, minUsdMicro], ...at });
+        return { request };
+      };
+      const { request } = await simulate(() => simulateBurn(), label, { onSlippage: (s) => slippageError(s, label) });
+      const txHash = await send(() => walletClient.writeContract(request), label);
+      const receipt = await waitMined(txHash, label, async (reverted) => {
+        if (minUsdMicro === undefined) return undefined;
+        // The simulation passed, the mined transaction did not: replay it against the state of its block
+        // to tell a price move (SlippageExceeded) from anything else. Either way only gas was spent.
+        try {
+          await simulateBurn(reverted.blockNumber);
+        } catch (error) {
+          const slippage = decodeSlippage(error);
+          if (slippage !== undefined) return slippageError(slippage, label, txHash);
+        }
+        return new WalletError(
+          'tx_reverted',
+          `${label} reverted (tx ${txHash}); the simulation had passed, so most likely the desk's quote fell below the credit floor of ${minUsdMicro.toString()} µUSD between simulation and inclusion. Only gas was spent, nothing was burned: re-quote and retry, or allow a wider tolerance.`,
+          { txHash },
+        );
+      });
       const event = decodeDeskEvent(receipt, desk, 'CreditPurchased');
       const receiptId = event?.args['receiptId'];
       const usdMicro = event?.args['usdMicro'];
@@ -425,12 +518,60 @@ export function createViemWalletExecutor(options: ViemWalletExecutorOptions): Wa
   };
 }
 
-async function simulate<T>(run: () => Promise<T>, label: string): Promise<T> {
+async function simulate<T>(run: () => Promise<T>, label: string, hooks: { onSlippage?: (s: Slippage) => WalletError } = {}): Promise<T> {
   try {
     return await run();
   } catch (error) {
+    if (hooks.onSlippage !== undefined) {
+      const slippage = decodeSlippage(error);
+      if (slippage !== undefined) throw hooks.onSlippage(slippage);
+    }
     throw new WalletError('simulation_failed', `${label} would revert: ${errorMessage(error)}`, { cause: error });
   }
+}
+
+/** The two numbers of the desk's `SlippageExceeded(uint256 usdMicro, uint256 minUsdMicro)`. */
+export interface Slippage {
+  /** What the desk would credit now. */
+  usdMicro: bigint;
+  /** The floor the caller asked for. */
+  minUsdMicro: bigint;
+}
+
+/**
+ * Finds a `SlippageExceeded` revert in a viem error: either already decoded by viem
+ * (`ContractFunctionRevertedError.data`) or as raw revert bytes (`data: 0x…`) anywhere down the `cause` chain.
+ */
+export function decodeSlippage(error: unknown): Slippage | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && typeof current === 'object' && current !== null; depth += 1) {
+    const data = (current as { data?: unknown }).data;
+    let decoded: { errorName?: unknown; args?: unknown } | undefined;
+    if (typeof data === 'object' && data !== null) decoded = data as { errorName?: unknown; args?: unknown };
+    else if (typeof data === 'string' && /^0x[0-9a-fA-F]{8,}$/.test(data)) {
+      try {
+        decoded = decodeErrorResult({ abi: CREDIT_DESK_ABI, data: data as Hex });
+      } catch {
+        // not a desk error
+      }
+    }
+    if (decoded?.errorName === 'SlippageExceeded' && Array.isArray(decoded.args)) {
+      const [usdMicro, minUsdMicro] = decoded.args as unknown[];
+      if (typeof usdMicro === 'bigint' && typeof minUsdMicro === 'bigint') return { usdMicro, minUsdMicro };
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+function slippageError(slippage: Slippage, label: string, txHash?: Hex): WalletError {
+  const { usdMicro, minUsdMicro } = slippage;
+  const where = txHash === undefined ? `${label} would revert with SlippageExceeded` : `${label} reverted with SlippageExceeded (tx ${txHash}, only gas was spent)`;
+  return new WalletError(
+    'slippage_exceeded',
+    `${where}: the desk now quotes ${usdMicro.toString()} µUSD (${formatUsdMicro(usdMicro)}) for this burn, below the credit floor of ${minUsdMicro.toString()} µUSD (${formatUsdMicro(minUsdMicro)}); the price moved since the quote. Nothing was burned: re-quote and retry, or allow a wider tolerance.`,
+    txHash === undefined ? {} : { txHash },
+  );
 }
 
 /** The most specific message viem offers (`shortMessage` of a `BaseError`), else `message`. */

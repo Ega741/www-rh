@@ -3,16 +3,21 @@
  * Approve → Burn with progress + explorer links, then poll `/api/receipts` and `/api/balance`
  * until the credit lands. The credit goes to the signed-in workspace by default (SPEC §7), even
  * when the connected wallet that pays the burn is another account.
+ *
+ * The burn goes through `burnForCreditMin(workspace, amount, minUsdMicro)` with the floor derived
+ * from the live quote and the chosen price tolerance (default 1 %): a price post landing between
+ * the quote and the transaction reverts `SlippageExceeded` instead of crediting less. The approve
+ * is cumulative (`allowance + amount`) so open budgets of the wallet keep their allowance.
  */
 import { useEffect, useRef, useState } from 'react';
-import { useConnection, useWriteContract } from 'wagmi';
+import { useConnection, usePublicClient, useWriteContract } from 'wagmi';
 import type { Hex } from 'viem';
 import { CREDIT_DESK_ABI, ERC20_ABI } from '@beagle/shared/abi';
 import { AmountInput } from '../../components/AmountInput.jsx';
 import { AddressText, TxLink } from '../../components/Hash.jsx';
 import { QueryGuard } from '../../components/QueryGuard.jsx';
 import { StepList } from '../../components/StepList.jsx';
-import { Badge, Button, Card, Field, Input, Note, PageHeader, Skeleton, Stat, TableWrap } from '../../components/ui.jsx';
+import { Badge, Button, Card, Field, Input, Note, PageHeader, Segmented, Skeleton, Stat, TableWrap } from '../../components/ui.jsx';
 import { config } from '../../config.js';
 import { useChainGuard } from '../../hooks/useChainGuard.js';
 import { useDesk } from '../../hooks/useDesk.js';
@@ -25,7 +30,7 @@ import { convertAmount, fmtPrice, fmtTokens, fmtUsd, parseAmount, type AmountMod
 import { sameAddress } from '../../lib/explorer.js';
 import { IDLE_WATCH, WATCH_POLL_MS, observeBalance, observeEvents, restartWatch, startWatch, type WatchState } from '../../lib/poll.js';
 import { defaultTargetWorkspace } from '../../lib/session.js';
-import { describeBlocker, planBurn } from '../../lib/steps.js';
+import { DEFAULT_TOLERANCE_BPS, SHARED_ALLOWANCE_NOTE, TOLERANCE_CHOICES_BPS, TOLERANCE_HELP, approveLabel, describeBlocker, failedWith, formatBps, planBurn } from '../../lib/steps.js';
 import { ageSeconds, formatDuration, formatUnixSeconds } from '../../lib/time.js';
 import { parseAddressInput } from '../../lib/validate.js';
 import { invalidateBalances, useBalance, useCreditEvents, usePrice } from '../../queries.js';
@@ -49,6 +54,7 @@ export function Credits() {
   const [input, setInput] = useState('');
   const [otherWorkspace, setOtherWorkspace] = useState(false);
   const [workspaceInput, setWorkspaceInput] = useState('');
+  const [toleranceBps, setToleranceBps] = useState<number>(DEFAULT_TOLERANCE_BPS);
 
   const parsed = parseAmount(input, mode, decimals);
   const priceE18 = params.priceE18 ?? apiPrice.data?.priceE18;
@@ -72,6 +78,7 @@ export function Credits() {
     workspaceValid: workspace !== undefined,
     amount: tokens,
     usdMicro: quote.usdMicro,
+    toleranceBps,
     priceAvailable,
     priceStale,
     minBurn: params.minBurn,
@@ -83,6 +90,8 @@ export function Credits() {
 
   const flow = useTxFlow();
   const write = useWriteContract();
+  const publicClient = usePublicClient({ chainId: config.chainId });
+  const slippage = failedWith(flow.state, 'SlippageExceeded');
   const [watch, setWatch] = useState<WatchState>(IDLE_WATCH);
   const watchRef = useRef(watch);
   watchRef.current = watch;
@@ -118,23 +127,28 @@ export function Credits() {
 
   const onBurn = async () => {
     if (!plan.canRun || tokens === undefined || workspace === undefined || desk === undefined || token === undefined) return;
-    const before = balance.data?.balanceMicro ?? me?.balanceMicro ?? 0n;
     const expected = quote.usdMicro;
+    const minUsdMicro = plan.minUsdMicro;
+    // Both are set when `canRun`: `quote_pending` blocks without a quote, `allowance_unknown` without an allowance.
+    if (expected === undefined || minUsdMicro === undefined) return;
+    const approveAmount = plan.approveAmount ?? tokens;
+    const before = balance.data?.balanceMicro ?? me?.balanceMicro ?? 0n;
     let burnHash: Hex | undefined;
     setWatch(IDLE_WATCH);
     const ok = await flow.run([
       {
         id: 'approve',
-        label: `Approve ${fmtTokens(tokens, decimals, symbol)} for the credit desk`,
+        label: approveLabel(approveAmount, account.allowance, tokens, decimals, symbol),
         skip: !plan.needsApprove,
-        write: () => write.mutateAsync({ abi: ERC20_ABI, address: token.address, functionName: 'approve', args: [desk, tokens], chainId: config.chainId }),
+        write: () => write.mutateAsync({ abi: ERC20_ABI, address: token.address, functionName: 'approve', args: [desk, approveAmount], chainId: config.chainId }),
         onConfirmed: () => account.refetch(),
       },
       {
         id: 'burn',
-        label: `Burn ${fmtTokens(tokens, decimals, symbol)}${expected === undefined ? '' : ` for ${fmtUsd(expected)}`} of credit`,
+        label: `Burn ${fmtTokens(tokens, decimals, symbol)} for ${fmtUsd(expected)} of credit (floor ${fmtUsd(minUsdMicro)}, −${formatBps(toleranceBps)})`,
+        simulate: publicClient === undefined ? undefined : () => publicClient.simulateContract({ account: address, abi: CREDIT_DESK_ABI, address: desk, functionName: 'burnForCreditMin', args: [workspace, tokens, minUsdMicro] }),
         write: async () => {
-          burnHash = await write.mutateAsync({ abi: CREDIT_DESK_ABI, address: desk, functionName: 'burnForCredit', args: [workspace, tokens], chainId: config.chainId });
+          burnHash = await write.mutateAsync({ abi: CREDIT_DESK_ABI, address: desk, functionName: 'burnForCreditMin', args: [workspace, tokens, minUsdMicro], chainId: config.chainId });
           return burnHash;
         },
         onConfirmed: () => Promise.all([account.refetch(), client.invalidateQueries({ queryKey: ['receipts'] })]),
@@ -216,6 +230,27 @@ export function Credits() {
               </div>
 
               <div>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="label mb-0">Price tolerance</span>
+                  <Segmented
+                    ariaLabel="Price tolerance"
+                    value={String(toleranceBps)}
+                    onChange={(v) => setToleranceBps(Number(v))}
+                    options={TOLERANCE_CHOICES_BPS.map((bps) => ({ value: String(bps), label: formatBps(bps) }))}
+                  />
+                </div>
+                <p className="mt-1 text-xs text-muted">
+                  {TOLERANCE_HELP}
+                  {plan.minUsdMicro !== undefined && quote.usdMicro !== undefined && tokens !== undefined ? (
+                    <>
+                      {' '}
+                      Floor for this burn: <span className="font-mono text-fg">{fmtUsd(plan.minUsdMicro)}</span> of credit (quote {fmtUsd(quote.usdMicro)} − {formatBps(toleranceBps)}).
+                    </>
+                  ) : null}
+                </p>
+              </div>
+
+              <div>
                 <label className="flex items-center gap-2 text-sm">
                   <input type="checkbox" checked={otherWorkspace} onChange={(e) => setOtherWorkspace(e.target.checked)} disabled={flow.running} />
                   Credit another workspace
@@ -256,16 +291,35 @@ export function Credits() {
                 <Button variant="primary" busy={flow.running} disabled={!plan.canRun} reason={firstBlocker === undefined ? undefined : describeBlocker(firstBlocker, blockerCtx)} onClick={() => void onBurn()}>
                   {plan.needsApprove ? 'Approve → Burn' : 'Burn for credit'}
                 </Button>
-                {firstBlocker !== undefined ? <span className="text-xs text-muted">{describeBlocker(firstBlocker, blockerCtx)}</span> : plan.needsApprove ? <span className="text-xs text-muted">Two wallet confirmations: approve, then burn.</span> : <span className="text-xs text-muted">Allowance is sufficient: one confirmation.</span>}
+                {firstBlocker !== undefined ? <span className="text-xs text-muted">{describeBlocker(firstBlocker, blockerCtx)}</span> : plan.needsApprove ? <span className="text-xs text-muted">Two wallet confirmations: approve (your current allowance + this amount), then burn.</span> : <span className="text-xs text-muted">One wallet confirmation: burn.</span>}
                 {guard.wrongChain ? (
                   <Button size="sm" busy={guard.switching} onClick={() => void guard.switchToAppChain().catch(() => undefined)}>
                     Switch chain
                   </Button>
                 ) : null}
               </div>
+              {plan.canRun && !plan.needsApprove ? <p className="text-xs text-muted">{SHARED_ALLOWANCE_NOTE}</p> : null}
 
               <StepList flow={flow.state} />
-              {flow.state.status === 'failed' ? (
+              {slippage !== undefined ? (
+                <Note
+                  tone="warn"
+                  title="Price moved before the transaction landed"
+                  actions={
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        flow.reset();
+                        void quote.refetch();
+                      }}
+                    >
+                      Re-quote
+                    </Button>
+                  }
+                >
+                  The desk compared the quote at inclusion time with your floor and refused to burn for less (details on the step above). Re-quote to refresh the price, then burn again or pick a wider tolerance.
+                </Note>
+              ) : flow.state.status === 'failed' ? (
                 <Button size="sm" variant="ghost" onClick={flow.reset}>
                   Dismiss
                 </Button>

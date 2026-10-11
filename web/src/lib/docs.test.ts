@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { UsageReceiptWire } from '@beagle/shared/api';
 import { receiptHash } from '@beagle/shared/canonical';
+import { DEFAULT_TOLERANCE_BPS } from './steps.js';
 import {
   ALIAS_DOCS,
+  CREDIT_FLOOR_DOC,
   HEADER_DOCS,
   INSUFFICIENT_CREDIT_BODY,
   KEY_PLACEHOLDER,
@@ -113,6 +115,14 @@ describe('docs snippets', () => {
     expect(creditsUrl?.direction).toBe('response');
     expect(creditsUrl?.text).toMatch(/402/);
     expect(ALIAS_DOCS.map((a) => a.id)).toEqual(['beagle/auto', 'beagle/best', 'beagle/cheap', 'beagle/house']);
+  });
+  it('documents the credit floor consistently with the Credits page', () => {
+    expect(CREDIT_FLOOR_DOC.defaultBps).toBe(DEFAULT_TOLERANCE_BPS);
+    expect(CREDIT_FLOOR_DOC.minFn).toBe('burnForCreditMin(workspace, amount, minUsdMicro)');
+    expect(CREDIT_FLOOR_DOC.floorFormula).toContain(`${DEFAULT_TOLERANCE_BPS / 100} %`);
+    expect(CREDIT_FLOOR_DOC.floorFormula).toMatch(/^minUsdMicro = quote − ceil\(/);
+    expect(CREDIT_FLOOR_DOC.revert).toBe('SlippageExceeded(usdMicro, minUsdMicro)');
+    expect(CREDIT_FLOOR_DOC.plainFn).toBe('burnForCredit(workspace, amount)');
   });
 });
 

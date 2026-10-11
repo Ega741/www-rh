@@ -4,6 +4,7 @@ import { publicGatewayUrl } from '../config.js';
 import { Card, Code } from '../components/ui.jsx';
 import {
   ALIAS_DOCS,
+  CREDIT_FLOOR_DOC,
   HEADER_DOCS,
   INSUFFICIENT_CREDIT_BODY,
   MCP_BUILD_COMMAND,
@@ -163,6 +164,10 @@ export function Docs() {
             open a budget
           </Link>
           . Each request has a verifiable receipt at <span className="font-mono">/api/receipts/&lt;request id&gt;</span> returning <span className="font-mono">{'{ receipt, hash }'}</span>; <span className="font-mono">hash = sha256(canonicalJson(receipt))</span> and can be recomputed with <span className="font-mono">receiptHash</span> from <span className="font-mono">@beagle/shared/canonical</span> in this repository (every receipt page shows the script).
+        </p>
+        <h3>Credit floor on burns</h3>
+        <p>
+          The Credits page and the MCP wallet tools burn through <span className="font-mono">{CREDIT_FLOOR_DOC.minFn}</span> with <span className="font-mono">{CREDIT_FLOOR_DOC.floorFormula}</span> (the tolerance is adjustable on the Credits page). If a price post lands between the quote and the transaction and the credit would fall below that floor, the desk reverts <span className="font-mono">{CREDIT_FLOOR_DOC.revert}</span> instead of crediting less: nothing is burned and you re-quote. A burn that succeeds is final and credits exactly the emitted <span className="font-mono">usdMicro</span>. Plain <span className="font-mono">{CREDIT_FLOOR_DOC.plainFn}</span> has no floor and stays available for third-party integrations.
         </p>
       </article>
     </div>

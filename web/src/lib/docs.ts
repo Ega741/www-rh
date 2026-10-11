@@ -3,6 +3,8 @@
  * base URL (no trailing slash) so the page always shows copy-pasteable commands.
  */
 
+import { DEFAULT_TOLERANCE_BPS } from './steps.js';
+
 /** Placeholder key used in snippets. */
 export const KEY_PLACEHOLDER = 'bgl_YOUR_API_KEY';
 
@@ -199,6 +201,24 @@ export const INSUFFICIENT_CREDIT_BODY = JSON.stringify(
   null,
   2,
 );
+
+/**
+ * Identifiers of the credit-floor paragraph in the "Credit & 402" section (contracts/README.md
+ * "Refinements"): how Beagle's own clients burn and what a third party calling the desk directly
+ * should know. `defaultBps` must match the Credits page default (`DEFAULT_TOLERANCE_BPS`).
+ */
+export const CREDIT_FLOOR_DOC = {
+  /** Default price tolerance of a burn from our clients, in bps (1 %). */
+  defaultBps: DEFAULT_TOLERANCE_BPS,
+  /** The desk function our clients call. */
+  minFn: 'burnForCreditMin(workspace, amount, minUsdMicro)',
+  /** How the floor is derived from the quote shown to the user. */
+  floorFormula: `minUsdMicro = quote − ceil(quote × ${DEFAULT_TOLERANCE_BPS / 100} %)`,
+  /** The revert when the quote at inclusion time is below the floor. */
+  revert: 'SlippageExceeded(usdMicro, minUsdMicro)',
+  /** The floor-less function left for third parties. */
+  plainFn: 'burnForCredit(workspace, amount)',
+} as const;
 
 /** One row of the header reference table. */
 export interface HeaderDoc {

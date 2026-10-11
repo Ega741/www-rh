@@ -20,7 +20,7 @@ import type { CallToolResult, ServerNotification, ServerRequest } from '@modelco
 import { getAddress, isAddress, type Address } from 'viem';
 import { z } from 'zod';
 import { BeagleApiError, type BeagleApi } from './api.js';
-import { buildUnsignedSteps, WalletError, type WalletExecutor } from './wallet.js';
+import { buildUnsignedSteps, creditFloor, DEFAULT_TOLERANCE_BPS, MAX_TOLERANCE_BPS, WalletError, type WalletExecutor } from './wallet.js';
 
 /** Name and version reported in `initialize`. */
 export const MCP_SERVER_INFO = { name: 'beagle', version: '0.1.0' } as const;
@@ -303,8 +303,10 @@ unless the route is served through your own provider key (BYOK).
 
 ## 2. Get credit
 
-- \`beagle_buy_compute\` with \`usd\` or \`tokens\`: burns BEAGLE through the CreditDesk contract (approve + burnForCredit).
+- \`beagle_buy_compute\` with \`usd\` or \`tokens\`: burns BEAGLE through the CreditDesk contract (approve + burnForCreditMin).
   The contract emits the USD value at the on-chain price and the gateway credits exactly that amount once indexed.
+  The burn carries a credit floor of quote − \`tolerance_bps\` (default 100 = 1 %): if a price change lands first and the
+  burn would credit less, it reverts with SlippageExceeded and costs only gas; re-quote and retry.
 - \`beagle_open_budget\` with \`usd\`/\`tokens\` and \`hours\` (≤ 720): approve + openBudget. The operator draws from the
   budget as usage accrues, never above the cap; the headroom counts as available credit right away.
 - Without an agent wallet both tools return unsigned transaction steps (\`to\`, \`data\`, \`value\`) to sign yourself.
@@ -674,7 +676,8 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
     {
       title: 'Buy compute',
       description:
-        'Buy credit by burning BEAGLE through the CreditDesk (approve + burnForCredit). Pass usd (credit wanted) or tokens (whole BEAGLE to burn); the on-chain price sets the rate. ' +
+        'Buy credit by burning BEAGLE through the CreditDesk (approve + burnForCreditMin). Pass usd (credit wanted) or tokens (whole BEAGLE to burn); the on-chain price sets the rate. ' +
+        `The burn carries a credit floor of quote − tolerance_bps (default ${DEFAULT_TOLERANCE_BPS} = 1 %): if a price change lands before the transaction and the contract would credit less, it reverts with SlippageExceeded and costs only gas (nothing is burned; error code slippage_exceeded) — re-quote and retry, or raise tolerance_bps. ` +
         (wallet === undefined
           ? 'No agent wallet is configured here, so this returns unsigned transaction steps (to, data, value) for your own wallet to sign in order; pass workspace to name the account to credit.'
           : `This signs and sends with the agent wallet (approving current allowance + amount so open budgets keep theirs), waits for the burn to be mined and polls the balance until the credit appears, returning within about ${Math.round(callBudgetMs / 1000)} s either way (credited: false means not visible yet, not failed). ` +
@@ -684,10 +687,19 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
         usd: AMOUNT_SCHEMA.optional().describe('Credit to buy, in USD (number or decimal string).'),
         tokens: AMOUNT_SCHEMA.optional().describe('Whole tokens to burn (number or decimal string).'),
         workspace: ADDRESS_SCHEMA.optional().describe('Workspace (0x address) to credit; defaults to the configured workspace, else the agent wallet address (a guess: see workspaceSource in the result).'),
+        tolerance_bps: z
+          .number()
+          .int()
+          .min(0)
+          .max(MAX_TOLERANCE_BPS)
+          .optional()
+          .describe(
+            `Slippage tolerance of the credit floor in basis points, 0–${MAX_TOLERANCE_BPS} (default ${DEFAULT_TOLERANCE_BPS} = 1 %). The burn reverts, costing only gas, if the on-chain quote at inclusion would credit less than quote − tolerance; 0 demands exactly the quoted amount.`,
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    ({ usd, tokens, workspace }, extra) =>
+    ({ usd, tokens, workspace, tolerance_bps }, extra) =>
       run(async () => {
         const started = now();
         const progress = progressReporter(extra);
@@ -696,6 +708,10 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
         const amount = await resolveAmount({ usd, tokens }, dep.decimals);
         const { address: ws, source: workspaceSource } = resolveWorkspace(workspace);
         const tokensFormatted = `${formatTokenAmount(amount.tokens, dep.decimals)} ${dep.symbol}`;
+        // Credit floor (policy): quote − ceil(quote · tolerance / 10 000); the desk reverts rather than credit less.
+        const toleranceBps = tolerance_bps ?? DEFAULT_TOLERANCE_BPS;
+        const minUsdMicro = creditFloor(amount.usdMicro, toleranceBps);
+        const floorText = `${formatUsdMicro(minUsdMicro)} (quote − ${toleranceBps} bps)`;
         const common = {
           workspace: ws,
           workspaceSource,
@@ -703,6 +719,9 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
           tokensFormatted,
           usdMicro: amount.usdMicro,
           usd: formatUsdMicro(amount.usdMicro),
+          minUsdMicro,
+          minUsd: formatUsdMicro(minUsdMicro),
+          toleranceBps,
           priceE18: amount.quote.priceE18,
           chainId: config.chainId,
           creditDesk: dep.creditDesk,
@@ -715,6 +734,7 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
             deployment: { creditDesk: dep.creditDesk, token: dep.token },
             workspace: ws,
             tokens: amount.tokens,
+            minUsdMicro,
             tokenSymbol: dep.symbol,
             tokenDecimals: dep.decimals,
           });
@@ -723,13 +743,14 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
             ...common,
             note:
               `Sign and send the steps in order on chain ${config.chainId}. The gateway credits ${formatUsdMicro(amount.usdMicro)} (at the price the contract reads when mined) once the CreditPurchased event is indexed. ` +
+              `The burnForCreditMin step carries a credit floor of ${floorText}: if the price moves and the burn would credit less, it reverts with SlippageExceeded and costs only gas; re-quote and build new steps. ` +
               'If this wallet has open budgets, approve your current allowance + the amount: the burn spends the allowance their headroom depends on.' +
               workspaceWarning(workspaceSource, ws),
           };
         }
         const before = await api.balance();
-        await progress(`burning ${tokensFormatted} for workspace ${ws}: approve + burnForCredit, waiting for the receipt`);
-        const result = await wallet.buyCompute({ workspace: ws, tokens: amount.tokens });
+        await progress(`burning ${tokensFormatted} for workspace ${ws}: approve + burnForCreditMin (credit floor ${floorText}), waiting for the receipt`);
+        const result = await wallet.buyCompute({ workspace: ws, tokens: amount.tokens, minUsdMicro });
         // The event's usdMicro is the exact credit the gateway books (SPEC §9); the balance poll only tells whether it is visible yet.
         let creditedMicro: bigint | null = result.usdMicro ?? null;
         let credited = false;

@@ -16,9 +16,77 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { describe, expect, it } from 'vitest';
-import { buildUnsignedSteps, createLazyWalletExecutor, createViemWalletExecutor, errorMessage, WalletError, type WalletExecutor } from '../src/wallet.js';
+import {
+  buildUnsignedSteps,
+  createLazyWalletExecutor,
+  createViemWalletExecutor,
+  creditFloor,
+  decodeSlippage,
+  DEFAULT_TOLERANCE_BPS,
+  errorMessage,
+  MAX_TOLERANCE_BPS,
+  WalletError,
+  type WalletExecutor,
+} from '../src/wallet.js';
 
 const UINT256_MAX = (1n << 256n) - 1n;
+
+describe('creditFloor', () => {
+  it('applies the policy formula quote − ceil(quote · bps / 10 000) with a 1 % default', () => {
+    expect(DEFAULT_TOLERANCE_BPS).toBe(100);
+    expect(MAX_TOLERANCE_BPS).toBe(5000);
+    expect(creditFloor(5_000_000n)).toBe(4_950_000n);
+    expect(creditFloor(5_000_000n, 100)).toBe(4_950_000n);
+    expect(creditFloor(5_000_000n, 250)).toBe(4_875_000n);
+    expect(creditFloor(5_000_000n, 5000)).toBe(2_500_000n);
+    // 0 bps demands exactly the quote
+    expect(creditFloor(5_000_000n, 0)).toBe(5_000_000n);
+  });
+
+  it('rounds the tolerance up, so the floor is never stricter than the stated percentage', () => {
+    // 1 % of 1_000_001 = 10_000.01 → ceil 10_001 → floor 990_000 (a floor of 990_001 would be stricter than 1 %)
+    expect(creditFloor(1_000_001n, 100)).toBe(990_000n);
+    // 1 % of 1 µUSD rounds up to 1 → floor 0, which disables the floor on chain rather than making the burn impossible
+    expect(creditFloor(1n, 100)).toBe(0n);
+    expect(creditFloor(99n, 100)).toBe(98n);
+    expect(creditFloor(0n, 100)).toBe(0n);
+    // 1 bps of 10_000 is exactly 1: no rounding
+    expect(creditFloor(10_000n, 1)).toBe(9_999n);
+    expect(creditFloor(10_001n, 1)).toBe(9_999n);
+  });
+
+  it('rejects tolerances outside [0, 5000], non-integers and negative quotes', () => {
+    expect(() => creditFloor(1n, 5001)).toThrow(WalletError);
+    expect(() => creditFloor(1n, 5001)).toThrow(/toleranceBps/);
+    expect(() => creditFloor(1n, -1)).toThrow(/toleranceBps/);
+    expect(() => creditFloor(1n, 1.5)).toThrow(/toleranceBps/);
+    expect(() => creditFloor(1n, Number.NaN)).toThrow(/toleranceBps/);
+    expect(() => creditFloor(-1n)).toThrow(/quotedUsdMicro/);
+    expect(() => creditFloor(5 as unknown as bigint)).toThrow(/quotedUsdMicro/);
+    const error = (() => {
+      try {
+        creditFloor(1n, 9000);
+        return undefined;
+      } catch (e) {
+        return e as WalletError;
+      }
+    })();
+    expect(error?.code).toBe('invalid_tolerance');
+  });
+});
+
+describe('decodeSlippage', () => {
+  it('reads SlippageExceeded from decoded viem data or raw revert bytes anywhere down the cause chain', () => {
+    const raw = encodeErrorResult({ abi: CREDIT_DESK_ABI, errorName: 'SlippageExceeded', args: [4_900_000n, 4_950_000n] });
+    expect(decodeSlippage({ cause: { cause: { data: raw } } })).toEqual({ usdMicro: 4_900_000n, minUsdMicro: 4_950_000n });
+    expect(decodeSlippage({ cause: { data: { errorName: 'SlippageExceeded', args: [1n, 2n] } } })).toEqual({ usdMicro: 1n, minUsdMicro: 2n });
+    // other desk errors, garbage data and unrelated errors are not slippage
+    expect(decodeSlippage({ data: encodeErrorResult({ abi: CREDIT_DESK_ABI, errorName: 'BurnTooSmall', args: [1n, 2n] }) })).toBeUndefined();
+    expect(decodeSlippage({ data: '0xdeadbeef' })).toBeUndefined();
+    expect(decodeSlippage(new Error('nope'))).toBeUndefined();
+    expect(decodeSlippage(undefined)).toBeUndefined();
+  });
+});
 
 const DESK = '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0' as Address;
 const TOKEN = '0x5FbDB2315678afecb367f032d93F642f64180aa3' as Address;
@@ -44,6 +112,27 @@ describe('buildUnsignedSteps', () => {
     expect(burn!.to).toBe(DESK);
     expect(decodeFunctionData({ abi: CREDIT_DESK_ABI, data: burn!.data })).toEqual({ functionName: 'burnForCredit', args: [getAddress(WORKSPACE), tokens] });
     expect(burn!.description).toContain(getAddress(WORKSPACE));
+    expect(burn!.description).toMatch(/^burnForCredit: /);
+    expect(burn!.description).toMatch(/no credit floor/);
+  });
+
+  it('encodes approve + burnForCreditMin with the credit floor when a quote is available', () => {
+    const tokens = 500n * 10n ** 18n;
+    const minUsdMicro = creditFloor(5_000_000n); // 4_950_000
+    const req = buildUnsignedSteps({ action: 'buyCompute', chainId: 4663, deployment: { creditDesk: DESK, token: TOKEN }, workspace: WORKSPACE, tokens, minUsdMicro });
+    expect(req.steps.length).toBe(2);
+    const [approve, burn] = req.steps;
+    expect(decodeFunctionData({ abi: ERC20_ABI, data: approve!.data })).toEqual({ functionName: 'approve', args: [DESK, tokens] });
+    expect(burn!.to).toBe(DESK);
+    expect(decodeFunctionData({ abi: CREDIT_DESK_ABI, data: burn!.data })).toEqual({ functionName: 'burnForCreditMin', args: [getAddress(WORKSPACE), tokens, 4_950_000n] });
+    // the step documents the floor in both forms and what a revert costs
+    expect(burn!.description).toMatch(/^burnForCreditMin: /);
+    expect(burn!.description).toMatch(/credit floor of \$4\.95 \(4950000 µUSD\)/);
+    expect(burn!.description).toMatch(/SlippageExceeded/);
+    expect(burn!.description).toMatch(/costs only gas/);
+    // a zero floor is still encoded (the contract treats 0 as "no floor")
+    const zero = buildUnsignedSteps({ action: 'buyCompute', chainId: 4663, deployment: { creditDesk: DESK, token: TOKEN }, workspace: WORKSPACE, tokens, minUsdMicro: 0n });
+    expect(decodeFunctionData({ abi: CREDIT_DESK_ABI, data: zero.steps[1]!.data })).toEqual({ functionName: 'burnForCreditMin', args: [getAddress(WORKSPACE), tokens, 0n] });
   });
 
   it('encodes approve + openBudget with the custom symbol and decimals', () => {
@@ -70,6 +159,8 @@ describe('buildUnsignedSteps', () => {
     const base = { chainId: 1, deployment: { creditDesk: DESK, token: TOKEN }, workspace: WORKSPACE } as const;
     expect(() => buildUnsignedSteps({ ...base, action: 'buyCompute', tokens: 0n })).toThrow(WalletError);
     expect(() => buildUnsignedSteps({ ...base, action: 'buyCompute', tokens: 1n, workspace: '0x123' as Address })).toThrow(/workspace/);
+    expect(() => buildUnsignedSteps({ ...base, action: 'buyCompute', tokens: 1n, minUsdMicro: -1n })).toThrow(/minUsdMicro/);
+    expect(() => buildUnsignedSteps({ ...base, action: 'buyCompute', tokens: 1n, minUsdMicro: 1n << 256n })).toThrow(/minUsdMicro/);
     expect(() => buildUnsignedSteps({ ...base, action: 'openBudget', cap: 1n << 128n, deadline: 1n })).toThrow(/uint128/);
     expect(() => buildUnsignedSteps({ ...base, action: 'openBudget', cap: 1n, deadline: 0n })).toThrow(/deadline/);
   });
@@ -88,10 +179,16 @@ interface FakeNode {
   transport: ReturnType<typeof custom>;
   sent: SentTx[];
   calls: string[];
-  /** `allowance(AGENT, DESK)`: overwritten by `approve`, decremented by `burnForCredit` like a real ERC-20. */
+  /** `allowance(AGENT, DESK)`: overwritten by `approve`, decremented by `burnForCredit[Min]` like a real ERC-20. */
   allowance: bigint;
-  /** When set, `burnForCredit` simulations revert with this encoded error. */
+  /** When set, `burnForCredit[Min]` simulations (`eth_call` at `latest`) revert with this encoded error. */
   revertBurnWith?: Hex;
+  /**
+   * When set, the simulation passes but the *mined* burn reverts (receipt status 0), and a replay of the
+   * call at the receipt's block (`eth_call` with a block number) reverts with this encoded error: a price
+   * post landing between simulation and inclusion.
+   */
+  revertMinedBurnWith?: Hex;
   /** Chain id the node reports (default 31337). */
   chainId: number;
   /** Emit an unrelated desk event (`BudgetClosed`) before the expected one in every desk receipt. */
@@ -102,11 +199,22 @@ const SELECTORS = {
   allowance: toFunctionSelector('allowance(address,address)'),
   approve: toFunctionSelector('approve(address,uint256)'),
   burnForCredit: toFunctionSelector('burnForCredit(address,uint256)'),
+  burnForCreditMin: toFunctionSelector('burnForCreditMin(address,uint256,uint256)'),
   openBudget: toFunctionSelector('openBudget(address,uint128,uint64)'),
 } as const;
 
 function selectorOf(data: Hex): string {
   return data.slice(0, 10).toLowerCase();
+}
+
+function isBurn(sel: string): boolean {
+  return sel === SELECTORS.burnForCredit || sel === SELECTORS.burnForCreditMin;
+}
+
+/** `[workspace, amount]` of either burn function (the floor, if any, comes third). */
+function burnArgs(data: Hex): readonly [Address, bigint] {
+  const { args } = decodeFunctionData({ abi: CREDIT_DESK_ABI, data }) as { args: readonly [Address, bigint, ...unknown[]] };
+  return [args[0], args[1]];
 }
 
 function deskLog(tx: SentTx, topics: ReturnType<typeof encodeEventTopics>, data: Hex, logIndex: number): unknown {
@@ -116,15 +224,15 @@ function deskLog(tx: SentTx, topics: ReturnType<typeof encodeEventTopics>, data:
 function receiptLogs(node: FakeNode, tx: SentTx): unknown[] {
   const sel = selectorOf(tx.data);
   const logs: unknown[] = [];
-  if (sel === SELECTORS.burnForCredit || sel === SELECTORS.openBudget) {
+  if (isBurn(sel) || sel === SELECTORS.openBudget) {
     if (node.foreignDeskEventFirst) {
       // another desk event in the same receipt, first: the decoder must skip it rather than mis-read it
       const topics = encodeEventTopics({ abi: CREDIT_DESK_ABI, eventName: 'BudgetClosed', args: { budgetId: 77n } });
       logs.push(deskLog(tx, topics, encodeAbiParameters([{ type: 'uint128' }], [5n]), 0));
     }
   }
-  if (sel === SELECTORS.burnForCredit) {
-    const { args } = decodeFunctionData({ abi: CREDIT_DESK_ABI, data: tx.data }) as { args: readonly [Address, bigint] };
+  if (isBurn(sel)) {
+    const args = burnArgs(tx.data);
     const topics = encodeEventTopics({ abi: CREDIT_DESK_ABI, eventName: 'CreditPurchased', args: { receiptId: 11n, workspace: args[0], payer: AGENT } });
     const data = encodeAbiParameters([{ type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }], [args[1], 5_000_000n, 10n ** 16n]);
     logs.push(deskLog(tx, topics, data, logs.length));
@@ -141,7 +249,7 @@ function receiptLogs(node: FakeNode, tx: SentTx): unknown[] {
   return [{ address: TOKEN, topics: [keccak256(Buffer.from('Approval(address,address,uint256)'))], data: '0x', blockNumber: '0x11', transactionHash: tx.hash, transactionIndex: '0x0', blockHash: `0x${'33'.repeat(32)}`, logIndex: '0x0', removed: false }];
 }
 
-function createFakeNode(options: { allowance: bigint; revertBurnWith?: Hex; chainId?: number; foreignDeskEventFirst?: boolean }): FakeNode {
+function createFakeNode(options: { allowance: bigint; revertBurnWith?: Hex; revertMinedBurnWith?: Hex; chainId?: number; foreignDeskEventFirst?: boolean }): FakeNode {
   const node: FakeNode = {
     sent: [],
     calls: [],
@@ -149,6 +257,7 @@ function createFakeNode(options: { allowance: bigint; revertBurnWith?: Hex; chai
     chainId: options.chainId ?? 31337,
     foreignDeskEventFirst: options.foreignDeskEventFirst ?? false,
     ...(options.revertBurnWith === undefined ? {} : { revertBurnWith: options.revertBurnWith }),
+    ...(options.revertMinedBurnWith === undefined ? {} : { revertMinedBurnWith: options.revertMinedBurnWith }),
     transport: custom(
       {
         request: async ({ method, params }: { method: string; params?: unknown }) => {
@@ -194,9 +303,14 @@ function createFakeNode(options: { allowance: bigint; revertBurnWith?: Hex; chai
               const call = p[0] as { to: Address; data: Hex };
               const sel = selectorOf(call.data);
               if (sel === SELECTORS.allowance) return encodeFunctionResult({ abi: ERC20_ABI, functionName: 'allowance', result: node.allowance });
-              if (sel === SELECTORS.burnForCredit) {
+              if (isBurn(sel)) {
+                // a replay pins a block number; the pre-send simulation runs at `latest`
+                const historical = typeof p[1] === 'string' && p[1] !== 'latest' && p[1] !== 'pending';
                 if (node.revertBurnWith !== undefined) {
                   throw { code: 3, message: 'execution reverted', data: node.revertBurnWith };
+                }
+                if (historical && node.revertMinedBurnWith !== undefined) {
+                  throw { code: 3, message: 'execution reverted', data: node.revertMinedBurnWith };
                 }
                 return encodeFunctionResult({ abi: CREDIT_DESK_ABI, functionName: 'burnForCredit', result: 11n });
               }
@@ -212,9 +326,9 @@ function createFakeNode(options: { allowance: bigint; revertBurnWith?: Hex; chai
                 const { args } = decodeFunctionData({ abi: ERC20_ABI, data: tx.data! }) as { args: readonly [Address, bigint] };
                 node.allowance = args[1];
               }
-              if (selectorOf(tx.data!) === SELECTORS.burnForCredit) {
-                // safeTransferFrom inside burnForCredit spends the allowance (OZ `_spendAllowance`), unless it is unlimited
-                const { args } = decodeFunctionData({ abi: CREDIT_DESK_ABI, data: tx.data! }) as { args: readonly [Address, bigint] };
+              if (isBurn(selectorOf(tx.data!)) && node.revertMinedBurnWith === undefined) {
+                // safeTransferFrom inside burnForCredit[Min] spends the allowance (OZ `_spendAllowance`), unless it is unlimited
+                const args = burnArgs(tx.data!);
                 if (node.allowance !== UINT256_MAX) node.allowance -= args[1];
               }
               return hash;
@@ -223,6 +337,7 @@ function createFakeNode(options: { allowance: bigint; revertBurnWith?: Hex; chai
               const hash = p[0] as Hex;
               const tx = node.sent.find((t) => t.hash === hash);
               if (tx === undefined) return null;
+              const reverted = isBurn(selectorOf(tx.data)) && node.revertMinedBurnWith !== undefined;
               return {
                 transactionHash: hash,
                 transactionIndex: '0x0',
@@ -233,9 +348,9 @@ function createFakeNode(options: { allowance: bigint; revertBurnWith?: Hex; chai
                 cumulativeGasUsed: '0x5208',
                 gasUsed: '0x5208',
                 contractAddress: null,
-                logs: receiptLogs(node, tx),
+                logs: reverted ? [] : receiptLogs(node, tx),
                 logsBloom: `0x${'00'.repeat(256)}`,
-                status: '0x1',
+                status: reverted ? '0x0' : '0x1',
                 effectiveGasPrice: '0x1',
                 type: '0x2',
               };
@@ -266,6 +381,96 @@ describe('createViemWalletExecutor', () => {
     // receiptId, usdMicro and priceE18 all come from the CreditPurchased event
     expect(result).toEqual({ txHash: node.sent[1]!.hash, receiptId: 11n, usdMicro: 5_000_000n, priceE18: 10n ** 16n, approveTxHash: node.sent[0]!.hash });
     expect(node.allowance).toBe(0n);
+  });
+
+  it('calls burnForCreditMin with the floor when minUsdMicro is given', async () => {
+    const node = createFakeNode({ allowance: 500n * 10n ** 18n });
+    const wallet = createViemWalletExecutor({ privateKey: PRIVATE_KEY, chainId: 31337, deployment: { creditDesk: DESK, token: TOKEN }, transport: node.transport, pollingIntervalMs: 1 });
+    const tokens = 500n * 10n ** 18n;
+    const minUsdMicro = creditFloor(5_000_000n); // the quote the tool made, minus 1 %
+    const result = await wallet.buyCompute({ workspace: WORKSPACE, tokens, minUsdMicro });
+    expect(node.sent.length).toBe(2);
+    // cumulative approve, as for the plain burn
+    expect(decodeFunctionData({ abi: ERC20_ABI, data: node.sent[0]!.data })).toEqual({ functionName: 'approve', args: [DESK, 1000n * 10n ** 18n] });
+    expect(node.sent[1]!.to).toBe(DESK);
+    expect(selectorOf(node.sent[1]!.data)).toBe(SELECTORS.burnForCreditMin);
+    expect(decodeFunctionData({ abi: CREDIT_DESK_ABI, data: node.sent[1]!.data })).toEqual({ functionName: 'burnForCreditMin', args: [getAddress(WORKSPACE), tokens, 4_950_000n] });
+    // the simulation used the same function and floor
+    expect(result).toEqual({ txHash: node.sent[1]!.hash, receiptId: 11n, usdMicro: 5_000_000n, priceE18: 10n ** 16n, approveTxHash: node.sent[0]!.hash });
+    expect(node.allowance).toBe(500n * 10n ** 18n);
+  });
+
+  it('keeps plain burnForCredit when no floor is given (third parties, no quote)', async () => {
+    const node = createFakeNode({ allowance: UINT256_MAX });
+    const wallet = createViemWalletExecutor({ privateKey: PRIVATE_KEY, chainId: 31337, deployment: { creditDesk: DESK, token: TOKEN }, transport: node.transport, pollingIntervalMs: 1 });
+    await wallet.buyCompute({ workspace: WORKSPACE, tokens: 1n });
+    expect(selectorOf(node.sent[0]!.data)).toBe(SELECTORS.burnForCredit);
+    // an explicit zero floor still goes through burnForCreditMin (the contract treats 0 as "no floor")
+    await wallet.buyCompute({ workspace: WORKSPACE, tokens: 1n, minUsdMicro: 0n });
+    expect(decodeFunctionData({ abi: CREDIT_DESK_ABI, data: node.sent[1]!.data })).toEqual({ functionName: 'burnForCreditMin', args: [getAddress(WORKSPACE), 1n, 0n] });
+  });
+
+  it('maps a SlippageExceeded simulation revert to slippage_exceeded with both numbers and sends nothing', async () => {
+    const node = createFakeNode({
+      allowance: UINT256_MAX,
+      revertBurnWith: encodeErrorResult({ abi: CREDIT_DESK_ABI, errorName: 'SlippageExceeded', args: [4_900_000n, 4_950_000n] }),
+    });
+    const wallet = createViemWalletExecutor({ privateKey: PRIVATE_KEY, chainId: 31337, deployment: { creditDesk: DESK, token: TOKEN }, transport: node.transport, pollingIntervalMs: 1 });
+    const error = await wallet.buyCompute({ workspace: WORKSPACE, tokens: 500n * 10n ** 18n, minUsdMicro: 4_950_000n }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(WalletError);
+    expect((error as WalletError).code).toBe('slippage_exceeded');
+    expect((error as WalletError).message).toMatch(/burnForCreditMin would revert with SlippageExceeded/);
+    expect((error as WalletError).message).toMatch(/4900000 µUSD \(\$4\.90\)/);
+    expect((error as WalletError).message).toMatch(/floor of 4950000 µUSD \(\$4\.95\)/);
+    expect((error as WalletError).message).toMatch(/Nothing was burned/);
+    expect((error as WalletError).txHash).toBeUndefined();
+    expect(node.calls).not.toContain('eth_sendRawTransaction');
+    expect(node.sent.length).toBe(0);
+  });
+
+  it('diagnoses a burn that reverted after inclusion by replaying it at its block: slippage_exceeded with the tx hash', async () => {
+    // the simulation passed; a price post landed before the transaction and the desk reverted it on chain
+    const node = createFakeNode({
+      allowance: UINT256_MAX,
+      revertMinedBurnWith: encodeErrorResult({ abi: CREDIT_DESK_ABI, errorName: 'SlippageExceeded', args: [4_925_000n, 4_950_000n] }),
+    });
+    const wallet = createViemWalletExecutor({ privateKey: PRIVATE_KEY, chainId: 31337, deployment: { creditDesk: DESK, token: TOKEN }, transport: node.transport, pollingIntervalMs: 1 });
+    const error = await wallet.buyCompute({ workspace: WORKSPACE, tokens: 500n * 10n ** 18n, minUsdMicro: 4_950_000n }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(WalletError);
+    expect((error as WalletError).code).toBe('slippage_exceeded');
+    expect(node.sent.length).toBe(1);
+    expect((error as WalletError).txHash).toBe(node.sent[0]!.hash);
+    expect((error as WalletError).message).toMatch(/reverted with SlippageExceeded \(tx 0x[0-9a-f]{64}, only gas was spent\)/);
+    expect((error as WalletError).message).toMatch(/4925000 µUSD/);
+    expect((error as WalletError).message).toMatch(/4950000 µUSD/);
+    // the allowance was not spent: nothing was transferred
+    expect(node.allowance).toBe(UINT256_MAX);
+  });
+
+  it('keeps tx_reverted (with a floor hint) when the replay does not explain a mined revert', async () => {
+    const node = createFakeNode({
+      allowance: UINT256_MAX,
+      revertMinedBurnWith: encodeErrorResult({ abi: CREDIT_DESK_ABI, errorName: 'QuoteTooSmall', args: [] }),
+    });
+    const wallet = createViemWalletExecutor({ privateKey: PRIVATE_KEY, chainId: 31337, deployment: { creditDesk: DESK, token: TOKEN }, transport: node.transport, pollingIntervalMs: 1 });
+    const withFloor = await wallet.buyCompute({ workspace: WORKSPACE, tokens: 1n, minUsdMicro: 7n }).catch((e: unknown) => e);
+    expect((withFloor as WalletError).code).toBe('tx_reverted');
+    expect((withFloor as WalletError).message).toMatch(/burnForCreditMin reverted \(tx 0x[0-9a-f]{64}\)/);
+    expect((withFloor as WalletError).message).toMatch(/credit floor of 7 µUSD/);
+    expect((withFloor as WalletError).message).toMatch(/nothing was burned/);
+    expect((withFloor as WalletError).txHash).toBe(node.sent[0]!.hash);
+    // without a floor there is nothing to diagnose: the plain tx_reverted of before
+    const plain = await wallet.buyCompute({ workspace: WORKSPACE, tokens: 1n }).catch((e: unknown) => e);
+    expect((plain as WalletError).code).toBe('tx_reverted');
+    expect((plain as WalletError).message).toBe(`burnForCredit reverted (tx ${node.sent[1]!.hash})`);
+  });
+
+  it('rejects a floor that does not fit uint256 before touching the chain', async () => {
+    const node = createFakeNode({ allowance: 0n });
+    const wallet = createViemWalletExecutor({ privateKey: PRIVATE_KEY, chainId: 31337, deployment: { creditDesk: DESK, token: TOKEN }, transport: node.transport });
+    await expect(wallet.buyCompute({ workspace: WORKSPACE, tokens: 1n, minUsdMicro: -1n })).rejects.toMatchObject({ code: 'invalid_amount' });
+    await expect(wallet.buyCompute({ workspace: WORKSPACE, tokens: 1n, minUsdMicro: 1n << 256n })).rejects.toMatchObject({ code: 'invalid_amount' });
+    expect(node.calls.length).toBe(0);
   });
 
   it('approves on top of an existing allowance so the burn leaves it intact for open budgets', async () => {
@@ -385,7 +590,7 @@ describe('createLazyWalletExecutor', () => {
     let gatewayUp = false;
     const inner: WalletExecutor = {
       address: AGENT,
-      buyCompute: async ({ tokens }) => ({ txHash: `0x${'aa'.repeat(32)}`, receiptId: tokens }),
+      buyCompute: async ({ tokens, minUsdMicro }) => ({ txHash: `0x${'aa'.repeat(32)}`, receiptId: tokens, ...(minUsdMicro === undefined ? {} : { usdMicro: minUsdMicro }) }),
       openBudget: async () => ({ txHash: `0x${'bb'.repeat(32)}`, budgetId: 1n }),
     };
     const wallet = createLazyWalletExecutor({
@@ -408,6 +613,8 @@ describe('createLazyWalletExecutor', () => {
 
     gatewayUp = true;
     expect(await wallet.buyCompute({ workspace: WORKSPACE, tokens: 2n })).toEqual({ txHash: `0x${'aa'.repeat(32)}`, receiptId: 2n });
+    // the floor is passed through untouched
+    expect(await wallet.buyCompute({ workspace: WORKSPACE, tokens: 2n, minUsdMicro: 99n })).toEqual({ txHash: `0x${'aa'.repeat(32)}`, receiptId: 2n, usdMicro: 99n });
     expect(await wallet.openBudget({ workspace: WORKSPACE, cap: 1n, deadline: 1n })).toMatchObject({ budgetId: 1n });
     expect(builds).toBe(2);
   });

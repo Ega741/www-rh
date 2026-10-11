@@ -358,7 +358,7 @@ describe('beagle_upgrade', () => {
 });
 
 describe('beagle_buy_compute without a wallet', () => {
-  it('returns unsigned approve + burnForCredit steps with decodable calldata', async () => {
+  it('returns unsigned approve + burnForCreditMin steps with decodable calldata and the default 1 % floor', async () => {
     const api = createFakeApi();
     const client = await connect(api);
     const data = structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE }));
@@ -367,10 +367,16 @@ describe('beagle_buy_compute without a wallet', () => {
     const expectedTokens = tokensForUsdMicro(5_000_000n, PRICE_E18);
     expect(data['tokens']).toBe(expectedTokens.toString());
     expect(data['usdMicro']).toBe('5000000');
+    // the floor: quote − ceil(quote · 100 / 10 000)
+    expect(data['minUsdMicro']).toBe('4950000');
+    expect(data['minUsd']).toBe('$4.95');
+    expect(data['toleranceBps']).toBe(100);
     expect(data['workspace']).toBe(getAddress(WORKSPACE));
     expect(data['workspaceSource']).toBe('input');
     expect(data['note']).not.toMatch(/Warning/);
     expect(data['note']).toMatch(/current allowance \+ the amount/);
+    expect(data['note']).toMatch(/credit floor of \$4\.95 \(quote − 100 bps\)/);
+    expect(data['note']).toMatch(/costs only gas/);
     const steps = data['steps'] as Array<{ to: string; data: Hex; value: string; description: string }>;
     expect(steps.length).toBe(2);
     expect(steps.every((s) => s.value === '0')).toBe(true);
@@ -383,11 +389,60 @@ describe('beagle_buy_compute without a wallet', () => {
 
     expect(steps[1]!.to).toBe(DESK);
     const burn = decodeFunctionData({ abi: CREDIT_DESK_ABI, data: steps[1]!.data });
-    expect(burn.functionName).toBe('burnForCredit');
-    expect(burn.args).toEqual([getAddress(WORKSPACE), expectedTokens]);
+    expect(burn.functionName).toBe('burnForCreditMin');
+    expect(burn.args).toEqual([getAddress(WORKSPACE), expectedTokens, 4_950_000n]);
+    expect(steps[1]!.description).toMatch(/credit floor of \$4\.95 \(4950000 µUSD\)/);
+    expect(steps[1]!.description).toMatch(/SlippageExceeded/);
     expect(data['note']).toMatch(/\$5\.00/);
     // the quote came from the api
     expect(api.state.calls.find((c) => c.method === 'quote')?.args[0]).toEqual({ usdMicro: 5_000_000n });
+  });
+
+  it('applies a caller-chosen tolerance_bps to the floor, including 0 (exactly the quote)', async () => {
+    const client = await connect(createFakeApi());
+    const expectedTokens = tokensForUsdMicro(5_000_000n, PRICE_E18);
+
+    const loose = structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE, tolerance_bps: 250 }));
+    expect(loose['minUsdMicro']).toBe('4875000');
+    expect(loose['toleranceBps']).toBe(250);
+    const looseSteps = loose['steps'] as Array<{ data: Hex }>;
+    expect(decodeFunctionData({ abi: CREDIT_DESK_ABI, data: looseSteps[1]!.data })).toEqual({ functionName: 'burnForCreditMin', args: [getAddress(WORKSPACE), expectedTokens, 4_875_000n] });
+
+    const exact = structured(await call(client, 'beagle_buy_compute', { tokens: 250, workspace: WORKSPACE, tolerance_bps: 0 }));
+    expect(exact['usdMicro']).toBe('2500000');
+    expect(exact['minUsdMicro']).toBe('2500000');
+    expect(exact['toleranceBps']).toBe(0);
+    const exactSteps = exact['steps'] as Array<{ data: Hex }>;
+    expect(decodeFunctionData({ abi: CREDIT_DESK_ABI, data: exactSteps[1]!.data })).toEqual({ functionName: 'burnForCreditMin', args: [getAddress(WORKSPACE), 250n * 10n ** 18n, 2_500_000n] });
+
+    const max = structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE, tolerance_bps: 5000 }));
+    expect(max['minUsdMicro']).toBe('2500000');
+  });
+
+  it('rejects tolerance_bps outside 0..5000, non-integers and non-numbers through the schema', async () => {
+    const client = await connect(createFakeApi());
+    for (const tolerance_bps of [5001, -1, 1.5, '100', null, 10_000]) {
+      const result = await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE, tolerance_bps });
+      expect(result.isError, `tolerance_bps ${JSON.stringify(tolerance_bps)}`).toBe(true);
+    }
+    // the boundaries are fine
+    structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE, tolerance_bps: 0 }));
+    structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE, tolerance_bps: 5000 }));
+  });
+
+  it('describes the floor, its default and what a reverted burn costs in the tool description', async () => {
+    const client = await connect(createFakeApi());
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === 'beagle_buy_compute');
+    expect(tool?.description).toMatch(/burnForCreditMin/);
+    expect(tool?.description).toMatch(/credit floor of quote − tolerance_bps \(default 100 = 1 %\)/);
+    expect(tool?.description).toMatch(/SlippageExceeded/);
+    expect(tool?.description).toMatch(/costs only gas/);
+    const props = (tool?.inputSchema as { properties: Record<string, { type?: string; minimum?: number; maximum?: number; description?: string }> }).properties;
+    expect(props['tolerance_bps']?.type).toBe('integer');
+    expect(props['tolerance_bps']?.minimum).toBe(0);
+    expect(props['tolerance_bps']?.maximum).toBe(5000);
+    expect(props['tolerance_bps']?.description).toMatch(/default 100/);
   });
 
   it('accepts a token amount and uses the configured default workspace', async () => {
@@ -442,13 +497,48 @@ describe('beagle_buy_compute with a wallet', () => {
     expect(data['workspace']).toBe(AGENT); // defaults to the agent wallet
     expect(data['workspaceSource']).toBe('agent_wallet');
     expect(data['explorerTxUrl']).toBeNull();
-    expect(wallet.calls).toEqual([{ buyCompute: { workspace: AGENT, tokens: 500n * 10n ** 18n } }]);
+    // the executor gets the policy floor (quote − 1 %) and the result reports it
+    expect(wallet.calls).toEqual([{ buyCompute: { workspace: AGENT, tokens: 500n * 10n ** 18n, minUsdMicro: 4_950_000n } }]);
+    expect(data['minUsdMicro']).toBe('4950000');
+    expect(data['minUsd']).toBe('$4.95');
+    expect(data['toleranceBps']).toBe(100);
     // one balance read before the burn, then polling until credited (visible on the third call overall)
     expect(api.callsTo('balance')).toBe(3);
     expect(data['note']).toMatch(/^Credited \$5\.00\./);
     // the agent-wallet default is a guess about the key's workspace: say so
     expect(data['note']).toMatch(/Warning: workspace defaulted to the agent wallet/);
     expect(typeof data['elapsedMs']).toBe('number');
+  });
+
+  it('passes a caller-chosen tolerance_bps to the executor as the floor', async () => {
+    const wallet = fakeWallet();
+    const client = await connect(createFakeApi(), { wallet, waitForCredit: false });
+    const data = structured(await call(client, 'beagle_buy_compute', { tokens: 10, workspace: WORKSPACE, tolerance_bps: 50 }));
+    // 10 BEAGLE @ $0.01 = 100_000 µUSD; 0.5 % = 500 → floor 99_500
+    expect(wallet.calls).toEqual([{ buyCompute: { workspace: getAddress(WORKSPACE), tokens: 10n * 10n ** 18n, minUsdMicro: 99_500n } }]);
+    expect(data['minUsdMicro']).toBe('99500');
+    expect(data['toleranceBps']).toBe(50);
+  });
+
+  it('maps a slippage_exceeded wallet failure to isError with that code, nothing burned', async () => {
+    const asked: unknown[] = [];
+    const wallet = fakeWallet({
+      async buyCompute(params) {
+        asked.push(params);
+        throw new WalletError('slippage_exceeded', 'burnForCreditMin would revert with SlippageExceeded: the desk now quotes 4900000 µUSD ($4.90) for this burn, below the credit floor of 4950000 µUSD ($4.95); the price moved since the quote. Nothing was burned: re-quote and retry, or allow a wider tolerance.');
+      },
+    });
+    const api = createFakeApi();
+    const client = await connect(api, { wallet });
+    const error = errorOf(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE }));
+    expect(error.code).toBe('slippage_exceeded');
+    expect(error.message).toMatch(/4900000 µUSD/);
+    expect(error.message).toMatch(/4950000 µUSD/);
+    expect((error as { txHash?: string }).txHash).toBeUndefined();
+    // the executor was asked for the floor the message talks about
+    expect(asked).toEqual([{ workspace: getAddress(WORKSPACE), tokens: 500n * 10n ** 18n, minUsdMicro: 4_950_000n }]);
+    // no credit poll after a failed burn
+    expect(api.callsTo('balance')).toBe(1);
   });
 
   it('reports a pending credit (with the emitted amount) when the indexer has not caught up in time', async () => {
@@ -542,6 +632,7 @@ describe('beagle_buy_compute with a wallet', () => {
     expect(data['credited']).toBe(true);
     expect(progress.length).toBeGreaterThanOrEqual(10);
     expect(progress[0]!.message).toMatch(/burning 500 BEAGLE/);
+    expect(progress[0]!.message).toMatch(/burnForCreditMin \(credit floor \$4\.95 \(quote − 100 bps\)\)/);
     expect(progress[1]!.message).toMatch(/burn mined \(tx 0xabab/);
     expect(progress.map((p) => p.progress)).toEqual(progress.map((_, i) => i + 1));
   });
@@ -690,5 +781,7 @@ describe('resources', () => {
     const qsText = (quickstart.contents[0] as { text: string }).text;
     expect(qsText).toMatch(/https:\/\/api\.beagle\.example\/v1\/chat\/completions/);
     expect(qsText).toMatch(/402 insufficient_credit/);
+    expect(qsText).toMatch(/approve \+ burnForCreditMin/);
+    expect(qsText).toMatch(/credit floor of quote − `tolerance_bps` \(default 100 = 1 %\)/);
   });
 });
