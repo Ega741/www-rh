@@ -164,7 +164,7 @@ describe('CreditDesk ABI (SPEC §3.4)', () => {
     const event = getAbiItem({ abi: CREDIT_DESK_ABI, name: 'CreditPurchased' });
     const topics = encodeEventTopics({ abi: CREDIT_DESK_ABI, eventName: 'CreditPurchased', args: { receiptId: 7n, workspace, payer: workspace } });
     const logData = encodeAbiParameters(event.inputs.filter((i) => !i.indexed), [1000n * 10n ** 18n, 2_500_000n, 2_500_000_000_000_000n]);
-    const decoded = decodeEventLog({ abi: CREDIT_DESK_ABI, eventName: 'CreditPurchased', topics, data: logData });
+    const decoded = decodeEventLog({ abi: CREDIT_DESK_ABI, eventName: 'CreditPurchased', topics: topics as [`0x${string}`, ...`0x${string}`[]], data: logData });
     const args: CreditPurchasedArgs = decoded.args;
     expect(args).toEqual({
       receiptId: 7n,
@@ -212,7 +212,9 @@ describe('CreditDesk ABI (SPEC §3.4)', () => {
 describe('ManualPriceSource ABI (SPEC §3.3)', () => {
   const abi = MANUAL_PRICE_SOURCE_ABI as unknown as Abi;
   it('has the price functions, events and errors', () => {
-    expect(fn(abi, 'latestPrice').outputs.map((o) => `${o.name}:${o.type}`)).toEqual(['priceE18:uint256', 'updatedAt:uint256']);
+    // The implementation returns the pair unnamed: naming the outputs `priceE18`/`updatedAt` would
+    // shadow the public storage getters of the same names (ABI output names are cosmetic for viem).
+    expect(fn(abi, 'latestPrice').outputs.map((o) => o.type)).toEqual(['uint256', 'uint256']);
     expect(toFunctionSelector(fn(abi, 'post'))).toBe(toFunctionSelector('post(uint256)'));
     expect(toFunctionSelector(fn(abi, 'forcePrice'))).toBe(toFunctionSelector('forcePrice(uint256)'));
     expect(toFunctionSelector(fn(abi, 'setBounds'))).toBe(toFunctionSelector('setBounds(uint16,uint32)'));

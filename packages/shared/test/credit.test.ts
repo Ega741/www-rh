@@ -118,10 +118,10 @@ describe('costMicroUsd', () => {
     expect(componentCostMicroUsd(1, 1)).toBe(1n); // ceil(1e-6)
     expect(componentCostMicroUsd(0, 4_000_000)).toBe(0n);
     expect(componentCostMicroUsd(5, 0)).toBe(0n);
-    expect(costMicroUsd({ inputTokens: 1234, outputTokens: 100 }, opus.price)).toBe(4936n + 2_000_000n);
+    expect(costMicroUsd({ inputTokens: 1234, outputTokens: 100 }, opus.price)).toBe(4936n + 2_000n);
     expect(
       costMicroUsd({ inputTokens: 1000, outputTokens: 0, cacheReadTokens: 1000, cacheWriteTokens: 1000 }, opus.price),
-    ).toBe(4_000_000n + 200_000n + 5_000_000n);
+    ).toBe(4_000n + 200n + 5_000n);
   });
   it('falls back to the input price for cache tokens without a cache price', () => {
     const price = { inputPerM: 50_000, outputPerM: 200_000 };

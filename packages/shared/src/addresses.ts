@@ -10,7 +10,7 @@
  *
  * @module addresses
  */
-import { getAddress, type Address } from 'viem';
+import { getAddress, isAddress, type Address } from 'viem';
 import { ANVIL_CHAIN_ID, ROBINHOOD_CHAIN_ID, ROBINHOOD_TESTNET_CHAIN_ID } from './chains.js';
 import { DEPLOYMENTS } from './deployments.generated.js';
 
@@ -178,9 +178,9 @@ export type OverridableAddress = 'creditDesk' | 'token' | 'priceSource';
 
 /** Env overrides for {@link resolveDeployment}; the zero address and blank strings count as unset. */
 export interface DeploymentOverrides {
-  creditDesk?: string | null;
-  token?: string | null;
-  priceSource?: string | null;
+  creditDesk?: string | null | undefined;
+  token?: string | null | undefined;
+  priceSource?: string | null | undefined;
 }
 
 /**
@@ -200,13 +200,16 @@ function overrideAddress(field: OverridableAddress, value: string | null | undef
   if (!/^0x[0-9a-fA-F]{40}$/.test(v)) {
     throw new Error(`resolveDeployment: override ${field} is not an address: ${JSON.stringify(value)}`);
   }
+  if (!isAddress(v)) {
+    throw new Error(`resolveDeployment: override ${field} has a bad EIP-55 checksum: ${JSON.stringify(value)}`);
+  }
   return getAddress(v);
 }
 
 /**
  * Resolves the deployment of `chainId`, applying `overrides` on top of the committed record.
  * Override values that are blank or the zero address are ignored; other values must be valid
- * addresses (checksummed on output) or the function throws.
+ * addresses (all-lowercase or correctly checksummed; checksummed on output) or the function throws.
  */
 export function resolveDeployment(chainId: number, overrides: DeploymentOverrides = {}): ResolvedDeployment {
   const base = deploymentFor(chainId);

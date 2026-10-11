@@ -124,7 +124,7 @@ export interface FormatOptions {
 function formatScaled(abs: bigint, scale: number, max: number, min: number, round: boolean): string {
   if (!Number.isInteger(max) || max < 0) throw new RangeError('maxFractionDigits must be a non-negative integer');
   if (!Number.isInteger(min) || min < 0) throw new RangeError('minFractionDigits must be a non-negative integer');
-  const digits = Math.min(max, scale);
+  const digits = Math.min(Math.max(max, min), scale);
   const drop = scale - digits;
   let q = abs;
   if (drop > 0) {
@@ -148,7 +148,7 @@ function formatScaled(abs: bigint, scale: number, max: number, min: number, roun
 export function formatUsdMicro(x: bigint, options: FormatOptions = {}): string {
   const { maxFractionDigits = 4, minFractionDigits = 2 } = options;
   const negative = x < 0n;
-  const body = formatScaled(negative ? -x : x, 6, Math.max(maxFractionDigits, minFractionDigits), minFractionDigits, true);
+  const body = formatScaled(negative ? -x : x, 6, maxFractionDigits, minFractionDigits, true);
   return `${negative ? '-' : ''}$${body}`;
 }
 
@@ -201,7 +201,7 @@ export function parseTokenAmount(input: string, decimals: number): bigint {
 export function formatPriceE18(priceE18: bigint, options: FormatOptions = {}): string {
   assertNonNegative('priceE18', priceE18);
   const { maxFractionDigits = 6, minFractionDigits = 2 } = options;
-  return `$${formatScaled(priceE18, 18, Math.max(maxFractionDigits, minFractionDigits), minFractionDigits, true)}`;
+  return `$${formatScaled(priceE18, 18, maxFractionDigits, minFractionDigits, true)}`;
 }
 
 /** Raw token units bought by one USD at `priceE18` (`tokensForUsdMicro(1_000_000n, …)`). */

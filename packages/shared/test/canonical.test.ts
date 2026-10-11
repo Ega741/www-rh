@@ -75,7 +75,7 @@ describe('sha256Hex / receiptHash', () => {
   it('hashes UTF-8 input to lowercase hex without 0x', () => {
     expect(sha256Hex('')).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
     expect(sha256Hex('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
-    expect(sha256Hex('é')).toBe('30b7b3e3b7ce28c8f3c1f3d58c89d5fbf2e5d8f3a0d2fe1c3a5c3b1d5d3b3a1b'.length === 64 ? sha256Hex('é') : '');
+    expect(sha256Hex('é')).toBe('4a99557e4033c3539de2eb65472017cad5f9557f7a0625a09f1c3f6e2ba69c4c');
     expect(sha256Hex('é')).toMatch(/^[0-9a-f]{64}$/);
   });
 
@@ -91,6 +91,6 @@ describe('sha256Hex / receiptHash', () => {
 
   it('matches a known digest', () => {
     expect(receiptHash({ a: 1 })).toBe(`0x${sha256Hex('{"a":1}')}`);
-    expect(sha256Hex('{"a":1}')).toBe('bbb4fb2185b6c1c3a7ee3c1cb13f3a9d1eb8cc6b67fd2f1cd3ed2a2c2a0e4b40'.length === 64 ? sha256Hex('{"a":1}') : '');
+    expect(sha256Hex('{"a":1}')).toBe('015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862');
   });
 });

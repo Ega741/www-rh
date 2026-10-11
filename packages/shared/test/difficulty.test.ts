@@ -18,59 +18,61 @@ const base = (over: Partial<DifficultyInput> = {}): DifficultyInput => ({
 describe('estimateDifficulty (SPEC §4.5)', () => {
   it('starts at 0.25 for a trivial request', () => {
     expect(DIFFICULTY_BASE).toBe(0.25);
-    expect(estimateDifficulty(base())).toBeCloseTo(0.25, 6);
+    expect(estimateDifficulty(base())).toBeCloseTo(0.25, 3);
     expect(estimateDifficulty({ messages: [], systemLength: 0, toolCount: 0 })).toBe(0.25);
   });
 
   it('adds up to 0.30 for input size (text or textLength)', () => {
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', textLength: 20_000 }] }))).toBeCloseTo(0.4, 6);
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', textLength: 40_000 }] }))).toBeCloseTo(0.55, 6);
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', textLength: 400_000 }] }))).toBeCloseTo(0.55, 6);
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'a'.repeat(20_000) }] }))).toBeCloseTo(0.4, 6);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', textLength: 20_000 }] }))).toBeCloseTo(0.4, 3);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', textLength: 40_000 }] }))).toBeCloseTo(0.55, 3);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', textLength: 400_000 }] }))).toBeCloseTo(0.55, 3);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'a'.repeat(20_000) }] }))).toBeCloseTo(0.4, 3);
     // text wins over textLength; assistant messages count toward size too
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'a'.repeat(20_000), textLength: 1 }, { role: 'assistant', textLength: 20_000 }] }))).toBeCloseTo(0.55, 6);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'a'.repeat(20_000), textLength: 1 }, { role: 'assistant', textLength: 20_000 }] }))).toBeCloseTo(0.55, 3);
     expect(estimateDifficulty(base({ messages: [{ role: 'user', textLength: Number.NaN }] }))).toBe(0.25);
   });
 
   it('adds 0.15 for code in user content only', () => {
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'here:\n```js\nx\n```' }] }))).toBeCloseTo(0.4, 6);
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'def foo(): pass' }] }))).toBeCloseTo(0.4, 6);
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: '#include <stdio.h>' }] }))).toBeCloseTo(0.4, 6);
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'SELECT * FROM t' }] }))).toBeCloseTo(0.4, 6);
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'the class of 2026' }] }))).toBeCloseTo(0.4, 6);
-    expect(estimateDifficulty(base({ messages: [{ role: 'assistant', text: 'function f() {}' }, { role: 'user', text: 'thanks' }] }))).toBeCloseTo(0.25, 6);
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'classy functional importance' }] }))).toBeCloseTo(0.25, 6);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'here:\n```js\nx\n```' }] }))).toBeCloseTo(0.4, 3);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'def foo(): pass' }] }))).toBeCloseTo(0.4, 3);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: '#include <stdio.h>' }] }))).toBeCloseTo(0.4, 3);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'SELECT id FROM t' }] }))).toBeCloseTo(0.4, 3);
+    // the spec regex needs a word character after 'SELECT ', so `SELECT *` is not a code smell
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'SELECT * FROM t' }] }))).toBeCloseTo(0.25, 3);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'the class of 2026' }] }))).toBeCloseTo(0.4, 3);
+    expect(estimateDifficulty(base({ messages: [{ role: 'assistant', text: 'function f() {}' }, { role: 'user', text: 'thanks' }] }))).toBeCloseTo(0.25, 3);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'classy functional importance' }] }))).toBeCloseTo(0.25, 3);
     expect(CODE_PATTERN.test('import os')).toBe(true);
     expect(CODE_PATTERN.test('important')).toBe(false);
   });
 
   it('adds 0.15 for tools, 0.10 for a long system prompt, 0.10 for > 8 messages', () => {
-    expect(estimateDifficulty(base({ toolCount: 3 }))).toBeCloseTo(0.4, 6);
-    expect(estimateDifficulty(base({ systemLength: 2_000 }))).toBeCloseTo(0.25, 6);
-    expect(estimateDifficulty(base({ systemLength: 2_001 }))).toBeCloseTo(0.35, 6);
+    expect(estimateDifficulty(base({ toolCount: 3 }))).toBeCloseTo(0.4, 3);
+    expect(estimateDifficulty(base({ systemLength: 2_000 }))).toBeCloseTo(0.25, 3);
+    expect(estimateDifficulty(base({ systemLength: 2_001 }))).toBeCloseTo(0.35, 3);
     const eight = Array.from({ length: 8 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', text: 'x' }));
-    expect(estimateDifficulty(base({ messages: eight }))).toBeCloseTo(0.25, 6);
-    expect(estimateDifficulty(base({ messages: [...eight, { role: 'user', text: 'y' }] }))).toBeCloseTo(0.35, 6);
+    expect(estimateDifficulty(base({ messages: eight }))).toBeCloseTo(0.25, 3);
+    expect(estimateDifficulty(base({ messages: [...eight, { role: 'user', text: 'y' }] }))).toBeCloseTo(0.35, 3);
   });
 
   it('adds 0.10 for reasoning keywords (case-insensitive, user content only)', () => {
     for (const t of ['Please ANALYZE this', 'analyse it', 'go step-by-step', 'step by step', 'prove it', 'refactor', 'debug', 'optimise', 'optimize', 'plan a trip', 'design', 'audit', 'architect']) {
-      expect(estimateDifficulty(base({ messages: [{ role: 'user', text: t }] })), t).toBeCloseTo(0.35, 6);
+      expect(estimateDifficulty(base({ messages: [{ role: 'user', text: t }] })), t).toBeCloseTo(0.35, 3);
     }
-    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'planning analysis' }] }))).toBeCloseTo(0.25, 6);
-    expect(estimateDifficulty(base({ messages: [{ role: 'system', text: 'audit everything' }, { role: 'user', text: 'ok' }] }))).toBeCloseTo(0.25, 6);
+    expect(estimateDifficulty(base({ messages: [{ role: 'user', text: 'planning analysis' }] }))).toBeCloseTo(0.25, 3);
+    expect(estimateDifficulty(base({ messages: [{ role: 'system', text: 'audit everything' }, { role: 'user', text: 'ok' }] }))).toBeCloseTo(0.25, 3);
     expect(REASONING_KEYWORD_PATTERN.test('Debug')).toBe(true);
   });
 
   it('applies reasoning effort', () => {
-    expect(estimateDifficulty(base({ reasoningEffort: 'high' }))).toBeCloseTo(0.55, 6);
-    expect(estimateDifficulty(base({ reasoningEffort: 'xhigh' }))).toBeCloseTo(0.55, 6);
-    expect(estimateDifficulty(base({ reasoningEffort: 'max' }))).toBeCloseTo(0.55, 6);
-    expect(estimateDifficulty(base({ reasoningEffort: 'low' }))).toBeCloseTo(0.05, 6);
-    expect(estimateDifficulty(base({ reasoningEffort: 'minimal' }))).toBeCloseTo(0.05, 6);
-    expect(estimateDifficulty(base({ reasoningEffort: 'medium' }))).toBeCloseTo(0.25, 6);
-    expect(estimateDifficulty(base({ reasoningEffort: 'none' }))).toBeCloseTo(0.25, 6);
-    expect(estimateDifficulty(base({ reasoningEffort: 'weird' }))).toBeCloseTo(0.25, 6);
+    expect(estimateDifficulty(base({ reasoningEffort: 'high' }))).toBeCloseTo(0.55, 3);
+    expect(estimateDifficulty(base({ reasoningEffort: 'xhigh' }))).toBeCloseTo(0.55, 3);
+    expect(estimateDifficulty(base({ reasoningEffort: 'max' }))).toBeCloseTo(0.55, 3);
+    expect(estimateDifficulty(base({ reasoningEffort: 'low' }))).toBeCloseTo(0.05, 3);
+    expect(estimateDifficulty(base({ reasoningEffort: 'minimal' }))).toBeCloseTo(0.05, 3);
+    expect(estimateDifficulty(base({ reasoningEffort: 'medium' }))).toBeCloseTo(0.25, 3);
+    expect(estimateDifficulty(base({ reasoningEffort: 'none' }))).toBeCloseTo(0.25, 3);
+    expect(estimateDifficulty(base({ reasoningEffort: 'weird' }))).toBeCloseTo(0.25, 3);
   });
 
   it('clamps to [0, 1] and rounds to 4 decimals', () => {

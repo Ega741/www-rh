@@ -77,7 +77,7 @@ export const CREDIT_DESK_ABI = [
     ],
     "outputs": [
       {
-        "name": "",
+        "name": "remaining",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -89,7 +89,7 @@ export const CREDIT_DESK_ABI = [
     "name": "budgets",
     "inputs": [
       {
-        "name": "",
+        "name": "budgetId",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -468,7 +468,7 @@ export const CREDIT_DESK_ABI = [
     "name": "setMaxPriceAge",
     "inputs": [
       {
-        "name": "maxPriceAge_",
+        "name": "newMaxAge",
         "type": "uint32",
         "internalType": "uint32"
       }
@@ -481,7 +481,7 @@ export const CREDIT_DESK_ABI = [
     "name": "setMinBurn",
     "inputs": [
       {
-        "name": "minBurn_",
+        "name": "newMinBurn",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -494,7 +494,7 @@ export const CREDIT_DESK_ABI = [
     "name": "setOperator",
     "inputs": [
       {
-        "name": "operator_",
+        "name": "newOperator",
         "type": "address",
         "internalType": "address"
       }
@@ -507,7 +507,7 @@ export const CREDIT_DESK_ABI = [
     "name": "setPriceSource",
     "inputs": [
       {
-        "name": "priceSource_",
+        "name": "newSource",
         "type": "address",
         "internalType": "contract IPriceSource"
       }
@@ -853,23 +853,17 @@ export const CREDIT_DESK_ABI = [
   },
   {
     "type": "error",
-    "name": "AddressEmptyCode",
-    "inputs": [
-      {
-        "name": "target",
-        "type": "address",
-        "internalType": "address"
-      }
-    ]
-  },
-  {
-    "type": "error",
     "name": "BadBudgetParams",
     "inputs": []
   },
   {
     "type": "error",
     "name": "BadDecimals",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "BadMaxPriceAge",
     "inputs": []
   },
   {
@@ -917,11 +911,6 @@ export const CREDIT_DESK_ABI = [
   {
     "type": "error",
     "name": "ExpectedPause",
-    "inputs": []
-  },
-  {
-    "type": "error",
-    "name": "FailedCall",
     "inputs": []
   },
   {
@@ -1615,7 +1604,7 @@ export const MANUAL_PRICE_SOURCE_ABI = [
     "name": "forcePrice",
     "inputs": [
       {
-        "name": "priceE18_",
+        "name": "newPriceE18",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -1629,12 +1618,12 @@ export const MANUAL_PRICE_SOURCE_ABI = [
     "inputs": [],
     "outputs": [
       {
-        "name": "priceE18",
+        "name": "",
         "type": "uint256",
         "internalType": "uint256"
       },
       {
-        "name": "updatedAt",
+        "name": "",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -1762,7 +1751,7 @@ export const MANUAL_PRICE_SOURCE_ABI = [
     "name": "setPoster",
     "inputs": [
       {
-        "name": "poster_",
+        "name": "newPoster",
         "type": "address",
         "internalType": "address"
       }
@@ -2031,6 +2020,11 @@ export const CHAINLINK_PRICE_SOURCE_ABI = [
       }
     ],
     "stateMutability": "view"
+  },
+  {
+    "type": "error",
+    "name": "BadDecimals",
+    "inputs": []
   },
   {
     "type": "error",
