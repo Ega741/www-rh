@@ -55,3 +55,9 @@ robinhood_testnet = "${ROBINHOOD_TESTNET_RPC_URL}"
 [etherscan]
 robinhood = { key = "${BLOCKSCOUT_API_KEY}", url = "https://robinhoodchain.blockscout.com/api", chain = 4663 }
 robinhood_testnet = { key = "${BLOCKSCOUT_API_KEY}", url = "https://explorer.testnet.chain.robinhood.com/api", chain = 46630 }
+
+[lint]
+# The spec fixes the public names `tokenDecimals`, `nativeBurn`, `feed`, `feedDecimals` (camelCase immutables).
+exclude_lints = ["screaming-snake-case-immutable"]
+# Tests are not production code: skip style/safety lints there.
+ignore = ["test/**/*.sol"]

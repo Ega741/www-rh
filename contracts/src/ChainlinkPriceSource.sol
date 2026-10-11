@@ -30,6 +30,8 @@ contract ChainlinkPriceSource is IPriceSource {
     function latestPrice() external view returns (uint256 priceE18, uint256 updatedAt) {
         (, int256 answer,, uint256 ts,) = feed.latestRoundData();
         if (answer <= 0) return (0, ts);
+        // Safe: answer > 0 here, so the int256 → uint256 cast cannot truncate.
+        // forge-lint: disable-next-line(unsafe-typecast)
         uint256 a = uint256(answer);
         if (feedDecimals == 18) priceE18 = a;
         else if (feedDecimals < 18) priceE18 = a * 10 ** (18 - uint256(feedDecimals));
