@@ -13,7 +13,7 @@ build/
 # foundry
 contracts/out/
 contracts/cache/
-contracts/broadcast/**/dry-run/
+contracts/broadcast/
 contracts/.env
 
 # gateway data

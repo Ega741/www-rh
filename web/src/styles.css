@@ -1,0 +1,131 @@
+@import "tailwindcss";
+
+/* Design tokens: dark theme, monospace accents. Exposed as Tailwind utilities (bg-surface, text-muted, …). */
+@theme {
+  --color-bg: #0b0d12;
+  --color-surface: #11141b;
+  --color-elevated: #171b24;
+  --color-line: #262b37;
+  --color-line-strong: #343b4a;
+  --color-fg: #e7e9ef;
+  --color-muted: #8f97a8;
+  --color-faint: #5d6577;
+  --color-accent: #f5b542;
+  --color-accent-fg: #0b0d12;
+  --color-ok: #3ccf91;
+  --color-warn: #f5b542;
+  --color-err: #ff6b6b;
+  --color-info: #6ea8fe;
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --radius-card: 0.75rem;
+}
+
+/* Base button utility (an @utility so the variants below can @apply it). */
+@utility btn {
+  @apply inline-flex items-center justify-center gap-2 rounded-lg border px-3.5 py-2 text-sm font-medium transition-colors
+    disabled:cursor-not-allowed disabled:opacity-50;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    background: var(--color-bg);
+  }
+  body {
+    @apply bg-bg text-fg font-sans antialiased;
+    min-height: 100dvh;
+  }
+  code,
+  kbd,
+  pre {
+    @apply font-mono;
+  }
+  a {
+    @apply underline-offset-2;
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--color-accent) 35%, transparent);
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-line bg-surface p-4 sm:p-5;
+  }
+  .card-title {
+    @apply text-xs font-medium uppercase tracking-wider text-muted;
+  }
+  .btn-primary {
+    @apply btn border-accent bg-accent text-accent-fg hover:bg-[#ffc857] hover:border-[#ffc857] disabled:hover:bg-accent;
+  }
+  .btn-secondary {
+    @apply btn border-line-strong bg-elevated text-fg hover:border-muted disabled:hover:border-line-strong;
+  }
+  .btn-ghost {
+    @apply btn border-transparent text-muted hover:text-fg hover:bg-elevated;
+  }
+  .btn-danger {
+    @apply btn border-err/40 bg-err/10 text-err hover:bg-err/20;
+  }
+  .btn-sm {
+    @apply px-2.5 py-1.5 text-xs;
+  }
+  .input {
+    @apply w-full rounded-lg border border-line-strong bg-bg px-3 py-2 text-sm text-fg placeholder:text-faint
+      focus:border-accent focus:outline-none disabled:opacity-50;
+  }
+  .label {
+    @apply mb-1 block text-xs font-medium text-muted;
+  }
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[11px] leading-4;
+  }
+  .table {
+    @apply w-full text-left text-sm;
+  }
+  .table th {
+    @apply whitespace-nowrap border-b border-line px-3 py-2 text-xs font-medium uppercase tracking-wider text-muted;
+  }
+  .table td {
+    @apply whitespace-nowrap border-b border-line/60 px-3 py-2 align-top;
+  }
+  .table tr:last-child td {
+    @apply border-b-0;
+  }
+  .mono {
+    @apply font-mono text-[0.92em];
+  }
+  .link {
+    @apply text-info hover:underline;
+  }
+  .prose-doc h2 {
+    @apply mt-10 mb-3 text-xl font-semibold;
+  }
+  .prose-doc h3 {
+    @apply mt-6 mb-2 text-base font-semibold;
+  }
+  .prose-doc p {
+    @apply my-2 text-sm leading-6 text-muted;
+  }
+  .prose-doc li {
+    @apply my-1 text-sm leading-6 text-muted;
+  }
+}
+
+@keyframes beagle-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.pulse {
+  animation: beagle-pulse 1.4s ease-in-out infinite;
+}

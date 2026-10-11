@@ -23,11 +23,18 @@ PIDS=()
 
 log()  { printf '\n\033[1;36m[e2e]\033[0m %s\n' "$*"; }
 fail() { printf '\n\033[1;31m[e2e] FAIL:\033[0m %s\n' "$*"; exit 1; }
+DEPLOY_FILE=contracts/deployments/31337.json
+GEN_FILE=packages/shared/src/deployments.generated.ts
 cleanup() {
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
-  rm -rf "$WORK"
+  # restore the committed anvil reference deployment (the deploy script rewrites it on every run)
+  [ -f "$WORK/deploy.bak" ] && cp "$WORK/deploy.bak" "$DEPLOY_FILE" && cp "$WORK/gen.bak" "$GEN_FILE" && \
+    (pnpm --filter @beagle/shared build >/dev/null 2>&1 || true)
+  rm -rf contracts/broadcast/31337 "$WORK"
 }
 trap cleanup EXIT
+mkdir -p "$(dirname "$DEPLOY_FILE")"
+[ -f "$DEPLOY_FILE" ] && cp "$DEPLOY_FILE" "$WORK/deploy.bak" && cp "$GEN_FILE" "$WORK/gen.bak"
 
 json() { # json <json-string> <js-expression on `d`>
   node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const d=JSON.parse(s);const v=eval(process.argv[1]);process.stdout.write(v===undefined?"":String(v))})' "$2" <<<"$1"
@@ -36,8 +43,10 @@ wait_for() { # wait_for <description> <timeout-seconds> <command...> (command mu
   local desc=$1 timeout=$2; shift 2
   local t=0
   until "$@" >/dev/null 2>&1; do
-    sleep 1; t=$((t+1)); [ $t -ge "$timeout" ] && fail "timeout waiting for $desc"
+    sleep 1; t=$((t+1))
+    if [ "$t" -ge "$timeout" ]; then fail "timeout waiting for $desc"; fi
   done
+  return 0
 }
 api() { # api <key> <path> [curl args]
   local key=$1 path=$2; shift 2

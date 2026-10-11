@@ -1,0 +1,243 @@
+/**
+ * Dashboard API (SPEC §5.9): auth (SIWE, sessions), keys, balance, usage, ledger, receipts, BYOK
+ * providers, budgets, upgrades, models, price, quote, status, config. JSON with decimal-string money;
+ * errors `{ error: { code, message } }`.
+ *
+ * @module api/dashboard
+ */
+import {
+  AdminCreditRequestSchema,
+  CreateApiKeyRequestSchema,
+  CursorQuerySchema,
+  PutProviderKeyRequestSchema,
+  QuoteQuerySchema,
+  UpgradeRequestSchema,
+  UsageQuerySchema,
+  UsageWindowSchema,
+  VerifyRequestSchema,
+} from '@beagle/shared/api';
+import { BYOK_PROVIDERS, type ByokProvider } from '@beagle/shared/models';
+import type { Context, Hono } from 'hono';
+import type { Hex } from 'viem';
+import { z } from 'zod';
+import { uuid } from '../auth/crypto.js';
+import { sessionCookie } from '../auth/session.js';
+import { buildReceipt } from '../metering/receipts.js';
+import { InsufficientCreditError } from '../metering/reserve.js';
+import { UpgradeInputError, UpgradeService } from '../upgrades/plans.js';
+import type { Services } from '../services.js';
+import type { InternalRequest } from '../translate/internal.js';
+import { ProviderError } from '../providers/types.js';
+import { UnsafeBaseUrlError } from '../providers/registry.js';
+import { principalOf, requireSession, type AppEnv } from './auth.js';
+import { apiKeyDto, balanceDto, budgetDrawDto, budgetDto, configDto, creditEventDto, ledgerRowDto, meDto, modelsDto, providerKeyDto, statusDto, usageListDto, usageSummaryDto } from './dto.js';
+import { ApiError } from './errors.js';
+
+void AdminCreditRequestSchema;
+
+async function readJson(c: Context<AppEnv>): Promise<unknown> {
+  try {
+    return await c.req.json();
+  } catch (e) {
+    throw new ApiError(400, 'invalid_json', `invalid JSON body: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/** Parses with `schema` or throws a 400 `invalid_request`. */
+export function parseOr400<S extends z.ZodType>(schema: S, value: unknown): z.output<S> {
+  const r = schema.safeParse(value);
+  if (!r.success) {
+    const issue = r.error.issues[0];
+    const path = issue === undefined ? '' : issue.path.map(String).join('.');
+    throw new ApiError(400, 'invalid_request', issue === undefined ? 'invalid request' : path === '' ? issue.message : `${path}: ${issue.message}`);
+  }
+  return r.data;
+}
+
+function byokProvider(raw: string): ByokProvider {
+  if (!(BYOK_PROVIDERS as readonly string[]).includes(raw)) throw new ApiError(400, 'invalid_provider', `provider must be one of ${BYOK_PROVIDERS.join(', ')}`);
+  return raw as ByokProvider;
+}
+
+/** Mounts the dashboard routes. */
+export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
+  const secureCookie = services.config.server.publicUrl.startsWith('https:');
+
+  // ---- auth ----------------------------------------------------------------------------------
+  app.get('/api/auth/nonce', (c) => c.json({ nonce: services.siwe.issueNonce() }));
+
+  app.post('/api/auth/verify', async (c) => {
+    const body = parseOr400(VerifyRequestSchema, await readJson(c));
+    const result = await services.siwe.verify(body.message, body.signature as Hex);
+    if (!result.ok) throw new ApiError(401, `siwe_${result.code}`, result.message);
+    const workspace = result.address.toLowerCase();
+    services.repos.workspaces.ensure(workspace, services.now());
+    const { token } = services.sessions.create(workspace);
+    c.header('set-cookie', sessionCookie(token, secureCookie));
+    return c.json({ token, workspace });
+  });
+
+  app.post('/api/auth/logout', requireSession(services), (c) => {
+    const p = principalOf(c);
+    if (p.kind === 'session') services.sessions.destroy(p.sessionToken);
+    c.header('set-cookie', sessionCookie(null, secureCookie));
+    return c.json({ ok: true });
+  });
+
+  app.get('/api/me', requireSession(services), (c) => {
+    const ws = services.repos.workspaces.ensure(principalOf(c).workspace, services.now());
+    return c.json(meDto(services, ws));
+  });
+
+  app.get('/api/balance', requireSession(services, true), async (c) => c.json(await balanceDto(services, principalOf(c).workspace)));
+
+  // ---- API keys ------------------------------------------------------------------------------
+  app.get('/api/keys', requireSession(services), (c) => c.json(services.apiKeys.list(principalOf(c).workspace).map((k) => apiKeyDto(k))));
+
+  app.post('/api/keys', requireSession(services), async (c) => {
+    const raw = c.req.header('content-length') === '0' || c.req.header('content-type') === undefined ? {} : await readJson(c);
+    const body = parseOr400(CreateApiKeyRequestSchema, raw ?? {});
+    const created = services.apiKeys.create(principalOf(c).workspace, body.name);
+    return c.json({ id: created.id, key: created.key, prefix: created.prefix, name: created.name, createdAt: created.createdAt, lastUsedAt: null }, 201);
+  });
+
+  app.delete('/api/keys/:id', requireSession(services), (c) => {
+    const ok = services.apiKeys.revoke(c.req.param('id'), principalOf(c).workspace);
+    if (!ok) throw new ApiError(404, 'not_found', 'unknown or already revoked key');
+    return c.json({ ok: true });
+  });
+
+  // ---- usage / ledger / receipts -------------------------------------------------------------
+  app.get('/api/usage', requireSession(services, true), (c) => {
+    const q = parseOr400(UsageQuerySchema, c.req.query());
+    return c.json(
+      usageListDto(services, principalOf(c).workspace, {
+        limit: q.limit,
+        ...(q.before === undefined ? {} : { before: q.before }),
+        ...(q.model === undefined ? {} : { model: q.model }),
+        ...(q.status === undefined ? {} : { status: q.status }),
+      }),
+    );
+  });
+
+  app.get('/api/usage/summary', requireSession(services, true), (c) => {
+    const window = parseOr400(UsageWindowSchema.default('24h'), c.req.query('window'));
+    return c.json(usageSummaryDto(services, principalOf(c).workspace, window));
+  });
+
+  app.get('/api/ledger', requireSession(services), (c) => {
+    const q = parseOr400(CursorQuerySchema, c.req.query());
+    const rows = services.repos.ledger.list(principalOf(c).workspace, q.limit, q.before);
+    const last = rows[rows.length - 1];
+    return c.json({ rows: rows.map(ledgerRowDto), nextBefore: rows.length === q.limit && last !== undefined ? last.createdAt : null });
+  });
+
+  app.get('/api/receipts', requireSession(services), (c) => {
+    const q = parseOr400(CursorQuerySchema, c.req.query());
+    const rows = services.repos.creditEvents.list(principalOf(c).workspace, q.limit, q.before);
+    const last = rows[rows.length - 1];
+    return c.json({ rows: rows.map((r) => creditEventDto(services, r)), nextBefore: rows.length === q.limit && last !== undefined ? last.blockNumber : null });
+  });
+
+  app.get('/api/receipts/:requestId', requireSession(services, true), (c) => {
+    const row = services.repos.usage.getForWorkspace(c.req.param('requestId'), principalOf(c).workspace);
+    if (row === undefined) throw new ApiError(404, 'not_found', 'unknown request id');
+    const built = buildReceipt(row);
+    if (built === undefined) throw new ApiError(404, 'receipt_unavailable', 'this request was not served by a model, so it has no receipt');
+    return c.json({ receipt: built.receipt, hash: built.hash, ...built.receipt });
+  });
+
+  // ---- BYOK providers ------------------------------------------------------------------------
+  app.get('/api/providers', requireSession(services), (c) => c.json(services.repos.providerKeys.list(principalOf(c).workspace).map(providerKeyDto)));
+
+  app.put('/api/providers/:provider', requireSession(services), async (c) => {
+    const provider = byokProvider(c.req.param('provider'));
+    const body = parseOr400(PutProviderKeyRequestSchema, await readJson(c));
+    if (services.keyring === undefined) throw new ApiError(503, 'byok_disabled', 'KEYRING_MASTER_KEY is not configured; BYOK is disabled on this gateway');
+    let baseUrl: string | null = null;
+    if (body.baseUrl !== undefined) {
+      try {
+        await services.registry.validateBaseUrl(body.baseUrl);
+      } catch (e) {
+        if (e instanceof UnsafeBaseUrlError) throw new ApiError(400, 'unsafe_base_url', e.message);
+        throw e;
+      }
+      baseUrl = body.baseUrl.replace(/\/+$/, '');
+    }
+    const workspace = principalOf(c).workspace;
+    const enc = services.keyring.encrypt(body.apiKey, workspace, provider);
+    services.repos.providerKeys.upsert({ id: `pk_${uuid()}`, workspace, provider, ciphertext: enc.ciphertext, iv: enc.iv, tag: enc.tag, last4: body.apiKey.slice(-4), baseUrl, createdAt: services.now() });
+    const row = services.repos.providerKeys.get(workspace, provider);
+    return c.json(row === undefined ? { ok: true } : providerKeyDto(row));
+  });
+
+  app.delete('/api/providers/:provider', requireSession(services), (c) => {
+    const provider = byokProvider(c.req.param('provider'));
+    if (!services.repos.providerKeys.delete(principalOf(c).workspace, provider)) throw new ApiError(404, 'not_found', 'no key stored for this provider');
+    return c.json({ ok: true });
+  });
+
+  app.post('/api/providers/:provider/test', requireSession(services), async (c) => {
+    const provider = byokProvider(c.req.param('provider'));
+    const workspace = principalOf(c).workspace;
+    const creds = await services.registry.byokCredentials(provider, workspace);
+    if (creds === undefined) throw new ApiError(404, 'not_found', 'no key stored for this provider');
+    const model = services.catalog.filter((m) => m.provider === provider && m.autoEligible).sort((a, b) => a.price.inputPerM + a.price.outputPerM - (b.price.inputPerM + b.price.outputPerM))[0];
+    if (model === undefined) throw new ApiError(404, 'no_model', 'no catalog model for this provider');
+    const req: InternalRequest = {
+      upstreamModel: model.upstreamId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Reply with the single word: ok' }] }],
+      maxTokens: 8,
+      stream: false,
+      metadata: { requestId: `test_${uuid()}`, workspace },
+    };
+    const started = services.now();
+    try {
+      await services.registry.adapter(provider).complete(req, creds, AbortSignal.timeout(30_000));
+      services.repos.providerKeys.setLastError(workspace, provider, null);
+      return c.json({ ok: true, model: model.id, latencyMs: services.now() - started, error: null });
+    } catch (e) {
+      const message = ProviderError.is(e) ? `${e.code} (${e.status}): ${e.message}` : e instanceof Error ? e.message : String(e);
+      if (ProviderError.is(e) && e.authFailure) services.repos.providerKeys.setLastError(workspace, provider, message.slice(0, 200));
+      return c.json({ ok: false, model: model.id, latencyMs: services.now() - started, error: message });
+    }
+  });
+
+  // ---- budgets -------------------------------------------------------------------------------
+  app.get('/api/budgets', requireSession(services, true), (c) => c.json(services.repos.budgets.list(principalOf(c).workspace).map((b) => budgetDto(services, b))));
+
+  const budgetOf = (c: Context<AppEnv>) => {
+    const id = Number(c.req.param('id'));
+    const row = Number.isInteger(id) ? services.repos.budgets.get(id) : undefined;
+    if (row === undefined || row.workspace !== principalOf(c).workspace) throw new ApiError(404, 'not_found', 'unknown budget');
+    return row;
+  };
+  app.get('/api/budgets/:id', requireSession(services, true), (c) => c.json(budgetDto(services, budgetOf(c))));
+  app.get('/api/budgets/:id/draws', requireSession(services, true), (c) => c.json(services.repos.budgetDraws.listByBudget(budgetOf(c).budgetId).map(budgetDrawDto)));
+
+  // ---- upgrades ------------------------------------------------------------------------------
+  app.get('/api/upgrades/prices', (c) => c.json(services.upgrades.prices()));
+  app.get('/api/upgrades', requireSession(services, true), (c) => c.json(services.upgrades.list(principalOf(c).workspace).map(UpgradeService.toDto)));
+  app.post('/api/upgrades', requireSession(services, true), async (c) => {
+    const body = parseOr400(UpgradeRequestSchema, await readJson(c));
+    try {
+      return c.json(UpgradeService.toDto(services.upgrades.purchase(principalOf(c).workspace, body.kind, body.quantity)), 201);
+    } catch (e) {
+      if (e instanceof InsufficientCreditError) {
+        throw new ApiError(402, 'insufficient_credit', e.message, { 'x-beagle-balance-micro': e.balanceMicro.toString(), 'x-beagle-credits-url': `${services.config.server.webOrigins[0] ?? ''}/app/credits` });
+      }
+      if (e instanceof UpgradeInputError) throw new ApiError(400, 'invalid_request', e.message);
+      throw e;
+    }
+  });
+
+  // ---- public --------------------------------------------------------------------------------
+  app.get('/api/models', (c) => c.json(modelsDto(services)));
+  app.get('/api/price', async (c) => c.json(await services.price.priceDto()));
+  app.get('/api/quote', async (c) => {
+    const q = parseOr400(QuoteQuerySchema, c.req.query());
+    return c.json(await services.price.quote({ ...(q.tokens === undefined ? {} : { tokens: q.tokens }), ...(q.usdMicro === undefined ? {} : { usdMicro: q.usdMicro }) }));
+  });
+  app.get('/api/status', (c) => c.json(statusDto(services)));
+  app.get('/api/config', (c) => c.json(configDto(services)));
+}

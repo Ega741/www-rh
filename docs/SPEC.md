@@ -466,7 +466,9 @@ above `2^53` are handled as `bigint` via `readBigInts`-safe access (`stmt.setRea
 
 ### 5.3 Authentication
 
-- **SIWE** (`viem/siwe`): `GET /api/auth/nonce` → `{ nonce }` (stored, 10 min). `POST /api/auth/verify { message, signature }`:
+- **SIWE** (`viem/siwe`): `GET /api/auth/nonce` → `{ nonce }` (stored, 10 min). The web signs `domain = host(VITE_GATEWAY_URL || page origin)`,
+  `uri = that origin + '/'`, `chainId = VITE_CHAIN_ID`, so `PUBLIC_URL` of the gateway MUST equal the origin the browser talks to
+  (dev: `http://localhost:8787` = `VITE_GATEWAY_URL`; prod behind nginx: the site URL). `POST /api/auth/verify { message, signature }`:
   `parseSiweMessage`, check `domain == host(PUBLIC_URL)`, `nonce` known & unused, `chainId ∈ SUPPORTED_CHAINS`,
   `verifySiweMessage` with a public client for the message's chain (EOA; contract wallets via ERC-1271 are supported
   by viem's verify when RPC is available). Creates the workspace if missing, creates a session, sets the cookie,
@@ -606,7 +608,7 @@ health. Platform `401/403` → `down` immediately (misconfiguration).
   `reserve = clamp(estimate, MIN_RESERVE, MAX_RESERVE)`.
 - **Gate**: credit-paid request requires `available ≥ MIN_RESERVE` else 402 (see error body below); then insert a
   reservation of `min(reserve, max(available, MIN_RESERVE))`. BYOK-paid requests skip reserve/gate.
-- **Settle**: `upstreamCost = costMicroUsd(usage, price)`; `charged = paidBy==='credit' ? applyMarkupBps(upstreamCost, MARKUP_BPS) : applyMarkupBps(upstreamCost, BYOK_FEE_BPS)` (BYOK default 0);
+- **Settle**: `upstreamCost = costMicroUsd(usage, price)`; `charged = paidBy==='credit' ? applyMarkupBps(upstreamCost, MARKUP_BPS) : ceilDiv(upstreamCost · BYOK_FEE_BPS, 10_000)` (BYOK default 0 → free);
   ledger `debit −charged` (`ref_type='usage'`, `ref_id=requestId`) when `charged > 0`; delete the reservation; write
   the `usage` row (always, also on errors: `charged` = cost of tokens actually streamed, else 0). Expired
   reservations are purged every minute.
@@ -614,10 +616,12 @@ health. Platform `401/403` → `down` immediately (misconfiguration).
 - **402 body** (OpenAI envelope; `/v1/messages` uses the Anthropic envelope `{ type: 'error', error: { type, message } }`):
   `{ "error": { "message": "Insufficient credit: burn BEAGLE on the Credits page or open a budget.", "type": "insufficient_credit", "code": "insufficient_credit", "param": null } }`
   with headers `x-beagle-balance-micro`, `x-beagle-credits-url: <PUBLIC_WEB_ORIGIN>/app/credits`.
-- **Receipt** (`GET /api/receipts/:requestId`): `UsageReceipt = { v: 1, requestId, workspace, createdAt, endpoint,
+- **Receipt** (`GET /api/receipts/:requestId` → `{ receipt, hash }`): `UsageReceipt = { v: 1, requestId, workspace, createdAt, endpoint,
   requestedModel, servedModel, provider, paidBy, usage: {…}, price: {inputPerM,…}, upstreamCostMicro, markupBps,
-  chargedMicro, routeReasons }` plus `hash = receiptHash(receipt)`. Anyone with the key or session of that workspace can
-  recompute it from `@beagle/shared`.
+  chargedMicro, routeReasons, price, markupBps }` and `hash = receiptHash(receipt)`. The receipt embeds the price table
+  and markup used at the time, so the hash stays stable when the catalog changes. Anyone with the key or session of
+  that workspace can recompute it from `@beagle/shared`. BYOK-paid requests are charged `ceilDiv(upstreamCost · BYOK_FEE_BPS, 10 000)`
+  (0 by default): BYOK consumes no credit.
 - **Rate limit**: fixed window per API key: `RATE_LIMIT_RPM` (`_PRO` on the pro plan); 429 `rate_limited` with `Retry-After`.
 
 ### 5.8 Inference API
@@ -656,7 +660,7 @@ sent as the final SSE comment line `: beagle cost=<micro> balance=<micro>` and i
 | `GET /api/usage/summary?window=24h\|7d\|30d` (key OK) | `{ window, requests, chargedMicro, upstreamCostMicro, inputTokens, outputTokens, byModel: [{ model, requests, chargedMicro }], byDay: [{ day, requests, chargedMicro }] }` |
 | `GET /api/ledger?limit&before` | ledger rows |
 | `GET /api/receipts?limit&before` | `credit_events` of the workspace with explorer links |
-| `GET /api/receipts/:requestId` (key OK) | `UsageReceipt` + `hash` |
+| `GET /api/receipts/:requestId` (key OK) | `ReceiptDto = { receipt: UsageReceipt, hash }` (`hash = receiptHash(receipt)`) |
 | `GET /api/providers`, `PUT /api/providers/:provider { apiKey, baseUrl? }`, `DELETE /api/providers/:provider`, `POST /api/providers/:provider/test` | BYOK; `provider ∈ anthropic\|openai\|google`; `baseUrl` must be `https:` and not resolve to a private/loopback range (SSRF guard; hostnames checked at save time and again at use time) ; test = minimal completion through the key |
 | `GET /api/budgets`, `GET /api/budgets/:id`, `GET /api/budgets/:id/draws` (key OK) | `BudgetDto { budgetId, owner, workspace, cap, drawn, remainingCap, headroomTokens, headroomMicro, deadline, closed, stalledReason, draws }` |
 | `GET /api/upgrades`, `GET /api/upgrades/prices`, `POST /api/upgrades { kind, quantity }` (key OK) | §5.11; 402 when `available` is short |
@@ -668,7 +672,9 @@ sent as the final SSE comment line `: beagle cost=<micro> balance=<micro>` and i
 | `POST /api/admin/credit { workspace, amountMicro, memo }`, `POST /api/admin/price { priceE18 }`, `GET /api/admin/workspaces` | `ADMIN_TOKEN` |
 | `GET /healthz` | `{ ok: true }` |
 
-All monetary values are decimal strings. Errors: `{ error: { code, message } }` with the status.
+All monetary values are decimal strings. List routes without pagination (`/api/keys`, `/api/providers`, `/api/budgets`,
+`/api/budgets/:id/draws`, `/api/upgrades`) return a **bare JSON array**; paginated routes (`/api/usage`, `/api/ledger`,
+`/api/receipts`) return `{ rows, nextBefore }`. Errors: `{ error: { code, message } }` with the status.
 
 ### 5.10 MCP over HTTP
 
