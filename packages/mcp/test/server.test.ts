@@ -110,8 +110,10 @@ describe('tools/list', () => {
     }
     const budget = tools.find((t) => t.name === 'beagle_open_budget')!;
     const props = Object.keys(budget.inputSchema.properties ?? {}).sort();
-    expect(props).toEqual(['payer', 'tokenAccount', 'tokens', 'usd', 'workspace']); // cap only: no hours / deadline
+    expect(props).toEqual(['fundOtherWorkspace', 'payer', 'tokenAccount', 'tokens', 'usd', 'workspace']); // cap only: no hours / deadline
     expect(budget.description).toMatch(/REPLACES the previous cap/);
+    expect(budget.description).toMatch(/not_owner/);
+    expect(budget.description).not.toMatch(/scanner will pick it up/);
     const buy = tools.find((t) => t.name === 'beagle_buy_compute')!;
     expect(Object.keys(buy.inputSchema.properties ?? {})).not.toContain('tolerance_bps');
     expect(buy.description).toMatch(/published price point when the gateway observes the burn/);
@@ -528,6 +530,17 @@ describe('beagle_buy_compute without a wallet', () => {
     }
   });
 
+  it('rejects a token account the signer does not own (the owner must sign the burn)', async () => {
+    const client = await connect(createFakeApi());
+    const error = errorOf(await call(client, 'beagle_buy_compute', { usd: 1, workspace: PAYER, tokenAccount: AGENT_ATA }));
+    expect(error.code).toBe('invalid_request');
+    expect(error.message).toMatch(new RegExp(`${AGENT_ATA} is owned by ${AGENT}, not by ${PAYER}, so ${PAYER} cannot sign its BurnChecked`));
+    // naming the owner as payer makes it a burn by the agent crediting PAYER via memo
+    const data = structured(await call(client, 'beagle_buy_compute', { usd: 1, workspace: PAYER, payer: AGENT, tokenAccount: AGENT_ATA }));
+    expect(data['feePayer']).toBe(AGENT);
+    expect(data['memo']).toBe(`beagle:v1 ws=${PAYER}`);
+  });
+
   it('uses the gateway rpcUrl for the default connection when none is injected (and surfaces the failure as rpc_error)', async () => {
     const api = createFakeApi();
     api.state.config = { ...api.state.config, rpcUrl: 'http://127.0.0.1:1' }; // nothing listens there
@@ -573,7 +586,7 @@ describe('beagle_buy_compute with a wallet', () => {
     expect(typeof data['elapsedMs']).toBe('number');
   });
 
-  it('falls back to the balance delta when the receipt is not listed (another workspace) but the balance moved', async () => {
+  it("falls back to the balance delta when the receipt is not listed yet but the key's workspace balance moved", async () => {
     const api = createFakeApi();
     api.scheduleCredit(4_000_000n, 3);
     const client = await connect(api, { wallet: fakeWallet(), pollIntervalMs: 1, creditWaitMs: 5_000, now: () => Date.now() });
@@ -791,6 +804,8 @@ describe('beagle_open_budget', () => {
     expect(data['workspaceSource']).toBe('input');
     expect(data['deadline']).toBeUndefined();
     expect(data['note']).toMatch(/POST \/api\/budgets\/register/);
+    expect(data['note']).toMatch(new RegExp(`or wait for the gateway scanner \\(it registers the delegation for its owner ${PAYER}\\)`));
+    expect(data['note']).not.toMatch(/not_owner/);
     expect(data['note']).toMatch(/replaces the existing delegation of 20 BEAGLE/);
     const tx = unsignedTx(data);
     expect(tx.feePayer?.toBase58()).toBe(PAYER);
@@ -803,12 +818,36 @@ describe('beagle_open_budget', () => {
     expect(approve.keys.account.pubkey.toBase58()).toBe(PAYER_ATA);
   });
 
-  it('names the funded workspace in the register body when it differs from the signer', async () => {
-    const client = await connect(createFakeApi(), { workspace: OTHER_WORKSPACE });
-    const data = structured(await call(client, 'beagle_open_budget', { tokens: 1, payer: PAYER }));
+  it('refuses an unsigned cross-workspace budget until fundOtherWorkspace confirms the owner will register it, then names the workspace in the register body', async () => {
+    const rpc = node();
+    const client = await connect(createFakeApi(), { workspace: OTHER_WORKSPACE, connection: rpc });
+    const refused = errorOf(await call(client, 'beagle_open_budget', { tokens: 1, payer: PAYER }));
+    expect(refused.code).toBe('invalid_request');
+    expect(refused.message).toMatch(new RegExp(`signed by ${PAYER} \\(the token account owner\\) but fund workspace ${OTHER_WORKSPACE} \\(the configured workspace\\)`));
+    expect(refused.message).toMatch(/403 not_owner/);
+    expect(refused.message).toMatch(new RegExp(`run this server with an API key of ${PAYER} and pass workspace: ${OTHER_WORKSPACE}`));
+    expect(refused.message).toMatch(new RegExp(`must then be sent with a key of ${PAYER}`));
+    expect(refused.message).toMatch(/fundOtherWorkspace: true/);
+    expect(rpc.calls.length).toBe(0); // refused before touching the chain
+
+    const data = structured(await call(client, 'beagle_open_budget', { tokens: 1, payer: PAYER, fundOtherWorkspace: true }));
     expect(data['workspace']).toBe(OTHER_WORKSPACE);
     expect(data['workspaceSource']).toBe('configured');
+    expect(data['feePayer']).toBe(PAYER);
     expect(data['register']).toEqual({ tokenAccount: PAYER_ATA, workspace: OTHER_WORKSPACE });
+    expect(data['note']).toMatch(new RegExp(`using a key or session of the owner ${PAYER}: any other key is refused \\(403 not_owner\\)`));
+    expect(data['note']).toMatch(new RegExp(`registers the delegation for ${PAYER}'s workspace, so ${OTHER_WORKSPACE} gets no headroom`));
+    expect(data['note']).not.toMatch(/or wait for the gateway scanner/);
+    unsignedTx(data);
+  });
+
+  it('rejects an unsigned approval for a token account the signer does not own', async () => {
+    const client = await connect(createFakeApi());
+    const error = errorOf(await call(client, 'beagle_open_budget', { tokens: 1, workspace: PAYER, tokenAccount: AGENT_ATA }));
+    expect(error.code).toBe('invalid_request');
+    expect(error.message).toMatch(new RegExp(`${AGENT_ATA} is owned by ${AGENT}, not by ${PAYER}`));
+    expect(error.message).toMatch(/cannot sign its ApproveChecked/);
+    expect(error.message).toMatch(new RegExp(`pass payer: ${AGENT}`));
   });
 
   it('fails cleanly when the gateway has no operator', async () => {
@@ -833,36 +872,106 @@ describe('beagle_open_budget', () => {
     expect(data['registered']).toBe(true);
     expect((data['budget'] as Record<string, unknown>)['tokenAccount']).toBe(AGENT_ATA);
     expect(data['registerError']).toBeNull();
+    expect(data['registerErrorCode']).toBeNull();
+    expect(data['fundsWorkspace']).toBe(AGENT);
     expect(data['workspace']).toBe(AGENT);
     expect(data['workspaceSource']).toBe('agent_wallet');
     expect(data['explorerUrl']).toMatch(/explorer\.solana\.com\/tx\//);
     expect(data['note']).toMatch(/^Delegated up to 200 BEAGLE of token account/);
-    expect(data['note']).toMatch(/registered the budget/);
+    expect(data['note']).toMatch(new RegExp(`registered the budget for workspace ${AGENT}`));
     expect(data['note']).not.toMatch(/balance is below the cap/);
+    expect(data['note']).not.toMatch(/replaces the existing delegation/);
     expect(data['note']).toMatch(/Warning: workspace defaulted to the agent wallet/);
     expect(wallet.calls).toEqual([{ openBudget: { cap: 200n * ONE } }]);
     // the agent is the workspace: no workspace in the register body
     expect(api.state.calls.find((c) => c.method === 'registerBudget')?.args[0]).toEqual({ tokenAccount: AGENT_ATA });
   });
 
-  it('passes the funded workspace to the registration and tolerates a registration failure', async () => {
+  it('reports the delegation an executed approval replaced', async () => {
+    const wallet = fakeWallet({ openBudget: async () => ({ signature: SIG, tokenAccount: AGENT_ATA, balance: 1_000n * ONE, previousDelegate: OPERATOR, previousDelegatedAmount: 30n * ONE }) });
+    const client = await connect(createFakeApi(), { wallet });
+    const data = structured(await call(client, 'beagle_open_budget', { tokens: 100 }));
+    expect(data['note']).toMatch(new RegExp(`This replaces the existing delegation of 30 BEAGLE to ${OPERATOR}`));
+  });
+
+  it('refuses to execute a cross-workspace budget without fundOtherWorkspace: nothing approved, nothing registered', async () => {
+    const wallet = fakeWallet();
+    const api = createFakeApi();
+    const client = await connect(api, { wallet, workspace: OTHER_WORKSPACE });
+    const error = errorOf(await call(client, 'beagle_open_budget', { tokens: 100 }));
+    expect(error.code).toBe('invalid_request');
+    expect(error.message).toMatch(new RegExp(`signed by ${AGENT} \\(the token account owner\\) but fund workspace ${OTHER_WORKSPACE} \\(the configured workspace\\)`));
+    expect(error.message).toMatch(/registers a delegation for its OWNER's workspace/);
+    expect(error.message).toMatch(/403 not_owner/);
+    expect(error.message).toMatch(new RegExp(`open the budget from ${OTHER_WORKSPACE}'s own wallet, or run this server with an API key of ${AGENT} and pass workspace: ${OTHER_WORKSPACE}`));
+    expect(error.message).toMatch(/fundOtherWorkspace: true/);
+    expect(wallet.calls).toEqual([]);
+    expect(api.callsTo('registerBudget')).toBe(0);
+
+    // explicit workspace input is gated the same way
+    const byInput = errorOf(await call(client, 'beagle_open_budget', { tokens: 100, workspace: PAYER }));
+    expect(byInput.message).toMatch(new RegExp(`fund workspace ${PAYER}\\. `));
+    expect(wallet.calls).toEqual([]);
+  });
+
+  it('with fundOtherWorkspace registers the funded workspace (a key of the owner) and reports it', async () => {
+    const wallet = fakeWallet();
+    const api = createFakeApi();
+    const client = await connect(api, { wallet, workspace: OTHER_WORKSPACE });
+    const data = structured(await call(client, 'beagle_open_budget', { tokens: 100, fundOtherWorkspace: true }));
+    expect(data['executed']).toBe(true);
+    expect(data['registered']).toBe(true);
+    expect(data['fundsWorkspace']).toBe(OTHER_WORKSPACE);
+    expect((data['budget'] as Record<string, unknown>)['workspace']).toBe(OTHER_WORKSPACE);
+    expect(data['note']).toMatch(new RegExp(`registered the budget for workspace ${OTHER_WORKSPACE}`));
+    expect(wallet.calls).toEqual([{ openBudget: { cap: 100n * ONE } }]);
+    expect(api.state.calls.find((c) => c.method === 'registerBudget')?.args[0]).toEqual({ tokenAccount: AGENT_ATA, workspace: OTHER_WORKSPACE });
+  });
+
+  it("explains a 403 not_owner after an executed approval: the delegation funds the owner's workspace, never 'the scanner will fix it'", async () => {
+    const api = createFakeApi({ failures: { registerBudget: new BeagleApiError(403, 'not_owner', 'only the token account owner may choose which workspace a budget funds') } });
+    const client = await connect(api, { wallet: fakeWallet(), workspace: OTHER_WORKSPACE });
+    const data = structured(await call(client, 'beagle_open_budget', { tokens: 100, fundOtherWorkspace: true }));
+    expect(data['executed']).toBe(true);
+    expect(data['registered']).toBe(false);
+    expect(data['budget']).toBeNull();
+    expect(data['registerError']).toMatch(/only the token account owner/);
+    expect(data['registerErrorCode']).toBe('not_owner');
+    expect(data['fundsWorkspace']).toBe(AGENT);
+    expect(data['note']).toMatch(new RegExp(`refused to register it for workspace ${OTHER_WORKSPACE} \\(403 not_owner: this server's API key does not belong to ${AGENT}\\)`));
+    expect(data['note']).toMatch(new RegExp(`funds the owner's workspace ${AGENT} instead`));
+    expect(data['note']).toMatch(new RegExp(`${OTHER_WORKSPACE} gets no headroom from it: revoke it with beagle_close_budget, or register it with a key of ${AGENT}`));
+    expect(data['note']).toMatch(new RegExp(`POST /api/budgets/register \\{ tokenAccount: ${AGENT_ATA}, workspace: ${OTHER_WORKSPACE} \\}`));
+    expect(data['note']).not.toMatch(/scanner will pick it up/);
+  });
+
+  it('tolerates another registration failure, saying who the delegation funds meanwhile', async () => {
     const api = createFakeApi({ failures: { registerBudget: new BeagleApiError(400, 'not_delegated', 'token account is not delegated to the operator') } });
     const client = await connect(api, { wallet: fakeWallet({ openBudget: async () => ({ signature: SIG, tokenAccount: AGENT_ATA, balance: 50n * ONE }) }), workspace: OTHER_WORKSPACE });
-    const data = structured(await call(client, 'beagle_open_budget', { tokens: 100 }));
+    const data = structured(await call(client, 'beagle_open_budget', { tokens: 100, fundOtherWorkspace: true }));
     expect(data['executed']).toBe(true);
     expect(data['registered']).toBe(false);
     expect(data['budget']).toBeNull();
     expect(data['registerError']).toMatch(/not delegated/);
-    expect(data['note']).toMatch(/registration failed/);
-    expect(data['note']).toMatch(/scanner will pick it up/);
+    expect(data['registerErrorCode']).toBe('not_delegated');
+    expect(data['fundsWorkspace']).toBe(AGENT);
+    expect(data['note']).toMatch(/registration failed: token account is not delegated/);
+    expect(data['note']).toMatch(new RegExp(`Until a key of ${AGENT} registers it naming workspace ${OTHER_WORKSPACE}, the delegation funds ${AGENT}`));
+    expect(data['note']).not.toMatch(/scanner will pick it up/);
     expect(data['note']).toMatch(/balance is below the cap/);
     expect(data['workspaceSource']).toBe('configured');
     expect(api.state.calls.find((c) => c.method === 'registerBudget')?.args[0]).toEqual({ tokenAccount: AGENT_ATA, workspace: OTHER_WORKSPACE });
+
+    // same-workspace failure: the scanner's registration under the owner is the right outcome
+    const own = await connect(createFakeApi({ failures: { registerBudget: new BeagleApiError(500, 'internal_error', 'db locked') } }), { wallet: fakeWallet() });
+    const ownData = structured(await call(own, 'beagle_open_budget', { tokens: 100 }));
+    expect(ownData['fundsWorkspace']).toBe(AGENT);
+    expect(ownData['note']).toMatch(new RegExp(`registration failed: db locked; the gateway scanner registers the delegation for its owner ${AGENT} on its own`));
   });
 });
 
 describe('beagle_close_budget', () => {
-  it('returns one unsigned Revoke transaction for the configured workspace (default: its ATA)', async () => {
+  it('returns one unsigned Revoke transaction for the configured workspace (default: its delegated account)', async () => {
     const client = await connect(createFakeApi(), { workspace: PAYER });
     const data = structured(await call(client, 'beagle_close_budget'));
     expect(data['unsigned']).toBe(true);
@@ -884,6 +993,48 @@ describe('beagle_close_budget', () => {
     expect(bad.code).toBe('invalid_address');
   });
 
+  it('works with only an API key configured: payer + tokenAccount give an unsigned Revoke with feePayer = payer', async () => {
+    const rpc = node();
+    const client = await connect(createFakeApi(), { connection: rpc }); // no workspace, no wallet: the documented stdio config
+    const data = structured(await call(client, 'beagle_close_budget', { payer: PAYER, tokenAccount: PAYER_ATA }));
+    expect(data['unsigned']).toBe(true);
+    expect(data['feePayer']).toBe(PAYER);
+    expect(data['tokenAccount']).toBe(PAYER_ATA);
+    expect(data['delegate']).toBe(OPERATOR);
+    expect(data['note']).toMatch(new RegExp(`^Sign with ${PAYER} `));
+    const tx = unsignedTx(data);
+    expect(tx.feePayer?.toBase58()).toBe(PAYER);
+    const revoke = decodeInstruction(tx.instructions[0]!);
+    if (!isRevokeInstruction(revoke)) throw new Error('expected Revoke');
+    expect(revoke.keys.account.pubkey.toBase58()).toBe(PAYER_ATA);
+    expect(revoke.keys.owner.pubkey.toBase58()).toBe(PAYER);
+    expect(rpc.calls.map((c) => c.method)).toEqual(['getAccountInfo', 'getLatestBlockhash']);
+  });
+
+  it('with only tokenAccount, reads the owner from the chain as the signer (the only valid one)', async () => {
+    const rpc = node();
+    const client = await connect(createFakeApi(), { connection: rpc });
+    const data = structured(await call(client, 'beagle_close_budget', { tokenAccount: PAYER_ATA }));
+    expect(data['feePayer']).toBe(PAYER);
+    expect(data['tokenAccount']).toBe(PAYER_ATA);
+    expect(data['delegatedAmount']).toBe((20n * ONE).toString());
+    expect(unsignedTx(data).feePayer?.toBase58()).toBe(PAYER);
+    expect(rpc.callsTo('getAccountInfo')).toBe(2); // owner lookup, then the account read of the builder
+
+    // an explicit payer that does not own the account cannot sign its Revoke
+    const mismatch = errorOf(await call(client, 'beagle_close_budget', { tokenAccount: PAYER_ATA, payer: AGENT }));
+    expect(mismatch.code).toBe('invalid_request');
+    expect(mismatch.message).toMatch(new RegExp(`${PAYER_ATA} is owned by ${PAYER}, not by ${AGENT}, so ${AGENT} cannot sign its Revoke`));
+  });
+
+  it('asks for payer or tokenAccount (not a workspace) when nothing identifies the signer', async () => {
+    const client = await connect(createFakeApi());
+    const error = errorOf(await call(client, 'beagle_close_budget'));
+    expect(error.code).toBe('invalid_request');
+    expect(error.message).toMatch(/signer of the Revoke is unknown: pass tokenAccount .* or payer/);
+    expect(error.message).not.toMatch(/workspace is required/);
+  });
+
   it('executes with a wallet', async () => {
     const wallet = fakeWallet();
     const client = await connect(createFakeApi(), { wallet });
@@ -892,10 +1043,30 @@ describe('beagle_close_budget', () => {
     expect(data['signature']).toBe(SIG);
     expect(data['slot']).toBe(43);
     expect(data['tokenAccount']).toBe(AGENT_ATA);
+    expect(data['delegate']).toBeUndefined(); // the fake executor does not read the delegation
+    expect(data['note']).toMatch(/^Revoked the delegation of token account/);
     expect(data['note']).toMatch(/closed \(revoked\)/);
     expect(wallet.calls).toEqual([{ closeBudget: { tokenAccount: AGENT_ATA } }]);
     structured(await call(client, 'beagle_close_budget'));
     expect(wallet.calls[1]).toEqual({ closeBudget: {} });
+  });
+
+  it('reports the delegation an executed Revoke cleared, or that there was none', async () => {
+    const wallet = fakeWallet({
+      closeBudget: async (params) => ({ signature: SIG, tokenAccount: params.tokenAccount ?? AGENT_ATA, delegate: params.tokenAccount === undefined ? null : OPERATOR, delegatedAmount: params.tokenAccount === undefined ? 0n : 20n * ONE }),
+    });
+    const client = await connect(createFakeApi(), { wallet });
+    const cleared = structured(await call(client, 'beagle_close_budget', { tokenAccount: PAYER_ATA }));
+    expect(cleared['delegate']).toBe(OPERATOR);
+    expect(cleared['delegatedAmount']).toBe((20n * ONE).toString());
+    expect(cleared['note']).toMatch(new RegExp(`^Revoked the delegation of 20 BEAGLE to ${OPERATOR} of token account ${PAYER_ATA}`));
+
+    const none = structured(await call(client, 'beagle_close_budget'));
+    expect(none['executed']).toBe(true);
+    expect(none['delegate']).toBeNull();
+    expect(none['delegatedAmount']).toBe('0');
+    expect(none['note']).toMatch(/had no delegate: nothing changed and no budget was open on it/);
+    expect(none['note']).toMatch(/Pass tokenAccount/);
   });
 });
 

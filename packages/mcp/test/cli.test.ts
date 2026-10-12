@@ -1,3 +1,4 @@
+import { SYSTEM_PROGRAM_ID } from '@beagle/shared/addresses';
 import bs58 from 'bs58';
 import { describe, expect, it } from 'vitest';
 import { BeagleApiError } from '../src/api.js';
@@ -119,5 +120,26 @@ describe('createAgentWallet', () => {
     expect(error).toBeInstanceOf(WalletError);
     expect((error as WalletError).code).toBe('chain_mismatch');
     expect(rpc.sent.length).toBe(0);
+  });
+
+  it('reports chain_unavailable (not chain_mismatch) when the gateway has no chain and advertises the all-zero mint', async () => {
+    const api = createFakeApi();
+    api.state.config = { ...api.state.config, mint: SYSTEM_PROGRAM_ID, operator: null };
+    const rpc = node();
+    const logs: string[] = [];
+    const wallet = createAgentWallet(api, config, { connection: rpc, log: (m) => logs.push(m) })!;
+    const error = await wallet.buyCompute({ workspace: AGENT, tokens: 1n }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(WalletError);
+    expect((error as WalletError).code).toBe('chain_unavailable');
+    expect((error as WalletError).message).toMatch(/no chain access configured/);
+    expect((error as WalletError).message).toMatch(/read-only and inference tools still work/);
+    expect(rpc.calls.length).toBe(0);
+    expect(logs).toEqual([]);
+
+    // the gateway gets its chain configured: the next call builds the wallet
+    api.state.config = createFakeApi().state.config;
+    const result = await wallet.buyCompute({ workspace: AGENT, tokens: 1n });
+    expect(result.tokenAccount).toBe(AGENT_ATA);
+    expect(api.callsTo('config')).toBe(2);
   });
 });

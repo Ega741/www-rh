@@ -23,6 +23,7 @@ import {
   MIN_FEE_LAMPORTS,
   parseSecretKey,
   prepareUnsignedTransactions,
+  resolveDelegatedTokenAccount,
   resolveTokenAccount,
   U64_MAX,
   WalletError,
@@ -68,14 +69,31 @@ async function failure(promise: Promise<unknown>): Promise<WalletError> {
 }
 
 describe('parseSecretKey / keypairFromSecret', () => {
-  it('reads a base58 secret key, a JSON byte array (solana-keygen file) and a 32-byte seed', () => {
+  it('reads a base58 secret key, a JSON byte array (solana-keygen file) and a 32-byte seed as JSON or raw bytes', () => {
     const b58 = bs58.encode(AGENT_KEYPAIR.secretKey);
     expect(keypairFromSecret(b58).publicKey.toBase58()).toBe(AGENT);
     expect(keypairFromSecret(JSON.stringify(Array.from(AGENT_KEYPAIR.secretKey))).publicKey.toBase58()).toBe(AGENT);
     expect(keypairFromSecret(` ${JSON.stringify(Array.from(AGENT_KEYPAIR.secretKey))}\n`).publicKey.toBase58()).toBe(AGENT);
     const seed = new Uint8Array(32).fill(7);
-    expect(keypairFromSecret(bs58.encode(seed)).publicKey.toBase58()).toBe(AGENT);
+    expect(keypairFromSecret(JSON.stringify(Array.from(seed))).publicKey.toBase58()).toBe(AGENT);
+    expect(keypairFromSecret(seed).publicKey.toBase58()).toBe(AGENT);
     expect(parseSecretKey(b58).length).toBe(64);
+  });
+
+  it('refuses a 32-byte base58 value (a pasted public key would otherwise become an unrelated, unfunded wallet)', () => {
+    for (const text of [AGENT, bs58.encode(new Uint8Array(32).fill(7))]) {
+      let error: unknown;
+      try {
+        parseSecretKey(text);
+      } catch (e) {
+        error = e;
+      }
+      expect(error, text).toBeInstanceOf(WalletError);
+      expect((error as WalletError).code).toBe('invalid_secret_key');
+      expect((error as WalletError).message).toMatch(/32 bytes, which is a public key/);
+      expect((error as WalletError).message).toMatch(/64-byte secret key/);
+      expect((error as WalletError).message).not.toContain(text);
+    }
   });
 
   it('rejects malformed keys with invalid_secret_key and never echoes the material', () => {
@@ -116,9 +134,21 @@ describe('resolveTokenAccount', () => {
   it('prefers the associated token account when it holds the amount (one read, no listing)', async () => {
     const rpc = createFakeConnection({ tokenAccounts: [account()] });
     const resolved = await resolveTokenAccount(rpc, { owner: AGENT, deployment: DEPLOYMENT, need: 500n * ONE });
-    expect(resolved).toEqual({ address: AGENT_ATA, amount: 1_000n * ONE, isAta: true, delegate: null, delegatedAmount: 0n });
+    expect(resolved).toEqual({ address: AGENT_ATA, owner: AGENT, amount: 1_000n * ONE, isAta: true, delegate: null, delegatedAmount: 0n });
     expect(rpc.callsTo('getAccountInfo')).toBe(1);
     expect(rpc.callsTo('getTokenAccountsByOwner')).toBe(0);
+  });
+
+  it('prefers a funded account over an empty ATA when nothing is needed (a budget on the empty ATA would have no headroom)', async () => {
+    const rpc = createFakeConnection({ tokenAccounts: [account({ amount: 0n }), account({ address: SECOND_ACCOUNT, amount: 5n * ONE })] });
+    const resolved = await resolveTokenAccount(rpc, { owner: AGENT, deployment: DEPLOYMENT, need: 0n });
+    expect(resolved.address).toBe(SECOND_ACCOUNT);
+    expect(resolved.isAta).toBe(false);
+    expect(rpc.callsTo('getTokenAccountsByOwner')).toBe(1);
+
+    // every account empty: the ATA still wins
+    const allEmpty = createFakeConnection({ tokenAccounts: [account({ amount: 0n }), account({ address: SECOND_ACCOUNT, amount: 0n })] });
+    expect((await resolveTokenAccount(allEmpty, { owner: AGENT, deployment: DEPLOYMENT, need: 0n })).address).toBe(AGENT_ATA);
   });
 
   it('falls back to the largest account of the mint when the ATA is short or missing', async () => {
@@ -130,7 +160,7 @@ describe('resolveTokenAccount', () => {
       ],
     });
     const resolved = await resolveTokenAccount(rpc, { owner: AGENT, deployment: DEPLOYMENT, need: 500n * ONE });
-    expect(resolved).toEqual({ address: SECOND_ACCOUNT, amount: 800n * ONE, isAta: false, delegate: OPERATOR, delegatedAmount: 50n * ONE });
+    expect(resolved).toEqual({ address: SECOND_ACCOUNT, owner: AGENT, amount: 800n * ONE, isAta: false, delegate: OPERATOR, delegatedAmount: 50n * ONE });
     expect(rpc.callsTo('getTokenAccountsByOwner')).toBe(1);
 
     const noAta = createFakeConnection({ tokenAccounts: [account({ address: SECOND_ACCOUNT, amount: 5n * ONE })] });
@@ -170,6 +200,38 @@ describe('resolveTokenAccount', () => {
     const rpc = createFakeConnection();
     await expect(resolveTokenAccount(rpc, { owner: 'nope', deployment: DEPLOYMENT, need: 0n })).rejects.toMatchObject({ code: 'invalid_address' });
     await expect(resolveTokenAccount(rpc, { owner: AGENT, deployment: { ...DEPLOYMENT, mint: '0x12' }, need: 0n })).rejects.toMatchObject({ code: 'invalid_address' });
+  });
+});
+
+describe('resolveDelegatedTokenAccount', () => {
+  it('picks the account delegated to the operator over the (undelegated, larger) ATA', async () => {
+    const rpc = createFakeConnection({
+      tokenAccounts: [account(), account({ address: SECOND_ACCOUNT, amount: 3n, delegate: OPERATOR, delegatedAmount: 3n })],
+    });
+    const resolved = await resolveDelegatedTokenAccount(rpc, { owner: AGENT, deployment: DEPLOYMENT });
+    expect(resolved).toEqual({ address: SECOND_ACCOUNT, owner: AGENT, amount: 3n, isAta: false, delegate: OPERATOR, delegatedAmount: 3n });
+    expect(rpc.calls.map((c) => c.method)).toEqual(['getTokenAccountsByOwner']);
+  });
+
+  it('ignores delegations to someone else while the operator is known, and falls back to the ATA-or-largest rule', async () => {
+    const foreign = createFakeConnection({ tokenAccounts: [account(), account({ address: SECOND_ACCOUNT, amount: 3n, delegate: PAYER, delegatedAmount: 3n })] });
+    expect((await resolveDelegatedTokenAccount(foreign, { owner: AGENT, deployment: DEPLOYMENT })).address).toBe(AGENT_ATA);
+    // without an operator any delegate counts
+    expect((await resolveDelegatedTokenAccount(foreign, { owner: AGENT, deployment: { ...DEPLOYMENT, operator: null } })).address).toBe(SECOND_ACCOUNT);
+
+    const none = createFakeConnection({ tokenAccounts: [] });
+    expect((await failure(resolveDelegatedTokenAccount(none, { owner: AGENT, deployment: DEPLOYMENT }))).code).toBe('insufficient_tokens');
+  });
+
+  it('refuses to guess between several budgets (ambiguous_token_account)', async () => {
+    const rpc = createFakeConnection({
+      tokenAccounts: [account({ delegate: OPERATOR, delegatedAmount: ONE }), account({ address: SECOND_ACCOUNT, amount: 3n, delegate: OPERATOR, delegatedAmount: 3n })],
+    });
+    const error = await failure(resolveDelegatedTokenAccount(rpc, { owner: AGENT, deployment: DEPLOYMENT }));
+    expect(error.code).toBe('ambiguous_token_account');
+    expect(error.message).toMatch(/2 token accounts delegated to the operator/);
+    expect(error.message).toContain(SECOND_ACCOUNT);
+    expect(error.message).toMatch(/pass tokenAccount/);
   });
 });
 
@@ -290,7 +352,7 @@ describe('prepareUnsignedTransactions', () => {
   it('uses a given token account after checking it belongs to the mint', async () => {
     const rpc = createFakeConnection({ tokenAccounts: [account({ address: SECOND_ACCOUNT, owner: PAYER, amount: 5n * ONE, delegate: OPERATOR, delegatedAmount: 5n * ONE })] });
     const prepared = await prepareUnsignedTransactions(rpc, { action: 'closeBudget', deployment: DEPLOYMENT, payer: PAYER, tokenAccount: SECOND_ACCOUNT });
-    expect(prepared.tokenAccount).toEqual({ address: SECOND_ACCOUNT, amount: 5n * ONE, isAta: false, delegate: OPERATOR, delegatedAmount: 5n * ONE });
+    expect(prepared.tokenAccount).toEqual({ address: SECOND_ACCOUNT, owner: PAYER, amount: 5n * ONE, isAta: false, delegate: OPERATOR, delegatedAmount: 5n * ONE });
     const bad = await failure(prepareUnsignedTransactions(rpc, { action: 'closeBudget', deployment: DEPLOYMENT, payer: PAYER, tokenAccount: OTHER_WORKSPACE }));
     expect(bad.code).toBe('invalid_address');
     expect(bad.message).toMatch(/not a token account of mint/);
@@ -309,11 +371,23 @@ describe('prepareUnsignedTransactions', () => {
     expect(down.message).toMatch(/blockhash/);
   });
 
-  it('describeTokenAccount reports ATA-ness relative to the account owner', async () => {
+  it('describeTokenAccount reports the owner and ATA-ness relative to it', async () => {
     const rpc = createFakeConnection({ tokenAccounts: [account()] });
     const info = await describeTokenAccount(rpc, AGENT_ATA, DEPLOYMENT);
     expect(info.isAta).toBe(true);
+    expect(info.owner).toBe(AGENT);
     expect(info.amount).toBe(1_000n * ONE);
+  });
+
+  it('closeBudget without a token account revokes the delegated account, not the undelegated ATA', async () => {
+    const rpc = createFakeConnection({
+      tokenAccounts: [account({ address: ata(PAYER), owner: PAYER }), account({ address: SECOND_ACCOUNT, owner: PAYER, amount: 2n, delegate: OPERATOR, delegatedAmount: 2n })],
+    });
+    const prepared = await prepareUnsignedTransactions(rpc, { action: 'closeBudget', deployment: DEPLOYMENT, payer: PAYER });
+    expect(prepared.tokenAccount.address).toBe(SECOND_ACCOUNT);
+    const revoke = decodeInstruction(Transaction.from(Buffer.from(prepared.transactions[0]!.base64, 'base64')).instructions[0]!);
+    if (!isRevokeInstruction(revoke)) throw new Error('expected Revoke');
+    expect(revoke.keys.account.pubkey.toBase58()).toBe(SECOND_ACCOUNT);
   });
 });
 
@@ -380,27 +454,42 @@ describe('createKeypairWalletExecutor', () => {
   it('openBudget delegates the ATA to the operator and reports its balance; closeBudget revokes it', async () => {
     const { rpc, wallet } = harness();
     const open = await wallet.openBudget({ cap: 2_000n * ONE }); // above the balance: SPL allows it, the headroom is capped by the balance
-    expect(open).toEqual({ signature: expect.any(String), slot: 42, tokenAccount: AGENT_ATA, balance: 1_000n * ONE });
+    expect(open).toEqual({ signature: expect.any(String), slot: 42, tokenAccount: AGENT_ATA, balance: 1_000n * ONE, previousDelegate: null, previousDelegatedAmount: 0n });
     const approve = decodeInstruction(sentInstructions(rpc).instructions[0]!);
     if (!isApproveCheckedInstruction(approve)) throw new Error('expected ApproveChecked');
     expect(approve.data).toEqual({ instruction: TokenInstruction.ApproveChecked, amount: 2_000n * ONE, decimals: 6 });
     expect(approve.keys.delegate.pubkey.toBase58()).toBe(OPERATOR);
     expect(approve.keys.owner.pubkey.toBase58()).toBe(AGENT);
 
+    // the fake node does not apply the approval: the ATA still shows no delegate, so the Revoke reports exactly that
     const close = await wallet.closeBudget({});
-    expect(close.tokenAccount).toBe(AGENT_ATA);
+    expect(close).toEqual({ signature: expect.any(String), slot: 42, tokenAccount: AGENT_ATA, delegate: null, delegatedAmount: 0n });
     const revoke = decodeInstruction(sentInstructions(rpc, 1).instructions[0]!);
     expect(isRevokeInstruction(revoke)).toBe(true);
 
     rpc.options.tokenAccounts = [...(rpc.options.tokenAccounts ?? []), account({ address: SECOND_ACCOUNT, amount: 3n, delegate: OPERATOR, delegatedAmount: 3n })];
     const explicit = await wallet.closeBudget({ tokenAccount: SECOND_ACCOUNT });
     expect(explicit.tokenAccount).toBe(SECOND_ACCOUNT);
+    expect(explicit.delegate).toBe(OPERATOR);
+    expect(explicit.delegatedAmount).toBe(3n);
     const revoke2 = decodeInstruction(sentInstructions(rpc, 2).instructions[0]!);
     if (!isRevokeInstruction(revoke2)) throw new Error('expected Revoke');
     expect(revoke2.keys.account.pubkey.toBase58()).toBe(SECOND_ACCOUNT);
 
+    // without a token account the delegated one is the default, even though the ATA holds more
+    const defaulted = await wallet.closeBudget({});
+    expect(defaulted.tokenAccount).toBe(SECOND_ACCOUNT);
+    expect(defaulted.delegate).toBe(OPERATOR);
+
     const bad = await failure(wallet.closeBudget({ tokenAccount: OTHER_WORKSPACE }));
     expect(bad.code).toBe('invalid_address');
+  });
+
+  it('openBudget reports the delegation it replaces', async () => {
+    const { wallet } = harness({ tokenAccounts: [account({ delegate: OPERATOR, delegatedAmount: 40n * ONE })] });
+    const open = await wallet.openBudget({ cap: ONE });
+    expect(open.previousDelegate).toBe(OPERATOR);
+    expect(open.previousDelegatedAmount).toBe(40n * ONE);
   });
 
   it('openBudget without an operator fails with not_configured before touching the chain', async () => {
@@ -534,5 +623,21 @@ describe('createLazyWalletExecutor', () => {
     expect(attempts).toBe(2); // the built executor is cached
     expect(inner.rpc.sent.length).toBe(2);
     expect(() => createLazyWalletExecutor({ address: 'nope', build: async () => inner.wallet })).toThrow(WalletError);
+  });
+
+  it('passes a WalletError of the build through with its own code (e.g. chain_unavailable) and still retries', async () => {
+    let attempts = 0;
+    const wallet = createLazyWalletExecutor({
+      address: AGENT,
+      build: async () => {
+        attempts += 1;
+        throw new WalletError('chain_unavailable', 'the gateway has no chain access configured');
+      },
+    });
+    const error = await failure(wallet.buyCompute({ workspace: AGENT, tokens: ONE }));
+    expect(error.code).toBe('chain_unavailable');
+    expect(error.message).not.toMatch(/wallet could not be set up/);
+    await failure(wallet.closeBudget({}));
+    expect(attempts).toBe(2);
   });
 });

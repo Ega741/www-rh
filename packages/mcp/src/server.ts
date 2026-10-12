@@ -25,7 +25,15 @@ import type { CallToolResult, ServerNotification, ServerRequest } from '@modelco
 import { Connection } from '@solana/web3.js';
 import { z } from 'zod';
 import { BeagleApiError, type BeagleApi } from './api.js';
-import { prepareUnsignedTransactions, WalletError, type SolanaRpc, type WalletDeployment, type WalletExecutor } from './wallet.js';
+import {
+  describeTokenAccount,
+  prepareUnsignedTransactions,
+  WalletError,
+  type ResolvedTokenAccount,
+  type SolanaRpc,
+  type WalletDeployment,
+  type WalletExecutor,
+} from './wallet.js';
 
 /** Name and version reported in `initialize`. */
 export const MCP_SERVER_INFO = { name: 'beagle', version: '0.1.0' } as const;
@@ -346,7 +354,9 @@ unless the route is served through your own provider key (BYOK).
 - \`beagle_open_budget\` with \`usd\`/\`tokens\`: \`ApproveChecked\` that delegates up to the cap to the gateway operator
   (no deadline, lives until revoked), then registers the token account. The operator burns from it as usage accrues,
   never above the cap, with a receipt hash in each burn's memo; the headroom (min(cap, balance)) counts as credit
-  right away. A new approval replaces the previous cap. \`beagle_close_budget\` revokes it.
+  right away. A new approval replaces the previous cap. \`beagle_close_budget\` revokes it. A budget funds the
+  workspace of the wallet that delegates unless a key of that wallet's workspace registers it for another one
+  (the tool asks for \`fundOtherWorkspace: true\` before opening such a budget).
 - Without an agent wallet these tools return unsigned legacy transactions (base64, fee payer = your workspace, fresh
   blockhash) to sign and send yourself.
 
@@ -496,6 +506,48 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
     const trimmed = payer.trim();
     if (!isBase58Pubkey(trimmed)) throw new ToolInputError(`payer is not a base58 Solana public key: ${JSON.stringify(payer)}`);
     return trimmed;
+  }
+
+  /**
+   * The signer of an unsigned Revoke: `payer`, else the configured workspace (a key's workspace
+   * owns the accounts it delegated), else the owner of `tokenAccount` read from the chain, who is
+   * the only valid signer anyway. The workspace to credit plays no part in closing a budget.
+   */
+  async function resolveRevokeSigner(rpc: SolanaRpc, deployment: WalletDeployment, payer: string | undefined, tokenAccount: string | undefined): Promise<string> {
+    const known = payer ?? opts.workspace;
+    if (known !== undefined) return resolvePayer(known, known);
+    if (tokenAccount === undefined) {
+      throw new ToolInputError(
+        'the signer of the Revoke is unknown: pass tokenAccount (the budget id from beagle_budgets; its owner is the signer) or payer (the token account owner that will sign), or configure BEAGLE_WORKSPACE.',
+      );
+    }
+    return (await describeTokenAccount(rpc, tokenAccount, deployment)).owner;
+  }
+
+  /** SPL accepts only the token account owner as the authority of a burn, approval or revoke: an unsigned transaction for anyone else can never land. */
+  function assertAccountOwner(account: ResolvedTokenAccount, signer: string, instruction: string): void {
+    if (account.owner === signer) return;
+    throw new ToolInputError(
+      `token account ${account.address} is owned by ${account.owner}, not by ${signer}, so ${signer} cannot sign its ${instruction}: pass payer: ${account.owner} (the owner signs) or a token account of ${signer}.`,
+    );
+  }
+
+  /**
+   * SPEC §3.4: a delegation funds its token account owner's workspace unless a key or session of the
+   * OWNER registers it naming another one; any other principal gets 403 `not_owner`, and the budget
+   * scanner registers unregistered delegations under the owner. So a budget signed by `owner` for
+   * a different `workspace` only works when the registering API key belongs to `owner`, which the
+   * caller confirms with `fundOtherWorkspace: true` (this server cannot tell whose key it holds).
+   */
+  function assertCrossWorkspaceBudget(owner: string, workspace: string, source: WorkspaceSource, confirmed: boolean | undefined, unsigned: boolean): void {
+    if (owner === workspace || confirmed === true) return;
+    const register = unsigned ? `POST /api/budgets/register { tokenAccount, workspace: ${workspace} } must then be sent with a key of ${owner}` : `this server's API key must then belong to ${owner}`;
+    throw new ToolInputError(
+      `This budget would be signed by ${owner} (the token account owner) but fund workspace ${workspace}${source === 'configured' ? ' (the configured workspace)' : source === 'agent_wallet' ? ' (the agent wallet)' : ''}. ` +
+        `The gateway registers a delegation for its OWNER's workspace unless a key or session of the owner registers it naming another workspace: any other key is refused (403 not_owner), and the budget then funds ${owner}, not ${workspace}. ` +
+        `Either open the budget from ${workspace}'s own wallet, or run this server with an API key of ${owner} and pass workspace: ${workspace}; ${register}. ` +
+        'Pass fundOtherWorkspace: true to proceed once that is the case.',
+    );
   }
 
   /** `GET /api/price` for the stale warning; a failure to read it is not fatal (the quote carries `stale` too). */
@@ -813,6 +865,7 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
             ...(tokenAccount === undefined ? {} : { tokenAccount }),
           });
           const { tokenAccount: account, memo, ...unsigned } = prepared;
+          assertAccountOwner(account, signer, 'BurnChecked');
           return {
             ...unsigned,
             tokenAccount: account.address,
@@ -906,17 +959,24 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
         'Authorize a budget: SPL ApproveChecked that delegates up to the cap (in usd or tokens) of your BEAGLE token account to the gateway operator, then register the account with the gateway. ' +
         'The operator burns from it as usage accrues, never above the cap, with a receipt hash in every burn memo; the headroom (min(cap, token balance) at the current price) counts as available credit right away and nothing is burned until used. ' +
         'No deadline: the budget lives until revoked (beagle_close_budget) or exhausted. SPL allows one delegate per token account, so a new approval REPLACES the previous cap rather than adding to it. ' +
-        (wallet === undefined ? UNSIGNED_HINT + ' After sending, register the token account (POST /api/budgets/register) or wait for the gateway scanner.' : 'This signs and sends with the agent wallet and registers the budget.'),
+        'A budget funds the workspace of the wallet that signs unless a key of that wallet’s workspace registers it for another one (anyone else gets 403 not_owner and the scanner registers it for the owner), so a cross-workspace budget needs fundOtherWorkspace: true. ' +
+        (wallet === undefined
+          ? UNSIGNED_HINT + ' After sending, register the token account (POST /api/budgets/register with the returned register body) or wait for the gateway scanner, which registers it for the owner’s workspace.'
+          : 'This signs and sends with the agent wallet and registers the budget.'),
       inputSchema: {
         usd: AMOUNT_SCHEMA.optional().describe('Cap in USD (number or decimal string), converted at the current price.'),
         tokens: AMOUNT_SCHEMA.optional().describe('Cap in whole tokens (number or decimal string).'),
         workspace: ADDRESS_SCHEMA.optional().describe('Workspace (base58 public key) the budget pays for; defaults to the configured workspace, else the agent wallet address (a guess: see workspaceSource in the result).'),
+        fundOtherWorkspace: z
+          .boolean()
+          .optional()
+          .describe('Required (true) when workspace is not the signing wallet: confirms the registration will come from a key of the signing wallet’s workspace, the only principal the gateway lets name another workspace.'),
         payer: ADDRESS_SCHEMA.optional().describe('Unsigned path only: the wallet that will sign (token account owner); defaults to workspace.'),
-        tokenAccount: ADDRESS_SCHEMA.optional().describe('Unsigned path only: token account to delegate; default: the payer’s associated token account of the mint.'),
+        tokenAccount: ADDRESS_SCHEMA.optional().describe('Unsigned path only: token account to delegate; default: the payer’s associated token account of the mint (or its largest account when the ATA is empty).'),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    ({ usd, tokens, workspace, payer, tokenAccount }) =>
+    ({ usd, tokens, workspace, fundOtherWorkspace, payer, tokenAccount }) =>
       run(async () => {
         const config = await getConfig();
         if (config.operator === null) {
@@ -927,6 +987,10 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
         const { address: ws, source: workspaceSource } = resolveWorkspace(workspace);
         const { warnings } = await priceWarnings(amount.quote);
         const capFormatted = `${formatTokenAmount(amount.tokens, config.decimals)} ${config.symbol}`;
+        const replacedNote = (delegate: string | null | undefined, delegatedAmount: bigint | undefined): string =>
+          delegate !== null && delegate !== undefined && (delegatedAmount ?? 0n) > 0n
+            ? ` This replaces the existing delegation of ${formatTokenAmount(delegatedAmount ?? 0n, config.decimals)} ${config.symbol} to ${delegate}.`
+            : '';
         const common = {
           workspace: ws,
           workspaceSource,
@@ -943,6 +1007,7 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
         };
         if (wallet === undefined) {
           const signer = resolvePayer(payer, ws);
+          assertCrossWorkspaceBudget(signer, ws, workspaceSource, fundOtherWorkspace, true);
           const prepared = await prepareUnsignedTransactions(getRpc(config), {
             action: 'openBudget',
             deployment,
@@ -951,29 +1016,50 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
             ...(tokenAccount === undefined ? {} : { tokenAccount }),
           });
           const { tokenAccount: account, memo: _memo, ...unsigned } = prepared;
+          assertAccountOwner(account, signer, 'ApproveChecked');
+          const crossWorkspace = ws !== signer;
           return {
             ...unsigned,
             tokenAccount: account.address,
             tokenAccountBalance: account.amount,
             ...common,
-            register: { tokenAccount: account.address, ...(ws === signer ? {} : { workspace: ws }) },
+            register: { tokenAccount: account.address, ...(crossWorkspace ? { workspace: ws } : {}) },
             note:
               `Sign with ${signer} and send on ${config.cluster} before block height ${prepared.lastValidBlockHeight}. ` +
-              `Then POST /api/budgets/register with the register object (or wait for the scanner). Headroom = min(cap ${capFormatted}, token balance ${formatTokenAmount(account.amount, config.decimals)} ${config.symbol}) at the current price; keep tokens in the account.` +
-              (account.delegatedAmount > 0n ? ` This replaces the existing delegation of ${formatTokenAmount(account.delegatedAmount, config.decimals)} ${config.symbol} to ${account.delegate ?? '?'}.` : '') +
+              (crossWorkspace
+                ? `Then POST /api/budgets/register with the register object using a key or session of the owner ${signer}: any other key is refused (403 not_owner), and until the owner registers it the gateway scanner registers the delegation for ${signer}'s workspace, so ${ws} gets no headroom from it. `
+                : `Then POST /api/budgets/register with the register object, or wait for the gateway scanner (it registers the delegation for its owner ${signer}). `) +
+              `Headroom = min(cap ${capFormatted}, token balance ${formatTokenAmount(account.amount, config.decimals)} ${config.symbol}) at the current price; keep tokens in the account.` +
+              replacedNote(account.delegate, account.delegatedAmount) +
               workspaceWarning(workspaceSource, ws),
           };
         }
+        const owner = wallet.address;
+        if (owner !== undefined) assertCrossWorkspaceBudget(owner, ws, workspaceSource, fundOtherWorkspace, false);
+        const crossWorkspace = ws !== owner;
         const result = await wallet.openBudget({ cap: amount.tokens });
         let registered = false;
         let budget: BudgetDto | null = null;
         let registerError: string | null = null;
+        let registerErrorCode: string | null = null;
         try {
-          budget = await api.registerBudget({ tokenAccount: result.tokenAccount, ...(ws === wallet.address ? {} : { workspace: ws }) });
+          budget = await api.registerBudget({ tokenAccount: result.tokenAccount, ...(crossWorkspace ? { workspace: ws } : {}) });
           registered = true;
         } catch (error) {
-          registerError = toolErrorInfo(error).message;
+          const info = toolErrorInfo(error);
+          registerError = info.message;
+          registerErrorCode = info.code;
         }
+        const ownerLabel = owner ?? 'the token account owner';
+        // Unregistered delegations are registered by the scanner for their owner's workspace, whatever the call asked for.
+        const fundsWorkspace = registered ? budget!.workspace : (owner ?? null);
+        const registration = registered
+          ? ` and registered the budget for workspace ${budget!.workspace}.`
+          : registerErrorCode === 'not_owner'
+            ? ` but the gateway refused to register it for workspace ${ws} (403 not_owner: this server's API key does not belong to ${ownerLabel}). The delegation funds the owner's workspace ${ownerLabel} instead (the scanner registers it there), so ${ws} gets no headroom from it: revoke it with beagle_close_budget, or register it with a key of ${ownerLabel} (POST /api/budgets/register { tokenAccount: ${result.tokenAccount}, workspace: ${ws} }).`
+            : crossWorkspace
+              ? ` (registration failed: ${registerError ?? '?'}). Until a key of ${ownerLabel} registers it naming workspace ${ws}, the delegation funds ${ownerLabel} (the scanner registers it there), not ${ws}: retry POST /api/budgets/register { tokenAccount: ${result.tokenAccount}, workspace: ${ws} } with such a key, or revoke it with beagle_close_budget.`
+              : ` (registration failed: ${registerError ?? '?'}; the gateway scanner registers the delegation for its owner ${ownerLabel} on its own, or retry POST /api/budgets/register { tokenAccount: ${result.tokenAccount} }).`;
         const balanceFormatted = `${formatTokenAmount(result.balance, config.decimals)} ${config.symbol}`;
         return {
           executed: true,
@@ -986,10 +1072,13 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
           registered,
           budget,
           registerError,
+          registerErrorCode,
+          fundsWorkspace,
           note:
             `Delegated up to ${capFormatted} of token account ${result.tokenAccount} to the operator ${config.operator}` +
-            (registered ? ' and registered the budget.' : ` (registration failed: ${registerError ?? '?'}; the gateway scanner will pick it up).`) +
+            registration +
             ` Headroom = min(cap, token balance ${balanceFormatted}) at the current price${result.balance < amount.tokens ? ' — the balance is below the cap, so the headroom is limited by it; top the account up to use the full cap' : ''}. Revoke any time with beagle_close_budget.` +
+            replacedNote(result.previousDelegate, result.previousDelegatedAmount) +
             workspaceWarning(workspaceSource, ws),
         };
       }),
@@ -1004,8 +1093,8 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
         'Usage already served but not yet drawn stays owed. ' +
         (wallet === undefined ? UNSIGNED_HINT : 'This signs and sends with the agent wallet.'),
       inputSchema: {
-        tokenAccount: ADDRESS_SCHEMA.optional().describe('Token account (= budget id from beagle_budgets) to revoke; default: the signer’s associated token account of the mint.'),
-        payer: ADDRESS_SCHEMA.optional().describe('Unsigned path only: the token account owner that will sign; defaults to the configured workspace.'),
+        tokenAccount: ADDRESS_SCHEMA.optional().describe('Token account (= budget id from beagle_budgets) to revoke; default: the signer’s account delegated to the operator (its open budget), else its associated token account of the mint.'),
+        payer: ADDRESS_SCHEMA.optional().describe('Unsigned path only: the token account owner that will sign; defaults to the configured workspace, else to the owner of tokenAccount (read from the chain).'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -1014,15 +1103,16 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
         const config = await getConfig();
         const deployment = walletDeployment(config);
         if (wallet === undefined) {
-          const { address: ws } = resolveWorkspace(undefined);
-          const signer = resolvePayer(payer, ws);
-          const prepared = await prepareUnsignedTransactions(getRpc(config), {
+          const rpc = getRpc(config);
+          const signer = await resolveRevokeSigner(rpc, deployment, payer, tokenAccount);
+          const prepared = await prepareUnsignedTransactions(rpc, {
             action: 'closeBudget',
             deployment,
             payer: signer,
             ...(tokenAccount === undefined ? {} : { tokenAccount }),
           });
           const { tokenAccount: account, memo: _memo, ...unsigned } = prepared;
+          assertAccountOwner(account, signer, 'Revoke');
           return {
             ...unsigned,
             tokenAccount: account.address,
@@ -1035,14 +1125,19 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
           };
         }
         const result = await wallet.closeBudget(tokenAccount === undefined ? {} : { tokenAccount });
+        const known = result.delegate !== undefined;
         return {
           executed: true,
           signature: result.signature,
           ...(result.slot === undefined ? {} : { slot: result.slot }),
           tokenAccount: result.tokenAccount,
+          ...(known ? { delegate: result.delegate, delegatedAmount: result.delegatedAmount ?? 0n } : {}),
           explorerUrl: explorerLink(config, result.signature),
           cluster: config.cluster,
-          note: `Revoked the delegation of token account ${result.tokenAccount}; the gateway shows the budget as closed (revoked) after its next scan.`,
+          note:
+            result.delegate === null
+              ? `Sent a Revoke for token account ${result.tokenAccount}, which had no delegate: nothing changed and no budget was open on it. Pass tokenAccount (the budget id from beagle_budgets) to close a budget on another account.`
+              : `Revoked the delegation${known ? ` of ${formatTokenAmount(result.delegatedAmount ?? 0n, config.decimals)} ${config.symbol} to ${result.delegate}` : ''} of token account ${result.tokenAccount}; the gateway shows the budget as closed (revoked) after its next scan.`,
         };
       }),
   );

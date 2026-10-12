@@ -727,7 +727,8 @@ empty — plus `Memo(beagle:v1 ws=…)` when `workspace ≠ agent`), `openBudget
 (`ApproveChecked(ata, operator, cap)` then `POST /api/budgets/register`), `closeBudget({ tokenAccount }) → { signature }`
 (`Revoke`); `createKeypairWalletExecutor({ secretKey, rpcUrl, deployment })`; `buildUnsignedTransactions(...)` for
 the same three actions. Errors surface as `WalletError` codes (`insufficient_tokens`, `insufficient_sol`,
-`blockhash_expired`, `tx_failed`, `chain_mismatch`), never the secret key.
+`blockhash_expired`, `tx_failed`, `chain_mismatch`, `chain_unavailable`, `ambiguous_token_account`), never the secret key.
+A 32-byte base58 secret is refused (it is a public key or a bare seed; the 64-byte secret key is required).
 
 ### 6.2 `BeagleApi` interface and REST client
 
@@ -751,7 +752,7 @@ implementation calls its services directly.
 | `beagle_complete` | `{ prompt? , messages?, system?, model? ('beagle/auto'), max_tokens?, difficulty? }` | `{ text, model, provider, paidBy, costMicro, balanceMicro, finishReason }` |
 | `beagle_usage` | `{ limit?, window? }` | rows + summary |
 | `beagle_buy_compute` | `{ usd? \| tokens?, workspace? }` | burn + memo; executed: `{ signature, creditedMicro, balanceMicro, pricePointId, priceStale }`; else unsigned transactions. The description says credit is computed from the published price when the burn is observed and warns when the price is stale |
-| `beagle_open_budget` | `{ usd? \| tokens?, workspace? }` | `ApproveChecked` of the cap to the operator + register; executed: `{ signature, tokenAccount, cap }`; else unsigned transactions. Notes that a new approval replaces the previous cap |
+| `beagle_open_budget` | `{ usd? \| tokens?, workspace?, fundOtherWorkspace? }` | `ApproveChecked` of the cap to the operator + register; refuses a cross-workspace budget (funded workspace ≠ signer) unless `fundOtherWorkspace: true`, and explains the owner-key registration rule (§3.4); executed: `{ signature, tokenAccount, cap, registered, fundsWorkspace }`; else unsigned transactions. Notes that a new approval replaces the previous cap |
 | `beagle_close_budget` | `{ tokenAccount? }` | `Revoke`; executed: `{ signature }`; else unsigned |
 | `beagle_budgets` | — | `BudgetDto[]` |
 | `beagle_upgrade` | `{ kind: 'pro'\|'warm', quantity? }` | `UpgradeDto` |

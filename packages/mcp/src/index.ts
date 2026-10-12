@@ -39,6 +39,7 @@ export {
   parseSecretKey,
   prepareUnsignedTransactions,
   pubkey,
+  resolveDelegatedTokenAccount,
   resolveTokenAccount,
   U64_MAX,
   WalletError,

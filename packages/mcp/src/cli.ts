@@ -4,8 +4,9 @@
  * Environment:
  * - `BEAGLE_API_URL`  gateway origin (default `http://localhost:8787`)
  * - `BEAGLE_API_KEY`  `bgl_…` API key (required; exit code 2 without it)
- * - `BEAGLE_AGENT_SECRET_KEY`  optional Solana keypair of the agent wallet: base58 or a JSON byte
- *   array (the contents of a `solana-keygen` file); with it the wallet tools sign and send
+ * - `BEAGLE_AGENT_SECRET_KEY`  optional Solana keypair of the agent wallet: base58 (64-byte secret
+ *   key; a 32-byte value is refused as it looks like a public key) or a JSON byte array (the
+ *   contents of a `solana-keygen` file); with it the wallet tools sign and send
  * - `BEAGLE_RPC_URL`  optional JSON-RPC URL (default: the cluster RPC from `GET /api/config`)
  * - `BEAGLE_WORKSPACE`  optional default workspace (base58 public key) for the wallet tools
  *
@@ -13,6 +14,7 @@
  *
  * @module cli
  */
+import { isUnsetAddress } from '@beagle/shared/addresses';
 import { isBase58Pubkey } from '@beagle/shared/solana';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { Keypair } from '@solana/web3.js';
@@ -94,7 +96,9 @@ export interface AgentWalletOptions {
  * each call until that succeeds. A gateway that is down, slow or mid-deploy when the MCP client
  * spawns the binary therefore neither delays the MCP handshake nor downgrades the session to
  * unsigned transactions: the affected call fails with `wallet_unavailable` and the next one tries
- * again. The RPC endpoint is `BEAGLE_RPC_URL`, else the gateway's `rpcUrl`.
+ * again. A gateway without chain access reports the all-zero key as its mint: the call then fails
+ * with `chain_unavailable` (not a misleading `chain_mismatch` against the RPC node). The RPC
+ * endpoint is `BEAGLE_RPC_URL`, else the gateway's `rpcUrl`.
  */
 export function createAgentWallet(api: BeagleApi, config: BinConfig, options: AgentWalletOptions = {}): WalletExecutor | undefined {
   const keypair = config.keypair;
@@ -106,7 +110,12 @@ export function createAgentWallet(api: BeagleApi, config: BinConfig, options: Ag
     build: async () => {
       const gateway = await api.config();
       const deployment = walletDeployment(gateway);
-      if (deployment.mint === '' ) throw new WalletError('not_configured', 'the gateway reports no mint for its cluster');
+      if (isUnsetAddress(deployment.mint)) {
+        throw new WalletError(
+          'chain_unavailable',
+          `the gateway at ${config.apiUrl} has no chain access configured (it reports no mint for ${gateway.cluster}), so the wallet tools cannot sign anything there; the read-only and inference tools still work`,
+        );
+      }
       const rpcUrl = config.rpcUrl ?? gateway.rpcUrl;
       const wallet = createKeypairWalletExecutor({
         secretKey: keypair,

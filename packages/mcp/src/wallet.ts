@@ -10,7 +10,8 @@
  *   gateway credits the burn at its published price when it observes the transaction.
  * - **openBudget** = `ApproveChecked(tokenAccount, mint, delegate = operator, owner, cap, decimals)`:
  *   SPL semantics, one delegate per account, a new approval replaces the previous cap.
- * - **closeBudget** = `Revoke(tokenAccount, owner)`.
+ * - **closeBudget** = `Revoke(tokenAccount, owner)` of the named account, else of the owner's
+ *   account delegated to the operator (its open budget), else of the ATA-or-largest account.
  *
  * Every transaction is a legacy `Transaction` with `feePayer = owner` and a fresh blockhash; the
  * executor signs, `sendRawTransaction`s and `confirmTransaction`s with the blockhash /
@@ -122,11 +123,14 @@ export interface OpenBudgetResult {
   tokenAccount: string;
   /** Token balance of that account at the time of the approval (headroom = min(cap, balance)). */
   balance: bigint;
+  /** The account's delegate before this approval replaced it (`null`: none); executors that do not read it leave it out. */
+  previousDelegate?: string | null;
+  previousDelegatedAmount?: bigint;
 }
 
 /** Input of {@link WalletExecutor.closeBudget}. */
 export interface CloseBudgetParams {
-  /** Token account to revoke the delegation of; default: the signer's ATA of the mint. */
+  /** Token account to revoke the delegation of; default: the signer's account delegated to the operator, else its ATA-or-largest account. */
   tokenAccount?: string;
 }
 
@@ -135,6 +139,9 @@ export interface CloseBudgetResult {
   signature: string;
   slot?: number;
   tokenAccount: string;
+  /** The delegation the Revoke cleared (`delegate: null`: the account had none, so nothing changed); executors that do not read it leave it out. */
+  delegate?: string | null;
+  delegatedAmount?: bigint;
 }
 
 /**
@@ -157,8 +164,9 @@ export class WalletError extends Error {
   override readonly name = 'WalletError';
   /**
    * `invalid_address`, `invalid_amount`, `invalid_secret_key`, `not_configured`, `chain_mismatch`,
-   * `rpc_error`, `insufficient_tokens`, `insufficient_sol`, `blockhash_expired`, `tx_failed`,
-   * `wallet_unavailable` (a lazy executor could not be set up).
+   * `chain_unavailable` (the gateway has no chain access), `ambiguous_token_account` (several
+   * budgets, name one), `rpc_error`, `insufficient_tokens`, `insufficient_sol`, `blockhash_expired`,
+   * `tx_failed`, `wallet_unavailable` (a lazy executor could not be set up).
    */
   readonly code: string;
   /** The transaction signature when one was sent. */
@@ -211,8 +219,10 @@ function assertDecimals(decimals: number): void {
 
 /**
  * Parses an agent secret key as the Solana tooling writes it: a JSON byte array (`solana-keygen`
- * file contents, 64 bytes) or base58 text (Phantom-style export, 64 bytes). A 32-byte seed in either
- * form is accepted too. The error message never echoes the input.
+ * file contents, 64 bytes) or base58 text (Phantom-style export, 64 bytes). A 32-byte seed is
+ * accepted as a JSON array only: 32 bytes of base58 look exactly like a public key, and a pasted
+ * address must not silently turn into an unrelated, unfunded wallet. The error message never
+ * echoes the input.
  */
 export function parseSecretKey(text: string): Uint8Array {
   const trimmed = typeof text === 'string' ? text.trim() : '';
@@ -235,9 +245,15 @@ export function parseSecretKey(text: string): Uint8Array {
     } catch {
       throw new WalletError('invalid_secret_key', 'the secret key is neither a JSON byte array nor base58');
     }
+    if (bytes.length === 32) {
+      throw new WalletError(
+        'invalid_secret_key',
+        'the base58 value is 32 bytes, which is a public key (or a bare seed), not a secret key: export the 64-byte secret key from the wallet, or use the JSON byte array of a solana-keygen file',
+      );
+    }
   }
   if (bytes.length !== 64 && bytes.length !== 32) {
-    throw new WalletError('invalid_secret_key', `the secret key must be 64 bytes (or a 32-byte seed), got ${bytes.length}`);
+    throw new WalletError('invalid_secret_key', `the secret key must be 64 bytes (or a 32-byte seed as a JSON array), got ${bytes.length}`);
   }
   return bytes;
 }
@@ -287,6 +303,8 @@ export function createMemoInstruction(text: string, signer: PublicKey, memoProgr
 export interface ResolvedTokenAccount {
   /** Token account address (base58). */
   address: string;
+  /** The account owner (base58): the only signer SPL accepts for a burn, approval or revoke on it. */
+  owner: string;
   /** Current token balance (raw units). */
   amount: bigint;
   /** `true` when it is the owner's associated token account. */
@@ -302,7 +320,8 @@ export interface ResolveTokenAccountInput {
   deployment: WalletDeployment;
   /**
    * Raw units the caller is about to burn / delegate. The ATA is used when it holds at least this
-   * much; otherwise the largest account of the mint is picked. With `0n` any existing account does.
+   * much (and is not empty); otherwise the largest account of the mint is picked. With `0n` any
+   * existing account does, funded ones first.
    */
   need: bigint;
   commitment?: Commitment;
@@ -321,6 +340,7 @@ function readTokenAccount(address: PublicKey, info: AccountInfo<Buffer> | null, 
 function describe(account: TokenAccountState, isAta: boolean): ResolvedTokenAccount {
   return {
     address: account.address.toBase58(),
+    owner: account.owner.toBase58(),
     amount: account.amount,
     isAta,
     delegate: account.delegate === null ? null : account.delegate.toBase58(),
@@ -330,9 +350,10 @@ function describe(account: TokenAccountState, isAta: boolean): ResolvedTokenAcco
 
 /**
  * The token account of `deployment.mint` owned by `owner` to act on (SPEC §6.1): the associated
- * token account when it exists and holds `need`, else the account with the largest balance. Throws
- * `insufficient_tokens` when the owner has no account of the mint or none holds `need`
- * (`need = 0n` only requires an account to exist), `rpc_error` when the node cannot be read.
+ * token account when it exists, holds `need` and is not empty, else the account with the largest
+ * balance (the ATA again when every account is empty). Throws `insufficient_tokens` when the owner
+ * has no account of the mint or none holds `need` (`need = 0n` only requires an account to exist),
+ * `rpc_error` when the node cannot be read.
  */
 export async function resolveTokenAccount(rpc: SolanaRpc, input: ResolveTokenAccountInput): Promise<ResolvedTokenAccount> {
   const owner = pubkey('owner', input.owner);
@@ -349,18 +370,12 @@ export async function resolveTokenAccount(rpc: SolanaRpc, input: ResolveTokenAcc
   } catch (error) {
     throw new WalletError('rpc_error', `reading token account ${ata.toBase58()} failed: ${errorMessage(error)}`, { cause: error });
   }
-  if (ataState !== undefined && ataState.amount >= input.need) return describe(ataState, true);
+  // An empty ATA is not preferred over a funded account of the mint, even when nothing is needed (a budget on it would have no headroom).
+  if (ataState !== undefined && ataState.amount >= input.need && ataState.amount > 0n) return describe(ataState, true);
 
-  let accounts: ReadonlyArray<{ pubkey: PublicKey; account: AccountInfo<Buffer> }>;
-  try {
-    accounts = (await rpc.getTokenAccountsByOwner(owner, { mint }, commitment)).value;
-  } catch (error) {
-    throw new WalletError('rpc_error', `listing token accounts of ${owner.toBase58()} failed: ${errorMessage(error)}`, { cause: error });
-  }
+  const accounts = await listTokenAccounts(rpc, owner, mint, programId, commitment);
   let best: TokenAccountState | undefined = ataState;
-  for (const { pubkey: address, account } of accounts) {
-    const state = readTokenAccount(address, account, programId, mint);
-    if (state === undefined) continue;
+  for (const state of accounts) {
     if (best === undefined || state.amount > best.amount) best = state;
   }
   if (best === undefined) {
@@ -373,6 +388,49 @@ export async function resolveTokenAccount(rpc: SolanaRpc, input: ResolveTokenAcc
     );
   }
   return describe(best, best.address.equals(ata));
+}
+
+/** Every token account of `mint` owned by `owner` (decoded; other programs' accounts skipped); throws `rpc_error`. */
+async function listTokenAccounts(rpc: SolanaRpc, owner: PublicKey, mint: PublicKey, programId: PublicKey, commitment: Commitment): Promise<TokenAccountState[]> {
+  let accounts: ReadonlyArray<{ pubkey: PublicKey; account: AccountInfo<Buffer> }>;
+  try {
+    accounts = (await rpc.getTokenAccountsByOwner(owner, { mint }, commitment)).value;
+  } catch (error) {
+    throw new WalletError('rpc_error', `listing token accounts of ${owner.toBase58()} failed: ${errorMessage(error)}`, { cause: error });
+  }
+  const states: TokenAccountState[] = [];
+  for (const { pubkey: address, account } of accounts) {
+    const state = readTokenAccount(address, account, programId, mint);
+    if (state !== undefined) states.push(state);
+  }
+  return states;
+}
+
+/**
+ * The token account whose delegation `closeBudget` revokes when the caller names none: the owner's
+ * account delegated to the deployment's operator (its open budget; any delegate counts while the
+ * operator is unknown), else the {@link resolveTokenAccount} default, whose Revoke then changes
+ * nothing. Several delegated accounts are several budgets: `ambiguous_token_account` asks the
+ * caller to name one.
+ */
+export async function resolveDelegatedTokenAccount(rpc: SolanaRpc, input: Omit<ResolveTokenAccountInput, 'need'>): Promise<ResolvedTokenAccount> {
+  const owner = pubkey('owner', input.owner);
+  const mint = pubkey('deployment.mint', input.deployment.mint);
+  const programId = tokenProgramOf(input.deployment);
+  const commitment = input.commitment ?? 'confirmed';
+  const operator = input.deployment.operator === undefined || input.deployment.operator === null ? undefined : pubkey('deployment.operator', input.deployment.operator);
+  const delegated = (await listTokenAccounts(rpc, owner, mint, programId, commitment)).filter(
+    (state) => state.delegate !== null && (operator === undefined || state.delegate.equals(operator)),
+  );
+  if (delegated.length === 0) return resolveTokenAccount(rpc, { ...input, need: 0n });
+  if (delegated.length > 1) {
+    throw new WalletError(
+      'ambiguous_token_account',
+      `${owner.toBase58()} has ${delegated.length} token accounts delegated to the operator (${delegated.map((s) => s.address.toBase58()).join(', ')}): pass tokenAccount to say which budget to close`,
+    );
+  }
+  const account = delegated[0]!;
+  return describe(account, account.address.equals(getAssociatedTokenAddressSync(mint, owner, true, programId)));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -527,7 +585,8 @@ export async function latestBlockhash(rpc: SolanaRpc, commitment: Commitment = '
 /**
  * Resolves the token account (unless given) and a fresh blockhash over `rpc`, then
  * {@link buildUnsignedTransactions}. For `buyCompute` the account must hold the tokens; for
- * `openBudget` / `closeBudget` any account of the mint does (the ATA when it exists).
+ * `openBudget` any account of the mint does (the ATA when it is funded); for `closeBudget` it is
+ * the account delegated to the operator ({@link resolveDelegatedTokenAccount}).
  */
 export async function prepareUnsignedTransactions(
   rpc: SolanaRpc,
@@ -539,9 +598,11 @@ export async function prepareUnsignedTransactions(
   if (input.action === 'buyCompute') assertTokenAmount('tokens', input.tokens);
   if (input.action === 'openBudget') assertTokenAmount('cap', input.cap);
   const tokenAccount =
-    input.tokenAccount === undefined
-      ? await resolveTokenAccount(rpc, { owner: input.payer, deployment: input.deployment, need, commitment })
-      : await describeTokenAccount(rpc, input.tokenAccount, input.deployment, commitment);
+    input.tokenAccount !== undefined
+      ? await describeTokenAccount(rpc, input.tokenAccount, input.deployment, commitment)
+      : input.action === 'closeBudget'
+        ? await resolveDelegatedTokenAccount(rpc, { owner: input.payer, deployment: input.deployment, commitment })
+        : await resolveTokenAccount(rpc, { owner: input.payer, deployment: input.deployment, need, commitment });
   const blockhash = await latestBlockhash(rpc, commitment);
   const full: UnsignedTransactionsInput = { ...input, tokenAccount: tokenAccount.address };
   return { ...serializeUnsigned(full, blockhash), tokenAccount };
@@ -590,7 +651,8 @@ export interface LazyWalletExecutorOptions {
   address: string;
   /**
    * Builds the real executor; called on the first wallet operation and again on every later
-   * operation until one build succeeds. Its failures surface as `WalletError('wallet_unavailable')`.
+   * operation until one build succeeds. Its failures surface as `WalletError('wallet_unavailable')`,
+   * except a `WalletError` it throws itself (e.g. `chain_unavailable`), which passes through as is.
    */
   build: () => Promise<WalletExecutor>;
 }
@@ -608,6 +670,7 @@ export function createLazyWalletExecutor(options: LazyWalletExecutorOptions): Wa
     try {
       inner = await options.build();
     } catch (error) {
+      if (error instanceof WalletError) throw error;
       throw new WalletError(
         'wallet_unavailable',
         `the agent wallet could not be set up (${errorMessage(error)}); nothing was sent. Retry once the gateway is reachable, or sign the unsigned transactions yourself.`,
@@ -765,19 +828,24 @@ export function createKeypairWalletExecutor(options: KeypairWalletExecutorOption
       // Any account of the mint can be delegated (the ATA when it exists); the headroom is min(cap, balance).
       const account = await resolveTokenAccount(rpc, { owner: address, deployment, need: 0n, commitment });
       const { signature, slot } = await run({ action: 'openBudget', deployment, payer: address, tokenAccount: account.address, cap }, 'approve');
-      return { signature, ...(slot === undefined ? {} : { slot }), tokenAccount: account.address, balance: account.amount };
+      return {
+        signature,
+        ...(slot === undefined ? {} : { slot }),
+        tokenAccount: account.address,
+        balance: account.amount,
+        previousDelegate: account.delegate,
+        previousDelegatedAmount: account.delegatedAmount,
+      };
     },
 
     async closeBudget({ tokenAccount }) {
       await assertCluster();
-      let account: ResolvedTokenAccount;
-      if (tokenAccount === undefined) {
-        account = await resolveTokenAccount(rpc, { owner: address, deployment, need: 0n, commitment });
-      } else {
-        account = await describeTokenAccount(rpc, tokenAccount, deployment, commitment);
-      }
+      const account =
+        tokenAccount === undefined
+          ? await resolveDelegatedTokenAccount(rpc, { owner: address, deployment, commitment })
+          : await describeTokenAccount(rpc, tokenAccount, deployment, commitment);
       const { signature, slot } = await run({ action: 'closeBudget', deployment, payer: address, tokenAccount: account.address }, 'revoke');
-      return { signature, ...(slot === undefined ? {} : { slot }), tokenAccount: account.address };
+      return { signature, ...(slot === undefined ? {} : { slot }), tokenAccount: account.address, delegate: account.delegate, delegatedAmount: account.delegatedAmount };
     },
   };
 }
