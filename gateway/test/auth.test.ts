@@ -185,6 +185,7 @@ describe('crypto', () => {
     expect(enc.iv).toHaveLength(12);
     expect(k.decrypt(enc, WS1, 'anthropic')).toBe('sk-ant-secret');
     expect(() => k.decrypt(enc, WS1, 'openai')).toThrow(KeyringError);
+    expect(() => k.decrypt(enc, WS1.toLowerCase(), 'anthropic')).toThrow(KeyringError); // AAD is the base58 workspace verbatim (case-sensitive)
     expect(() => k.decrypt({ ...enc, tag: new Uint8Array(16) }, WS1, 'anthropic')).toThrow(KeyringError);
     expect(() => new Keyring(Buffer.alloc(16))).toThrow(KeyringError);
   });
@@ -214,6 +215,26 @@ describe('logging redaction', () => {
     expect(out).toContain('[redacted]');
     expect(redactString(`key ${key} used`)).toBe('key [redacted] used');
     expect(JSON.parse(lines[0]!)).toMatchObject({ level: 'info', msg: 'auth ok' });
+    // URLs with userinfo / key query parameters, and byte arrays under secret-named keys (a Keypair's secretKey).
+    log.info('boot', {
+      rpcUrl: 'https://mainnet.helius-rpc.com/?api-key=SECRET-KEY-123&x=1',
+      feed: 'https://user:PASSWORD@feed.example/p?a=1',
+      operator: { secretKey: new Uint8Array([1, 2, 3, 4, 5]) },
+      keypair: { _keypair: { secretKey: new Uint8Array([9, 9, 9]) } },
+      bytes: new Uint8Array([7, 7]),
+      explorer: 'https://explorer.solana.com/tx/abc?cluster=custom&customUrl=http%3A%2F%2F127.0.0.1%3A8899',
+    });
+    const boot = lines.at(-1)!;
+    expect(boot).not.toContain('SECRET-KEY-123');
+    expect(boot).toContain('api-key=[redacted]&x=1');
+    expect(boot).not.toContain('PASSWORD');
+    expect(boot).toContain('https://[redacted]@feed.example/p?a=1');
+    expect(boot).not.toContain('"0":');
+    expect(boot).toContain('"operator":{"secretKey":"[redacted]"}');
+    expect(boot).toContain('"_keypair":{"secretKey":"[redacted]"}');
+    expect(boot).toContain('"bytes":"[bytes:2]"');
+    expect(boot).toContain('customUrl=http%3A%2F%2F127.0.0.1%3A8899');
+    expect(redactString('https://x.example/?key=abc&apikey=def&token=ghi')).toBe('https://x.example/?key=[redacted]&apikey=[redacted]&token=[redacted]');
   });
 
   it('respects the level threshold', () => {

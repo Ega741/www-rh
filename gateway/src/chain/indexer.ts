@@ -5,7 +5,17 @@
  * `beagle:` memo, classifies purchases vs operator draws, prices each event with the published
  * price point at observation and applies it idempotently on `(signature, ixIndex)` — one SQLite
  * transaction per signature, cursor included. The ledger credit for purchases and draws is written
- * here and nowhere else. `sweepFinality()` reverts events whose signatures the RPC no longer knows.
+ * here and nowhere else.
+ *
+ * Paging never loses burns: a walk that hits the page cap (`maxPages`) records the unfetched range
+ * as a **backfill gap** in `indexer_state` and keeps draining it on the following polls; a cursor the
+ * RPC no longer knows (dropped transaction) is detected by slot and resumed from its slot instead of
+ * walking the whole history.
+ *
+ * `sweepFinality()` reverts events whose signatures the RPC consistently fails to report: a
+ * signature seen `finalized` leaves the sweep set; one that is missing is re-checked with
+ * `getTransaction` and reverted only after `finalityMisses` consecutive sweeps agree (a single
+ * answer from a lagging / snapshot-restarted RPC node must never destroy a credit).
  *
  * @module chain/indexer
  */
@@ -34,12 +44,16 @@ export interface IndexerOptions {
   creditWhenStale: boolean;
   /** `MIN_CREDIT_USD` in µUSD (dust guard). */
   minCreditMicro: bigint;
-  /** Age after which an event must be found at the RPC or is reverted (default 120 000 ms). */
+  /** Signature pages fetched per walk before the rest is deferred to a backfill gap (default 200). */
+  maxPages?: number;
+  /** Age after which an event must be found at the RPC or counts as missing (default 120 000 ms). */
   finalityAgeMs?: number;
   /** Slot window of the finality sweep relative to the head (default 3000 ≈ 20 min). */
   finalitySweepSlots?: number;
   /** Signatures checked per sweep (RPC maximum 256). */
   finalityBatch?: number;
+  /** Consecutive sweeps that must fail to find a signature before its events are reverted (default 3). */
+  finalityMisses?: number;
   now?: () => number;
 }
 
@@ -47,8 +61,22 @@ const KEY_LAST_SIGNATURE = 'last_signature';
 const KEY_LAST_SLOT = 'last_slot';
 const KEY_HEAD_SLOT = 'head_slot';
 const KEY_LAST_EVENT_AT = 'last_event_at';
-/** Hard cap on signature pages collected in one poll (RPC paging safety). */
-const MAX_PAGES = 200;
+/** JSON list of {@link BackfillGap}s still to drain (newest gap first). */
+const KEY_BACKFILL = 'backfill';
+/** Default {@link IndexerOptions.maxPages}. */
+export const DEFAULT_MAX_PAGES = 200;
+/** Default {@link IndexerOptions.finalityMisses}. */
+export const DEFAULT_FINALITY_MISSES = 3;
+
+/** A range of the mint's signature history that a capped walk left unfetched: everything older than `before` and newer than `until`. */
+export interface BackfillGap {
+  /** The oldest signature already fetched: the walk continues with `before = this`. */
+  before: string;
+  /** The cursor the walk was heading for (exclusive); `undefined` = the beginning of history. */
+  until?: string;
+  /** Slot of `until` (stops the walk when the RPC no longer knows `until`). */
+  untilSlot?: number;
+}
 
 /** One burn instruction of the mint found in a transaction. */
 export interface BurnInstruction {
@@ -61,9 +89,19 @@ export interface BurnInstruction {
   amount: bigint;
 }
 
+/** Thrown while applying a transaction when the poll must stop and retry later (the cursor stays before the transaction). */
+export class IndexerDeferredError extends Error {
+  override readonly name: string = 'IndexerDeferredError';
+}
+
 /** Thrown by {@link Indexer.applyParsedTransaction} when no usable price point exists; the poll stops and retries later. */
-export class PriceDeferredError extends Error {
+export class PriceDeferredError extends IndexerDeferredError {
   override readonly name = 'PriceDeferredError';
+}
+
+/** Thrown when the owner of a burned token account could not be looked up because the RPC failed (never credit the wrong key on a transient error). */
+export class OwnerLookupDeferredError extends IndexerDeferredError {
+  override readonly name = 'OwnerLookupDeferredError';
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -117,10 +155,29 @@ export function resolveOwner(tx: RpcParsedTransaction, tokenAccount: string): st
   return undefined;
 }
 
+/** Result of one signature walk. */
+interface Walk {
+  /** Pages as fetched (newest first, each page newest first). */
+  pages: RpcSignatureInfo[][];
+  /** `true` when the walk ended at `until` / the end of history; `false` when the page cap stopped it. */
+  reachedUntil: boolean;
+  /** The oldest signature fetched (the `before` of a continuation), if any. */
+  oldest: string | undefined;
+}
+
+/** What a batch application did; `complete` is false when the poll stopped early (retry next poll). */
+interface Applied {
+  processed: number;
+  events: number;
+  complete: boolean;
+}
+
 /** The indexer. `step()` does one poll; `sweepFinality()` one finality check; `status()` feeds `GET /api/status`. */
 export class Indexer {
   private head = 0;
   private readonly now: () => number;
+  /** `INDEX_FROM_SIGNATURE` once the RPC confirmed it exists (with its slot). */
+  private indexFrom: { signature: string; slot: number } | undefined;
 
   constructor(
     private readonly repos: Repos,
@@ -157,63 +214,169 @@ export class Indexer {
     };
   }
 
-  /** Signatures newer than the cursor, oldest first (the newest `pageLimit` only on a fresh database). */
-  async collectSignatures(): Promise<RpcSignatureInfo[]> {
-    const until = this.lastSignature() ?? this.options.indexFromSignature;
-    const pages: RpcSignatureInfo[][] = [];
-    let before: string | undefined;
-    for (let n = 0; n < MAX_PAGES; n++) {
-      const page = await this.reader.getSignaturesForAddress(this.options.mint, {
-        limit: this.options.pageLimit,
-        ...(before === undefined ? {} : { before }),
-        ...(until === undefined ? {} : { until }),
-      });
-      if (page.length === 0) break;
-      pages.push(page);
-      if (until === undefined || page.length < this.options.pageLimit) break;
-      before = page[page.length - 1]?.signature;
+  /** Backfill gaps still to drain (SPEC §5.4 paging never skips burns). */
+  backfillGaps(): BackfillGap[] {
+    const raw = this.repos.indexerState.get(KEY_BACKFILL);
+    if (raw === undefined) return [];
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? (parsed.filter((g) => isRecord(g) && typeof g['before'] === 'string') as unknown as BackfillGap[]) : [];
+    } catch {
+      return [];
     }
-    return pages.flat().reverse();
   }
 
-  /** One poll: fetch the signatures after the cursor, apply them oldest first, advance the cursor. */
+  private saveGaps(gaps: readonly BackfillGap[]): void {
+    if (gaps.length === 0) this.repos.indexerState.delete(KEY_BACKFILL);
+    else this.repos.indexerState.set(KEY_BACKFILL, JSON.stringify(gaps));
+  }
+
+  /**
+   * Pages backwards from `before` (or the head) towards `until`, at most `maxPages` pages. When the
+   * RPC no longer knows `until` (a dropped cursor transaction) it would return the whole history:
+   * entries older than `untilSlot` are cut off instead and the walk counts as complete.
+   */
+  private async walk(range: { until: string | undefined; untilSlot: number | null | undefined; before?: string }): Promise<Walk> {
+    const maxPages = Math.max(1, this.options.maxPages ?? DEFAULT_MAX_PAGES);
+    const pages: RpcSignatureInfo[][] = [];
+    let before = range.before;
+    let oldest: string | undefined;
+    for (let n = 0; n < maxPages; n++) {
+      let page = await this.reader.getSignaturesForAddress(this.options.mint, {
+        limit: this.options.pageLimit,
+        ...(before === undefined ? {} : { before }),
+        ...(range.until === undefined ? {} : { until: range.until }),
+      });
+      if (page.length === 0) return { pages, reachedUntil: true, oldest };
+      if (range.until !== undefined && range.untilSlot !== null && range.untilSlot !== undefined && page.some((s) => s.slot < (range.untilSlot as number))) {
+        // The RPC paged past the cursor's slot without stopping at `until`: it does not know that signature
+        // (dropped at finality, or missing from this node's history). Resume from the cursor's slot.
+        const untilSlot = range.untilSlot;
+        page = page.filter((s) => s.slot >= untilSlot);
+        this.logger.warn('indexer: cursor signature unknown to the RPC; resuming from its slot', { until: range.until, untilSlot });
+        if (page.length > 0) {
+          pages.push(page);
+          oldest = page[page.length - 1]?.signature;
+        }
+        return { pages, reachedUntil: true, oldest };
+      }
+      pages.push(page);
+      oldest = page[page.length - 1]?.signature;
+      if (range.until === undefined || page.length < this.options.pageLimit) return { pages, reachedUntil: true, oldest };
+      before = oldest;
+    }
+    return { pages, reachedUntil: false, oldest };
+  }
+
+  /** Signatures newer than the cursor, oldest first (the newest `pageLimit` only on a fresh database). */
+  async collectSignatures(): Promise<RpcSignatureInfo[]> {
+    const walk = await this.walk({ until: this.lastSignature() ?? this.options.indexFromSignature, untilSlot: this.lastSlot() ?? this.indexFrom?.slot });
+    return walk.pages.flat().reverse();
+  }
+
+  /** On a fresh database with `INDEX_FROM_SIGNATURE`: refuse to walk the whole history behind a signature the RPC does not know. */
+  private async checkIndexFrom(): Promise<boolean> {
+    const from = this.options.indexFromSignature;
+    if (from === undefined || this.lastSignature() !== undefined) return true;
+    if (this.indexFrom?.signature === from) return true;
+    const [status] = await this.reader.getSignatureStatuses([from]);
+    if (status === null || status === undefined) {
+      this.logger.error('indexer: INDEX_FROM_SIGNATURE is unknown to the RPC; not indexing until it is (typo, or a node without that history?)', { indexFromSignature: from });
+      return false;
+    }
+    this.indexFrom = { signature: from, slot: status.slot };
+    return true;
+  }
+
+  /** One poll: drain a backfill gap (if any), fetch the signatures after the cursor, apply them oldest first, advance the cursor. */
   async step(): Promise<{ processed: number; events: number } | undefined> {
     this.head = await this.reader.getSlot();
     this.repos.indexerState.set(KEY_HEAD_SLOT, String(this.head));
-    const signatures = await this.collectSignatures();
-    if (signatures.length === 0) return undefined;
+    if (!(await this.checkIndexFrom())) return undefined;
+    let processed = 0;
+    let events = 0;
+    let didSomething = false;
+
+    const gap = this.backfillGaps()[0];
+    if (gap !== undefined) {
+      const r = await this.backfill(gap);
+      processed += r.processed;
+      events += r.events;
+      didSomething = true;
+    }
+
+    const until = this.lastSignature() ?? this.options.indexFromSignature;
+    const cursorSlot = this.lastSlot() ?? this.indexFrom?.slot ?? null;
+    const walk = await this.walk({ until, untilSlot: cursorSlot });
+    const signatures = walk.pages.flat().reverse();
+    if (signatures.length > 0) {
+      didSomething = true;
+      const r = await this.apply(signatures, true);
+      processed += r.processed;
+      events += r.events;
+      if (!walk.reachedUntil && r.processed > 0 && walk.oldest !== undefined) {
+        // The cursor is now at or past the oldest fetched signature: everything between it and the old
+        // cursor is still unindexed and unreachable from the head — remember it and drain it on later polls.
+        const newGap: BackfillGap = { before: walk.oldest, ...(until === undefined ? {} : { until }), ...(cursorSlot === null ? {} : { untilSlot: cursorSlot }) };
+        this.saveGaps([newGap, ...this.backfillGaps()]);
+        this.logger.error('indexer: page cap reached; older signatures queued for backfill', { ...newGap, maxPages: this.options.maxPages ?? DEFAULT_MAX_PAGES, pageLimit: this.options.pageLimit });
+      }
+    }
+    if (!didSomething) return undefined;
+    if (events > 0) this.logger.info('indexed burns', { events, processed, head: this.head });
+    return { processed, events };
+  }
+
+  /** Drains up to `maxPages` pages of `gap` (older history: applied without moving the cursor). */
+  private async backfill(gap: BackfillGap): Promise<Applied> {
+    const walk = await this.walk({ until: gap.until, untilSlot: gap.untilSlot, before: gap.before });
+    const signatures = walk.pages.flat().reverse();
+    const r = signatures.length === 0 ? { processed: 0, events: 0, complete: true } : await this.apply(signatures, false);
+    if (r.complete) {
+      const rest = this.backfillGaps().filter((g) => g.before !== gap.before || g.until !== gap.until);
+      if (walk.reachedUntil || walk.oldest === undefined) {
+        this.saveGaps(rest);
+        this.logger.info('indexer: backfill gap drained', { before: gap.before, until: gap.until ?? null, processed: r.processed, events: r.events });
+      } else {
+        this.saveGaps([{ ...gap, before: walk.oldest }, ...rest]);
+      }
+    }
+    return r;
+  }
+
+  /** Applies `signatures` (oldest first), `fetchConcurrency` at a time; `moveCursor` advances `last_signature` per signature (head walk only). */
+  private async apply(signatures: readonly RpcSignatureInfo[], moveCursor: boolean): Promise<Applied> {
     let processed = 0;
     let events = 0;
     const concurrency = Math.max(1, this.options.fetchConcurrency);
-    outer: for (let i = 0; i < signatures.length; i += concurrency) {
+    for (let i = 0; i < signatures.length; i += concurrency) {
       const chunk = signatures.slice(i, i + concurrency);
       const txs = await Promise.all(chunk.map((info) => (info.err === null || info.err === undefined ? this.reader.getParsedTransaction(info.signature) : Promise.resolve(null))));
       for (let j = 0; j < chunk.length; j++) {
         const info = chunk[j] as RpcSignatureInfo;
         const tx = txs[j] ?? null;
         if (info.err !== null && info.err !== undefined) {
-          this.advance(info);
+          if (moveCursor) this.advance(info);
           processed++;
           continue;
         }
         if (tx === null) {
           this.logger.warn('indexer: transaction not available at the commitment yet; retrying next poll', { signature: info.signature, slot: info.slot });
-          break outer;
+          return { processed, events, complete: false };
         }
         try {
-          events += await this.applySignature(info, tx);
+          events += moveCursor ? await this.applySignature(info, tx) : await this.applyParsedTransaction(info.signature, tx);
         } catch (e) {
-          if (e instanceof PriceDeferredError) {
-            this.logger.warn('indexer: no usable price point; deferring burns', { signature: info.signature, reason: e.message });
-            break outer;
+          if (e instanceof IndexerDeferredError) {
+            this.logger.warn('indexer: deferring the rest of the poll', { signature: info.signature, reason: e.message });
+            return { processed, events, complete: false };
           }
           throw e;
         }
         processed++;
       }
     }
-    if (events > 0) this.logger.info('indexed burns', { events, processed, head: this.head });
-    return { processed, events };
+    return { processed, events, complete: true };
   }
 
   private advance(info: RpcSignatureInfo): void {
@@ -231,7 +394,7 @@ export class Indexer {
     });
   }
 
-  /** Applies one parsed transaction (idempotent). Public for tests; `applySignature` also moves the cursor. */
+  /** Applies one parsed transaction (idempotent). Public for tests and backfills; `applySignature` also moves the cursor. */
   async applyParsedTransaction(signature: string, tx: RpcParsedTransaction): Promise<number> {
     const prepared = await this.prepare(signature, tx);
     return this.repos.transaction(() => this.applyPrepared(prepared));
@@ -250,14 +413,17 @@ export class Indexer {
     return { signature, slot: tx.slot, blockTime: tx.blockTime ?? null, burns, owners, memo, parsedMemo: parseMemo(memo) };
   }
 
+  /** The owner from `getAccountInfo`; `null` when the account is gone; defers the poll when the RPC fails (SPEC §3.2 credits the owner, never a guess). */
   private async fetchOwner(tokenAccount: string): Promise<string | null> {
+    let account;
     try {
-      const [account] = await this.reader.getMultipleParsedAccounts([tokenAccount]);
-      const parsed = account?.data?.parsed;
-      if (isRecord(parsed) && isRecord(parsed['info']) && typeof parsed['info']['owner'] === 'string') return parsed['info']['owner'];
+      [account] = await this.reader.getMultipleParsedAccounts([tokenAccount]);
     } catch (e) {
-      this.logger.warn('indexer: owner lookup failed', { tokenAccount, error: e });
+      this.logger.warn('indexer: owner lookup failed; retrying next poll', { tokenAccount, error: e });
+      throw new OwnerLookupDeferredError(`owner lookup of ${tokenAccount} failed: ${e instanceof Error ? e.message : String(e)}`);
     }
+    const parsed = account?.data?.parsed;
+    if (isRecord(parsed) && isRecord(parsed['info']) && typeof parsed['info']['owner'] === 'string') return parsed['info']['owner'];
     return null;
   }
 
@@ -298,13 +464,25 @@ export class Indexer {
         }
         usdMicro = quoteUsdMicro(burn.amount, priceE18, this.options.decimals);
       } else {
-        workspace = p.parsedMemo?.kind === 'purchase' ? p.parsedMemo.workspace : (owner ?? burn.authority ?? burn.tokenAccount);
         const price = this.currentPrice();
         priceE18 = price.priceE18;
         pricePointId = price.id;
         priceStale = price.stale;
         usdMicro = quoteUsdMicro(burn.amount, priceE18, this.options.decimals);
         if (usdMicro < this.options.minCreditMicro) usdMicro = 0n;
+        if (p.parsedMemo?.kind === 'purchase') workspace = p.parsedMemo.workspace;
+        else if (owner !== null) workspace = owner;
+        else if (burn.authority !== null) {
+          // The account is gone (closed in the same transaction) and the balances do not name its owner: the
+          // burn authority is the owner in every ordinary burn; a third-party delegate burn is the rare exception.
+          workspace = burn.authority;
+          this.logger.warn('owner_unresolved', { signature: p.signature, ixIndex: burn.ixIndex, tokenAccount: burn.tokenAccount, creditedTo: 'authority', workspace });
+        } else {
+          // Nobody to credit: record the burn with no credit instead of inventing a workspace from the account address.
+          workspace = burn.tokenAccount;
+          usdMicro = 0n;
+          this.logger.warn('owner_unresolved', { signature: p.signature, ixIndex: burn.ixIndex, tokenAccount: burn.tokenAccount, creditedTo: 'none' });
+        }
       }
       this.repos.workspaces.ensure(workspace, now);
       this.repos.creditEvents.insert({
@@ -360,27 +538,59 @@ export class Indexer {
   }
 
   /**
-   * Finality sweep: events older than `finalityAgeMs` within the last `finalitySweepSlots` slots whose
-   * signature the RPC no longer knows (or reports as failed) are reverted: credit events and their
-   * ledger rows are deleted; a reverted draw goes back to `failed` and releases its usage rows.
+   * Finality sweep: events older than `finalityAgeMs` within the last `finalitySweepSlots` slots that
+   * were not yet seen `finalized`. A signature reported finalized without error is marked and never
+   * re-checked; one reported with an error or not at all is re-fetched with `getTransaction` and, when
+   * that fails to show it successful too, counts as one miss — `finalityMisses` consecutive misses
+   * revert its events (credit events and ledger rows deleted; a reverted draw goes back to `failed`
+   * and releases its usage rows). Any successful sighting in between resets the counter.
    */
-  async sweepFinality(): Promise<{ checked: number; reverted: string[] }> {
+  async sweepFinality(): Promise<{ checked: number; reverted: string[]; finalized: number }> {
     const ageMs = this.options.finalityAgeMs ?? 120_000;
     const windowSlots = this.options.finalitySweepSlots ?? 3000;
     const batch = Math.min(256, this.options.finalityBatch ?? 256);
+    const threshold = Math.max(1, this.options.finalityMisses ?? DEFAULT_FINALITY_MISSES);
     const head = this.head > 0 ? this.head : await this.reader.getSlot();
-    const candidates = this.repos.creditEvents.signaturesForSweep(Math.max(0, head - windowSlots), this.now() - ageMs, batch);
-    if (candidates.length === 0) return { checked: 0, reverted: [] };
+    const now = this.now();
+    const candidates = this.repos.creditEvents.signaturesForSweep(Math.max(0, head - windowSlots), now - ageMs, batch);
+    if (candidates.length === 0) return { checked: 0, reverted: [], finalized: 0 };
     const statuses = await this.reader.getSignatureStatuses(candidates.map((c) => c.signature));
     const reverted: string[] = [];
-    candidates.forEach((c, i) => {
+    let finalized = 0;
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i] as (typeof candidates)[number];
       const status = statuses[i] ?? null;
-      if (status !== null && (status.err === null || status.err === undefined)) return;
+      if (status !== null && (status.err === null || status.err === undefined)) {
+        if (status.confirmationStatus === 'finalized') {
+          this.repos.creditEvents.markFinalized(c.signature, now);
+          finalized++;
+        } else if (c.misses > 0) this.repos.creditEvents.setFinalityMisses(c.signature, 0);
+        continue;
+      }
+      // Not found (or reported failed): ask again by another route before counting a miss.
+      let tx: RpcParsedTransaction | null;
+      try {
+        tx = await this.reader.getParsedTransaction(c.signature);
+      } catch (e) {
+        this.logger.warn('finality_check_failed', { signature: c.signature, slot: c.slot, error: e });
+        continue;
+      }
+      if (tx !== null && (tx.meta?.err === null || tx.meta?.err === undefined)) {
+        if (c.misses > 0) this.repos.creditEvents.setFinalityMisses(c.signature, 0);
+        continue;
+      }
+      const misses = c.misses + 1;
+      const reason = status === null ? 'signature not found at finalized' : 'transaction failed';
+      if (misses < threshold) {
+        this.repos.creditEvents.setFinalityMisses(c.signature, misses);
+        this.logger.warn('finality_miss', { signature: c.signature, slot: c.slot, misses, threshold, reason });
+        continue;
+      }
       const n = this.revertSignature(c.signature);
       if (n > 0) reverted.push(c.signature);
-      this.logger.warn('finality_revert', { signature: c.signature, slot: c.slot, events: n, reason: status === null ? 'signature not found at finalized' : 'transaction failed' });
-    });
-    return { checked: candidates.length, reverted };
+      this.logger.warn('finality_revert', { signature: c.signature, slot: c.slot, events: n, misses, reason });
+    }
+    return { checked: candidates.length, reverted, finalized };
   }
 
   /** Deletes every event of `signature` with its ledger rows; reverted draws become `failed`. Returns the events removed. */

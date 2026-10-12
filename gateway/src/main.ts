@@ -6,7 +6,7 @@
  */
 import { serve } from '@hono/node-server';
 import { createApp } from './api/server.js';
-import { verifyMint } from './chain/rpc.js';
+import { ChainConfigError, createChainContext, rpcHostOf, verifyMint } from './chain/rpc.js';
 import { ConfigError, loadConfig } from './config.js';
 import { createLogger } from './log.js';
 import { createServices, type Services } from './services.js';
@@ -90,8 +90,20 @@ async function main(): Promise<void> {
     throw e;
   }
   const logger = createLogger({ level: config.server.logLevel });
-  const services = createServices(config, { logger });
-  if (services.chain !== undefined) await verifyMint(services.chain, logger);
+  // The mint account is the authority on decimals / token program (SPEC §1): verify it BEFORE the
+  // workers are built, because the indexer, scanner, drawer and price service copy those facts.
+  let chain;
+  try {
+    chain = createChainContext(config, logger);
+    if (chain !== undefined) await verifyMint(chain, logger);
+  } catch (e) {
+    if (e instanceof ChainConfigError) {
+      process.stderr.write(`${e.message}\n`);
+      process.exit(2);
+    }
+    throw e;
+  }
+  const services = createServices(config, { logger, chain: chain ?? null });
   const app = createApp(services);
   const stopWorkers = startWorkers(services);
   const server = serve({ fetch: app.fetch, port: config.server.port, hostname: config.server.host }, (info) => {
@@ -99,7 +111,8 @@ async function main(): Promise<void> {
       host: info.address,
       port: info.port,
       cluster: config.cluster.name,
-      rpcUrl: services.chainInfo.rpcUrl,
+      rpcHost: rpcHostOf(services.chainInfo.rpcUrl),
+      publicRpcUrl: services.chainInfo.publicRpcUrl,
       mint: services.chainInfo.mint ?? null,
       operator: services.chainInfo.operator ?? null,
       chain: services.chain !== undefined,

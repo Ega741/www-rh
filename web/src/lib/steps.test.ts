@@ -35,7 +35,7 @@ describe('flow reducer', () => {
   });
 });
 
-const READY: FlowEnv = { connected: true, deploymentKnown: true, configMismatch: false, workspaceValid: true, accountKnown: true, hasTokenAccount: true, balance: 10_000_000n };
+const READY: FlowEnv = { connected: true, deploymentKnown: true, gatewayConfig: 'ready', configMismatch: false, workspaceValid: true, accountKnown: true, hasTokenAccount: true, balance: 10_000_000n };
 
 describe('planBurn', () => {
   const base = { ...READY, amount: 1_000_000n, usdMicro: 10_000n, priceAvailable: true, priceStale: false, minCreditMicro: 1_000n };
@@ -50,13 +50,26 @@ describe('planBurn', () => {
     expect(planBurn({ ...base, usdMicro: 999n }).blockers).toEqual(['below_min_credit']);
     expect(planBurn({ ...base, usdMicro: 1_000n }).canRun).toBe(true);
     expect(planBurn({ ...base, usdMicro: 0n }).blockers).toEqual(['quote_zero']);
-    expect(planBurn({ ...base, usdMicro: 5n, minCreditMicro: undefined }).canRun).toBe(true);
+  });
+  it('requires /api/config: an unknown minimum never skips the guard (SPEC §3.2)', () => {
+    // A committed mint keeps the deployment known while the config read failed; a 500 µUSD quote must still be blocked.
+    expect(planBurn({ ...base, usdMicro: 500n, minCreditMicro: undefined, gatewayConfig: 'unavailable' })).toEqual({ canRun: false, blockers: ['config_unavailable'] });
+    expect(planBurn({ ...base, usdMicro: 500n, minCreditMicro: undefined, gatewayConfig: 'pending' }).blockers).toEqual(['config_pending']);
+    // Defensive: a "ready" config without a minimum still blocks.
+    expect(planBurn({ ...base, usdMicro: 5n, minCreditMicro: undefined }).blockers).toEqual(['config_unavailable']);
+    // The config state is not reported on top of a mismatch, and a known config with no mint is "deployment unknown".
+    expect(planBurn({ ...base, configMismatch: true, gatewayConfig: 'unavailable' }).blockers).toEqual(['config_mismatch']);
+    expect(planBurn({ ...base, deploymentKnown: false, gatewayConfig: 'unavailable' }).blockers).toEqual(['config_unavailable']);
   });
   it('checks the token account and the balance', () => {
     expect(planBurn({ ...base, accountKnown: false }).blockers).toEqual(['account_pending']);
     expect(planBurn({ ...base, hasTokenAccount: false, balance: 0n }).blockers).toEqual(['no_token_account']);
     expect(planBurn({ ...base, balance: 999_999n }).blockers).toEqual(['insufficient_balance']);
     expect(planBurn({ ...base, balance: undefined }).canRun).toBe(true);
+  });
+  it('reports a failed account read as an RPC problem, not as a missing token account', () => {
+    expect(planBurn({ ...base, hasTokenAccount: false, balance: undefined, accountError: 'fetch failed' }).blockers).toEqual(['account_error']);
+    expect(planBurn({ ...base, accountKnown: false, accountError: 'fetch failed' }).blockers).toEqual(['account_pending']);
   });
   it('collects environment blockers and stops at a missing amount', () => {
     expect(planBurn({ ...base, connected: false, amount: undefined }).blockers).toEqual(['not_connected', 'no_amount']);
@@ -69,7 +82,7 @@ describe('planBurn', () => {
 });
 
 describe('planBudget', () => {
-  const base = { ...READY, cap: 5_000_000n, operatorKnown: true };
+  const base = { ...READY, cap: 5_000_000n, operatorKnown: true, walletMismatch: false, priceAvailable: true };
   it('runs and flags a cap above the balance as advisory', () => {
     expect(planBudget(base)).toEqual({ canRun: true, blockers: [], capAboveBalance: false });
     expect(planBudget({ ...base, cap: 50_000_000n })).toEqual({ canRun: true, blockers: [], capAboveBalance: true });
@@ -81,15 +94,27 @@ describe('planBudget', () => {
     expect(planBudget({ ...base, hasTokenAccount: false, balance: 0n }).blockers).toEqual(['no_token_account']);
     expect(planBudget({ ...base, accountKnown: false }).blockers).toEqual(['account_pending']);
     expect(planBudget({ ...base, configMismatch: true, operatorKnown: false }).blockers).toEqual(['config_mismatch']);
+    expect(planBudget({ ...base, gatewayConfig: 'unavailable', operatorKnown: false }).blockers).toEqual(['config_unavailable']);
+    expect(planBudget({ ...base, gatewayConfig: 'pending' }).blockers).toEqual(['config_pending']);
+  });
+  it('refuses to approve while the connected wallet is not the signed-in workspace (the gateway registers budgets for their owner only)', () => {
+    expect(planBudget({ ...base, walletMismatch: true })).toEqual({ canRun: false, blockers: ['wallet_mismatch'], capAboveBalance: false });
+    expect(planBudget({ ...base, walletMismatch: true, cap: undefined }).blockers).toEqual(['wallet_mismatch', 'no_amount']);
+  });
+  it('needs the published price and explains a failed account read', () => {
+    expect(planBudget({ ...base, priceAvailable: false, cap: undefined }).blockers).toEqual(['price_unavailable', 'no_amount']);
+    expect(planBudget({ ...base, hasTokenAccount: false, balance: undefined, accountError: 'fetch failed' }).blockers).toEqual(['account_error']);
   });
 });
 
 describe('describeBlocker', () => {
   it('has text for every code', () => {
-    const codes: BlockerCode[] = ['not_connected', 'no_session', 'deployment_unknown', 'config_mismatch', 'operator_unknown', 'price_unavailable', 'price_stale', 'bad_workspace', 'no_amount', 'below_min_credit', 'quote_zero', 'no_token_account', 'insufficient_balance', 'account_pending'];
+    const codes: BlockerCode[] = ['not_connected', 'no_session', 'wallet_mismatch', 'deployment_unknown', 'config_pending', 'config_unavailable', 'config_mismatch', 'operator_unknown', 'price_unavailable', 'price_stale', 'bad_workspace', 'no_amount', 'below_min_credit', 'quote_zero', 'no_token_account', 'account_error', 'insufficient_balance', 'account_pending'];
     for (const c of codes) expect(describeBlocker(c, { symbol: 'BEAGLE' }).length).toBeGreaterThan(5);
     expect(describeBlocker('below_min_credit', { symbol: 'BEAGLE', minCreditText: '$0.001 (0.1 BEAGLE)' })).toBe('Minimum credit is $0.001 (0.1 BEAGLE)');
     expect(describeBlocker('no_token_account', { symbol: 'BGL' })).toBe('This wallet has no BGL token account');
+    expect(describeBlocker('account_error', { symbol: 'BGL', accountError: '429 Too Many Requests' })).toBe('Could not read the wallet token account: 429 Too Many Requests; the page retries');
+    expect(describeBlocker('wallet_mismatch', { symbol: 'BGL' })).toMatch(/Sign in with the connected wallet/);
   });
 });
 

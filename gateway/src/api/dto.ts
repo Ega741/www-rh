@@ -108,10 +108,10 @@ export function ledgerRowDto(row: LedgerRow): LedgerRowDtoWire {
   };
 }
 
-/** Explorer link of a signature on the configured cluster (localnet links carry the RPC URL). */
+/** Explorer link of a signature on the configured cluster (localnet links carry the *public* RPC URL, never `RPC_URL`). */
 export function explorerLink(services: Services, signature: string): string {
   const info = services.chainInfo;
-  return explorerTxUrl(info.cluster, signature, { rpcUrl: info.rpcUrl });
+  return explorerTxUrl(info.cluster, signature, { rpcUrl: info.publicRpcUrl });
 }
 
 /** `CreditEventDto` with the explorer link. */
@@ -308,7 +308,8 @@ export function configDto(services: Services): ConfigDtoWire {
   const info = services.chainInfo;
   return {
     cluster: info.cluster,
-    rpcUrl: info.rpcUrl,
+    // The public endpoint only: RPC_URL may carry the operator's provider key (SPEC §5.13 never logs/publishes secrets).
+    rpcUrl: info.publicRpcUrl,
     mint: mintOf(services),
     decimals: info.decimals,
     symbol: info.symbol,

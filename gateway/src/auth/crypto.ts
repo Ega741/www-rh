@@ -60,7 +60,7 @@ export class Keyring {
   encrypt(plaintext: string, workspace: string, provider: string): Encrypted {
     const iv = randomBytes(12);
     const cipher = createCipheriv('aes-256-gcm', this.masterKey, iv);
-    cipher.setAAD(Buffer.from(`${workspace.toLowerCase()}|${provider}`, 'utf8'));
+    cipher.setAAD(Buffer.from(`${workspace}|${provider}`, 'utf8')); // SPEC §5.3: `workspace|provider` verbatim (base58 is case-sensitive)
     const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
     return { ciphertext, iv, tag: cipher.getAuthTag() };
   }
@@ -69,7 +69,7 @@ export class Keyring {
   decrypt(enc: Encrypted, workspace: string, provider: string): string {
     try {
       const decipher = createDecipheriv('aes-256-gcm', this.masterKey, Buffer.from(enc.iv));
-      decipher.setAAD(Buffer.from(`${workspace.toLowerCase()}|${provider}`, 'utf8'));
+      decipher.setAAD(Buffer.from(`${workspace}|${provider}`, 'utf8'));
       decipher.setAuthTag(Buffer.from(enc.tag));
       return Buffer.concat([decipher.update(Buffer.from(enc.ciphertext)), decipher.final()]).toString('utf8');
     } catch (e) {

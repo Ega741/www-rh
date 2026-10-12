@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { MEMO_PROGRAM_ID, TOKEN_PROGRAM_ID, deploymentFor, resolveDeployment } from '@beagle/shared/addresses';
-import { loadConfig, publicGatewayUrl, reconcileDeployment, stripSlash } from './config.js';
+import { deploymentStatus, loadConfig, publicGatewayUrl, reconcileDeployment, stripSlash } from './config.js';
 
 const LOCAL = deploymentFor('localnet');
 if (LOCAL === undefined) throw new Error('the committed localnet deployment is required by these tests');
 const OTHER_MINT = 'So11111111111111111111111111111111111111112';
+/** What `configDto` reports as the mint when the gateway has none (the System Program id). */
+const ZERO_MINT = '11111111111111111111111111111111';
 const OPERATOR = LOCAL.operator;
 
 describe('loadConfig', () => {
@@ -103,5 +105,36 @@ describe('reconcileDeployment', () => {
     const v = reconcileDeployment(committed, { ...gateway, cluster: 'devnet' });
     expect(v.mint).toBeUndefined();
     expect(v.mismatch).toMatch(/targets localnet but the gateway runs on devnet/);
+  });
+  it("treats the gateway's all-zero mint as no mint", () => {
+    const none = resolveDeployment('devnet');
+    const unknown = reconcileDeployment(none, { ...gateway, cluster: 'devnet', mint: ZERO_MINT, operator: ZERO_MINT });
+    expect(unknown.mint).toBeUndefined();
+    expect(unknown.operator).toBeUndefined();
+    expect(unknown.mismatch).toBeUndefined();
+    const v = reconcileDeployment(committed, { ...gateway, mint: ZERO_MINT });
+    expect(v.mint).toBeUndefined();
+    expect(v.mismatch).toMatch(/has no mint configured/);
+    expect(v.mismatch).not.toContain(ZERO_MINT);
+  });
+});
+
+describe('deploymentStatus', () => {
+  const known = { mint: LOCAL.mint, mismatch: undefined };
+  const unknown = { mint: undefined, mismatch: undefined };
+  it('is ready once /api/config answered', () => {
+    expect(deploymentStatus(known, { hasData: true, pending: false })).toEqual({ gatewayConfig: 'ready', loading: false, error: undefined });
+    expect(deploymentStatus(unknown, { hasData: true, pending: false })).toMatchObject({ gatewayConfig: 'ready', loading: false, error: expect.stringMatching(/mint is not configured/) });
+  });
+  it('waits while the first read is in flight (loading only without a committed mint)', () => {
+    expect(deploymentStatus(known, { hasData: false, pending: true })).toEqual({ gatewayConfig: 'pending', loading: false, error: undefined });
+    expect(deploymentStatus(unknown, { hasData: false, pending: true })).toEqual({ gatewayConfig: 'pending', loading: true, error: undefined });
+  });
+  it('reports a failed read as an error even when the build commits a mint', () => {
+    const s = deploymentStatus(known, { hasData: false, pending: false });
+    expect(s.gatewayConfig).toBe('unavailable');
+    expect(s.loading).toBe(false);
+    expect(s.error).toMatch(/Gateway configuration is unavailable/);
+    expect(deploymentStatus({ mint: undefined, mismatch: 'disagree' }, { hasData: true, pending: false }).error).toBe('disagree');
   });
 });

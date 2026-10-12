@@ -352,7 +352,7 @@ only Anthropic client), `@modelcontextprotocol/sdk` (HTTP transport), zod 4, no 
 
 ```
 src/main.ts            boot: config → db.migrate → services → indexer/poster/drawer/warm loops → http
-src/cli.ts             create-key | credit | post-price | status | migrate
+src/cli.ts             migrate | create-key | credit | set-price | register-budget | status   (§5.12)
 src/config.ts          zod-validated env (§5.1)
 src/db/{sqlite,schema,repos}.ts
 src/auth/{siws,session,apiKeys,crypto}.ts
@@ -818,7 +818,10 @@ are presentational.
   (`solana/keys/deployer.json`, `solana/keys/mint-localnet.json`, `solana/keys/operator.json`), airdrops SOL,
   creates the mint (6 decimals, fixed mint keypair → deterministic address), mints 1e9 tokens to the deployer,
   disables minting, writes `solana/deployments/localnet.json`; for `devnet`/`mainnet-beta` takes
-  `DEPLOYER_KEYPAIR`, `OPERATOR_PUBKEY`, optional `MINT_KEYPAIR`/`EXISTING_MINT` from env.
+  `DEPLOYER_KEYPAIR`, `OPERATOR_PUBKEY`, optional `MINT_KEYPAIR`/`EXISTING_MINT` from env. Re-runs are idempotent:
+  the mint of `MINT_KEYPAIR`, `EXISTING_MINT` or, with neither, the one the output file already records is reused
+  (never replaced by a new throw-away mint); supply and the authority change are applied only when still needed;
+  chain reads use `confirmed` like the writes.
 - `scripts/solana-e2e.sh`: `solana-test-validator --reset --quiet --ledger <tmp>` (port 8899) → setup-cluster
   localnet → `sync-deployments` → build → mock provider on 9999 → gateway (`CLUSTER=localnet`,
   `OPERATOR_SECRET_KEY` = operator keypair, `DRY_RUN=false`, `PRICE_SOURCE=manual`, `INITIAL_PRICE_USD=0.01`,
@@ -834,9 +837,15 @@ are presentational.
   → headroom appears → agent 2 request succeeds (balance negative) → drawer burns as delegate → indexer confirms
   → `/api/balance ≥ 0`, `/api/budgets` shows the draw confirmed with a recomputable receipt hash and
   `cap` decreased by the drawn amount → agent 2 revokes → budget `closed` → MCP HTTP `initialize`, `tools/list`,
-  `beagle_balance` → `/api/status.cluster == 'localnet'` → ALL GOOD. Timeouts fail loudly; cleanup via `trap`
-  (validator killed, ledger dir removed, committed `localnet.json`/generated file untouched because the mint
-  keypair is fixed).
+  `beagle_balance` → MCP stdio binary (`scripts/e2e/mcp-call.mjs` drives `packages/mcp/dist/bin.js` as an MCP
+  client with `BEAGLE_AGENT_SECRET_KEY` = agent 1's keypair, i.e. the real Keypair executor): `beagle_buy_compute`
+  100 BEAGLE with `workspace` = agent 2 under agent 2's key → memo `beagle:v1 ws=<agent 2>`, `credited`, agent 2's
+  balance +1_000_000 µUSD, receipt and on-chain `burnChecked` + `spl-memo` asserted; `beagle_open_budget` 250 BEAGLE
+  under agent 1's key → `ApproveChecked`, `registered`, headroom; `beagle_close_budget` → `Revoke`, budget `closed`
+  → `/api/status.cluster == 'localnet'` → ALL GOOD. Timeouts fail loudly; cleanup via `trap` (validator killed,
+  ledger dir removed). The committed `localnet.json`/generated file are never written: the fixed mint keypair keeps
+  them valid, and a mismatch (keys changed without the record) fails the run — `E2E_UPDATE_DEPLOYMENT=1` rewrites
+  both for committing.
 - CI (`.github/workflows/ci.yml`): one job: install the Agave release tarball (cached), pnpm 10 from
   `packageManager`, Node 22, `pnpm install --frozen-lockfile`, `sync-deployments --check`, build, typecheck,
   test, web lint, `solana:e2e`.

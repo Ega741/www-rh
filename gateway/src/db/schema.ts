@@ -200,6 +200,13 @@ export const MIGRATIONS: readonly string[] = [
     count INTEGER NOT NULL
   );
   `,
+  // 2: finality tracking of credit events (SPEC §5.4 sweep): a signature seen finalized leaves the sweep
+  // set; a signature the RPC fails to report is reverted only after consecutive misses.
+  `
+  ALTER TABLE credit_events ADD COLUMN finalized_at INTEGER;
+  ALTER TABLE credit_events ADD COLUMN finality_misses INTEGER NOT NULL DEFAULT 0;
+  CREATE INDEX credit_events_unfinalized ON credit_events(slot) WHERE finalized_at IS NULL;
+  `,
 ];
 
 /** Applies pending migrations. Idempotent; safe to call from the CLI while the gateway runs. */

@@ -76,6 +76,10 @@ export interface CreditEventRow {
   /** Unix seconds, or null when the RPC reported none. */
   blockTime: number | null;
   createdAt: number;
+  /** When the finality sweep saw the signature `finalized` (then it is never re-checked); null until then. */
+  finalizedAt?: number | null;
+  /** Consecutive sweeps that failed to find the signature (reverted once the threshold is reached). */
+  finalityMisses?: number;
 }
 
 /** `price_points` row. */
@@ -282,6 +286,8 @@ const mapCreditEvent = (r: Row): CreditEventRow => ({
   slot: num(r['slot']),
   blockTime: optNum(r['block_time']),
   createdAt: num(r['created_at']),
+  finalizedAt: optNum(r['finalized_at']),
+  finalityMisses: r['finality_misses'] === undefined || r['finality_misses'] === null ? 0 : num(r['finality_misses']),
 });
 
 const mapPricePoint = (r: Row): PricePointRow => ({
@@ -675,11 +681,29 @@ export class CreditEventRepo {
     return this.db.all('SELECT * FROM credit_events WHERE signature = ? ORDER BY ix_index ASC', [signature], true).map(mapCreditEvent);
   }
 
-  /** Distinct signatures of events applied at or before `maxCreatedAt` with `slot ≥ minSlot`, newest first (finality sweep). */
-  signaturesForSweep(minSlot: number, maxCreatedAt: number, limit: number): { signature: string; slot: number }[] {
+  /**
+   * Distinct signatures of events applied at or before `maxCreatedAt` with `slot ≥ minSlot` that the
+   * sweep has not yet seen finalized, oldest first (finality sweep; SPEC §5.4). `misses` is the
+   * number of consecutive sweeps that failed to find the signature.
+   */
+  signaturesForSweep(minSlot: number, maxCreatedAt: number, limit: number): { signature: string; slot: number; misses: number }[] {
     return this.db
-      .all('SELECT signature, MAX(slot) AS slot FROM credit_events WHERE slot >= ? AND created_at <= ? GROUP BY signature ORDER BY slot DESC LIMIT ?', [minSlot, maxCreatedAt, limit])
-      .map((r) => ({ signature: text(r['signature']), slot: num(r['slot']) }));
+      .all(
+        `SELECT signature, MAX(slot) AS slot, MAX(finality_misses) AS misses FROM credit_events
+         WHERE slot >= ? AND created_at <= ? AND finalized_at IS NULL GROUP BY signature ORDER BY slot ASC, signature ASC LIMIT ?`,
+        [minSlot, maxCreatedAt, limit],
+      )
+      .map((r) => ({ signature: text(r['signature']), slot: num(r['slot']), misses: num(r['misses']) }));
+  }
+
+  /** Marks every event of `signature` finalized (it leaves the sweep set) and clears its miss counter. */
+  markFinalized(signature: string, now: number): number {
+    return this.db.run('UPDATE credit_events SET finalized_at = ?, finality_misses = 0 WHERE signature = ? AND finalized_at IS NULL', [now, signature]).changes;
+  }
+
+  /** Sets the consecutive-miss counter of every event of `signature`. */
+  setFinalityMisses(signature: string, misses: number): void {
+    this.db.run('UPDATE credit_events SET finality_misses = ? WHERE signature = ?', [misses, signature]);
   }
 
   deleteBySignature(signature: string): number {
@@ -1086,6 +1110,13 @@ export class BudgetDrawRepo {
   /** Draws still `pending`/`sent` (not yet confirmed by the indexer). */
   listInFlight(): BudgetDrawRow[] {
     return this.db.all(`SELECT * FROM budget_draws WHERE status IN ('pending','sent') ORDER BY id ASC`, [], true).map(mapBudgetDraw);
+  }
+
+  /** `failed` draws of `workspace` that had a transaction signed (signature set) and were updated at or after `since`. */
+  listFailedWithSignature(workspace: string, since: number): BudgetDrawRow[] {
+    return this.db
+      .all(`SELECT * FROM budget_draws WHERE workspace = ? AND status = 'failed' AND signature IS NOT NULL AND updated_at >= ? ORDER BY id ASC`, [normalizeWorkspace(workspace), since], true)
+      .map(mapBudgetDraw);
   }
 
   setStatus(

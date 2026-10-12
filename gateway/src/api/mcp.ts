@@ -200,7 +200,7 @@ export function mountMcp(app: Hono<AppEnv>, services: Services): void {
       return c.json({ jsonrpc: '2.0', error: { code: -32603, message: 'MCP server unavailable on this gateway.' }, id: null }, 503);
     }
     const api = createInProcessBeagleApi(services, principal.workspace, principal.apiKeyId, principal.plan);
-    const server = mcp.createBeagleMcpServer(api, { workspace: principal.workspace, apiUrl: services.config.server.publicUrl, rpcUrl: services.chainInfo.rpcUrl });
+    const server = mcp.createBeagleMcpServer(api, { workspace: principal.workspace, apiUrl: services.config.server.publicUrl, rpcUrl: services.chainInfo.publicRpcUrl });
     const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
     try {
       await server.connect(transport);

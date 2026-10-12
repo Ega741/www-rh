@@ -4,8 +4,12 @@
 #   API keys → agent 1 burns 1000 BEAGLE (+ memo) → credit indexed (= $10.00 at $0.01) → chat completion (JSON + SSE)
 #   → /v1/messages → agent 2 without credit gets 402 → agent 2 delegates 500 BEAGLE to the operator (budget) →
 #   headroom → request on budget → operator draws (delegate BurnChecked + memo) → indexer confirms → cap decreased →
-#   agent 2 revokes → budget closed → MCP over HTTP → /api/status → ALL GOOD.
+#   agent 2 revokes → budget closed → MCP over HTTP → MCP stdio binary signing with agent 1's keypair (buy compute
+#   with a memo for agent 2 → credited; open budget → registered, headroom; close budget → closed) → /api/status →
+#   ALL GOOD.
 # Requires the Agave CLI (solana, solana-keygen, solana-test-validator, spl-token) on PATH and `pnpm install` done.
+# The committed solana/deployments/localnet.json must describe the mint/operator of solana/keys/*: a mismatch fails the
+# run (E2E_UPDATE_DEPLOYMENT=1 rewrites the record and the generated file instead, for committing them).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -78,8 +82,10 @@ DEPLOY_JSON=$(cat "$WORK/localnet.json")
 MINT=$(json "$DEPLOY_JSON" 'd.mint'); OPERATOR=$(json "$DEPLOY_JSON" 'd.operator'); DECIMALS=$(json "$DEPLOY_JSON" 'd.decimals')
 [ "$OPERATOR" = "$(solana-keygen pubkey $OPERATOR_KEYPAIR)" ] || fail "operator in the deployment record is not solana/keys/operator.json"
 log "mint=$MINT operator=$OPERATOR decimals=$DECIMALS"
-# The committed localnet.json and deployments.generated.ts stay untouched when they describe this mint (only
-# createdSlot can differ between validator runs). Anything else means the keys changed: update both, the tree is dirty.
+# The committed localnet.json and deployments.generated.ts are never touched (SPEC §8): they must describe this mint
+# (only createdSlot can differ between validator runs). Anything else means solana/keys/* changed without the record —
+# that fails the run instead of being papered over (a self-heal would keep CI green on a stale committed record);
+# E2E_UPDATE_DEPLOYMENT=1 rewrites both files so they can be committed.
 same_deployment() {
   node -e 'const [a,b]=process.argv.slice(1).map(p=>JSON.parse(require("node:fs").readFileSync(p,"utf8")));
     const keys=["cluster","mint","decimals","symbol","tokenProgram","operator","memoProgram"];
@@ -87,10 +93,13 @@ same_deployment() {
 }
 if [ -f "$DEPLOY_FILE" ] && same_deployment "$DEPLOY_FILE" "$WORK/localnet.json"; then
   log "deployment matches the committed $DEPLOY_FILE (committed files untouched)"
-else
-  log "committed $DEPLOY_FILE is missing or describes another mint: updating it and the generated file"
+elif [ "${E2E_UPDATE_DEPLOYMENT:-}" = "1" ]; then
+  log "E2E_UPDATE_DEPLOYMENT=1: committed $DEPLOY_FILE is missing or describes another mint/operator: rewriting it and the generated file (commit both)"
   cp "$WORK/localnet.json" "$DEPLOY_FILE"
   node scripts/sync-deployments.mjs
+else
+  echo "--- committed $DEPLOY_FILE vs this run ---"; diff "$DEPLOY_FILE" "$WORK/localnet.json" || true
+  fail "committed $DEPLOY_FILE is missing or does not describe the mint/operator of solana/keys/*: run \`pnpm cluster:setup && pnpm deployments:sync\` against a validator and commit both files (or E2E_UPDATE_DEPLOYMENT=1 to let the e2e rewrite them)"
 fi
 node scripts/sync-deployments.mjs --check || fail "deployments.generated.ts is stale: run pnpm deployments:sync and commit"
 
@@ -245,6 +254,47 @@ TOOLS=$(curl -sS "${MCPH[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/list",
 grep -q 'beagle_balance' <<<"$TOOLS" || fail "mcp tools/list: $TOOLS"
 CALL=$(curl -sS "${MCPH[@]}" -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"beagle_balance","arguments":{}}}' "$GW/mcp")
 grep -q 'balanceMicro' <<<"$CALL" || fail "mcp beagle_balance: $CALL"
+
+# The stdio binary with BEAGLE_AGENT_SECRET_KEY runs the real Keypair executor (packages/mcp/src/wallet.ts) against the
+# validator: memo program, blockhash confirmation, budget registration — none of which the package's fake-connection
+# tests cover. scripts/e2e/mcp-call.mjs drives packages/mcp/dist/bin.js as an MCP client, one tools/call per process.
+mcp() { # mcp <tool> [json-args]: tools/call against the stdio binary (BEAGLE_* from the environment); prints the structured result
+  local tool=$1
+  node scripts/e2e/mcp-call.mjs "$@" 2>>"$WORK/chain.err" || { grep -v 'bigint: Failed to load bindings' "$WORK/chain.err" || true; fail "mcp-call $tool failed"; }
+}
+export BEAGLE_API_URL=$GW BEAGLE_RPC_URL=$RPC BEAGLE_AGENT_SECRET_KEY="$(cat "$WORK/agent1.json")"
+
+log "MCP stdio binary, API key of agent 2 + keypair of agent 1: beagle_buy_compute burns 100 BEAGLE for agent 2 (memo), credited \$1.00"
+BAL2_BEFORE=$(json "$(api "$KEY2" /api/balance)" 'd.balanceMicro')
+BUY=$(BEAGLE_API_KEY=$KEY2 mcp beagle_buy_compute "{\"tokens\":100,\"workspace\":\"$A2\"}")
+[ "$(json "$BUY" "d.executed === true && d.workspace === '$A2' && d.workspaceSource === 'input' && d.memo === 'beagle:v1 ws=$A2' && String(d.tokens) === '100000000' && typeof d.signature === 'string'")" = true ] \
+  || fail "beagle_buy_compute result: $BUY"
+MCP_BURN_SIG=$(json "$BUY" 'd.signature')
+[ "$(json "$BUY" 'd.credited === true && String(d.creditedMicro) === "1000000"')" = true ] || fail "beagle_buy_compute did not see the \$1.00 credit on agent 2's workspace: $BUY"
+log "burn tx $MCP_BURN_SIG credited $(json "$BUY" 'd.creditedMicro') µUSD to $A2 in $(json "$BUY" 'd.elapsedMs') ms"
+BAL2_AFTER=$(json "$(api "$KEY2" /api/balance)" 'd.balanceMicro')
+[ "$BAL2_AFTER" -eq $((BAL2_BEFORE + 1000000)) ] || fail "agent 2 balance should grow by exactly 1_000_000 µUSD: $BAL2_BEFORE → $BAL2_AFTER"
+RECEIPTS2=$(api "$KEY2" '/api/receipts?limit=10')
+[ "$(json "$RECEIPTS2" "d.rows.some(r=>r.signature==='$MCP_BURN_SIG' && r.kind==='purchase' && r.tokenAmount==='100000000' && r.usdMicro==='1000000' && r.memo==='beagle:v1 ws=$A2')")" = true ] \
+  || fail "purchase credit event of the MCP burn missing or wrong: $RECEIPTS2"
+TX=$(rpc getTransaction "[\"$MCP_BURN_SIG\",{\"encoding\":\"jsonParsed\",\"commitment\":\"confirmed\",\"maxSupportedTransactionVersion\":0}]")
+[ "$(json "$TX" "d.result.transaction.message.instructions.some(ix=>ix.program==='spl-token' && ix.parsed.type==='burnChecked' && ix.parsed.info.authority==='$A1' && ix.parsed.info.mint==='$MINT')")" = true ] \
+  || fail "MCP burn tx $MCP_BURN_SIG is not a burnChecked by agent 1"
+[ "$(json "$TX" "d.result.transaction.message.instructions.find(ix=>ix.program==='spl-memo').parsed")" = "beagle:v1 ws=$A2" ] || fail "MCP burn tx carries no spl-memo for agent 2"
+
+log "MCP stdio binary, API key + keypair of agent 1: beagle_open_budget 250 BEAGLE (ApproveChecked + register), beagle_close_budget (Revoke)"
+OPEN=$(BEAGLE_API_KEY=$KEY1 mcp beagle_open_budget '{"tokens":250}')
+ATA1=$(json "$OPEN" 'd.tokenAccount'); [ -n "$ATA1" ] || fail "beagle_open_budget printed no token account: $OPEN"
+[ "$(json "$OPEN" "d.executed === true && d.registered === true && d.workspace === '$A1' && String(d.cap) === '250000000' && d.operator === '$OPERATOR' && d.budget !== null && d.budget.tokenAccount === '$ATA1' && d.budget.owner === '$A1' && d.budget.delegate === '$OPERATOR' && BigInt(d.budget.cap) === 250000000n && d.budget.closed === false")" = true ] \
+  || fail "beagle_open_budget result: $OPEN"
+headroom1_positive() { local h; h=$(json "$(api "$KEY1" /api/balance)" 'd.budgetHeadroomMicro'); [ -n "$h" ] && [ "$h" -gt 0 ]; }
+wait_for "agent 1 budget headroom" 40 headroom1_positive
+log "budget $ATA1 registered by the binary: headroom $(json "$(api "$KEY1" /api/balance)" 'd.budgetHeadroomMicro') µUSD"
+CLOSE=$(BEAGLE_API_KEY=$KEY1 mcp beagle_close_budget '{}')
+[ "$(json "$CLOSE" "d.executed === true && d.tokenAccount === '$ATA1' && typeof d.signature === 'string'")" = true ] || fail "beagle_close_budget result: $CLOSE"
+budget1_closed() { [ "$(json "$(api "$KEY1" "/api/budgets/$ATA1")" 'd.closed === true && d.stalledReason === "revoked"')" = true ]; }
+wait_for "agent 1 budget to close" 40 budget1_closed
+unset BEAGLE_API_URL BEAGLE_RPC_URL BEAGLE_AGENT_SECRET_KEY
 
 log "status endpoint"
 STATUS=$(curl -sS $GW/api/status)

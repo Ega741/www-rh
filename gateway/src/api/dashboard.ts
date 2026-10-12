@@ -34,6 +34,7 @@ import type { InternalRequest } from '../translate/internal.js';
 import { ProviderError } from '../providers/types.js';
 import { UnsafeBaseUrlError } from '../providers/registry.js';
 import { principalOf, requireSession, type AppEnv } from './auth.js';
+import { ipRateLimit, principalRateLimit } from './ratelimit.js';
 import { apiKeyDto, balanceDto, budgetDrawDto, budgetDto, configDto, creditEventDto, ledgerRowDto, meDto, modelsDto, providerKeyDto, statusDto, usageListDto, usageSummaryDto } from './dto.js';
 import { ApiError } from './errors.js';
 
@@ -71,12 +72,18 @@ function byokProvider(raw: string): ByokProvider {
 
 /**
  * `POST /api/budgets/register` (SPEC §3.4, §5.9), shared with the MCP in-process api: validates the
- * account on chain (mint, delegate = operator → 400 `not_delegated`), lets only the token account
- * owner choose another `workspace` to fund (403 `not_owner` otherwise) and returns the budget.
+ * account on chain (mint, delegate = operator → 400 `not_delegated`) and returns the budget. Only
+ * the token account owner may choose (or change) the `workspace` the budget funds — any
+ * `workspace` argument from another principal is a 403 `not_owner`, whatever its value, and such a
+ * registration is a pure refresh of the chain facts (it never touches `workspace` / `registeredAt`
+ * of an existing budget).
  */
 export async function registerBudget(services: Services, principalWorkspace: string, tokenAccount: string, workspace?: string): Promise<BudgetDtoWire> {
   const scanner = services.budgets;
   if (scanner === undefined) throw new ApiError(503, 'chain_unavailable', 'This gateway has no chain access configured; budgets are disabled.');
+  // The HTTP route validates its body; the in-process (MCP) caller passes the agent's input verbatim.
+  if (!isBase58Pubkey(tokenAccount)) throw new ApiError(400, 'invalid_request', 'tokenAccount must be a base58 public key');
+  if (workspace !== undefined && !isBase58Pubkey(workspace)) throw new ApiError(400, 'invalid_request', 'workspace must be a base58 public key');
   let state;
   try {
     state = await scanner.inspect(tokenAccount);
@@ -84,10 +91,13 @@ export async function registerBudget(services: Services, principalWorkspace: str
     if (e instanceof BudgetRegisterError) throw new ApiError(400, e.code === 'not_delegated' ? 'not_delegated' : 'invalid_token_account', e.message);
     throw e;
   }
-  if (workspace !== undefined && workspace !== state.owner && state.owner !== principalWorkspace) {
-    throw new ApiError(403, 'not_owner', 'only the token account owner may fund another workspace with it');
+  const isOwner = state.owner === principalWorkspace;
+  if (workspace !== undefined && !isOwner) {
+    throw new ApiError(403, 'not_owner', 'only the token account owner may choose which workspace a budget funds');
   }
-  const row = scanner.applyState(state, undefined, { registeredAt: services.now(), ...(workspace === undefined ? {} : { workspace }) });
+  const existing = services.repos.budgets.get(tokenAccount);
+  const extra = isOwner || existing === undefined ? { registeredAt: services.now(), ...(workspace === undefined ? {} : { workspace }) } : {};
+  const row = scanner.applyState(state, undefined, extra);
   services.logger.info('budget registered', { tokenAccount, owner: row.owner, workspace: row.workspace, by: principalWorkspace });
   return budgetDto(services, row);
 }
@@ -107,11 +117,15 @@ export function budgetsOf(services: Services, workspace: string): BudgetRow[] {
 /** Mounts the dashboard routes. */
 export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
   const secureCookie = services.config.server.publicUrl.startsWith('https:');
+  /** Per-principal window on routes that write or trigger I/O (chain reads, outbound provider calls). */
+  const limited = principalRateLimit(services);
+  /** Per-IP window on the unauthenticated SIWS routes (nonce rows, signature checks, workspace creation). */
+  const authLimited = ipRateLimit(services);
 
   // ---- auth ----------------------------------------------------------------------------------
-  app.get('/api/auth/nonce', (c) => c.json({ nonce: services.siws.issueNonce() }));
+  app.get('/api/auth/nonce', authLimited, (c) => c.json({ nonce: services.siws.issueNonce() }));
 
-  app.post('/api/auth/verify', async (c) => {
+  app.post('/api/auth/verify', authLimited, async (c) => {
     const body = parseOr400(VerifyRequestSchema, await readJson(c));
     const result = services.siws.verify(body.message, body.signature, body.publicKey);
     if (!result.ok) throw new ApiError(401, `siws_${result.code}`, result.message);
@@ -139,7 +153,7 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
   // ---- API keys ------------------------------------------------------------------------------
   app.get('/api/keys', requireSession(services), (c) => c.json(services.apiKeys.list(principalOf(c).workspace).map((k) => apiKeyDto(k))));
 
-  app.post('/api/keys', requireSession(services), async (c) => {
+  app.post('/api/keys', requireSession(services), limited, async (c) => {
     const raw = c.req.header('content-length') === '0' || c.req.header('content-type') === undefined ? {} : await readJson(c);
     const body = parseOr400(CreateApiKeyRequestSchema, raw ?? {});
     const workspace = principalOf(c).workspace;
@@ -150,7 +164,7 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
     return c.json({ id: created.id, key: created.key, prefix: created.prefix, name: created.name, createdAt: created.createdAt, lastUsedAt: null }, 201);
   });
 
-  app.delete('/api/keys/:id', requireSession(services), (c) => {
+  app.delete('/api/keys/:id', requireSession(services), limited, (c) => {
     const ok = services.apiKeys.revoke(c.req.param('id'), principalOf(c).workspace);
     if (!ok) throw new ApiError(404, 'not_found', 'unknown or already revoked key');
     return c.json({ ok: true });
@@ -199,7 +213,7 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
   // ---- BYOK providers ------------------------------------------------------------------------
   app.get('/api/providers', requireSession(services), (c) => c.json(services.repos.providerKeys.list(principalOf(c).workspace).map(providerKeyDto)));
 
-  app.put('/api/providers/:provider', requireSession(services), async (c) => {
+  app.put('/api/providers/:provider', requireSession(services), limited, async (c) => {
     const provider = byokProvider(c.req.param('provider'));
     const body = parseOr400(PutProviderKeyRequestSchema, await readJson(c));
     if (services.keyring === undefined) throw new ApiError(503, 'byok_disabled', 'KEYRING_MASTER_KEY is not configured; BYOK is disabled on this gateway');
@@ -220,13 +234,13 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
     return c.json(row === undefined ? { ok: true } : providerKeyDto(row));
   });
 
-  app.delete('/api/providers/:provider', requireSession(services), (c) => {
+  app.delete('/api/providers/:provider', requireSession(services), limited, (c) => {
     const provider = byokProvider(c.req.param('provider'));
     if (!services.repos.providerKeys.delete(principalOf(c).workspace, provider)) throw new ApiError(404, 'not_found', 'no key stored for this provider');
     return c.json({ ok: true });
   });
 
-  app.post('/api/providers/:provider/test', requireSession(services), async (c) => {
+  app.post('/api/providers/:provider/test', requireSession(services), limited, async (c) => {
     const provider = byokProvider(c.req.param('provider'));
     const workspace = principalOf(c).workspace;
     const creds = await services.registry.byokCredentials(provider, workspace);
@@ -255,7 +269,7 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
   // ---- budgets (SPL delegation) --------------------------------------------------------------
   app.get('/api/budgets', requireSession(services, true), (c) => c.json(budgetsOf(services, principalOf(c).workspace).map((b) => budgetDto(services, b))));
 
-  app.post('/api/budgets/register', requireSession(services, true), async (c) => {
+  app.post('/api/budgets/register', requireSession(services, true), limited, async (c) => {
     const body = parseOr400(RegisterBudgetRequestSchema, await readJson(c));
     return c.json(await registerBudget(services, principalOf(c).workspace, body.tokenAccount, body.workspace), 201);
   });
@@ -273,7 +287,7 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
   // ---- upgrades ------------------------------------------------------------------------------
   app.get('/api/upgrades/prices', (c) => c.json(services.upgrades.prices()));
   app.get('/api/upgrades', requireSession(services, true), (c) => c.json(services.upgrades.list(principalOf(c).workspace).map(UpgradeService.toDto)));
-  app.post('/api/upgrades', requireSession(services, true), async (c) => {
+  app.post('/api/upgrades', requireSession(services, true), limited, async (c) => {
     const body = parseOr400(UpgradeRequestSchema, await readJson(c));
     try {
       return c.json(UpgradeService.toDto(services.upgrades.purchase(principalOf(c).workspace, body.kind, body.quantity)), 201);

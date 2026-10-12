@@ -5,7 +5,9 @@ import { encodeBase58 } from '@beagle/shared/solana';
 import nacl from 'tweetnacl';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { MAX_ACTIVE_KEYS } from '../src/api/dashboard.js';
+import { explorerLink } from '../src/api/dto.js';
 import { headerSafe } from '../src/api/inference.js';
+import { rpcHostOf } from '../src/chain/rpc.js';
 import { ATA1, ATA2, FakeRpc, jsonRequest, makeBurnTx, makeHarness, makeTokenAccount, META, MINT, OPERATOR, parseSse, testPubkey, testSignature, WS1, WS2, type Harness } from './helpers.js';
 
 describe('HTTP flows (house model via mock provider)', () => {
@@ -553,6 +555,18 @@ describe('budgets and receipts over a fake chain', () => {
     expect(((await (await h.app.request('/api/balance', { headers: { authorization: `Bearer ${key1}` } })).json()) as { budgetHeadroomMicro: string }).budgetHeadroomMicro).toBe('5000000');
     expect(((await (await h.app.request('/api/budgets', { headers: auth })).json()) as unknown[]).length).toBe(1);
     expect((await h.app.request(`/api/budgets/${ATA2}`, { headers: { authorization: `Bearer ${key1}` } })).status).toBe(200);
+    // A stranger cannot re-point the gift back to the owner (or anywhere else): any `workspace` from a non-owner is 403.
+    const key3 = h.key(testPubkey(33));
+    const repoint = await h.app.request(jsonRequest('POST', '/api/budgets/register', { tokenAccount: ATA2, workspace: WS2 }, { authorization: `Bearer ${key3}` }));
+    expect(repoint.status).toBe(403);
+    expect(await repoint.json()).toMatchObject({ error: { code: 'not_owner' } });
+    expect(h.services.repos.budgets.get(ATA2)?.workspace).toBe(WS1);
+    expect(((await (await h.app.request('/api/balance', { headers: { authorization: `Bearer ${key1}` } })).json()) as { budgetHeadroomMicro: string }).budgetHeadroomMicro).toBe('5000000');
+    // A non-owner may refresh the chain facts, which touches neither the funded workspace nor registeredAt.
+    const registeredAt = h.services.repos.budgets.get(ATA2)?.registeredAt;
+    const refresh = await h.app.request(jsonRequest('POST', '/api/budgets/register', { tokenAccount: ATA2 }, { authorization: `Bearer ${key3}` }));
+    expect(refresh.status).toBe(201);
+    expect(h.services.repos.budgets.get(ATA2)).toMatchObject({ workspace: WS1, registeredAt });
     // status reflects the fake chain and the operator key
     const status = (await (await h.app.request('/api/status')).json()) as { operator: { enabled: boolean; dryRun: boolean; address: string } };
     expect(status.operator).toEqual({ address: OPERATOR, enabled: true, dryRun: false });
@@ -593,5 +607,60 @@ describe('budgets and receipts over a fake chain', () => {
     const status = (await (await h.app.request('/api/status')).json()) as { indexer: Record<string, unknown> };
     expect(status.indexer).toMatchObject({ lastSignature: testSignature(901), lastSlot: 301, headSlot: 301, lagSlots: 0 });
     expect(META.sigs.burnSig).toHaveLength(88);
+  });
+});
+
+describe('dashboard rate limits', () => {
+  it('limits mutating dashboard routes per principal and the SIWS routes per client IP', async () => {
+    const rpc = new FakeRpc();
+    const h = await makeHarness({ RATE_LIMIT_RPM: '2', AUTH_RATE_LIMIT_RPM: '2', TRUST_PROXY: 'true' }, {}, false, { rpc });
+    try {
+      const session = { authorization: `Bearer ${h.session(WS1)}` };
+      const register = () => h.app.request(jsonRequest('POST', '/api/budgets/register', { tokenAccount: ATA2 }, session));
+      expect((await register()).status).toBe(400); // unknown account: one RPC read each, still counted
+      expect((await register()).status).toBe(400);
+      const third = await register();
+      expect(third.status).toBe(429);
+      expect(await third.json()).toMatchObject({ error: { code: 'rate_limited' } });
+      expect(third.headers.get('retry-after')).toMatch(/^\d+$/);
+      expect(rpc.calls.filter((c) => c.method === 'getMultipleParsedAccounts')).toHaveLength(2);
+      // Reads are not limited; the window is per principal (keys share their inference window) and covers every mutating route.
+      expect((await h.app.request('/api/budgets', { headers: session })).status).toBe(200);
+      expect((await h.app.request(jsonRequest('POST', '/api/budgets/register', { tokenAccount: ATA2 }, { authorization: `Bearer ${h.key(WS2)}` }))).status).toBe(400);
+      expect((await h.app.request(jsonRequest('POST', '/api/keys', { name: 'x' }, session))).status).toBe(429);
+      // SIWS routes: per IP, X-Forwarded-For honoured with TRUST_PROXY.
+      const nonce = (ip: string) => h.app.request('/api/auth/nonce', { headers: { 'x-forwarded-for': `${ip}, 10.0.0.1` } });
+      expect((await nonce('203.0.113.7')).status).toBe(200);
+      expect((await nonce('203.0.113.7')).status).toBe(200);
+      expect((await nonce('203.0.113.7')).status).toBe(429);
+      expect((await nonce('203.0.113.8')).status).toBe(200);
+      expect((await h.app.request(jsonRequest('POST', '/api/auth/verify', { message: 'x', signature: 'y', publicKey: 'z' }, { 'x-forwarded-for': '203.0.113.7' }))).status).toBe(429);
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+describe('public RPC endpoint', () => {
+  it('never publishes RPC_URL (which may carry a provider key): /api/config and explorer links use the public endpoint', async () => {
+    const secret = 'https://mainnet.helius-rpc.com/?api-key=SECRET-KEY-123';
+    const h = await makeHarness({ CLUSTER: 'mainnet-beta', RPC_URL: secret }, {}, false);
+    try {
+      const config = (await (await h.app.request('/api/config')).json()) as { rpcUrl: string };
+      expect(config.rpcUrl).toBe('https://api.mainnet-beta.solana.com');
+      expect(JSON.stringify(config)).not.toContain('SECRET');
+      expect(h.services.chainInfo.rpcUrl).toBe(secret);
+      expect(explorerLink(h.services, testSignature(1))).not.toContain('SECRET');
+    } finally {
+      await h.close();
+    }
+    const h2 = await makeHarness({ CLUSTER: 'devnet', RPC_URL: 'https://user:pw@rpc.example.com/x', PUBLIC_RPC_URL: 'https://rpc.public.example/' }, {}, false);
+    try {
+      expect(((await (await h2.app.request('/api/config')).json()) as { rpcUrl: string }).rpcUrl).toBe('https://rpc.public.example');
+    } finally {
+      await h2.close();
+    }
+    expect(rpcHostOf(secret)).toBe('https://mainnet.helius-rpc.com');
+    expect(rpcHostOf('nope')).toBe('[invalid url]');
   });
 });

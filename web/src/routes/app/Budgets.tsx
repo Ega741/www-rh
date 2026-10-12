@@ -3,8 +3,11 @@
  * wallet confirmation, then `POST /api/budgets/register`), list with cap / balance / headroom /
  * stalled reason, draws with explorer links, close (`Revoke`). A budget is an SPL delegation
  * (SPEC §3.4): one delegate per account, a new approval replaces the previous cap, the operator
- * can only burn from the account, never transfer. The budget funds the signed-in workspace, paid
- * from the connected wallet.
+ * can only burn from the account, never transfer. A budget funds the workspace of the wallet that
+ * delegates: the gateway lets only the token account owner name another workspace to fund
+ * (`POST /api/budgets/register` → 403 `not_owner` otherwise), so the page registers the account
+ * for its owner and refuses to approve while the connected wallet differs from the signed-in
+ * workspace (the approval would otherwise be confirmed on chain before the registration fails).
  */
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
@@ -54,31 +57,39 @@ export function Budgets() {
   const converted = parsedCap.ok && priceE18 !== undefined ? convertAmount(mode, parsedCap.value, priceE18, decimals) : undefined;
   const cap = converted?.tokens;
   const workspace = defaultTargetWorkspace(me?.workspace, address);
+  const walletMismatch = session.walletMismatch && address !== undefined;
 
+  const accountError = account.account === undefined ? account.error : undefined;
   const plan = planBudget({
     connected,
     deploymentKnown: mint !== undefined,
+    gatewayConfig: dep.gatewayConfig,
     configMismatch: dep.mismatch !== undefined,
     workspaceValid: workspace !== undefined,
+    walletMismatch,
+    priceAvailable: priceE18 !== undefined,
     accountKnown: account.settled,
     hasTokenAccount: account.account?.exists === true,
+    accountError,
     balance: account.balance,
     cap,
     operatorKnown: operator !== undefined,
   });
   const firstBlocker = plan.blockers[0];
-  const blockerCtx = { symbol };
+  const blockerCtx = { symbol, accountError };
   const delegatedToOperator = account.account !== undefined && account.account.delegate !== null && sameAddress(account.account.delegate, operator);
   const existingCap = delegatedToOperator && account.account !== undefined ? account.account.delegatedAmount : 0n;
   const replaceNote = replacesCapNote(existingCap, fmtTokens(existingCap, decimals, symbol));
-  const unregistered = delegatedToOperator && existingCap > 0n && account.address !== undefined && budgets.data !== undefined && !budgets.data.some((b) => b.tokenAccount === account.address);
+  // A delegation of another wallet is not this workspace's to register (see the module comment).
+  const unregistered = !walletMismatch && delegatedToOperator && existingCap > 0n && account.address !== undefined && budgets.data !== undefined && !budgets.data.some((b) => b.tokenAccount === account.address);
 
   const flow = useTxFlow();
   const closeFlow = useTxFlow();
 
+  /** Registers the account for its owner's workspace; the gateway reads the owner from the chain. */
   const registerAccount = async (tokenAccount: string): Promise<boolean> => {
     try {
-      await register.mutateAsync({ tokenAccount, ...(workspace !== undefined && address !== undefined && workspace !== address ? { workspace } : {}) });
+      await register.mutateAsync({ tokenAccount });
       return true;
     } catch (e) {
       toast.push({ kind: 'warning', title: 'Registration failed', message: `${describeError(e)} The gateway's scanner also discovers delegations on its own; "Register" below retries.` });
@@ -147,15 +158,15 @@ export function Budgets() {
                 setCapInput('');
               }}
               error={capInput.trim() !== '' && !parsedCap.ok ? parsedCap.error : undefined}
-              converted={converted === undefined ? (priceE18 === undefined ? 'Waiting for the published price…' : undefined) : mode === 'usd' ? `≈ ${fmtTokens(converted.tokens, decimals, symbol)} cap at today's price` : `≈ ${fmtUsd(converted.usdMicro)} at today's price`}
+              converted={converted === undefined ? (priceE18 === undefined ? (apiPrice.isPending ? 'Waiting for the published price…' : 'Token price is unavailable') : undefined) : mode === 'usd' ? `≈ ${fmtTokens(converted.tokens, decimals, symbol)} cap at today's price` : `≈ ${fmtUsd(converted.usdMicro)} at today's price`}
               disabled={flow.running}
             />
             <p className="text-xs text-muted">
               Budget for {workspace === undefined ? 'your workspace' : <AddressText address={workspace} />}
-              {session.walletMismatch && address !== undefined ? (
+              {walletMismatch && address !== undefined ? (
                 <>
                   {' '}
-                  (your signed-in workspace); the cap is delegated from the connected wallet <AddressText address={address} />
+                  (your signed-in workspace). The connected wallet <AddressText address={address} /> is another account: a budget funds the workspace of the wallet that delegates, so sign in with that wallet to open one here
                 </>
               ) : null}
               . Wallet: {account.balance === undefined ? '—' : fmtTokens(account.balance, decimals, symbol)}

@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { SendTransactionError, TransactionExpiredBlockheightExceededError } from '@solana/web3.js';
-import { WalletNotConnectedError, WalletSendTransactionError, WalletSignMessageError, WalletSignTransactionError } from '@solana/wallet-adapter-base';
+import { WalletConnectionError, WalletNotConnectedError, WalletNotReadyError, WalletSendTransactionError, WalletSignInError, WalletSignMessageError, WalletSignTransactionError } from '@solana/wallet-adapter-base';
 import { ApiError } from './apiError.js';
-import { TransactionFailedError, WalletUnavailableError, customErrorCode, describeError, describeLogs, describeTransactionError, errorLogs, errorSignature, isUserRejection } from './errors.js';
+import { TransactionFailedError, WalletUnavailableError, customErrorCode, describeError, describeLogs, describeTransactionError, errorLogs, errorSignature, isFlowHandledWalletError, isUserRejection } from './errors.js';
 
 const SIG = '5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW';
 
@@ -17,6 +17,15 @@ describe('user rejection', () => {
     expect(isUserRejection(new Error('rejected'))).toBe(false);
     expect(isUserRejection(null)).toBe(false);
     expect(describeError(new WalletSignTransactionError('User rejected the request.'))).toBe('Request rejected in the wallet');
+  });
+  it('tells the global adapter handler which errors a flow already reports', () => {
+    expect(isFlowHandledWalletError(new WalletSendTransactionError('Not enough SOL to pay the transaction fee'))).toBe(true);
+    expect(isFlowHandledWalletError(new WalletSignTransactionError('Simulation failed'))).toBe(true);
+    expect(isFlowHandledWalletError(new WalletSignMessageError('boom'))).toBe(true);
+    expect(isFlowHandledWalletError(new WalletSignInError('boom'))).toBe(true);
+    expect(isFlowHandledWalletError(new WalletConnectionError('Connection refused'))).toBe(false);
+    expect(isFlowHandledWalletError(new WalletNotReadyError())).toBe(false);
+    expect(isFlowHandledWalletError(new Error('x'))).toBe(false);
   });
 });
 

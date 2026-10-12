@@ -13,14 +13,18 @@ export const KEY_PLACEHOLDER = 'bgl_YOUR_API_KEY';
  */
 export const REPO_PLACEHOLDER = '<repo>';
 
-/** The stdio MCP binary relative to the repository root (built by `pnpm --filter @beagle/mcp build`). */
+/** The stdio MCP binary relative to the repository root (built by {@link MCP_BUILD_COMMAND}). */
 export const MCP_BIN_PATH = 'packages/mcp/dist/bin.js';
 
 /** The canonical-JSON / receipt-hash module relative to the repository root (built by `pnpm --filter @beagle/shared build`). */
 export const SHARED_CANONICAL_PATH = 'packages/shared/dist/canonical.js';
 
-/** Build step the local MCP binary needs once. */
-export const MCP_BUILD_COMMAND = 'pnpm --filter @beagle/mcp build';
+/**
+ * Build step the local MCP binary needs once. `@beagle/mcp` imports `@beagle/shared` through its
+ * `dist/` (not committed) and a package filter does not build dependencies, so the shared package
+ * is built explicitly first (pnpm orders the two topologically).
+ */
+export const MCP_BUILD_COMMAND = 'pnpm install && pnpm --filter @beagle/shared --filter @beagle/mcp build';
 
 /** Absolute path of the stdio MCP binary inside `repo`. */
 export function mcpBinPath(repo = REPO_PLACEHOLDER): string {

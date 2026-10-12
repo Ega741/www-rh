@@ -42,6 +42,10 @@ const REDACTIONS: readonly RegExp[] = [
   /sk-[A-Za-z0-9_-]{16,}/g,
   /AIza[A-Za-z0-9_-]{20,}/g,
   /\b(bearer)\s+[A-Za-z0-9._~+/=-]{16,}/gi,
+  // URL userinfo (`https://user:pass@host`) and key-carrying query parameters (`?api-key=…`, `&token=…`),
+  // the usual shape of private RPC / feed endpoints.
+  /(\w+:\/\/)[^\s/@"']+@/g,
+  /([?&](?:api[-_]?key|apikey|access[-_]?token|auth[-_]?token|token|secret|key|password)=)[^&\s"'#]+/gi,
 ];
 
 /** Replaces secret-looking substrings of `text` with `[redacted]`. */
@@ -51,6 +55,8 @@ export function redactString(text: string): string {
     out = out.replace(re, (match: string, ...groups: unknown[]) => {
       const first = groups[0];
       if (typeof first === 'string' && /^bearer$/i.test(first)) return `${first} [redacted]`;
+      if (typeof first === 'string' && /:\/\/$/.test(first)) return `${first}[redacted]@`;
+      if (typeof first === 'string' && /^[?&]/.test(first)) return `${first}[redacted]`;
       void match;
       return '[redacted]';
     });
@@ -58,10 +64,10 @@ export function redactString(text: string): string {
   return out;
 }
 
-/** Field names whose string values are replaced wholesale (tx/receipt hashes are not secrets and stay visible). */
+/** Field names whose values are replaced wholesale (tx/receipt hashes are not secrets and stay visible). */
 const SECRET_KEYS = /(apikey|api_key|secret|password|private|privatekey|private_key|token|authorization|cookie|ciphertext|key)$/i;
 
-/** Deep-redacts `value`: secret-named keys are replaced wholesale, strings are pattern-redacted. */
+/** Deep-redacts `value`: secret-named keys are replaced wholesale (whatever their type), byte arrays are never enumerated, strings are pattern-redacted. */
 export function redactValue(value: unknown, depth = 0): unknown {
   if (depth > 6) return '[depth]';
   if (typeof value === 'string') return redactString(value);
@@ -69,12 +75,15 @@ export function redactValue(value: unknown, depth = 0): unknown {
   if (value instanceof Error) {
     return { name: value.name, message: redactString(value.message), ...(value.stack ? { stack: redactString(value.stack) } : {}) };
   }
+  // Uint8Array / Buffer / ArrayBuffer: a keypair's secretKey is one of these; print the length only.
+  if (ArrayBuffer.isView(value)) return `[bytes:${value.byteLength}]`;
+  if (value instanceof ArrayBuffer) return `[bytes:${value.byteLength}]`;
   if (Array.isArray(value)) return value.map((v) => redactValue(v, depth + 1));
   if (value !== null && typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       if (v === undefined) continue;
-      out[k] = SECRET_KEYS.test(k) && typeof v === 'string' && v !== '' ? '[redacted]' : redactValue(v, depth + 1);
+      out[k] = SECRET_KEYS.test(k) && v !== null && v !== '' ? '[redacted]' : redactValue(v, depth + 1);
     }
     return out;
   }

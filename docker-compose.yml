@@ -11,6 +11,10 @@ services:
     # `required: false` lets `docker compose config` validate a fresh checkout that has no .env yet (`cp .env.example
     # .env`, docs/DEPLOY.md); the image runs with NODE_ENV=production, so a gateway started without the file refuses
     # to boot (SESSION_SECRET is required).
+    # PUBLIC_URL is the SIWS domain the gateway accepts (docs/DEPLOY.md §3): behind nginx the browser signs in from the
+    # SITE origin (the web image is built with VITE_GATEWAY_URL="", so the message names the page origin, :8080 here),
+    # not the gateway's own :8787. Empty in .env (the .env.example default) → the site origin below; a value in .env
+    # (the real site URL in production, e.g. https://beagle.example) wins. PUBLIC_WEB_ORIGIN (CORS, credits links) alike.
     env_file:
       - path: .env
         required: false
@@ -18,6 +22,8 @@ services:
       HOST: 0.0.0.0
       PORT: "8787"
       DB_PATH: /app/data/gateway.sqlite
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      PUBLIC_WEB_ORIGIN: ${PUBLIC_WEB_ORIGIN:-http://localhost:8080}
       DEPLOYER_KEYPAIR: ""
       MINT_KEYPAIR: ""
     volumes:

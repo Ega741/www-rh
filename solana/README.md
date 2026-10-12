@@ -36,4 +36,6 @@ EXISTING_MINT=<pump.fun mint> OPERATOR_PUBKEY=<base58> bash solana/scripts/setup
 pnpm deployments:sync
 ```
 
-Files named `deployments/*.local.json` are ignored by git and by `sync-deployments`.
+Re-running is safe (e.g. after the devnet faucet rate-limited the airdrop): the mint `deployments/<cluster>.json`
+already records is reused, never replaced by a new one — set `EXISTING_MINT` / `MINT_KEYPAIR` or remove the file to
+switch mints. Files named `deployments/*.local.json` are ignored by git and by `sync-deployments`.

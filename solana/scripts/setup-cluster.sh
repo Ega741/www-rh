@@ -12,13 +12,16 @@
 #                 disables further minting (`spl-token authorize <mint> mint --disable`) and writes the file.
 #   devnet        the same flow with keys from the environment: DEPLOYER_KEYPAIR (path; fee payer + mint authority),
 #   mainnet-beta  OPERATOR_PUBKEY (base58) and either EXISTING_MINT (base58: record an already launched mint, e.g. the
-#                 pump.fun token on mainnet — nothing is sent to the chain) or MINT_KEYPAIR (path; a throw-away keypair
-#                 is generated when unset). devnet airdrops best-effort (https://faucet.solana.com when rate limited);
-#                 mainnet-beta never airdrops.
+#                 pump.fun token on mainnet — nothing is sent to the chain) or MINT_KEYPAIR (path). With neither, the
+#                 mint recorded in OUT_FILE is reused when it exists on the cluster; only when there is none is a
+#                 throw-away mint keypair generated (the deployer is the mint authority, the keypair is not needed
+#                 again). devnet airdrops best-effort (https://faucet.solana.com when rate limited); mainnet-beta never
+#                 airdrops.
 #
 # Other env: RPC_URL (cluster default), TOKEN_2022=1 (create the mint under Token-2022), SUPPLY (whole tokens,
-# 1000000000), SYMBOL (BEAGLE), OUT_FILE (solana/deployments/<cluster>.json). Re-running against the same ledger is
-# safe: an existing mint is reused, supply is minted only once, minting is disabled only when still enabled.
+# 1000000000), SYMBOL (BEAGLE), OUT_FILE (solana/deployments/<cluster>.json). Re-running is safe: the existing mint
+# (MINT_KEYPAIR's, EXISTING_MINT, or the one OUT_FILE records) is reused — never replaced — supply is minted only once,
+# minting is disabled only when still enabled. Reads use `confirmed`, like the writes, so an immediate re-run works.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -79,6 +82,10 @@ if [ -z "$EXISTING_MINT" ]; then
 fi
 
 # ---------- helpers ----------
+TMP_DIR="$(mktemp -d)"                      # throw-away mint keypair, when one is generated
+trap 'rm -rf "$TMP_DIR"' EXIT
+# Every read below asks for `confirmed`: the spl-token writes confirm at `confirmed`, and a node's default commitment is
+# `finalized` (~13 s behind) — without it a re-run right after a run airdropped twice and tried to create the mint again.
 rpc() { # rpc <method> [params-json]  → raw JSON-RPC response (retries transient failures; empty body = fatal)
   local body
   body=$(curl -sS --retry 3 --retry-connrefused --retry-all-errors -X POST -H 'content-type: application/json' \
@@ -95,10 +102,10 @@ tok() { # spl-token with the cluster, fee payer and token program pinned (no ~/.
   local cmd=$1; shift
   spl-token "$cmd" --url "$RPC_URL" --program-id "$TOKEN_PROGRAM" ${FEE_PAYER[@]+"${FEE_PAYER[@]}"} "$@"
 }
-lamports_of() { json "$(rpc getBalance "[\"$1\"]")" 'd.result.value'; }
+lamports_of() { json "$(rpc getBalance "[\"$1\",{\"commitment\":\"confirmed\"}]")" 'd.result.value'; }
 account_exists() { # account_exists <pubkey>: true when the account has an owner (an RPC failure aborts, never "missing")
   local resp owner
-  resp=$(rpc getAccountInfo "[\"$1\",{\"encoding\":\"base64\"}]")
+  resp=$(rpc getAccountInfo "[\"$1\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]")
   owner=$(json "$resp" 'd.error ? (()=>{throw new Error(JSON.stringify(d.error))})() : (d.result && d.result.value && d.result.value.owner)') || die "getAccountInfo $1 failed: $resp"
   [ -n "$owner" ]
 }
@@ -138,7 +145,7 @@ CREATED_SLOT=""
 if [ -n "$EXISTING_MINT" ]; then
   # ---------- record an existing mint (pump.fun launch on mainnet, or any mint created elsewhere) ----------
   MINT="$EXISTING_MINT"
-  ACCT=$(rpc getAccountInfo "[\"$MINT\",{\"encoding\":\"base64\"}]")
+  ACCT=$(rpc getAccountInfo "[\"$MINT\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]")
   TOKEN_PROGRAM=$(json "$ACCT" 'd.result && d.result.value && d.result.value.owner')
   [ -n "$TOKEN_PROGRAM" ] || die "EXISTING_MINT $MINT does not exist on $CLUSTER"
   case "$TOKEN_PROGRAM" in
@@ -152,19 +159,35 @@ if [ -n "$EXISTING_MINT" ]; then
   [ -z "$AUTH" ] || warn "mint authority is still set ($AUTH): the supply is not fixed"
   CREATED_SLOT="${EXISTING_MINT_CREATED_SLOT:-}"
 else
-  # ---------- create the mint ----------
+  # ---------- create the mint (or reuse the one a previous run created) ----------
   if [ -z "$MINT_KEYPAIR" ]; then
-    MINT_KEYPAIR="$(mktemp -d)/mint-$CLUSTER.json"
-    solana-keygen new --no-bip39-passphrase --silent --force -o "$MINT_KEYPAIR" >/dev/null
-    log "generated a throw-away mint keypair at $MINT_KEYPAIR (useless once minting is disabled)"
+    # No keypair pinned (the devnet default): a re-run — the airdrop warning below asks for one — must not create a
+    # second mint and overwrite the record of the first, so the mint OUT_FILE already records for this cluster is
+    # reused whenever it exists on the chain. Only when the file names no (live) mint is a throw-away keypair made.
+    PREV_MINT=""
+    if [ -f "$OUT_FILE" ]; then
+      PREV=$(cat "$OUT_FILE")
+      [ "$(json "$PREV" 'd.cluster')" = "$CLUSTER" ] && PREV_MINT=$(json "$PREV" 'd.mint')
+    fi
+    if [ -n "$PREV_MINT" ] && account_exists "$PREV_MINT"; then
+      MINT="$PREV_MINT"
+      log "reusing mint $MINT recorded in $OUT_FILE (set EXISTING_MINT or MINT_KEYPAIR, or remove the file, to use another mint)"
+    else
+      [ -z "$PREV_MINT" ] || warn "mint $PREV_MINT recorded in $OUT_FILE does not exist at $RPC_URL: creating a new mint, the record will be replaced"
+      MINT_KEYPAIR="$TMP_DIR/mint-$CLUSTER.json"
+      solana-keygen new --no-bip39-passphrase --silent --force -o "$MINT_KEYPAIR" >/dev/null
+      MINT=$(solana-keygen pubkey "$MINT_KEYPAIR")
+      log "generated a throw-away mint keypair for $MINT (the deployer is the mint authority; the keypair is not needed again)"
+    fi
+  else
+    [ -f "$MINT_KEYPAIR" ] || die "MINT_KEYPAIR not found: $MINT_KEYPAIR"
+    MINT=$(solana-keygen pubkey "$MINT_KEYPAIR")
   fi
-  [ -f "$MINT_KEYPAIR" ] || die "MINT_KEYPAIR not found: $MINT_KEYPAIR"
-  MINT=$(solana-keygen pubkey "$MINT_KEYPAIR")
 
   if account_exists "$MINT"; then
     log "mint $MINT already exists on $CLUSTER, reusing it"
-    INFO=$(tok display --output json "$MINT")
-    [ "$(json "$INFO" 'd.programId')" = "$TOKEN_PROGRAM" ] || die "mint $MINT is owned by $(json "$INFO" 'd.programId'), expected $TOKEN_PROGRAM"
+    INFO=$(tok display --output json "$MINT") || die "$MINT exists on $CLUSTER but is not an SPL mint (set EXISTING_MINT or MINT_KEYPAIR, or remove $OUT_FILE, to use another mint)"
+    [ "$(json "$INFO" 'd.programId')" = "$TOKEN_PROGRAM" ] || die "mint $MINT is owned by $(json "$INFO" 'd.programId'), expected $TOKEN_PROGRAM (set EXISTING_MINT or MINT_KEYPAIR, or remove $OUT_FILE, to use another mint)"
     DECIMALS=$(json "$INFO" 'd.decimals')
     # keep the slot recorded by the run that created it, when the previous file describes the same mint
     if [ -f "$OUT_FILE" ]; then

@@ -168,8 +168,10 @@ tools fall back to `balance()` when it is absent. `WalletExecutor` has `buyCompu
 construction needs the network (what the binary does) and `createAgentWallet(api, config)` is the binary's own
 wiring. `buildUnsignedTransactions(input, blockhash)` / `prepareUnsignedTransactions(rpc, input)` build the
 same three transactions for external signers; `resolveTokenAccount(rpc, …)` implements the ATA-or-largest rule.
-The memo instruction targets the Memo **v2** program (`MemoSq4…`, the one the gateway indexes); note that
-`@solana/spl-memo`'s `createMemoInstruction` would emit the v1 id.
+The memo instruction targets the Memo program the gateway indexes, `MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr`
+(Solana's Memo v2 program, `spl-memo` crate 3.x; `MEMO_PROGRAM_ID` from `@beagle/shared/addresses`). It is built by
+hand on purpose: `@solana/spl-memo` 0.3.x exports `Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH` as its
+`MEMO_PROGRAM_ID`, which `solana-test-validator` does not ship and the indexer does not parse as `spl-memo`.
 
 ## Development
 

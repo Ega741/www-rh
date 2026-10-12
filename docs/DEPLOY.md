@@ -16,9 +16,16 @@ operator keypair + price service) and the web app. Everything is configured from
 
 - **Localnet / devnet**: `bash solana/scripts/setup-cluster.sh <cluster>` creates a 6-decimal mint, mints the supply
   to the deployer, disables further minting and writes `solana/deployments/<cluster>.json`. Localnet uses the
-  committed test keypairs in `solana/keys/` (never fund them anywhere else).
-- **Mainnet**: launch the token the way the original launched `$DARWIN` — on **pump.fun** — then write
-  `solana/deployments/mainnet-beta.json` by hand (`mint`, `decimals: 6`, `symbol`, `tokenProgram`, `operator`).
+  committed test keypairs in `solana/keys/` (never fund them anywhere else); devnet takes `DEPLOYER_KEYPAIR` and
+  `OPERATOR_PUBKEY` from the environment. Re-running is safe: the mint the file already records is reused (it is
+  never replaced unless you set `EXISTING_MINT` / `MINT_KEYPAIR` or remove the file).
+- **Mainnet**: launch the token the way the original launched `$DARWIN` — on **pump.fun** — then record it
+  (nothing is sent to the chain; the script reads decimals and the token program from the mint and writes every
+  key `sync-deployments` requires — `cluster`, `mint`, `decimals`, `symbol`, `tokenProgram`, `operator`,
+  `memoProgram` — SPEC §3.1):
+  ```bash
+  EXISTING_MINT=<mint> OPERATOR_PUBKEY=<operator pubkey> bash solana/scripts/setup-cluster.sh mainnet-beta
+  ```
   The gateway only needs the mint address; nothing is deployed.
 
 Then `node scripts/sync-deployments.mjs && pnpm -r build` and commit the deployment JSON plus
@@ -44,8 +51,10 @@ Price: `PRICE_SOURCE=jupiter` on mainnet (Jupiter Price API by mint), `feed` for
 (`{ "priceUsd": … }`), `manual` for devnet/local (`set-price`, `POST /api/admin/price`). Changes are published as
 price points (`/api/price/history`) and every credit event pins the point it used.
 
-Indexing: the first start indexes the newest `INDEX_PAGE_LIMIT` burns of the mint; set `INDEX_FROM_SIGNATURE` to
-start from a known transaction instead. Rebuilding from scratch = delete the DB rows of `credit_events`/`ledger`
+Indexing: without a cursor the first start processes only the newest `INDEX_PAGE_LIMIT` **transactions that
+mention the mint** (`getSignaturesForAddress(mint)`: every transfer or trade, not just burns — on a busy token that is
+minutes of history, and burns before it are never credited); set `INDEX_FROM_SIGNATURE` to a recent signature at
+launch, as `docs/SOLANA.md` recommends. Rebuilding from scratch = delete the DB rows of `credit_events`/`ledger`
 credits and restart with the cursor cleared (or point at a fresh `DB_PATH`); debits cannot be rebuilt — back up
 the SQLite file.
 
@@ -68,7 +77,9 @@ VITE_CLUSTER=mainnet-beta VITE_GATEWAY_URL= pnpm --filter @beagle/web build   # 
 
 `docker compose up -d gateway web` builds both images; nginx serves the SPA on `:8080` and proxies `/api`, `/v1`,
 `/mcp`, `/healthz` to the gateway with buffering disabled (SSE). `PUBLIC_URL` of the gateway must equal the
-origin the browser talks to (SIWS domain): dev `http://localhost:8787` = `VITE_GATEWAY_URL`; prod the site URL.
+origin the browser talks to (SIWS domain): dev `http://localhost:8787` = `VITE_GATEWAY_URL`; behind nginx the
+**site** origin (compose fills in `http://localhost:8080` for `PUBLIC_URL` and `PUBLIC_WEB_ORIGIN` while `.env`
+leaves them empty); prod the site URL.
 
 ## 4. Smoke test
 

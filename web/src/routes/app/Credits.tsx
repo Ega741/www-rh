@@ -65,13 +65,16 @@ export function Credits() {
   const creditsOwnWorkspace = workspace !== undefined && me !== undefined && sameAddress(workspace, me.workspace);
   const memo = address !== undefined && workspace !== undefined ? purchaseMemoFor(address, workspace) : undefined;
 
+  const accountError = account.account === undefined ? account.error : undefined;
   const plan = planBurn({
     connected,
     deploymentKnown: mint !== undefined,
+    gatewayConfig: dep.gatewayConfig,
     configMismatch: dep.mismatch !== undefined,
     workspaceValid: workspace !== undefined,
     accountKnown: account.settled,
     hasTokenAccount: account.account?.exists === true,
+    accountError,
     balance: account.balance,
     amount: tokens,
     usdMicro,
@@ -81,7 +84,7 @@ export function Credits() {
   });
   const minTokens = minCreditMicro === undefined ? undefined : minCreditTokens(minCreditMicro, priceE18, decimals);
   const minCreditText = minCreditMicro === undefined ? undefined : `${fmtUsd(minCreditMicro, { maxFractionDigits: 6 })}${minTokens === undefined ? '' : ` ≈ ${fmtTokens(minTokens, decimals, symbol, 6)}`}`;
-  const blockerCtx = { symbol, minCreditText };
+  const blockerCtx = { symbol, minCreditText, accountError };
   const firstBlocker = plan.blockers[0];
 
   const flow = useTxFlow();
@@ -205,7 +208,7 @@ export function Credits() {
                       {priceStale ? <Badge tone="warn">stale</Badge> : <Badge tone="ok">fresh</Badge>}
                     </>
                   ) : null}
-                  {minCreditText !== undefined ? <span>· minimum {minCreditText}</span> : null}
+                  {minCreditText !== undefined ? <span>· minimum {minCreditText}</span> : dep.gatewayConfig === 'unavailable' ? <span className="text-err">· minimum unknown (gateway configuration unavailable)</span> : null}
                 </div>
                 <p className="mt-1 text-xs text-muted">{OBSERVED_SENTENCE} The event records the price point it was priced with; the figures above are what applies if the point does not change before then.</p>
               </div>

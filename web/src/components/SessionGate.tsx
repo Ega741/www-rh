@@ -79,7 +79,7 @@ export function AppShell() {
       {session.walletMismatch && session.me !== undefined ? (
         <div className="mb-4">
           <Note tone="warn" title="Wallet differs from the signed-in workspace">
-            You are signed in as <span className="font-mono">{session.me.workspace}</span>; the connected wallet is another account. Credits you buy here still go to the signed-in workspace (the burn carries a memo naming it), paid from the connected wallet; a budget you open delegates the connected wallet's tokens to fund the signed-in workspace. Sign out and in again to switch workspaces.
+            You are signed in as <span className="font-mono">{session.me.workspace}</span>; the connected wallet is another account. Credits you buy here still go to the signed-in workspace (the burn carries a memo naming it), paid from the connected wallet. Budgets are different: a budget funds the workspace of the wallet that delegates, so opening one is disabled until you sign in with the connected wallet. Sign out and in again to switch workspaces.
           </Note>
         </div>
       ) : null}

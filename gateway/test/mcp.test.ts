@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { GatewayError } from '../src/api/errors.js';
 import { toApiError } from '../src/api/mcp.js';
-import { ATA2, FakeRpc, jsonRequest, makeHarness, makeTokenAccount, MINT, OPERATOR, WS1, type Harness } from './helpers.js';
+import { ATA2, FakeRpc, jsonRequest, makeHarness, makeTokenAccount, MINT, OPERATOR, WS1, WS2, type Harness } from './helpers.js';
 
 describe('MCP error mapping', () => {
   it('masks internal errors like the /v1 envelopes and keeps gateway codes', () => {
@@ -84,7 +84,12 @@ describe('MCP over HTTP (stateless Streamable HTTP, JSON responses)', () => {
     const registered = await api.registerBudget({ tokenAccount: ATA2 });
     expect(registered).toMatchObject({ tokenAccount: ATA2, owner: WS1, workspace: WS1, cap: 10n ** 9n, headroomMicro: 10_000_000n });
     expect((await api.budgets()).map((b) => b.tokenAccount)).toEqual([ATA2]);
-    await expect(api.registerBudget({ tokenAccount: ATA2, workspace: 'x' })).rejects.toMatchObject({ name: 'BeagleApiError' });
+    await expect(api.registerBudget({ tokenAccount: ATA2, workspace: 'x' })).rejects.toMatchObject({ name: 'BeagleApiError', status: 400, code: 'invalid_request' });
+    expect(h.services.repos.budgets.get(ATA2)?.workspace).toBe(WS1); // rejected before anything is written
+    // Another key's workspace may not choose where the owner's budget goes, not even "back" to the owner.
+    const stranger = createInProcessBeagleApi(h.services, WS2, null, 'free');
+    await expect(stranger.registerBudget({ tokenAccount: ATA2, workspace: WS1 })).rejects.toMatchObject({ name: 'BeagleApiError', status: 403, code: 'not_owner' });
+    expect(h.services.repos.budgets.get(ATA2)?.workspace).toBe(WS1);
     expect((await api.price()).pricePointId).toBe(1);
     expect((await api.priceHistory({ limit: 3 })).length).toBe(1);
     expect((await api.receipts({ limit: 5 })).rows).toEqual([]);

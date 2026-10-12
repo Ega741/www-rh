@@ -82,7 +82,7 @@ export interface WalletDeployment {
   tokenProgram?: string;
   /** The gateway's operator: delegate of every budget. `null` while the gateway has no operator key. */
   operator?: string | null;
-  /** Memo program the gateway indexes (default: Memo v2, `MemoSq4…`; `@solana/spl-memo` would emit the v1 id). */
+  /** Memo program the gateway indexes (default: `MemoSq4…`, Solana's Memo v2; not the `Memo4c2p…` id `@solana/spl-memo` 0.3.x exports). */
   memoProgram?: string;
   /** Symbol for human-readable descriptions (default `BEAGLE`). */
   symbol?: string;
@@ -268,8 +268,9 @@ function tokenProgramOf(deployment: WalletDeployment): PublicKey {
 
 /**
  * An SPL Memo instruction (`text` as UTF-8) signed by `signer`, on the deployment's memo program
- * (Memo v2 by default: `@solana/spl-memo`'s `createMemoInstruction` targets the v1 program id, which
- * the gateway does not index).
+ * (by default `MemoSq4…`, Solana's Memo v2 — `spl-memo` crate 3.x — which the gateway indexes). Built by hand
+ * on purpose: `@solana/spl-memo` 0.3.x's `createMemoInstruction` targets `Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH`,
+ * which `solana-test-validator` does not ship and the indexer does not parse as `spl-memo`.
  */
 export function createMemoInstruction(text: string, signer: PublicKey, memoProgram: string = MEMO_PROGRAM_ID): TransactionInstruction {
   return new TransactionInstruction({

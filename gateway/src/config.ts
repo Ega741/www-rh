@@ -68,6 +68,11 @@ export function parsePriceUsdE18(input: string): bigint {
  * decodes to a 64-byte secret key or a 32-byte seed. Returns the 64-byte Ed25519 secret key.
  */
 export function parseSecretKey(input: string): Uint8Array {
+  return parseSecretKeyDetailed(input).secretKey;
+}
+
+/** {@link parseSecretKey} plus whether the input was a 32-byte seed (indistinguishable from a public key). */
+export function parseSecretKeyDetailed(input: string): { secretKey: Uint8Array; fromSeed: boolean } {
   const text = input.trim();
   let bytes: Uint8Array | undefined;
   if (text.startsWith('[')) {
@@ -85,18 +90,18 @@ export function parseSecretKey(input: string): Uint8Array {
     bytes = decodeBase58(text);
     if (bytes === undefined) throw new TypeError('OPERATOR_SECRET_KEY: expected base58 or a JSON byte array');
   }
-  if (bytes.length === 32) return nacl.sign.keyPair.fromSeed(bytes).secretKey;
+  if (bytes.length === 32) return { secretKey: nacl.sign.keyPair.fromSeed(bytes).secretKey, fromSeed: true };
   if (bytes.length !== 64) throw new RangeError(`OPERATOR_SECRET_KEY: expected 64 bytes (or a 32-byte seed), got ${bytes.length}`);
   // Validate: the public half must match the seed half.
   const derived = nacl.sign.keyPair.fromSeed(bytes.subarray(0, 32)).secretKey;
   for (let i = 32; i < 64; i++) if (derived[i] !== bytes[i]) throw new RangeError('OPERATOR_SECRET_KEY: public key does not match the seed');
-  return bytes;
+  return { secretKey: bytes, fromSeed: false };
 }
 
 const secretKey = z.preprocess(blankToUndefined, z.string().optional()).transform((s, ctx) => {
   if (s === undefined) return undefined;
   try {
-    return parseSecretKey(s);
+    return parseSecretKeyDetailed(s);
   } catch (e) {
     ctx.addIssue({ code: 'custom', message: e instanceof Error ? e.message : String(e) });
     return undefined;
@@ -119,6 +124,7 @@ export const EnvSchema = z.object({
   CLUSTER: cluster,
   RPC_URL: optStr(),
   RPC_WS_URL: optStr(),
+  PUBLIC_RPC_URL: optStr(),
   MINT_ADDRESS: pubkey,
   TOKEN_PROGRAM: pubkey,
   COMMITMENT: z.preprocess(blankToUndefined, z.enum(['confirmed', 'finalized']).default('confirmed')),
@@ -186,6 +192,7 @@ export const EnvSchema = z.object({
   WARM_HOUR_PRICE_USD: usd('2'),
   RATE_LIMIT_RPM: int(60, 1),
   RATE_LIMIT_RPM_PRO: int(300, 1),
+  AUTH_RATE_LIMIT_RPM: int(60, 1),
   WARM_DRIVER: z.preprocess(blankToUndefined, z.enum(['log', 'ollama', 'http']).default('log')),
   WARM_WEBHOOK_URL: optStr(),
   WARM_PING_INTERVAL_MS: int(240_000, 1000),
@@ -205,9 +212,11 @@ export interface Config {
   isProduction: boolean;
   cluster: {
     name: Cluster;
-    /** `RPC_URL` override (the cluster default applies when unset). */
+    /** `RPC_URL` override (the cluster default applies when unset). May carry a provider key: never published. */
     rpcUrl: string | undefined;
     wsUrl: string | undefined;
+    /** `PUBLIC_RPC_URL`: the endpoint published to clients; unset → the cluster's public endpoint (localnet: `RPC_URL`). */
+    publicRpcUrl: string | undefined;
     /** `MINT_ADDRESS` override of the deployment mint. */
     mint: string | undefined;
     tokenProgram: string | undefined;
@@ -220,6 +229,8 @@ export interface Config {
   operator: {
     /** 64-byte Ed25519 secret key; `undefined` → draws disabled. */
     secretKey: Uint8Array | undefined;
+    /** `true` when `OPERATOR_SECRET_KEY` was a 32-byte seed (which a pasted public key also is). */
+    secretKeyIsSeed: boolean;
     dryRun: boolean;
     priorityFeeMicrolamports: number;
   };
@@ -289,6 +300,8 @@ export interface Config {
     warmHourPriceMicro: bigint;
     rateLimitRpm: number;
     rateLimitRpmPro: number;
+    /** Per-IP limit of `GET /api/auth/nonce` / `POST /api/auth/verify` per minute (`AUTH_RATE_LIMIT_RPM`). */
+    authRateLimitRpm: number;
     warmDriver: 'log' | 'ollama' | 'http';
     warmWebhookUrl: string | undefined;
     warmPingIntervalMs: number;
@@ -331,6 +344,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (e.WARM_DRIVER === 'http' && e.WARM_WEBHOOK_URL === undefined) throw new ConfigError('WARM_WEBHOOK_URL is required when WARM_DRIVER=http');
   for (const [key, value] of [
     ['RPC_URL', e.RPC_URL],
+    ['PUBLIC_RPC_URL', e.PUBLIC_RPC_URL],
     ['PRICE_FEED_URL', e.PRICE_FEED_URL],
     ['JUPITER_PRICE_URL', e.JUPITER_PRICE_URL],
   ] as const) {
@@ -351,6 +365,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       name: e.CLUSTER,
       rpcUrl: e.RPC_URL?.replace(/\/+$/, ''),
       wsUrl: e.RPC_WS_URL,
+      publicRpcUrl: e.PUBLIC_RPC_URL?.replace(/\/+$/, ''),
       mint: e.MINT_ADDRESS,
       tokenProgram: e.TOKEN_PROGRAM,
       commitment: e.COMMITMENT,
@@ -359,7 +374,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       pollIntervalMs: e.POLL_INTERVAL_MS,
       txFetchConcurrency: e.TX_FETCH_CONCURRENCY,
     },
-    operator: { secretKey: e.OPERATOR_SECRET_KEY, dryRun: e.DRY_RUN, priorityFeeMicrolamports: e.PRIORITY_FEE_MICROLAMPORTS },
+    operator: { secretKey: e.OPERATOR_SECRET_KEY?.secretKey, secretKeyIsSeed: e.OPERATOR_SECRET_KEY?.fromSeed ?? false, dryRun: e.DRY_RUN, priorityFeeMicrolamports: e.PRIORITY_FEE_MICROLAMPORTS },
     price: {
       source: e.PRICE_SOURCE,
       initialPriceE18: e.INITIAL_PRICE_USD,
@@ -425,6 +440,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       warmHourPriceMicro: e.WARM_HOUR_PRICE_USD,
       rateLimitRpm: e.RATE_LIMIT_RPM,
       rateLimitRpmPro: e.RATE_LIMIT_RPM_PRO,
+      authRateLimitRpm: e.AUTH_RATE_LIMIT_RPM,
       warmDriver: e.WARM_DRIVER,
       warmWebhookUrl: e.WARM_WEBHOOK_URL,
       warmPingIntervalMs: e.WARM_PING_INTERVAL_MS,

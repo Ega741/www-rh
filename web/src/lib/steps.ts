@@ -108,7 +108,10 @@ export function lastSignature(state: FlowState): string | undefined {
 export type BlockerCode =
   | 'not_connected'
   | 'no_session'
+  | 'wallet_mismatch'
   | 'deployment_unknown'
+  | 'config_pending'
+  | 'config_unavailable'
   | 'config_mismatch'
   | 'operator_unknown'
   | 'price_unavailable'
@@ -118,14 +121,24 @@ export type BlockerCode =
   | 'below_min_credit'
   | 'quote_zero'
   | 'no_token_account'
+  | 'account_error'
   | 'insufficient_balance'
   | 'account_pending';
+
+/**
+ * State of `GET /api/config`: `ready` once it answered (the token facts, the operator and the
+ * minimum credit are the gateway's), `pending` while the first read is in flight, `unavailable`
+ * when it failed. The flows need it: the committed deployment only serves as a display fallback,
+ * and the minimum-credit guard (SPEC §3.2) cannot run without `minCreditMicro`.
+ */
+export type GatewayConfigState = 'pending' | 'unavailable' | 'ready';
 
 /** Common environment of both plans. */
 export interface FlowEnv {
   connected: boolean;
   /** The mint (and token program) are known. */
   deploymentKnown: boolean;
+  gatewayConfig: GatewayConfigState;
   /** The build and the gateway disagree on the mint or the cluster. */
   configMismatch: boolean;
   workspaceValid: boolean;
@@ -133,6 +146,8 @@ export interface FlowEnv {
   accountKnown: boolean;
   /** The wallet has a token account of the mint (`false` = never received BEAGLE). */
   hasTokenAccount: boolean;
+  /** The read of the token account failed and no earlier read is available (an RPC problem, not a missing account). */
+  accountError?: string | undefined;
   /** Raw token balance of that account. */
   balance: bigint | undefined;
 }
@@ -159,6 +174,7 @@ function envBlockers(env: FlowEnv): BlockerCode[] {
   const out: BlockerCode[] = [];
   if (!env.connected) out.push('not_connected');
   if (env.configMismatch) out.push('config_mismatch');
+  else if (env.gatewayConfig !== 'ready') out.push(env.gatewayConfig === 'pending' ? 'config_pending' : 'config_unavailable');
   else if (!env.deploymentKnown) out.push('deployment_unknown');
   if (!env.workspaceValid) out.push('bad_workspace');
   return out;
@@ -167,6 +183,7 @@ function envBlockers(env: FlowEnv): BlockerCode[] {
 function accountBlockers(env: FlowEnv, amount: bigint): BlockerCode[] {
   if (!env.connected || !env.deploymentKnown || env.configMismatch) return [];
   if (!env.accountKnown) return ['account_pending'];
+  if (env.accountError !== undefined) return ['account_error'];
   if (!env.hasTokenAccount) return ['no_token_account'];
   if (env.balance !== undefined && env.balance < amount) return ['insufficient_balance'];
   return [];
@@ -175,10 +192,12 @@ function accountBlockers(env: FlowEnv, amount: bigint): BlockerCode[] {
 /**
  * Preflight of the burn. The price blockers come first so a stale/unavailable price is not
  * reported as a missing quote; the minimum is enforced in µUSD at the published price
- * (SPEC §3.2: burns quoting below `MIN_CREDIT_USD` are recorded with no credit).
+ * (SPEC §3.2: burns quoting below `MIN_CREDIT_USD` are recorded with no credit), so an unknown
+ * minimum (`/api/config` unanswered) blocks the burn instead of skipping the guard.
  */
 export function planBurn(input: BurnPlanInput): Plan {
   const blockers = envBlockers(input);
+  if (input.gatewayConfig === 'ready' && !input.configMismatch && input.minCreditMicro === undefined) blockers.push('config_unavailable');
   if (!input.priceAvailable) blockers.push('price_unavailable');
   else if (input.priceStale) blockers.push('price_stale');
   const { amount, usdMicro } = input;
@@ -200,6 +219,15 @@ export interface BudgetPlanInput extends FlowEnv {
   cap: bigint | undefined;
   /** The operator (delegate) is known; `false` while the gateway has no operator key. */
   operatorKnown: boolean;
+  /**
+   * The connected wallet is not the signed-in workspace. A budget funds the workspace of the
+   * wallet that delegates: the gateway lets only the token account owner (the principal) name
+   * another workspace (`POST /api/budgets/register` → 403 `not_owner`), so with a mismatch the
+   * approval would be confirmed on chain and then registered for the wrong workspace.
+   */
+  walletMismatch: boolean;
+  /** The published price is known (the cap is converted at it, whichever unit is typed). */
+  priceAvailable: boolean;
 }
 
 /** {@link Plan} of an approval, with the advisory flag for a cap above the balance. */
@@ -215,7 +243,9 @@ export interface BudgetPlan extends Plan {
  */
 export function planBudget(input: BudgetPlanInput): BudgetPlan {
   const blockers = envBlockers(input);
-  if (input.deploymentKnown && !input.configMismatch && !input.operatorKnown) blockers.push('operator_unknown');
+  if (input.walletMismatch) blockers.push('wallet_mismatch');
+  if (input.deploymentKnown && !input.configMismatch && input.gatewayConfig === 'ready' && !input.operatorKnown) blockers.push('operator_unknown');
+  if (!input.priceAvailable) blockers.push('price_unavailable');
   const { cap } = input;
   if (cap === undefined || cap <= 0n) {
     blockers.push('no_amount');
@@ -229,6 +259,8 @@ export function planBudget(input: BudgetPlanInput): BudgetPlan {
 export interface BlockerContext {
   symbol: string;
   minCreditText?: string | undefined;
+  /** The RPC error of the token account read (`account_error`). */
+  accountError?: string | undefined;
 }
 
 /** English text for a blocker. */
@@ -238,8 +270,14 @@ export function describeBlocker(code: BlockerCode, ctx: BlockerContext): string 
       return 'Connect a wallet';
     case 'no_session':
       return 'Sign in first';
+    case 'wallet_mismatch':
+      return 'Sign in with the connected wallet to open a budget for it: a budget funds the workspace of the wallet that delegates';
     case 'deployment_unknown':
       return 'The mint is not configured';
+    case 'config_pending':
+      return 'Loading the gateway configuration';
+    case 'config_unavailable':
+      return 'Gateway configuration is unavailable; the page keeps retrying';
     case 'config_mismatch':
       return 'This build and the gateway disagree on the deployment';
     case 'operator_unknown':
@@ -258,6 +296,8 @@ export function describeBlocker(code: BlockerCode, ctx: BlockerContext): string 
       return 'Amount is too small to credit anything';
     case 'no_token_account':
       return `This wallet has no ${ctx.symbol} token account`;
+    case 'account_error':
+      return `Could not read the wallet token account${ctx.accountError === undefined ? '' : `: ${ctx.accountError}`}; the page retries`;
     case 'insufficient_balance':
       return `Insufficient ${ctx.symbol} balance`;
     case 'account_pending':

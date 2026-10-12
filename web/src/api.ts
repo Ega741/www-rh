@@ -2,7 +2,9 @@
  * Typed client of the dashboard API (SPEC §5.9). Wire DTOs are parsed with the zod schemas of
  * `@beagle/shared/api`, so every monetary field, token amount and `priceE18` arrives as `bigint`. Requests send the session
  * cookie (`credentials: 'include'`) and, when the gateway is on another origin, the session token
- * returned by `POST /api/auth/verify` as a bearer header.
+ * returned by `POST /api/auth/verify` as a bearer header. The token lives in `localStorage` so a
+ * cross-origin deployment (where the SameSite=Lax cookie never reaches `fetch`) keeps the 7-day
+ * session across tabs and reloads; sign-out and a 401/403 clear it.
  */
 import {
   ApiKeyDtoSchema,
@@ -68,25 +70,25 @@ interface Parser<T> {
 
 const TOKEN_KEY = 'beagle.session.token';
 
-/** In-browser storage of the bearer session token (fallback when the cookie cannot be sent). */
+/** In-browser storage of the bearer session token (fallback when the cookie cannot be sent); shared by every tab of the origin. */
 export const sessionToken = {
   get(): string | undefined {
     try {
-      return window.sessionStorage.getItem(TOKEN_KEY) ?? undefined;
+      return window.localStorage.getItem(TOKEN_KEY) ?? undefined;
     } catch {
       return undefined;
     }
   },
   set(token: string): void {
     try {
-      window.sessionStorage.setItem(TOKEN_KEY, token);
+      window.localStorage.setItem(TOKEN_KEY, token);
     } catch {
       /* storage unavailable: cookie-only session */
     }
   },
   clear(): void {
     try {
-      window.sessionStorage.removeItem(TOKEN_KEY);
+      window.localStorage.removeItem(TOKEN_KEY);
     } catch {
       /* ignore */
     }

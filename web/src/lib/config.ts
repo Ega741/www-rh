@@ -6,8 +6,9 @@
  * committed deployment by {@link reconcileDeployment}: a disagreement disables burning and says why.
  */
 import { DEFAULT_CLUSTER, CLUSTERS, parseCluster, type Cluster } from '@beagle/shared/clusters';
-import { resolveDeployment, type ResolvedDeployment } from '@beagle/shared/addresses';
+import { isUnsetAddress, resolveDeployment, type ResolvedDeployment } from '@beagle/shared/addresses';
 import { DEFAULT_DECIMALS } from '@beagle/shared/solana';
+import type { GatewayConfigState } from './steps.js';
 
 /** The `VITE_*` keys the app reads. */
 export interface WebEnv {
@@ -128,17 +129,22 @@ export interface DeploymentView {
  * (with `VITE_MINT_ADDRESS`) only serves as a fallback and as a cross-check: a burn of a mint the
  * gateway's indexer does not watch would never be credited, and a gateway on another cluster would
  * never see the transaction, so either disagreement disables the flows instead of proceeding.
+ * The gateway reports an unconfigured mint as the all-zero key (`configDto` falls back to the
+ * System Program id) and an unset operator as `null`; both count as unknown here.
  */
 export function reconcileDeployment(committed: ResolvedDeployment, gateway: GatewayDeployment | undefined): DeploymentView {
+  const gatewayMint = gateway === undefined || isUnsetAddress(gateway.mint) ? undefined : gateway.mint;
   let mismatch: string | undefined;
   if (gateway !== undefined && gateway.cluster !== committed.cluster) {
     mismatch = `This web build targets ${committed.cluster} but the gateway runs on ${gateway.cluster}. Burns and budgets are disabled until the two agree (VITE_CLUSTER vs the gateway's CLUSTER).`;
-  } else if (gateway !== undefined && committed.mint !== undefined && gateway.mint !== committed.mint) {
-    mismatch = `This web build targets mint ${committed.mint} but the gateway indexes ${gateway.mint}. Burns and budgets are disabled until the two agree (check VITE_MINT_ADDRESS / deployments.generated.ts against the gateway's MINT_ADDRESS).`;
+  } else if (gateway !== undefined && committed.mint !== undefined && gatewayMint === undefined) {
+    mismatch = `This web build targets mint ${committed.mint} but the gateway has no mint configured, so it would never index the burn. Burns and budgets are disabled until the gateway's MINT_ADDRESS is set.`;
+  } else if (gateway !== undefined && committed.mint !== undefined && gatewayMint !== committed.mint) {
+    mismatch = `This web build targets mint ${committed.mint} but the gateway indexes ${gatewayMint}. Burns and budgets are disabled until the two agree (check VITE_MINT_ADDRESS / deployments.generated.ts against the gateway's MINT_ADDRESS).`;
   }
-  const operator = gateway !== undefined ? (gateway.operator ?? undefined) : committed.operator;
+  const operator = gateway !== undefined ? (gateway.operator === null || isUnsetAddress(gateway.operator) ? undefined : gateway.operator) : committed.operator;
   return {
-    mint: mismatch !== undefined ? undefined : (gateway?.mint ?? committed.mint),
+    mint: mismatch !== undefined ? undefined : (gatewayMint ?? committed.mint),
     decimals: gateway?.decimals ?? committed.decimals ?? DEFAULT_DECIMALS,
     symbol: gateway?.symbol ?? committed.symbol ?? 'BEAGLE',
     tokenProgram: gateway?.tokenProgram ?? committed.tokenProgram,
@@ -146,4 +152,27 @@ export function reconcileDeployment(committed: ResolvedDeployment, gateway: Gate
     operator,
     mismatch,
   };
+}
+
+/** What `useDeployment` derives from the reconciled view and the state of the `/api/config` query. */
+export interface DeploymentStatus {
+  gatewayConfig: GatewayConfigState;
+  /** Still waiting for `/api/config` and nothing committed to fall back on. */
+  loading: boolean;
+  /** Why the flows are disabled: a disagreement, an unreachable `/api/config`, or no mint anywhere. */
+  error: string | undefined;
+}
+
+/**
+ * Status of the deployment for the pages. `/api/config` is required by the flows even when the
+ * build commits a mint (the committed record is a display fallback: the gateway's operator and
+ * minimum credit have no substitute), so a failed read is an error on its own.
+ */
+export function deploymentStatus(view: Pick<DeploymentView, 'mint' | 'mismatch'>, query: { hasData: boolean; pending: boolean }): DeploymentStatus {
+  const gatewayConfig: GatewayConfigState = query.hasData ? 'ready' : query.pending ? 'pending' : 'unavailable';
+  const loading = gatewayConfig === 'pending' && view.mint === undefined;
+  let error: string | undefined = view.mismatch;
+  if (error === undefined && gatewayConfig === 'unavailable') error = 'Gateway configuration is unavailable (GET /api/config failed); burns and budgets are disabled until it answers. The page keeps retrying.';
+  if (error === undefined && gatewayConfig === 'ready' && view.mint === undefined) error = 'The mint is not configured (set VITE_MINT_ADDRESS or MINT_ADDRESS on the gateway)';
+  return { gatewayConfig, loading, error };
 }

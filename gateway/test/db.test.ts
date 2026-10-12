@@ -23,7 +23,7 @@ describe('database', () => {
     }
     expect(tables).not.toContain('price_posts');
     const indices = db.all(`SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name`).map((r) => r['name']);
-    for (const i of ['ledger_workspace', 'ledger_ref', 'usage_workspace_created', 'credit_events_workspace', 'credit_events_slot', 'reservations_workspace', 'budgets_workspace', 'budgets_owner', 'siws_nonces_expires']) {
+    for (const i of ['ledger_workspace', 'ledger_ref', 'usage_workspace_created', 'credit_events_workspace', 'credit_events_slot', 'credit_events_unfinalized', 'reservations_workspace', 'budgets_workspace', 'budgets_owner', 'siws_nonces_expires']) {
       expect(indices).toContain(i);
     }
     db.close();
@@ -99,8 +99,16 @@ describe('database', () => {
     ]);
     expect(repos.creditEvents.list(WS1, 10, 200).map((e) => e.signature)).toEqual([testSignature(1), testSignature(1)]);
     expect(repos.creditEvents.listBySignature(testSignature(1)).map((e) => e.ixIndex)).toEqual([0, 2]);
-    expect(repos.creditEvents.signaturesForSweep(0, 150, 10)).toEqual([{ signature: testSignature(1), slot: 10 }]);
-    expect(repos.creditEvents.signaturesForSweep(11, 300, 10)).toEqual([{ signature: testSignature(2), slot: 11 }]);
+    expect(repos.creditEvents.signaturesForSweep(0, 150, 10)).toEqual([{ signature: testSignature(1), slot: 10, misses: 0 }]);
+    expect(repos.creditEvents.signaturesForSweep(11, 300, 10)).toEqual([{ signature: testSignature(2), slot: 11, misses: 0 }]);
+    repos.creditEvents.setFinalityMisses(testSignature(2), 2);
+    expect(repos.creditEvents.signaturesForSweep(0, 300, 10).map((c) => [c.slot, c.misses])).toEqual([
+      [10, 0],
+      [11, 2],
+    ]); // oldest first
+    expect(repos.creditEvents.markFinalized(testSignature(2), 500)).toBe(1);
+    expect(repos.creditEvents.get(testSignature(2), 0)).toMatchObject({ finalizedAt: 500, finalityMisses: 0 });
+    expect(repos.creditEvents.signaturesForSweep(0, 300, 10).map((c) => c.signature)).toEqual([testSignature(1)]); // finalized events leave the sweep set
     expect(repos.creditEvents.lastBlockTime()).toBe(1);
     expect(repos.creditEvents.deleteBySignature(testSignature(1))).toBe(2);
     expect(repos.creditEvents.list(WS1, 10)).toHaveLength(1);

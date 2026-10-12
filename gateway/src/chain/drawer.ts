@@ -3,14 +3,23 @@
  * that has an open non-stalled budget, settles unsettled credit-paid usage rows against the budget
  * with the largest headroom: `DrawBatch` → `receiptHash` → `budget_draws(pending)` → operator
  * transaction `[ComputeBudget?, BurnChecked(tokenAccount, mint, authority = operator), Memo(beagle:draw …)]`
- * → `sent` (signature + last valid block height). Confirmation and the ledger credit come **only**
- * from the indexer (memo hash match).
+ * → `sent` (signature + last valid block height) → the RPC. Confirmation and the ledger credit come
+ * **only** from the indexer (memo hash match).
+ *
+ * A draw is marked `failed` only on evidence that its transaction can never credit the workspace:
+ * the node rejected it (never forwarded), it landed with an error, or its blockhash expired while
+ * the signature stayed unknown. The transaction is signed and its signature persisted **before** it
+ * is sent, so a crash, a network error or an ambiguous confirmation outcome (web3's `expired`, a
+ * timeout) leaves a `sent` row that `reconcile()` settles later from the chain — never a released
+ * batch that could be burned twice.
  *
  * `reconcile()` runs first on every tick: a `pending` row without a signature older than the grace
- * period fails; a `sent` row is checked with `getSignatureStatuses` — an on-chain error fails it,
- * an unknown signature past `last_valid_block_height` fails it (the blockhash expired, the
- * transaction can never land), anything else is left for the indexer. A failed draw releases its
- * usage rows and stalls the budget (`draw_failed`) until the next successful refresh.
+ * period fails (nothing was signed); a `sent` row is checked with `getSignatureStatuses` — an
+ * on-chain error fails it, an unknown signature past `last_valid_block_height` (re-checked with
+ * `getTransaction`) fails it, anything else is left for the indexer. A failed draw releases its
+ * usage rows and stalls the budget (`draw_failed`) until the next successful refresh. Before a
+ * workspace is drawn again, recently failed draws that had a signature are re-checked: one that
+ * actually landed is restored to `sent` instead of being re-sent.
  *
  * @module chain/drawer
  */
@@ -24,7 +33,7 @@ import { ComputeBudgetProgram, PublicKey, TransactionInstruction } from '@solana
 import type { BudgetDrawRow, BudgetRow, Repos, UsageRow } from '../db/repos.js';
 import type { Logger } from '../log.js';
 import type { PriceService } from './price.js';
-import type { ChainReader, ChainWriter, RecentBlockhash } from './rpc.js';
+import { TransactionRejectedError, type ChainReader, type ChainWriter, type RecentBlockhash, type SignedTransaction } from './rpc.js';
 
 /** Options of {@link BudgetDrawer}. */
 export interface DrawerOptions {
@@ -44,12 +53,16 @@ export interface DrawerOptions {
   maxRows?: number;
   /** A `pending` row without a signature older than this is a crash leftover → failed (default 10 min). */
   pendingGraceMs?: number;
+  /** How far back failed draws with a signature are re-checked on chain before the workspace is drawn again (default 24 h). */
+  failedRecheckMs?: number;
   dryRun: boolean;
   now?: () => number;
 }
 
 /** Default {@link DrawerOptions.pendingGraceMs}. */
 export const PENDING_GRACE_MS = 10 * 60_000;
+/** Default {@link DrawerOptions.failedRecheckMs}. */
+export const FAILED_RECHECK_MS = 24 * 3_600_000;
 
 /** What one tick did for one workspace. */
 export interface DrawAttempt {
@@ -110,6 +123,8 @@ export function buildDrawInstructions(input: DrawInstructionInput): TransactionI
   return instructions;
 }
 
+const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
 /** The drawer. */
 export class BudgetDrawer {
   private readonly now: () => number;
@@ -150,14 +165,15 @@ export class BudgetDrawer {
 
   /**
    * Marks `draw` failed and releases its usage rows — unless the indexer confirmed it in the meantime
-   * (a confirmed draw is never rewritten). Returns whether the row changed.
+   * (a confirmed draw is never rewritten). `clearSignature` drops a signature that was never sent.
+   * Returns whether the row changed.
    */
-  private fail(draw: Pick<BudgetDrawRow, 'id' | 'tokenAccount' | 'usageIds' | 'workspace'>, error: string): boolean {
+  private fail(draw: Pick<BudgetDrawRow, 'id' | 'tokenAccount' | 'usageIds' | 'workspace'>, error: string, clearSignature = false): boolean {
     const t = this.now();
     return this.repos.transaction(() => {
       const current = this.repos.budgetDraws.get(draw.id);
       if (current === undefined || (current.status !== 'pending' && current.status !== 'sent')) return false;
-      this.repos.budgetDraws.setStatus(draw.id, 'failed', t, { error });
+      this.repos.budgetDraws.setStatus(draw.id, 'failed', t, { error, ...(clearSignature ? { signature: null, lastValidBlockHeight: null } : {}) });
       this.repos.usage.clearDrawId(draw.usageIds, draw.id);
       this.repos.budgets.setStalled(draw.tokenAccount, 'draw_failed', t);
       this.logger.error('drawer: draw failed', { workspace: draw.workspace, tokenAccount: draw.tokenAccount, drawId: draw.id, error });
@@ -176,7 +192,8 @@ export class BudgetDrawer {
     for (const draw of inFlight) {
       if (draw.signature !== null) continue;
       const age = now - draw.updatedAt;
-      if (age > (this.options.pendingGraceMs ?? PENDING_GRACE_MS)) this.fail(draw, `no transaction sent within ${Math.round(age / 1000)} s (gateway restarted?)`);
+      // Without a signature nothing was signed, let alone sent: safe to give up.
+      if (age > (this.options.pendingGraceMs ?? PENDING_GRACE_MS)) this.fail(draw, `no transaction signed within ${Math.round(age / 1000)} s (gateway restarted?)`);
     }
     if (sent.length === 0) return;
     let statuses: Awaited<ReturnType<ChainReader['getSignatureStatuses']>>;
@@ -200,12 +217,61 @@ export class BudgetDrawer {
             return;
           }
         }
-        if (blockHeight > draw.lastValidBlockHeight) this.fail(draw, `transaction ${draw.signature} never landed: blockhash expired at block height ${draw.lastValidBlockHeight}`);
+        if (blockHeight <= draw.lastValidBlockHeight) continue; // may still land
+        // The blockhash expired: the transaction can no longer land — unless it already did and this node
+        // just does not report it. Corroborate before giving the rows back to a new batch.
+        let tx;
+        try {
+          tx = await this.reader.getParsedTransaction(draw.signature as string);
+        } catch (e) {
+          this.logger.warn('drawer: transaction lookup failed; keeping the draw sent', { drawId: draw.id, signature: draw.signature, error: e });
+          continue;
+        }
+        if (tx !== null) {
+          this.logger.warn('drawer: transaction known by getTransaction but not by getSignatureStatuses; leaving it for the indexer', { drawId: draw.id, signature: draw.signature });
+          continue;
+        }
+        this.fail(draw, `transaction ${draw.signature} never landed: blockhash expired at block height ${draw.lastValidBlockHeight}`);
         continue;
       }
       if (status.err !== null && status.err !== undefined) this.fail(draw, `transaction ${draw.signature} failed on chain: ${JSON.stringify(status.err)}`);
       // Confirmed / finalized without error: the indexer confirms it (and credits the ledger) when it reaches the signature.
     }
+  }
+
+  /**
+   * Re-checks recently failed draws of `workspace` that had a signature (plus `extra`): one whose
+   * transaction is known on chain without error actually landed — it is restored to `sent` (rows
+   * re-marked) for the indexer to confirm, and nothing is drawn this tick. Returns `true` when the
+   * workspace must not be drawn now (a draw was restored, or the chain could not be asked).
+   */
+  private async restoreLandedDraws(workspace: string, extra?: BudgetDrawRow): Promise<boolean> {
+    const since = this.now() - (this.options.failedRecheckMs ?? FAILED_RECHECK_MS);
+    const rows = this.repos.budgetDraws.listFailedWithSignature(workspace, since);
+    if (extra !== undefined && extra.status === 'failed' && extra.signature !== null && !rows.some((r) => r.id === extra.id)) rows.push(extra);
+    if (rows.length === 0) return false;
+    let statuses: Awaited<ReturnType<ChainReader['getSignatureStatuses']>>;
+    try {
+      statuses = await this.reader.getSignatureStatuses(rows.map((r) => r.signature as string));
+    } catch (e) {
+      this.logger.warn('drawer: status lookup of failed draws failed; not drawing this tick', { workspace, error: e });
+      return true;
+    }
+    let restored = false;
+    const now = this.now();
+    rows.forEach((row, i) => {
+      const status = statuses[i] ?? null;
+      if (status === null || (status.err !== null && status.err !== undefined)) return;
+      this.repos.transaction(() => {
+        const current = this.repos.budgetDraws.get(row.id);
+        if (current === undefined || current.status !== 'failed') return;
+        this.repos.budgetDraws.setStatus(row.id, 'sent', now, { error: null });
+        this.repos.usage.claimDrawId(row.usageIds, row.id);
+      });
+      restored = true;
+      this.logger.warn('drawer: a failed draw actually landed; restored to sent for the indexer to confirm', { workspace, drawId: row.id, signature: row.signature });
+    });
+    return restored;
   }
 
   /** Draws from `budget` for `workspace`'s `deficit`. */
@@ -243,9 +309,11 @@ export class BudgetDrawer {
       this.logger.info('drawer: dry run', { workspace, tokenAccount: budget.tokenAccount, amountMicro: batchRows.amountMicro.toString(), tokens: tokens.toString(), receiptHash: hash });
       return { ...base, status: 'dry_run' };
     }
-    const now = this.now();
     const previous = this.repos.budgetDraws.byReceiptHash(hash);
     if (previous !== undefined && previous.status !== 'failed') return undefined; // same batch already in flight or settled
+    // A draw this process gave up on may have landed anyway: never re-send rows a landed burn already settled.
+    if (await this.restoreLandedDraws(workspace, previous)) return undefined;
+    const now = this.now();
     const drawId = this.repos.transaction(() => {
       if (previous !== undefined) {
         this.repos.budgetDraws.setStatus(previous.id, 'pending', now, { signature: null, lastValidBlockHeight: null, error: null });
@@ -271,8 +339,8 @@ export class BudgetDrawer {
       return id;
     });
     const draw = { id: drawId, tokenAccount: budget.tokenAccount, usageIds: batchRows.usageIds, workspace };
-    const failed = (error: string): DrawAttempt => {
-      this.fail(draw, error);
+    const failed = (error: string, clearSignature = false): DrawAttempt => {
+      this.fail(draw, error.slice(0, 500), clearSignature);
       return { ...base, drawId, status: 'failed', error };
     };
     const instructions = buildDrawInstructions({
@@ -287,19 +355,31 @@ export class BudgetDrawer {
       priorityFeeMicrolamports: this.options.priorityFeeMicrolamports,
     });
     let recent: RecentBlockhash;
-    let signature: string;
+    let signed: SignedTransaction;
     try {
       recent = await this.reader.getLatestBlockhash();
-      signature = await this.writer.signAndSend(instructions, recent);
+      signed = this.writer.sign(instructions, recent);
     } catch (e) {
-      return failed(`send failed: ${e instanceof Error ? e.message : String(e)}`.slice(0, 500));
+      return failed(`signing failed: ${message(e)}`, true); // nothing left this process
     }
+    const signature = signed.signature;
+    // Persist the signature BEFORE sending: whatever happens next, reconcile() can ask the chain about it.
     this.repos.budgetDraws.setStatus(drawId, 'sent', this.now(), { signature, lastValidBlockHeight: recent.lastValidBlockHeight });
+    try {
+      await this.writer.send(signed);
+    } catch (e) {
+      if (e instanceof TransactionRejectedError) return { ...failed(`send rejected: ${message(e)}`, true), signature }; // the node refused it: never forwarded
+      // Network error after the node may have accepted it: ambiguous → stays `sent`, reconcile() decides from the chain.
+      this.logger.warn('drawer: send failed with an ambiguous error; leaving the draw sent for reconciliation', { drawId, signature, error: e });
+      return { ...base, drawId, status: 'sent', signature, error: `send failed: ${message(e)}`.slice(0, 500) };
+    }
     this.logger.info('drawer: draw sent', { workspace, tokenAccount: budget.tokenAccount, drawId, signature, amountMicro: batchRows.amountMicro.toString(), tokens: tokens.toString() });
     try {
       const outcome = await this.writer.confirm(signature, recent, this.options.confirmTimeoutMs);
       if (outcome.status === 'failed') return { ...failed(`transaction failed on chain: ${JSON.stringify(outcome.err)}`), signature };
-      if (outcome.status === 'expired') return { ...failed('blockhash expired before the transaction landed'), signature };
+      // `expired` is web3's local view (block height passed without a notification), not the chain's: a transaction
+      // that landed in its last valid block still shows up at the RPC. reconcile() fails it once the chain agrees.
+      if (outcome.status === 'expired') this.logger.warn('drawer: blockhash expired before a confirmation arrived; leaving the draw sent for reconciliation', { drawId, signature });
       if (outcome.status === 'timeout') this.logger.warn('drawer: confirmation timed out; leaving the draw sent for reconciliation', { drawId, signature });
     } catch (e) {
       // Unknown as far as we know: keep `sent` (rows stay marked); reconcile() decides later from the chain.

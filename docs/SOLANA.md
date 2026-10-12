@@ -57,16 +57,22 @@ curl -sSfL https://github.com/anza-xyz/agave/releases/download/v3.0.9/solana-rel
 # or: sh -c "$(curl -sSfL https://release.anza.xyz/v3.0.9/install)"
 ```
 
-Keys and SOL (every command below also accepts `-u localhost|devnet|mainnet-beta` or `--url <rpc>`):
+Keys and SOL (every command below also accepts `-u localhost|devnet|mainnet-beta` or `--url <rpc>`). Keep keypair
+files **outside the checkout** (`~/.config/solana/…` below): nothing in `.gitignore` covers a `*.json` key dropped
+into the repo, and `git add -A` for the deployment record (docs/DEPLOY.md §1) would commit it — only the committed
+TEST keys live in `solana/keys/`:
 
 ```sh
-solana-keygen new --no-bip39-passphrase -o wallet.json        # bash solana/scripts/keypair.sh new wallet.json
-solana-keygen pubkey wallet.json
-bash solana/scripts/keypair.sh base58 operator.json           # secret key as base58 → OPERATOR_SECRET_KEY
+K=~/.config/solana; mkdir -p "$K"
+solana-keygen new --no-bip39-passphrase -o "$K/wallet.json"    # bash solana/scripts/keypair.sh new "$K/wallet.json"
+solana-keygen pubkey "$K/wallet.json"
+bash solana/scripts/keypair.sh base58 "$K/operator.json"      # secret key as base58 → OPERATOR_SECRET_KEY
 solana balance <pubkey> -u devnet
 solana airdrop 1 <pubkey> -u devnet
-solana config set -u devnet -k wallet.json                    # optional: default signer / cluster for the CLIs
+solana config set -u devnet -k "$K/wallet.json"               # optional: default signer / cluster for the CLIs
 ```
+
+Below, `wallet.json`, `deployer.json`, `sender.json` stand for such files.
 
 Mint (what `solana/scripts/setup-cluster.sh` does, with `--fee-payer` / `--mint-authority` so no default signer is needed):
 
@@ -94,7 +100,7 @@ Budgets (= SPL delegation to the operator; a new approve replaces the cap, revok
 ```sh
 spl-token approve <token-account> 500 <operator-pubkey> --owner wallet.json --fee-payer wallet.json
 spl-token revoke <token-account> --owner wallet.json --fee-payer wallet.json
-spl-token account-info <mint> --owner <pubkey>                # delegate, delegated amount, balance
+spl-token display <token-account>                             # delegate, delegated amount, balance (also: spl-token account-info <mint> <owner-pubkey>)
 node scripts/e2e/approve.mjs --keypair wallet.json --mint <mint> --amount 500 --delegate <operator> --rpc <url>
 node scripts/e2e/revoke.mjs  --keypair wallet.json --mint <mint> --rpc <url>
 ```

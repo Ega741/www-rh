@@ -51,7 +51,13 @@ export function WalletButton() {
   if (!connected || address === undefined) {
     return (
       <Button variant="primary" busy={connecting} onClick={() => setVisible(true)} className="font-mono">
-        {connecting ? 'Connecting…' : 'Connect wallet'}
+        {connecting ? (
+          'Connecting…'
+        ) : (
+          <>
+            Connect<span className="hidden sm:inline"> wallet</span>
+          </>
+        )}
       </Button>
     );
   }

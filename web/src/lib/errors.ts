@@ -5,7 +5,7 @@
  * across the adapters' varied messages.
  */
 import { SendTransactionError, TransactionExpiredBlockheightExceededError, TransactionExpiredTimeoutError, type TransactionError } from '@solana/web3.js';
-import { WalletError, WalletNotConnectedError, WalletSendTransactionError, WalletSignMessageError, WalletSignTransactionError } from '@solana/wallet-adapter-base';
+import { WalletError, WalletNotConnectedError, WalletSendTransactionError, WalletSignInError, WalletSignMessageError, WalletSignTransactionError } from '@solana/wallet-adapter-base';
 import { ApiError } from './apiError.js';
 
 /** SPL Token program error codes (`TokenError` in the program) worth a sentence. */
@@ -54,6 +54,15 @@ export function isUserRejection(err: unknown): boolean {
     return REJECT_RE.test(message) || (e.error instanceof Error && REJECT_RE.test(e.error.message));
   }
   return REJECT_RE.test(message) && (e.name === 'WalletError' || /wallet/i.test(message) || /user/i.test(message));
+}
+
+/**
+ * `true` for adapter errors that a page flow already reports inline (`useTxFlow` shows the failed
+ * step, `useSession.signIn` its own toast): the adapter also emits them as `error` events, and the
+ * global handler must not toast them a second time. Connection / readiness errors stay global.
+ */
+export function isFlowHandledWalletError(err: unknown): boolean {
+  return err instanceof WalletSendTransactionError || err instanceof WalletSignTransactionError || err instanceof WalletSignMessageError || err instanceof WalletSignInError;
 }
 
 /** The SPL Token custom error code of `err` (`{ InstructionError: [i, { Custom: n }] }`), if any. */

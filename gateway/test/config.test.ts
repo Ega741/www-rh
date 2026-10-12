@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { encodeBase58 } from '@beagle/shared/solana';
 import { describe, expect, it } from 'vitest';
+import { ChainConfigError, publicRpcUrlOf, resolveChainInfo } from '../src/chain/rpc.js';
 import { ConfigError, DEV_SESSION_SECRET, loadConfig, parsePriceUsdE18, parseSecretKey, testConfig } from '../src/config.js';
 import { MINT, OPERATOR } from './helpers.js';
 
@@ -21,7 +22,7 @@ describe('config', () => {
       pollIntervalMs: 2000,
       txFetchConcurrency: 4,
     });
-    expect(c.operator).toEqual({ secretKey: undefined, dryRun: true, priorityFeeMicrolamports: 0 });
+    expect(c.operator).toEqual({ secretKey: undefined, secretKeyIsSeed: false, dryRun: true, priorityFeeMicrolamports: 0 });
     expect(c.price).toEqual({
       source: 'manual',
       initialPriceE18: undefined,
@@ -106,6 +107,24 @@ describe('config', () => {
     expect(() => parseSecretKey('[1,2')).toThrow(/JSON/);
     expect(() => parseSecretKey('0OIl')).toThrow(/base58/);
     expect(() => loadConfig({ OPERATOR_SECRET_KEY: '[1,2,3]' })).toThrow(ConfigError);
+    // A 32-byte value is flagged as a seed; the operator's *public* key pasted by mistake derives another key → refused at chain resolution.
+    expect(loadConfig({ OPERATOR_SECRET_KEY: encodeBase58(bytes.subarray(0, 32)) }).operator.secretKeyIsSeed).toBe(true);
+    expect(loadConfig({ OPERATOR_SECRET_KEY: encodeBase58(bytes) }).operator.secretKeyIsSeed).toBe(false);
+    expect(resolveChainInfo(testConfig({ OPERATOR_SECRET_KEY: encodeBase58(bytes.subarray(0, 32)) })).operator).toBe(OPERATOR);
+    expect(() => resolveChainInfo(testConfig({ OPERATOR_SECRET_KEY: OPERATOR }))).toThrow(ChainConfigError);
+  });
+
+  it('keeps RPC_URL private and publishes PUBLIC_RPC_URL or the cluster endpoint', () => {
+    const c = testConfig({ CLUSTER: 'mainnet-beta', RPC_URL: 'https://mainnet.helius-rpc.com/?api-key=SECRET' });
+    expect(c.cluster.publicRpcUrl).toBeUndefined();
+    expect(publicRpcUrlOf(c, c.cluster.rpcUrl!)).toBe('https://api.mainnet-beta.solana.com');
+    const explicit = testConfig({ CLUSTER: 'mainnet-beta', RPC_URL: 'https://mainnet.helius-rpc.com/?api-key=SECRET', PUBLIC_RPC_URL: 'https://rpc.public.example/' });
+    expect(publicRpcUrlOf(explicit, explicit.cluster.rpcUrl!)).toBe('https://rpc.public.example');
+    const local = testConfig({ RPC_URL: 'http://127.0.0.1:18899' });
+    expect(publicRpcUrlOf(local, local.cluster.rpcUrl!)).toBe('http://127.0.0.1:18899');
+    expect(resolveChainInfo(local)).toMatchObject({ rpcUrl: 'http://127.0.0.1:18899', publicRpcUrl: 'http://127.0.0.1:18899' });
+    expect(() => testConfig({ PUBLIC_RPC_URL: 'ftp://x' })).toThrow(ConfigError);
+    expect(testConfig({ AUTH_RATE_LIMIT_RPM: '7' }).economics.authRateLimitRpm).toBe(7);
   });
 
   it('parses USD prices into priceE18', () => {

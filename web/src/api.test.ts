@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { BudgetDtoWire, ConfigDtoWire, CreditEventDtoWire, PriceDtoWire, StatusDtoWire, UsageReceiptWire } from '@beagle/shared/api';
 import { receiptHash } from '@beagle/shared/canonical';
-import { ApiError, api, queryString } from './api.js';
+import { ApiError, api, queryString, sessionToken } from './api.js';
 
 type FetchCall = { url: string; init: RequestInit };
 
@@ -240,5 +240,35 @@ describe('api client', () => {
     await expect(api.price()).rejects.toMatchObject({ code: 'bad_response' });
     stubFetch(200, { token: 'abc', workspace: '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266' }, []);
     await expect(api.verify('m', SIG, WS)).rejects.toMatchObject({ code: 'bad_response' });
+  });
+});
+
+describe('sessionToken', () => {
+  it('keeps the bearer token in localStorage (shared by every tab) and sends it as a header', async () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal('window', {
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => void store.set(k, v),
+        removeItem: (k: string) => void store.delete(k),
+      },
+    });
+    expect(sessionToken.get()).toBeUndefined();
+    sessionToken.set('tok_1');
+    expect(store.get('beagle.session.token')).toBe('tok_1');
+    expect(sessionToken.get()).toBe('tok_1');
+    const calls: FetchCall[] = [];
+    stubFetch(200, PRICE, calls);
+    await api.price();
+    expect(new Headers(calls[0]?.init.headers).get('authorization')).toBe('Bearer tok_1');
+    sessionToken.clear();
+    expect(sessionToken.get()).toBeUndefined();
+    expect(store.size).toBe(0);
+  });
+  it('is a no-op without storage (cookie-only session)', () => {
+    vi.stubGlobal('window', {});
+    expect(sessionToken.get()).toBeUndefined();
+    expect(() => sessionToken.set('x')).not.toThrow();
+    expect(() => sessionToken.clear()).not.toThrow();
   });
 });

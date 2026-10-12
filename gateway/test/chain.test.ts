@@ -1,18 +1,21 @@
 import { DrawBatchSchema } from '@beagle/shared/api';
-import { COMPUTE_BUDGET_PROGRAM_ID, MEMO_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@beagle/shared/addresses';
+import { COMPUTE_BUDGET_PROGRAM_ID, MEMO_PROGRAM_ID, resolveDeployment, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@beagle/shared/addresses';
 import { receiptHash } from '@beagle/shared/canonical';
 import { tokensForUsdMicro } from '@beagle/shared/credit';
 import { encodeDrawMemo } from '@beagle/shared/memo';
 import { describe, expect, it } from 'vitest';
+import { configDto } from '../src/api/dto.js';
 import { BudgetRegisterError, BudgetScanner, budgetScanFilters, computeHeadroom } from '../src/chain/budgets.js';
 import { BudgetDrawer, buildDrawInstructions, selectBatch } from '../src/chain/drawer.js';
 import { extractBurns, extractMemo, flattenInstructions, Indexer, resolveOwner, type IndexerOptions } from '../src/chain/indexer.js';
 import { PriceService, usdToPriceE18, type PriceServiceOptions } from '../src/chain/price.js';
-import { parseMintAccount, parseTokenAccount, type RpcParsedAccount, type RpcParsedTransaction, type RpcSignatureInfo } from '../src/chain/rpc.js';
+import { ChainConfigError, parseMintAccount, parseTokenAccount, TransactionRejectedError, verifyMint, type RpcParsedAccount, type RpcParsedTransaction, type RpcSignatureInfo } from '../src/chain/rpc.js';
+import { testConfig } from '../src/config.js';
 import { Repos, type UsageRow } from '../src/db/repos.js';
 import { migrate } from '../src/db/schema.js';
 import { Db } from '../src/db/sqlite.js';
 import { createLogger, silentLogger } from '../src/log.js';
+import { createServices } from '../src/services.js';
 import { ATA1, ATA2, FakeRpc, fixture, makeBurnTx, makeTokenAccount, META, MINT, OPERATOR, testPubkey, testSignature, WS1, WS2 } from './helpers.js';
 
 const T0 = 1_791_808_200_000; // ms, just after the fixtures' block times
@@ -381,7 +384,7 @@ describe('indexer', () => {
     expect(r.ledger.balance(WS2)).toBe(20_000n);
   });
 
-  it('finality sweep reverts events whose signature is gone or failed at finalized, after the grace period', async () => {
+  it('finality sweep: a finalized signature leaves the sweep set; a missing one is corroborated and reverted only after consecutive misses', async () => {
     const r = repos();
     const rpc = new FakeRpc();
     let nowMs = T0;
@@ -403,12 +406,25 @@ describe('indexer', () => {
     expect(r.ledger.balance(WS2)).toBe(0n);
     expect(r.budgetDraws.get(drawId)?.status).toBe('confirmed');
     // Young events are not checked yet.
-    expect(await ix.sweepFinality()).toEqual({ checked: 0, reverted: [] });
+    expect(await ix.sweepFinality()).toEqual({ checked: 0, reverted: [], finalized: 0 });
     nowMs += 3 * 60_000;
-    rpc.statuses.set(s1, null);
-    rpc.statuses.set(s3, null);
+    // s1 and s3 vanish from the RPC entirely (status null, getTransaction null); s2 is healthy.
+    rpc.transactions.delete(s1);
+    rpc.transactions.delete(s3);
+    expect(await ix.sweepFinality()).toEqual({ checked: 3, reverted: [], finalized: 1 });
+    // One answer never reverts a credit: balances intact, misses counted, s2 marked finalized and out of the set.
+    expect(r.ledger.balance(WS1)).toBe(30_000n);
+    expect(r.ledger.balance(WS2)).toBe(0n);
+    expect(r.budgetDraws.get(drawId)?.status).toBe('confirmed');
+    expect(r.creditEvents.get(s1, 0)).toMatchObject({ finalityMisses: 1, finalizedAt: null });
+    expect(r.creditEvents.get(s2, 0)).toMatchObject({ finalityMisses: 0, finalizedAt: nowMs });
+    expect(r.creditEvents.signaturesForSweep(0, nowMs, 10).map((c) => c.signature)).toEqual([s1, s3]);
+    expect(await ix.sweepFinality()).toEqual({ checked: 2, reverted: [], finalized: 0 });
+    expect(r.creditEvents.get(s1, 0)?.finalityMisses).toBe(2);
+    expect(r.ledger.balance(WS1)).toBe(30_000n);
+    // Third consecutive miss: reverted (credit events + ledger rows gone; the draw back to failed, its rows released).
     const swept = await ix.sweepFinality();
-    expect(swept.checked).toBe(3);
+    expect(swept.checked).toBe(2);
     expect(swept.reverted.sort()).toEqual([s1, s3].sort());
     expect(r.creditEvents.get(s1, 0)).toBeUndefined();
     expect(r.ledger.hasRef('credit_event', `${s1}:0`)).toBe(false);
@@ -417,20 +433,205 @@ describe('indexer', () => {
     expect(r.budgetDraws.get(drawId)).toMatchObject({ status: 'failed' });
     expect(r.usage.get('u1')?.drawId).toBeNull();
     expect(r.budgets.get(ATA2)?.stalledReason).toBe('draw_failed');
-    // A transaction that failed at finalized is reverted too; a healthy one survives repeated sweeps.
-    rpc.statuses.set(s2, { slot: 151, confirmations: null, err: { InstructionError: [0, 'Custom'] }, confirmationStatus: 'finalized' });
-    expect((await ix.sweepFinality()).reverted).toEqual([s2]);
-    expect(r.ledger.balance(WS1)).toBe(0n);
-    expect(await ix.sweepFinality()).toEqual({ checked: 0, reverted: [] });
-    // Events outside the slot window are not re-checked.
-    rpc.statuses.clear();
-    rpc.addTransaction(makeBurnTx({ signature: testSignature(44), slot: 160, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
+    expect(await ix.sweepFinality()).toEqual({ checked: 0, reverted: [], finalized: 0 });
+
+    // A single null from getSignatureStatuses (lagging / snapshot-restarted node) is corroborated by getTransaction: not even a miss.
+    const s4 = rpc.addTransaction(makeBurnTx({ signature: testSignature(44), slot: 160, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
     await ix.step();
+    expect(r.ledger.balance(WS1)).toBe(30_000n);
     nowMs += 3 * 60_000;
-    rpc.slot = 160 + 5000;
+    rpc.statuses.set(s4, null);
+    expect(await ix.sweepFinality()).toEqual({ checked: 1, reverted: [], finalized: 0 });
+    expect(r.creditEvents.get(s4, 0)?.finalityMisses).toBe(0);
+    // Both routes fail once, then the node catches up: the counter resets, the event is finalized, the credit stays.
+    const tx4 = rpc.transactions.get(s4)!;
+    rpc.transactions.delete(s4);
+    expect(await ix.sweepFinality()).toEqual({ checked: 1, reverted: [], finalized: 0 });
+    expect(r.creditEvents.get(s4, 0)?.finalityMisses).toBe(1);
+    rpc.transactions.set(s4, tx4);
+    rpc.statuses.delete(s4);
+    expect(await ix.sweepFinality()).toEqual({ checked: 1, reverted: [], finalized: 1 });
+    expect(r.creditEvents.get(s4, 0)).toMatchObject({ finalityMisses: 0, finalizedAt: nowMs });
+    expect(r.ledger.balance(WS1)).toBe(30_000n);
+    expect(await ix.sweepFinality()).toEqual({ checked: 0, reverted: [], finalized: 0 });
+
+    // A transaction reported failed at finalized is reverted the same way (after the misses); a `confirmed` one keeps being checked.
+    const s5 = rpc.addTransaction(makeBurnTx({ signature: testSignature(45), slot: 161, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
+    const s6 = rpc.addTransaction(makeBurnTx({ signature: testSignature(46), slot: 162, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
     await ix.step();
-    expect(await ix.sweepFinality()).toEqual({ checked: 0, reverted: [] });
-    expect(r.ledger.balance(WS1)).toBe(10_000n);
+    expect(r.ledger.balance(WS1)).toBe(50_000n);
+    nowMs += 3 * 60_000;
+    rpc.statuses.set(s5, { slot: 161, confirmations: null, err: { InstructionError: [0, 'Custom'] }, confirmationStatus: 'finalized' });
+    rpc.transactions.get(s5)!.meta!.err = { InstructionError: [0, 'Custom'] };
+    rpc.statuses.set(s6, { slot: 162, confirmations: 5, err: null, confirmationStatus: 'confirmed' });
+    expect(await ix.sweepFinality()).toEqual({ checked: 2, reverted: [], finalized: 0 });
+    expect(await ix.sweepFinality()).toEqual({ checked: 2, reverted: [], finalized: 0 });
+    expect((await ix.sweepFinality()).reverted).toEqual([s5]);
+    expect(r.ledger.balance(WS1)).toBe(40_000n);
+    expect(r.creditEvents.signaturesForSweep(0, nowMs, 10).map((c) => c.signature)).toEqual([s6]);
+    // Events outside the slot window are not re-checked.
+    rpc.slot = 162 + 5000;
+    await ix.step();
+    expect(await ix.sweepFinality()).toEqual({ checked: 0, reverted: [], finalized: 0 });
+    expect(r.ledger.balance(WS1)).toBe(40_000n);
+  });
+
+  it('a walk that hits the page cap queues the unfetched range as a backfill gap and drains it on later polls (no burn is skipped)', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    const price = priceService(r, () => T0);
+    const lines: string[] = [];
+    const ix = new Indexer(
+      r,
+      rpc,
+      price,
+      { mint: MINT, operator: OPERATOR, decimals: 6, pageLimit: 1, fetchConcurrency: 2, indexFromSignature: undefined, creditWhenStale: true, minCreditMicro: 1000n, maxPages: 2, now: () => T0 },
+      createLogger({ level: 'info', write: (l) => lines.push(l) }),
+    );
+    const sigs: string[] = [];
+    sigs.push(rpc.addTransaction(makeBurnTx({ signature: testSignature(61), slot: 201, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n })));
+    expect(await ix.step()).toEqual({ processed: 1, events: 1 });
+    expect(ix.lastSignature()).toBe(sigs[0]);
+    for (let i = 2; i <= 6; i++) sigs.push(rpc.addTransaction(makeBurnTx({ signature: testSignature(60 + i), slot: 200 + i, tokenAccount: ATA1, owner: WS1, amount: BigInt(i) * 1_000_000n })));
+    // Poll 1: the two newest pages (#6, #5) are applied and the cursor moves to #6; the rest (#2..#4) is queued, not skipped.
+    expect(await ix.step()).toEqual({ processed: 2, events: 2 });
+    expect(ix.lastSignature()).toBe(sigs[5]);
+    expect(r.ledger.balance(WS1)).toBe(10_000n + 50_000n + 60_000n);
+    expect(ix.backfillGaps()).toEqual([{ before: sigs[4], until: sigs[0], untilSlot: 201 }]);
+    expect(lines.some((l) => l.includes('page cap reached'))).toBe(true);
+    // Poll 2: nothing new at the head; two more pages of the gap (#4, #3), cursor untouched.
+    expect(await ix.step()).toEqual({ processed: 2, events: 2 });
+    expect(r.ledger.balance(WS1)).toBe(10_000n + 30_000n + 40_000n + 50_000n + 60_000n);
+    expect(ix.backfillGaps()).toEqual([{ before: sigs[2], until: sigs[0], untilSlot: 201 }]);
+    expect(ix.lastSignature()).toBe(sigs[5]);
+    // Poll 3: #2, then `until` is reached: the gap is drained.
+    expect(await ix.step()).toEqual({ processed: 1, events: 1 });
+    expect(r.ledger.balance(WS1)).toBe(210_000n);
+    expect(ix.backfillGaps()).toEqual([]);
+    expect(await ix.step()).toBeUndefined();
+    expect(r.creditEvents.list(WS1, 10)).toHaveLength(6);
+  });
+
+  it('a cursor signature the RPC no longer knows is resumed from its slot (not the whole history); an unknown INDEX_FROM_SIGNATURE is refused', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    const price = priceService(r, () => T0);
+    const ix = indexer(r, rpc, price);
+    rpc.addTransaction(makeBurnTx({ signature: testSignature(71), slot: 90, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
+    const s1 = rpc.addTransaction(makeBurnTx({ signature: testSignature(72), slot: 101, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
+    await ix.step();
+    expect(ix.lastSignature()).toBe(s1);
+    expect(r.ledger.balance(WS1)).toBe(20_000n);
+    // s1 is dropped at finality: the RPC forgets it and would hand back the whole history.
+    rpc.signatures = rpc.signatures.filter((s) => s.signature !== s1);
+    rpc.transactions.delete(s1);
+    const s2 = rpc.addTransaction(makeBurnTx({ signature: testSignature(73), slot: 102, tokenAccount: ATA1, owner: WS1, amount: 2_000_000n }));
+    rpc.calls.length = 0;
+    expect(await ix.step()).toEqual({ processed: 1, events: 1 });
+    expect(ix.lastSignature()).toBe(s2);
+    expect(rpc.calls.filter((c) => c.method === 'getParsedTransaction').map((c) => c.args[0])).toEqual([s2]); // nothing older than the cursor's slot is re-fetched
+    expect(r.ledger.balance(WS1)).toBe(40_000n);
+    expect(ix.backfillGaps()).toEqual([]);
+
+    // Fresh database with an INDEX_FROM_SIGNATURE the RPC does not know: refuse rather than index everything.
+    const r2 = repos();
+    const lines: string[] = [];
+    const strict = new Indexer(
+      r2,
+      rpc,
+      priceService(r2, () => T0),
+      { mint: MINT, operator: OPERATOR, decimals: 6, pageLimit: 1000, fetchConcurrency: 2, indexFromSignature: testSignature(99), creditWhenStale: true, minCreditMicro: 1000n, now: () => T0 },
+      createLogger({ level: 'error', write: (l) => lines.push(l) }),
+    );
+    rpc.calls.length = 0;
+    expect(await strict.step()).toBeUndefined();
+    expect(rpc.calls.some((c) => c.method === 'getSignaturesForAddress')).toBe(false);
+    expect(lines.some((l) => l.includes('INDEX_FROM_SIGNATURE is unknown'))).toBe(true);
+    expect(r2.ledger.balance(WS1)).toBe(0n);
+  });
+
+  it('defers the poll when the owner lookup fails at the RPC; a burn with neither owner nor authority is recorded without credit', async () => {
+    const r = repos();
+    class FlakyRpc extends FakeRpc {
+      failAccounts: Error | undefined;
+      override async getMultipleParsedAccounts(addresses: readonly string[]): Promise<(RpcParsedAccount | null)[]> {
+        if (this.failAccounts) throw this.failAccounts;
+        return super.getMultipleParsedAccounts(addresses);
+      }
+    }
+    const rpc = new FlakyRpc();
+    const price = priceService(r, () => T0);
+    const ix = indexer(r, rpc, price);
+    const tx = makeBurnTx({ signature: testSignature(81), slot: 181, tokenAccount: ATA2, owner: WS2, amount: 3_000_000n });
+    tx.meta!.preTokenBalances = [];
+    tx.meta!.postTokenBalances = [];
+    rpc.addTransaction(tx);
+    rpc.failAccounts = new Error('429 Too Many Requests');
+    expect(await ix.step()).toEqual({ processed: 0, events: 0 });
+    expect(ix.lastSignature()).toBeUndefined();
+    expect(r.creditEvents.get(testSignature(81), 0)).toBeUndefined();
+    rpc.failAccounts = undefined;
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 1n }));
+    expect(await ix.step()).toEqual({ processed: 1, events: 1 });
+    expect(r.creditEvents.get(testSignature(81), 0)).toMatchObject({ workspace: WS2, payer: WS2, usdMicro: 30_000n });
+    // Account gone and no authority in the instruction: recorded, nobody credited (no workspace invented from the address).
+    const orphan = makeBurnTx({ signature: testSignature(82), slot: 182, tokenAccount: ATA1, owner: WS1, amount: 3_000_000n });
+    orphan.meta!.preTokenBalances = [];
+    orphan.meta!.postTokenBalances = [];
+    delete (orphan.transaction.message.instructions[0]!.parsed as { info: Record<string, unknown> }).info['authority'];
+    rpc.addTransaction(orphan);
+    expect(await ix.step()).toEqual({ processed: 1, events: 1 });
+    expect(r.creditEvents.get(testSignature(82), 0)).toMatchObject({ workspace: ATA1, payer: null, authority: null, usdMicro: 0n });
+    expect(r.ledger.balance(ATA1)).toBe(0n);
+  });
+});
+
+describe('mint verification (boot)', () => {
+  const mintAccount = (decimals: number, programId: string = TOKEN_PROGRAM_ID): RpcParsedAccount => {
+    const m = fixture<{ value: RpcParsedAccount }>('mint-account').value;
+    const info = (m.data!.parsed as { info: Record<string, unknown> }).info;
+    return { ...m, owner: programId, data: { ...m.data!, parsed: { type: 'mint', info: { ...info, decimals } } } };
+  };
+
+  it('adopts the chain decimals for an overridden mint before the workers exist, so every quote uses them', async () => {
+    const rpc = new FakeRpc();
+    rpc.accounts.set(MINT, mintAccount(9));
+    const chain = rpc.context();
+    chain.deployment = resolveDeployment('localnet', { mint: MINT }); // MINT_ADDRESS given: the record's decimals do not describe this mint
+    expect(await verifyMint(chain, silentLogger)).toEqual({ status: 'verified', decimals: 9, tokenProgram: TOKEN_PROGRAM_ID });
+    expect(chain.decimals).toBe(9);
+    const services = createServices(testConfig({ INITIAL_PRICE_USD: '0.01' }), { logger: silentLogger, chain });
+    try {
+      expect(configDto(services).decimals).toBe(9);
+      rpc.addTransaction(makeBurnTx({ signature: testSignature(91), slot: 191, tokenAccount: ATA1, owner: WS1, amount: 1_000_000_000n }));
+      await services.indexer!.step();
+      expect(services.repos.creditEvents.get(testSignature(91), 0)?.usdMicro).toBe(10_000n); // one whole 9-decimal token at $0.01 — not $10
+      expect(services.ledger.balance(WS1)).toBe(10_000n);
+      expect(services.price.quote({ tokens: 1_000_000_000n }).usdMicro).toBe('10000');
+      rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 10n ** 12n, delegate: OPERATOR, delegatedAmount: 10n ** 12n }));
+      expect((await services.budgets!.register(ATA2)).headroomMicro).toBe(10_000_000n); // 1000 whole tokens = $10
+    } finally {
+      services.close();
+    }
+  });
+
+  it('refuses to boot when the committed record or TOKEN_PROGRAM contradicts the mint account; keeps the config when the mint is unreadable', async () => {
+    const rpc = new FakeRpc();
+    rpc.accounts.set(MINT, mintAccount(9));
+    await expect(verifyMint(rpc.context(), silentLogger)).rejects.toBeInstanceOf(ChainConfigError);
+    rpc.accounts.set(MINT, mintAccount(6, TOKEN_2022_PROGRAM_ID));
+    await expect(verifyMint(rpc.context(), silentLogger)).rejects.toThrow(/owned by/);
+    const overridden = rpc.context();
+    overridden.deployment = resolveDeployment('localnet', { mint: MINT, tokenProgram: TOKEN_PROGRAM_ID });
+    await expect(verifyMint(overridden, silentLogger)).rejects.toThrow(/TOKEN_PROGRAM/);
+    const adopt = rpc.context();
+    adopt.deployment = resolveDeployment('localnet', { mint: MINT });
+    expect(await verifyMint(adopt, silentLogger)).toEqual({ status: 'verified', decimals: 6, tokenProgram: TOKEN_2022_PROGRAM_ID });
+    expect(adopt.tokenProgram).toBe(TOKEN_2022_PROGRAM_ID);
+    rpc.accounts.delete(MINT);
+    const untouched = rpc.context();
+    expect(await verifyMint(untouched, silentLogger)).toEqual({ status: 'not_found' });
+    expect(untouched.decimals).toBe(6);
   });
 });
 
@@ -498,6 +699,14 @@ describe('budget scanner', () => {
     rpc.accounts.set(ATA2, null);
     await s.refresh();
     expect(r.budgets.get(ATA2)).toMatchObject({ closed: true, stalledReason: 'revoked' });
+    // Drawn to the end: the Token program clears the delegate itself and the balance drops by exactly the cap → `exhausted`, not `revoked`.
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 100_000_000_000n, delegate: OPERATOR, delegatedAmount: 200_000_000n }));
+    await s.scan();
+    expect(r.budgets.get(ATA2)).toMatchObject({ closed: false, cap: 200_000_000n, balance: 100_000_000_000n });
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 100_000_000_000n - 200_000_000n }));
+    await s.refresh();
+    expect(r.budgets.get(ATA2)).toMatchObject({ closed: true, stalledReason: 'exhausted', delegate: null, headroomMicro: 0n });
+    expect(r.ledger.budgetHeadroom(WS2)).toBe(0n);
     // pure rule
     expect(computeHeadroom({ delegate: OPERATOR, delegatedAmount: 10n, amount: 4n }, OPERATOR, { id: 1, priceE18: PRICE, source: 'manual', observedAt: 0, stale: false }, 6)).toEqual({ closed: false, headroomTokens: 4n, headroomMicro: 0n, stalledReason: null });
     expect(computeHeadroom({ delegate: OPERATOR, delegatedAmount: 10n ** 9n, amount: 10n ** 12n }, OPERATOR, { id: 1, priceE18: PRICE, source: 'manual', observedAt: 0, stale: false }, 6)).toEqual({ closed: false, headroomTokens: 10n ** 9n, headroomMicro: 10_000_000n, stalledReason: null });
@@ -629,33 +838,62 @@ describe('budget drawer', () => {
     expect((await drawer(r, rpc, price, () => nowMs).tick())[0]?.status).toBe('sent');
   });
 
-  it('a failed send, an on-chain error or an expired blockhash fail the draw, release the rows and stall the budget', async () => {
+  it('a rejected send or an on-chain error fail the draw and release the rows; an ambiguous send error, web3 `expired` or a timeout keep it sent for reconcile', async () => {
     const r = repos();
     const rpc = new FakeRpc();
     const price = priceService(r, () => T0);
     openBudget(r, ATA2, WS2, 500_000_000n, 100_000_000_000n, 5_000_000n);
     debt(r, WS2, [{ id: 'u1', charged: 5n }]);
-    rpc.failSend = new Error('Transaction simulation failed: insufficient funds for fee');
+    // The node rejected the transaction (preflight): never forwarded → failed, signature dropped.
+    rpc.failSend = new TransactionRejectedError('Transaction simulation failed: insufficient funds for fee', undefined);
     const d = drawer(r, rpc, price);
     const [a] = await d.tick();
     expect(a?.status).toBe('failed');
     expect(a?.error).toContain('insufficient funds');
-    expect(r.budgetDraws.get(a!.drawId!)?.status).toBe('failed');
+    expect(r.budgetDraws.get(a!.drawId!)).toMatchObject({ status: 'failed', signature: null, lastValidBlockHeight: null });
     expect(r.usage.get('u1')?.drawId).toBeNull();
     expect(r.budgets.get(ATA2)?.stalledReason).toBe('draw_failed');
+    expect(rpc.sent).toEqual([]);
     expect(await d.tick()).toEqual([]); // stalled budgets are skipped
+    // A network error after signing is ambiguous (the node may have forwarded it): the signature was persisted before
+    // the send, so the row stays `sent` with its rows marked until reconcile() can ask the chain.
+    rpc.failSend = new Error('fetch failed');
+    r.budgets.setStalled(ATA2, null, T0);
+    const [n] = await d.tick();
+    expect(n?.status).toBe('sent');
+    expect(n?.error).toContain('fetch failed');
+    expect(r.budgetDraws.get(n!.drawId!)).toMatchObject({ status: 'sent', signature: n!.signature, lastValidBlockHeight: 400 });
+    expect(r.usage.get('u1')?.drawId).toBe(n!.drawId);
+    expect(await d.tick()).toEqual([]); // in flight: neither re-sent nor failed while the blockhash is alive
+    expect(r.budgetDraws.get(n!.drawId!)?.status).toBe('sent');
+    rpc.blockHeight = 401; // expired and unknown by every route → reconcile fails it
+    expect(await d.tick()).toEqual([]);
+    expect(r.budgetDraws.get(n!.drawId!)?.status).toBe('failed');
+    expect(r.budgetDraws.get(n!.drawId!)?.error).toContain('never landed');
+    expect(r.usage.get('u1')?.drawId).toBeNull();
+    expect(r.budgets.get(ATA2)?.stalledReason).toBe('draw_failed');
+    rpc.blockHeight = 200;
     rpc.failSend = undefined;
+    // Landed with an error: failed (signature kept for the record).
     rpc.confirmOutcome = { status: 'failed', err: { InstructionError: [0, { Custom: 1 }] } };
     r.budgets.setStalled(ATA2, null, T0);
     const [b] = await d.tick();
     expect(b?.status).toBe('failed');
     expect(b?.error).toContain('failed on chain');
     expect(b?.signature).toBe(rpc.sent[0]!.signature);
+    expect(r.budgetDraws.get(b!.drawId!)?.signature).toBe(b!.signature);
+    // web3's `expired` is not the chain's verdict: the draw stays sent (rows marked) until reconcile sees the blockhash expired.
     rpc.confirmOutcome = { status: 'expired' };
     r.budgets.setStalled(ATA2, null, T0);
     const [c] = await d.tick();
-    expect(c?.status).toBe('failed');
-    expect(c?.error).toContain('blockhash expired');
+    expect(c?.status).toBe('sent');
+    expect(r.budgetDraws.get(c!.drawId!)?.status).toBe('sent');
+    expect(r.usage.get('u1')?.drawId).toBe(c!.drawId);
+    expect(await d.tick()).toEqual([]);
+    rpc.blockHeight = 401;
+    await d.tick();
+    expect(r.budgetDraws.get(c!.drawId!)?.status).toBe('failed');
+    rpc.blockHeight = 200;
     // A confirmation timeout keeps the draw sent (the chain decides later).
     rpc.confirmOutcome = { status: 'timeout' };
     r.budgets.setStalled(ATA2, null, T0);
@@ -663,6 +901,7 @@ describe('budget drawer', () => {
     expect(t?.status).toBe('sent');
     expect(r.budgetDraws.get(t!.drawId!)?.status).toBe('sent');
     expect(r.usage.get('u1')?.drawId).toBe(t!.drawId);
+    expect(rpc.sent).toHaveLength(3);
     // The same batch (same hash) is re-used after a failure instead of inserting a duplicate.
     expect(r.budgetDraws.listByTokenAccount(ATA2)).toHaveLength(1);
   });
@@ -691,6 +930,49 @@ describe('budget drawer', () => {
     expect(r.budgets.get(ATA2)?.stalledReason).toBeNull();
   });
 
+  it('never burns a batch twice: an expired-then-landed draw is confirmed by the indexer; a failed draw whose signature landed is restored, not re-sent', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    const price = priceService(r, () => T0);
+    openBudget(r, ATA2, WS2, 500_000_000n, 100_000_000_000n, 5_000_000n);
+    debt(r, WS2, [{ id: 'u1', charged: 5_000n }]);
+    rpc.confirmOutcome = { status: 'expired' };
+    const d = drawer(r, rpc, price);
+    const [a] = await d.tick();
+    expect(a?.status).toBe('sent');
+    const hashA = r.budgetDraws.get(a!.drawId!)!.receiptHash;
+    // The transaction lands after all (web3 missed the notification) while the indexer is still behind; the blockhash expires.
+    rpc.addTransaction(makeBurnTx({ signature: a!.signature!, slot: 300, tokenAccount: ATA2, owner: WS2, authority: OPERATOR, amount: a!.tokens, memo: encodeDrawMemo({ workspace: WS2, receiptHash: hashA }) }));
+    rpc.blockHeight = 401;
+    expect(await d.tick()).toEqual([]); // reconcile sees it on chain: nothing is re-sent
+    expect(rpc.sent).toHaveLength(1);
+    expect(r.budgetDraws.get(a!.drawId!)?.status).toBe('sent');
+    expect(r.budgets.get(ATA2)?.stalledReason).toBeNull();
+    const ix = indexer(r, rpc, price);
+    await ix.step();
+    expect(r.budgetDraws.get(a!.drawId!)).toMatchObject({ status: 'confirmed', signature: a!.signature });
+    expect(r.ledger.balance(WS2)).toBe(0n);
+    expect(r.creditEvents.list(WS2, 10)).toHaveLength(1);
+    expect(await d.tick()).toEqual([]);
+
+    // A draw this process had given up on (failed, signature kept, rows released) whose transaction is on chain:
+    // restored to `sent` with its rows re-marked; nothing is sent again, the indexer confirms it.
+    debt(r, WS2, [{ id: 'u2', charged: 7_000n }]);
+    const landedSig = testSignature(77);
+    const batch = { v: 1, cluster: 'localnet', mint: MINT, tokenAccount: ATA2, workspace: WS2, usageIds: ['u2'], amountMicro: '7000', priceE18: PRICE.toString(), pricePointId: 1 };
+    const hash = receiptHash(batch);
+    const ghost = r.budgetDraws.insert({ tokenAccount: ATA2, workspace: WS2, tokenAmount: 700_000n, usdMicro: 7_000n, receiptHash: hash, usageIds: ['u2'], batchJson: JSON.stringify(batch), signature: landedSig, lastValidBlockHeight: 350, status: 'failed', error: 'blockhash expired', createdAt: T0 - 1000, updatedAt: T0 - 1000 });
+    rpc.addTransaction(makeBurnTx({ signature: landedSig, slot: 301, tokenAccount: ATA2, owner: WS2, authority: OPERATOR, amount: 700_000n, memo: encodeDrawMemo({ workspace: WS2, receiptHash: hash }) }));
+    expect(await d.tick()).toEqual([]);
+    expect(rpc.sent).toHaveLength(1);
+    expect(r.budgetDraws.get(ghost)).toMatchObject({ status: 'sent', signature: landedSig, error: null });
+    expect(r.usage.get('u2')?.drawId).toBe(ghost);
+    await ix.step();
+    expect(r.budgetDraws.get(ghost)?.status).toBe('confirmed');
+    expect(r.ledger.balance(WS2)).toBe(0n);
+    expect(await d.tick()).toEqual([]);
+  });
+
   it('reconciles in-flight rows: stale pending → failed; sent unknown → failed once the blockhash expired; on-chain error → failed; landed → kept', async () => {
     const r = repos();
     const rpc = new FakeRpc();
@@ -705,7 +987,7 @@ describe('budget drawer', () => {
     nowMs += 61_000;
     expect(await d.tick()).toEqual([]); // orphan fails, the budget is stalled until the next refresh
     expect(r.budgetDraws.get(orphan)).toMatchObject({ status: 'failed' });
-    expect(r.budgetDraws.get(orphan)?.error).toContain('no transaction sent');
+    expect(r.budgetDraws.get(orphan)?.error).toContain('no transaction signed');
     expect(r.budgets.get(ATA2)?.stalledReason).toBe('draw_failed');
     expect(r.usage.get('u1')?.drawId).toBeNull();
     r.budgets.setStalled(ATA2, null, nowMs);
@@ -721,8 +1003,11 @@ describe('budget drawer', () => {
     const unknownExpired = mk(3, 150);
     const errored = mk(4, 1000);
     const landed = mk(5, 1000);
+    const statusMissingButFetchable = mk(6, 150);
     rpc.statuses.set(testSignature(504), { slot: 199, confirmations: null, err: { InstructionError: [1, 'Custom'] }, confirmationStatus: 'confirmed' });
     rpc.statuses.set(testSignature(505), { slot: 199, confirmations: 3, err: null, confirmationStatus: 'confirmed' });
+    rpc.statuses.set(testSignature(506), null); // a node without that history…
+    rpc.transactions.set(testSignature(506), makeBurnTx({ signature: testSignature(506), slot: 199, tokenAccount: ATA1, owner: WS1, authority: OPERATOR, amount: 1n })); // …while getTransaction knows it
     rpc.blockHeight = 200;
     await d.reconcile();
     expect(r.budgetDraws.get(unknownAlive)?.status).toBe('sent');
@@ -730,11 +1015,13 @@ describe('budget drawer', () => {
     expect(r.budgetDraws.get(unknownExpired)?.error).toContain('blockhash expired');
     expect(r.budgetDraws.get(errored)?.status).toBe('failed');
     expect(r.budgetDraws.get(landed)?.status).toBe('sent');
-    expect(rpc.calls.filter((c) => c.method === 'getSignatureStatuses').at(-1)?.args[0]).toEqual([fresh!.signature, testSignature(502), testSignature(503), testSignature(504), testSignature(505)]);
+    expect(r.budgetDraws.get(statusMissingButFetchable)?.status).toBe('sent'); // one missing status never fails a draw that getTransaction can see
+    expect(rpc.calls.filter((c) => c.method === 'getSignatureStatuses').at(-1)?.args[0]).toEqual([fresh!.signature, testSignature(502), testSignature(503), testSignature(504), testSignature(505), testSignature(506)]);
     rpc.blockHeight = 1001;
     await d.reconcile();
     expect(r.budgetDraws.get(unknownAlive)?.status).toBe('failed');
     expect(r.budgetDraws.get(landed)?.status).toBe('sent');
+    expect(r.budgetDraws.get(statusMissingButFetchable)?.status).toBe('sent');
   });
 });
 

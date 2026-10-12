@@ -50,9 +50,9 @@ export function useStatus() {
   return useQuery({ queryKey: qk.status, queryFn: () => api.status(), refetchInterval: 10_000, staleTime: 5_000 });
 }
 
-/** `GET /api/config`. */
+/** `GET /api/config`; a failed read is retried every 15 s (the flows need it), a good one refreshed every 5 min. */
 export function useGatewayConfig() {
-  return useQuery({ queryKey: qk.config, queryFn: () => api.config(), staleTime: 5 * 60_000 });
+  return useQuery({ queryKey: qk.config, queryFn: () => api.config(), staleTime: 5 * 60_000, refetchInterval: (q) => (q.state.status === 'error' ? 15_000 : 5 * 60_000) });
 }
 
 /** `GET /api/price`, polled every 15 s. */

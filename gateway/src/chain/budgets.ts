@@ -88,6 +88,7 @@ export class BudgetScanner {
   applyState(state: TokenAccountState, slot?: number, extra: { workspace?: string; registeredAt?: number } = {}): BudgetRow {
     const now = this.now();
     return this.repos.transaction(() => {
+      const before = this.repos.budgets.get(state.address);
       this.repos.budgets.upsert({
         tokenAccount: state.address,
         owner: state.owner,
@@ -99,10 +100,14 @@ export class BudgetScanner {
         ...(extra.workspace === undefined ? {} : { workspace: extra.workspace }),
         ...(extra.registeredAt === undefined ? {} : { registeredAt: extra.registeredAt }),
       });
-      const decision = computeHeadroom(state, this.options.operator, this.price.current(), this.options.decimals);
+      let decision = computeHeadroom(state, this.options.operator, this.price.current(), this.options.decimals);
+      if (decision.closed && decision.stalledReason === 'revoked' && before !== undefined && !before.closed && before.delegate === this.options.operator && before.cap > 0n && state.delegate === null && state.amount === before.balance - before.cap) {
+        // The Token program clears the delegate itself once delegated_amount reaches 0: the balance dropped by exactly
+        // the previous cap, so the budget was drawn to the end, not revoked (SPEC §3.4 "until revoked or exhausted").
+        decision = { ...decision, stalledReason: 'exhausted' };
+      }
       if (decision.closed) this.repos.budgets.setClosed(state.address, true, decision.stalledReason, now);
       else {
-        const before = this.repos.budgets.get(state.address);
         if (before?.closed === true) this.repos.budgets.setClosed(state.address, false, null, now);
         this.repos.budgets.setHeadroom(state.address, decision.headroomTokens, decision.headroomMicro, decision.stalledReason, now);
       }

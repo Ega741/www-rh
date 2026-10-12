@@ -26,6 +26,7 @@ import type {
   RpcProgramAccount,
   RpcSignatureInfo,
   RpcSignatureStatus,
+  SignedTransaction,
 } from '../src/chain/rpc.js';
 import { testConfig, type Config } from '../src/config.js';
 import { silentLogger } from '../src/log.js';
@@ -311,8 +312,12 @@ export class FakeRpc implements ChainReader, ChainWriter {
   statuses = new Map<string, RpcSignatureStatus | null>();
   balances = new Map<string, bigint>();
   blockhash: RecentBlockhash = { blockhash: 'D9xXKaQ8SQZfLgWpomSxv9VZMDfZrCxhJYdYxXKoWn1z', lastValidBlockHeight: 400 };
+  /** Transactions handed to `send` (signed ones that the fake node accepted). */
   sent: { signature: string; instructions: TransactionInstruction[]; recent: RecentBlockhash }[] = [];
+  /** Everything `sign` produced, whether or not `send` accepted it. */
+  signed: { signature: string; instructions: TransactionInstruction[]; recent: RecentBlockhash }[] = [];
   confirmOutcome: ConfirmOutcome = { status: 'confirmed' };
+  /** Thrown by `send` (a `TransactionRejectedError` models an RPC rejection, anything else a network failure). */
   failSend: Error | undefined;
   failConfirm: Error | undefined;
   calls: { method: string; args: unknown[] }[] = [];
@@ -429,11 +434,17 @@ export class FakeRpc implements ChainReader, ChainWriter {
     return { ...this.blockhash };
   }
 
-  async signAndSend(instructions: readonly TransactionInstruction[], recent: RecentBlockhash): Promise<string> {
-    if (this.failSend) throw this.failSend;
+  sign(instructions: readonly TransactionInstruction[], recent: RecentBlockhash): SignedTransaction {
     const signature = this.newSignature();
-    this.sent.push({ signature, instructions: [...instructions], recent });
-    return signature;
+    this.signed.push({ signature, instructions: [...instructions], recent });
+    return { signature, serialized: new TextEncoder().encode(signature) };
+  }
+
+  async send(tx: SignedTransaction): Promise<string> {
+    if (this.failSend) throw this.failSend;
+    const entry = this.signed.find((s) => s.signature === tx.signature);
+    this.sent.push({ signature: tx.signature, instructions: entry?.instructions ?? [], recent: entry?.recent ?? { ...this.blockhash } });
+    return tx.signature;
   }
 
   async confirm(): Promise<ConfirmOutcome> {
@@ -449,6 +460,7 @@ export class FakeRpc implements ChainReader, ChainWriter {
       cluster: 'localnet',
       deployment: resolveDeployment('localnet', {}),
       rpcUrl: CLUSTERS.localnet.rpcUrl,
+      publicRpcUrl: CLUSTERS.localnet.rpcUrl,
       commitment: 'confirmed',
       mint: MINT,
       decimals: 6,

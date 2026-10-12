@@ -6,6 +6,7 @@ import {
   INSUFFICIENT_CREDIT_BODY,
   KEY_PLACEHOLDER,
   MCP_BIN_PATH,
+  MCP_BUILD_COMMAND,
   REPO_PLACEHOLDER,
   claudeCodeMcpCommand,
   curlMessagesSnippet,
@@ -51,6 +52,9 @@ describe('docs snippets', () => {
     expect(env).toContain(`BEAGLE_RPC_URL=${CTX.rpcUrl}`);
     expect(env).not.toMatch(/PRIVATE_KEY|0x\.\.\./);
     expect(env).toContain(`node ${MCP_BIN_PATH}`);
+    // @beagle/shared resolves through its uncommitted dist/, so the build command must build it too.
+    expect(MCP_BUILD_COMMAND).toMatch(/pnpm install && pnpm --filter @beagle\/shared --filter @beagle\/mcp build/);
+    expect(env).toContain(MCP_BUILD_COMMAND);
   });
   it('chain snippets name the deployment, with placeholders when unknown', () => {
     expect(splTokenBurnSnippet(CTX)).toContain(`--token ${CTX.mint}`);

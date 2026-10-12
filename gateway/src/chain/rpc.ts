@@ -16,6 +16,7 @@ import {
   Connection,
   Keypair,
   PublicKey,
+  SendTransactionError,
   Transaction,
   TransactionExpiredBlockheightExceededError,
   type Commitment,
@@ -136,12 +137,37 @@ export interface ChainReader {
 /** Outcome of {@link ChainWriter.confirm}. */
 export type ConfirmOutcome = { status: 'confirmed' } | { status: 'failed'; err: unknown } | { status: 'expired' } | { status: 'timeout' };
 
+/** A signed, serialized transaction and its (locally computed) signature; nothing sent yet. */
+export interface SignedTransaction {
+  signature: string;
+  serialized: Uint8Array;
+}
+
+/**
+ * Thrown by {@link ChainWriter.send} when the RPC node **rejected** the transaction (preflight
+ * simulation failure, bad blockhash, …): it was never forwarded to the cluster, so the caller may
+ * treat it as not sent. Any other error from `send` (network, timeout) is ambiguous: the node may
+ * have accepted and forwarded the transaction before the answer was lost.
+ */
+export class TransactionRejectedError extends Error {
+  override readonly name = 'TransactionRejectedError';
+  constructor(
+    message: string,
+    readonly logs: readonly string[] | undefined,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+  }
+}
+
 /** Operator-signed writes (legacy transactions, `feePayer = operator`). */
 export interface ChainWriter {
   /** The operator public key (base58). */
   readonly address: string;
-  /** Signs `[instructions]` with the operator key and sends it; returns the signature. */
-  signAndSend(instructions: readonly TransactionInstruction[], recent: RecentBlockhash): Promise<string>;
+  /** Signs `[instructions]` with the operator key (local, synchronous): the signature is known before anything is sent. */
+  sign(instructions: readonly TransactionInstruction[], recent: RecentBlockhash): SignedTransaction;
+  /** Sends a signed transaction; resolves to its signature. Throws {@link TransactionRejectedError} when the node refused it. */
+  send(tx: SignedTransaction): Promise<string>;
   /** Waits for `signature` with the blockhash/height strategy, at most `timeoutMs`. */
   confirm(signature: string, recent: RecentBlockhash, timeoutMs: number): Promise<ConfirmOutcome>;
 }
@@ -150,7 +176,10 @@ export interface ChainWriter {
 export interface ChainInfo {
   cluster: Cluster;
   deployment: ResolvedDeployment;
+  /** The gateway's own JSON-RPC endpoint (`RPC_URL`): may carry a provider key — never published, logged as host only. */
   rpcUrl: string;
+  /** The endpoint published to clients (`PUBLIC_RPC_URL`, else the cluster's public endpoint; localnet: `rpcUrl`). */
+  publicRpcUrl: string;
   commitment: CommitmentLevel;
   /** The BEAGLE mint; `undefined` when neither the deployment record nor `MINT_ADDRESS` names one. */
   mint: string | undefined;
@@ -305,11 +334,21 @@ export function createConnectionReader(connection: Connection, commitment: Commi
 export function createConnectionWriter(connection: Connection, keypair: Keypair, commitment: CommitmentLevel): ChainWriter {
   return {
     address: keypair.publicKey.toBase58(),
-    async signAndSend(instructions, recent) {
+    sign(instructions, recent) {
       const tx = new Transaction({ feePayer: keypair.publicKey, blockhash: recent.blockhash, lastValidBlockHeight: recent.lastValidBlockHeight });
       tx.add(...instructions);
       tx.sign(keypair);
-      return connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3, preflightCommitment: commitment as Commitment });
+      const sig = tx.signature;
+      if (sig === null) throw new Error('transaction signing produced no signature');
+      return { signature: encodeBase58(new Uint8Array(sig)), serialized: new Uint8Array(tx.serialize()) };
+    },
+    async send(signed) {
+      try {
+        return await connection.sendRawTransaction(signed.serialized, { skipPreflight: false, maxRetries: 3, preflightCommitment: commitment as Commitment });
+      } catch (e) {
+        if (e instanceof SendTransactionError) throw new TransactionRejectedError(e.message, e.logs, { cause: e });
+        throw e;
+      }
     },
     async confirm(signature, recent, timeoutMs) {
       const abort = new AbortController();
@@ -338,6 +377,27 @@ export function createConnectionWriter(connection: Connection, keypair: Keypair,
 }
 
 /**
+ * The RPC endpoint published to clients (`ConfigDto.rpcUrl`, explorer links, the MCP server):
+ * `PUBLIC_RPC_URL` when set, else the cluster's public endpoint; on localnet the gateway's own
+ * `RPC_URL` (a local validator carries no secret). The private `RPC_URL` of a mainnet/devnet
+ * deployment typically embeds a provider key and is never published.
+ */
+export function publicRpcUrlOf(config: Pick<Config, 'cluster'>, rpcUrl: string): string {
+  if (config.cluster.publicRpcUrl !== undefined) return config.cluster.publicRpcUrl;
+  return config.cluster.name === 'localnet' ? rpcUrl : CLUSTERS[config.cluster.name].rpcUrl;
+}
+
+/** `scheme://host` of an RPC URL for logs: the path and query (where provider keys live) are dropped. */
+export function rpcHostOf(rpcUrl: string): string {
+  try {
+    const u = new URL(rpcUrl);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return '[invalid url]';
+  }
+}
+
+/**
  * Resolves the static chain facts from the deployment record and the env (`MINT_ADDRESS`,
  * `TOKEN_PROGRAM`, `RPC_URL`, `OPERATOR_SECRET_KEY`). Never touches the network. Throws
  * `TypeError` (from `resolveDeployment`) on malformed overrides.
@@ -352,6 +412,14 @@ export function resolveChainInfo(config: Config, logger?: Logger): ChainInfo {
   const keyOperator = config.operator.secretKey === undefined ? undefined : encodeBase58(config.operator.secretKey.subarray(32));
   const operator = keyOperator ?? deployment.operator;
   if (keyOperator !== undefined && deployment.operator !== undefined && keyOperator !== deployment.operator) {
+    if (config.operator.secretKeyIsSeed) {
+      // A 32-byte base58 value is indistinguishable from a public key: the operator's *public* key pasted into
+      // OPERATOR_SECRET_KEY derives an unrelated keypair. With a deployment operator to compare against, refuse.
+      throw new ChainConfigError(
+        `OPERATOR_SECRET_KEY is a 32-byte value whose derived public key ${keyOperator} is not the deployment operator ${deployment.operator}: ` +
+          'it looks like a public key (or a seed of another keypair), not the operator secret key',
+      );
+    }
     logger?.warn('OPERATOR_SECRET_KEY does not match the deployment operator: budgets delegated to the recorded operator cannot be drawn', {
       keyOperator,
       deploymentOperator: deployment.operator,
@@ -361,6 +429,7 @@ export function resolveChainInfo(config: Config, logger?: Logger): ChainInfo {
     cluster: config.cluster.name,
     deployment,
     rpcUrl: deployment.rpcUrl,
+    publicRpcUrl: publicRpcUrlOf(config, deployment.rpcUrl),
     commitment: config.cluster.commitment,
     mint: deployment.mint,
     decimals: deployment.decimals ?? DEFAULT_DECIMALS,
@@ -393,29 +462,57 @@ export function createChainContext(config: Config, logger: Logger): ChainContext
   };
 }
 
+/** What {@link verifyMint} found. */
+export type MintVerification = { status: 'verified'; decimals: number; tokenProgram: string } | { status: 'rpc_unavailable' } | { status: 'not_found' };
+
 /**
- * Reads the mint account and reconciles `decimals` / `tokenProgram` with the context (the
- * deployment record may be stale or absent). Logs on mismatch; never throws.
+ * Reads the mint account and reconciles `decimals` / `tokenProgram` with the context. The mint
+ * account is the authority on both (SPEC §1): a value the chain contradicts is **never** used for
+ * quoting. MUST run before the workers are built (`main.ts`): they copy these facts.
+ *
+ * - The committed deployment record names decimals / token program for its own mint. When that mint
+ *   is in use (not overridden by `MINT_ADDRESS`) and the chain disagrees, the record is wrong and the
+ *   gateway refuses to boot (`ChainConfigError`) rather than serve a cluster whose clients reconcile
+ *   against a stale record. An explicit `TOKEN_PROGRAM` override the chain contradicts is refused too.
+ * - With `MINT_ADDRESS` pointing at another mint (no record applies) the chain values are adopted.
+ * - RPC unavailable / mint not found: logged, the configured values stay (nothing better is known).
  */
-export async function verifyMint(chain: ChainContext, logger: Logger): Promise<void> {
+export async function verifyMint(chain: ChainContext, logger: Logger): Promise<MintVerification> {
   let account: RpcParsedAccount | null | undefined;
   try {
     [account] = await chain.reader.getMultipleParsedAccounts([chain.mint]);
   } catch (e) {
-    logger.warn('mint check skipped: RPC unavailable', { mint: chain.mint, rpcUrl: chain.rpcUrl, error: e });
-    return;
+    logger.warn('mint check skipped: RPC unavailable', { mint: chain.mint, rpcHost: rpcHostOf(chain.rpcUrl), error: e });
+    return { status: 'rpc_unavailable' };
   }
   const mint = parseMintAccount(account);
   if (mint === undefined) {
     logger.warn('mint account not found or not an SPL mint on this cluster', { mint: chain.mint, cluster: chain.cluster });
-    return;
+    return { status: 'not_found' };
   }
+  const recordApplies = !chain.deployment.overridden.includes('mint') && chain.deployment.mint === chain.mint;
   if (mint.decimals !== chain.decimals) {
-    logger.warn('mint decimals differ from the deployment record; using the chain value', { mint: chain.mint, recorded: chain.decimals, actual: mint.decimals });
+    if (recordApplies && chain.deployment.decimals !== undefined) {
+      throw new ChainConfigError(
+        `the deployment record for ${chain.cluster} says mint ${chain.mint} has ${chain.decimals} decimals but the mint account says ${mint.decimals}: ` +
+          'fix solana/deployments/<cluster>.json (re-run setup-cluster / sync-deployments) before starting the gateway',
+      );
+    }
+    logger.warn('mint decimals differ from the configured value; using the chain value', { mint: chain.mint, configured: chain.decimals, actual: mint.decimals });
     chain.decimals = mint.decimals;
   }
   if (mint.programId !== chain.tokenProgram) {
-    logger.warn('mint token program differs from the deployment record; using the chain value', { mint: chain.mint, recorded: chain.tokenProgram, actual: mint.programId });
+    if (chain.deployment.overridden.includes('tokenProgram')) {
+      throw new ChainConfigError(`TOKEN_PROGRAM=${chain.tokenProgram} but mint ${chain.mint} is owned by ${mint.programId}: unset or fix TOKEN_PROGRAM`);
+    }
+    if (recordApplies && chain.deployment.mint !== undefined) {
+      throw new ChainConfigError(
+        `the deployment record for ${chain.cluster} says mint ${chain.mint} is a ${chain.tokenProgram} mint but the mint account is owned by ${mint.programId}: ` +
+          'fix solana/deployments/<cluster>.json before starting the gateway',
+      );
+    }
+    logger.warn('mint token program differs from the configured value; using the chain value', { mint: chain.mint, configured: chain.tokenProgram, actual: mint.programId });
     chain.tokenProgram = mint.programId;
   }
+  return { status: 'verified', decimals: chain.decimals, tokenProgram: chain.tokenProgram };
 }

@@ -8,12 +8,14 @@ import {
   isRevokeInstruction,
   TokenInstruction,
 } from '@solana/spl-token';
+import { MEMO_PROGRAM_ID as SPL_MEMO_PACKAGE_PROGRAM_ID } from '@solana/spl-memo';
 import { Keypair, PublicKey, SendTransactionError, Transaction, TransactionExpiredBlockheightExceededError, type TransactionInstruction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { describe, expect, it } from 'vitest';
 import {
   buildUnsignedTransactions,
   createKeypairWalletExecutor,
+  createMemoInstruction,
   createLazyWalletExecutor,
   describeTokenAccount,
   GENESIS_HASHES,
@@ -92,6 +94,21 @@ describe('parseSecretKey / keypairFromSecret', () => {
     // 64 bytes that are not a keypair (public half does not match)
     const wrong = new Uint8Array(64).fill(1);
     expect(() => keypairFromSecret(wrong)).toThrow(WalletError);
+  });
+});
+
+describe('createMemoInstruction', () => {
+  it('targets the Memo program the gateway indexes (MemoSq4…), not the id @solana/spl-memo exports', () => {
+    const signer = new PublicKey(AGENT);
+    const ix = createMemoInstruction('beagle:v1 ws=x', signer);
+    expect(ix.programId.toBase58()).toBe('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
+    expect(ix.programId.toBase58()).toBe(MEMO_PROGRAM_ID);
+    // @solana/spl-memo 0.3.x targets Memo4c2pN8…, which solana-test-validator does not ship (README, docs/SOLANA.md).
+    expect(SPL_MEMO_PACKAGE_PROGRAM_ID.toBase58()).toBe('Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH');
+    expect(ix.programId.equals(SPL_MEMO_PACKAGE_PROGRAM_ID)).toBe(false);
+    expect(ix.keys).toEqual([{ pubkey: signer, isSigner: true, isWritable: false }]);
+    expect(Buffer.from(ix.data).toString('utf8')).toBe('beagle:v1 ws=x');
+    expect(createMemoInstruction('m', signer, TOKEN_PROGRAM_ID).programId.toBase58()).toBe(TOKEN_PROGRAM_ID);
   });
 });
 

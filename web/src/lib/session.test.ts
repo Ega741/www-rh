@@ -24,7 +24,7 @@ describe('session helpers', () => {
     expect(walletMismatch(SESSION_A, WALLET_B)).toBe(true);
     expect(walletMismatch(undefined, WALLET_B)).toBe(false);
   });
-  it('burns and budgets target the signed-in workspace, not the connected wallet (SPEC §7)', () => {
+  it('burns credit the signed-in workspace, not the connected wallet (SPEC §7; budgets block on a mismatch instead)', () => {
     expect(defaultTargetWorkspace(SESSION_A, WALLET_B)).toBe(SESSION_A);
     expect(defaultTargetWorkspace(undefined, WALLET_B)).toBe(WALLET_B);
     expect(defaultTargetWorkspace(undefined, undefined)).toBeUndefined();

@@ -45,10 +45,12 @@ export function walletMismatch(sessionWorkspace: string | undefined, walletAddre
 }
 
 /**
- * The workspace a burn or a budget targets by default (SPEC §7: "the target workspace defaults
- * to the signed-in workspace"): the session workspace; the connected wallet only when there is
- * no session. The connected wallet always pays, but with a wallet/session mismatch the credit
- * must still reach the workspace the dashboard shows (the burn then carries a memo).
+ * The workspace a burn credits by default (SPEC §7: "the target workspace defaults to the
+ * signed-in workspace"): the session workspace; the connected wallet only when there is no
+ * session. The connected wallet always pays, but with a wallet/session mismatch the credit must
+ * still reach the workspace the dashboard shows (the burn then carries a memo). Budgets cannot be
+ * redirected this way: only the token account owner may fund another workspace (SPEC §3.4), so
+ * the Budgets page blocks on a mismatch instead (`planBudget` → `wallet_mismatch`).
  */
 export function defaultTargetWorkspace(sessionWorkspace: string | undefined, walletAddress: string | undefined): string | undefined {
   return sessionWorkspace ?? walletAddress;
