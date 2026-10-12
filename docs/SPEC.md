@@ -148,6 +148,9 @@ replaces the previous cap; `Revoke` clears it; every delegate burn decrements `d
   authority = operator, amount, decimals), Memo("beagle:draw v1 ws=<workspace> h=<receiptHash>")]`. The
   indexer confirms the draw by the memo hash (§5.4). The operator cannot move tokens anywhere else: `Burn` is
   the only instruction it signs, bounded by `delegatedAmount`.
+- Who funds whom: a delegation funds its token account owner's workspace by default; the owner (a key or session of
+  the owner's workspace) may register it for another workspace. Clients therefore refuse to open a cross-workspace
+  budget unless the signer is the owner and the registering key belongs to the owner (MCP: explicit `fundOtherWorkspace`).
 - Discovery: (a) `POST /api/budgets/register { tokenAccount }` right after approving (web and MCP do this),
   (b) a periodic scan `getProgramAccounts(tokenProgram, { filters: [{ dataSize: 165 }, { memcmp: { offset: 0,
   bytes: mint } }, { memcmp: { offset: 76, bytes: operator } }] })` every `BUDGET_SCAN_INTERVAL_MS` (classic
@@ -656,7 +659,7 @@ sent as the final SSE comment line `: beagle cost=<micro> balance=<micro>` and i
 | `GET /api/receipts?limit&before` (key OK) | `credit_events` of the workspace: `CreditEventDto { signature, ixIndex, slot, blockTime, kind, workspace, payer, tokenAccount, tokenAmount, usdMicro, priceE18, pricePointId, priceStale, memo, receiptHash, explorerUrl }` |
 | `GET /api/receipts/:requestId` (key OK) | `ReceiptDto = { receipt: UsageReceipt, hash }` (`hash = receiptHash(receipt)`) |
 | `GET /api/providers`, `PUT /api/providers/:provider { apiKey, baseUrl? }`, `DELETE /api/providers/:provider`, `POST /api/providers/:provider/test` | BYOK; `provider ∈ anthropic\|openai\|google`; `baseUrl` must be `https:` and not resolve to a private/loopback range (SSRF guard; hostnames checked at save time and again at use time) ; test = minimal completion through the key |
-| `GET /api/budgets`, `GET /api/budgets/:tokenAccount`, `GET /api/budgets/:tokenAccount/draws`, `POST /api/budgets/register { tokenAccount, workspace? }` (all key OK) | `BudgetDto { tokenAccount, owner, workspace, delegate, cap, balance, headroomTokens, headroomMicro, closed, stalledReason, registeredAt, lastSeenSlot, draws }`; register validates the account (mint, delegate = operator) and returns the dto (201) or 400 `not_delegated` |
+| `GET /api/budgets`, `GET /api/budgets/:tokenAccount`, `GET /api/budgets/:tokenAccount/draws`, `POST /api/budgets/register { tokenAccount, workspace? }` (all key OK) | `BudgetDto { tokenAccount, owner, workspace, delegate, cap, balance, headroomTokens, headroomMicro, closed, stalledReason, registeredAt, lastSeenSlot, draws }`; register validates the account (mint, delegate = operator) and returns the dto (201) or 400 `not_delegated`; any principal may register a delegation (it then funds the account **owner's** workspace), but naming another `workspace` is allowed only when the principal is the owner, else 403 `not_owner` (a registered budget's workspace is never changed by a non-owner) |
 | `GET /api/upgrades`, `GET /api/upgrades/prices`, `POST /api/upgrades { kind, quantity }` (key OK) | §5.11; 402 when `available` is short |
 | `GET /api/models` (public) | `ModelDto[]` + aliases, availability per provider health and plan |
 | `GET /api/price` (public), `GET /api/price/history?limit=100` (public) | `PriceDto { pricePointId, priceE18, observedAt, stale, source: 'manual'\|'feed'\|'jupiter', maxAgeS, usdPerToken, tokensPerUsd }`; history = `PriceDto[]` newest first |
