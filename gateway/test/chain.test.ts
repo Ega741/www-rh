@@ -1,18 +1,22 @@
 import { DrawBatchSchema } from '@beagle/shared/api';
+import { COMPUTE_BUDGET_PROGRAM_ID, MEMO_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@beagle/shared/addresses';
 import { receiptHash } from '@beagle/shared/canonical';
 import { tokensForUsdMicro } from '@beagle/shared/credit';
+import { encodeDrawMemo } from '@beagle/shared/memo';
 import { describe, expect, it } from 'vitest';
-import { allocateHeadroom, computeHeadroom, HeadroomRefresher } from '../src/chain/budgets.js';
-import type { BlockInfo } from '../src/chain/clients.js';
-import { BudgetDrawer, selectBatch } from '../src/chain/drawer.js';
-import { Indexer } from '../src/chain/indexer.js';
-import { clampStep, needsKeepAlive, PricePoster, usdStringToPriceE18, usdToPriceE18 } from '../src/chain/poster.js';
-import { PriceService } from '../src/chain/price.js';
+import { BudgetRegisterError, BudgetScanner, budgetScanFilters, computeHeadroom } from '../src/chain/budgets.js';
+import { BudgetDrawer, buildDrawInstructions, selectBatch } from '../src/chain/drawer.js';
+import { extractBurns, extractMemo, flattenInstructions, Indexer, resolveOwner, type IndexerOptions } from '../src/chain/indexer.js';
+import { PriceService, usdToPriceE18, type PriceServiceOptions } from '../src/chain/price.js';
+import { parseMintAccount, parseTokenAccount, type RpcParsedAccount, type RpcParsedTransaction, type RpcSignatureInfo } from '../src/chain/rpc.js';
 import { Repos, type UsageRow } from '../src/db/repos.js';
 import { migrate } from '../src/db/schema.js';
 import { Db } from '../src/db/sqlite.js';
-import { silentLogger } from '../src/log.js';
-import { DESK, FakeChain, WS1, WS2 } from './helpers.js';
+import { createLogger, silentLogger } from '../src/log.js';
+import { ATA1, ATA2, FakeRpc, fixture, makeBurnTx, makeTokenAccount, META, MINT, OPERATOR, testPubkey, testSignature, WS1, WS2 } from './helpers.js';
+
+const T0 = 1_791_808_200_000; // ms, just after the fixtures' block times
+const PRICE = 10n ** 16n; // $0.01
 
 function repos(): Repos {
   const db = new Db(':memory:');
@@ -20,212 +24,65 @@ function repos(): Repos {
   return new Repos(db);
 }
 
-const purchase = (workspace: string, usdMicro: bigint, receiptId: number) => ({
-  eventName: 'CreditPurchased' as const,
-  args: { receiptId: BigInt(receiptId), workspace, payer: workspace, tokenAmount: 1000n * 10n ** 18n, usdMicro, priceE18: 10n ** 16n },
-});
-const opened = (budgetId: number, workspace: string, cap: bigint, deadline: number) => ({
-  eventName: 'BudgetOpened' as const,
-  args: { budgetId: BigInt(budgetId), owner: workspace, workspace, cap, deadline: BigInt(deadline) },
-});
-const drawn = (budgetId: number, receiptId: number, workspace: string, tokenAmount: bigint, usdMicro: bigint, hash: string) => ({
-  eventName: 'BudgetDrawn' as const,
-  args: { budgetId: BigInt(budgetId), receiptId: BigInt(receiptId), workspace, tokenAmount, usdMicro, priceE18: 10n ** 16n, receiptHash: hash },
-});
-
-function indexer(r: Repos, chain: FakeChain, confirmations = 0): Indexer {
-  return new Indexer(r, chain, { creditDesk: DESK, startBlock: 1, confirmations, chunkBlocks: 2, now: () => 1_700_000_000_000 }, silentLogger);
+function priceService(r: Repos, now: () => number, overrides: Partial<PriceServiceOptions> = {}): PriceService {
+  const svc = new PriceService(
+    r,
+    { source: 'manual', initialPriceE18: PRICE, jupiterUrl: 'https://jup.test/price/v3', mint: MINT, minChangeBps: 50, maxStepBps: 2500, maxAgeS: 3600, decimals: 6, now, ...overrides },
+    silentLogger,
+  );
+  svc.init();
+  return svc;
 }
 
-describe('indexer', () => {
-  it('starts at START_BLOCK − 1, applies events in chunks, credits the ledger exactly once', async () => {
-    const r = repos();
-    const chain = new FakeChain();
-    const ix = indexer(r, chain);
-    expect(ix.lastBlock()).toBe(0);
-    expect(await ix.step()).toBeUndefined();
-    chain.mine([purchase(WS1, 10_000_000n, 1)]);
-    chain.mine();
-    chain.mine([opened(1, WS2, 500n * 10n ** 18n, 1_800_000_000), purchase(WS2, 5n, 2)]);
-    const res = await ix.step();
-    expect(res).toEqual({ from: 1, to: 3, events: 3 });
-    expect(r.ledger.balance(WS1)).toBe(10_000_000n);
-    expect(r.ledger.balance(WS2)).toBe(5n);
-    expect(r.budgets.get(1)).toMatchObject({ owner: WS2, workspace: WS2, cap: 500n * 10n ** 18n, drawn: 0n, closed: false, deadline: 1_800_000_000 });
-    expect(ix.status()).toMatchObject({ lastBlock: 3, head: 3, lagBlocks: 0, lastEventAt: 1_700_000_003 });
-    // Re-applying the same logs is a no-op.
-    const logs = await chain.getLogs(1n, 3n);
-    expect(ix.applyChunk(logs, new Map(), 3, undefined)).toBe(0);
-    expect(r.ledger.balance(WS1)).toBe(10_000_000n);
-    expect(r.creditEvents.list(WS1, 10)[0]).toMatchObject({ kind: 'purchase', receiptId: 1, usdMicro: 10_000_000n, blockNumber: 1 });
-  });
+function indexer(r: Repos, rpc: FakeRpc, price: PriceService, overrides: Partial<IndexerOptions> = {}): Indexer {
+  return new Indexer(
+    r,
+    rpc,
+    price,
+    { mint: MINT, operator: OPERATOR, decimals: 6, pageLimit: 1000, fetchConcurrency: 2, indexFromSignature: undefined, creditWhenStale: true, minCreditMicro: 1000n, now: () => T0, ...overrides },
+    silentLogger,
+  );
+}
 
-  it('respects confirmations and marks draws confirmed by receipt hash', async () => {
-    const r = repos();
-    const chain = new FakeChain();
-    const ix = indexer(r, chain, 1);
-    chain.mine([opened(7, WS1, 10n ** 21n, 1_800_000_000)]);
-    expect(await ix.step()).toBeUndefined(); // head 1 − 1 confirmation = 0
-    chain.mine();
-    await ix.step();
-    r.workspaces.ensure(WS1, 1);
-    r.budgetDraws.insert({ budgetId: 7, workspace: WS1, tokenAmount: 3n, usdMicro: 3n, receiptHash: '0xabc', usageIds: ['u1'], batchJson: '{}', txHash: '0x1', status: 'sent', error: null, createdAt: 1, updatedAt: 1 });
-    chain.mine([drawn(7, 3, WS1, 300n, 3n, '0xABC')]);
-    chain.mine();
-    await ix.step();
-    expect(r.ledger.balance(WS1)).toBe(3n);
-    expect(r.budgets.get(7)?.drawn).toBe(300n);
-    expect(r.budgetDraws.byReceiptHash('0xabc')?.status).toBe('confirmed');
-    chain.mine([{ eventName: 'BudgetClosed', args: { budgetId: 7n, drawn: 300n } }]);
-    chain.mine();
-    await ix.step();
-    expect(r.budgets.get(7)?.closed).toBe(true);
-  });
+function scanner(r: Repos, rpc: FakeRpc, price: PriceService, now: () => number = () => T0): BudgetScanner {
+  return new BudgetScanner(r, rpc, price, { mint: MINT, operator: OPERATOR, tokenProgram: TOKEN_PROGRAM_ID, decimals: 6, now }, silentLogger);
+}
 
-  it('rewinds on a reorg: deletes events, ledger rows and recomputes drawn', async () => {
-    const r = repos();
-    const chain = new FakeChain();
-    const ix = new Indexer(r, chain, { creditDesk: DESK, startBlock: 1, confirmations: 0, chunkBlocks: 100, now: () => 1 }, silentLogger);
-    chain.mine([opened(1, WS1, 10n ** 21n, 1_800_000_000)]);
-    chain.mine([purchase(WS1, 100n, 1)]);
-    chain.mine([drawn(1, 2, WS1, 50n, 7n, '0xdd')]);
-    await ix.step();
-    expect(r.ledger.balance(WS1)).toBe(107n);
-    expect(r.budgets.get(1)?.drawn).toBe(50n);
-    chain.reorg(3n);
-    expect(await ix.checkReorg()).toBe(true);
-    expect(ix.lastBlock()).toBe(0);
-    expect(r.ledger.balance(WS1)).toBe(0n);
-    expect(r.creditEvents.list(WS1, 10)).toEqual([]);
-    expect(r.budgets.get(1)?.drawn).toBe(0n);
-    // Replays from the rewound cursor; the purchase comes back, the dropped draw does not.
-    await ix.step();
-    expect(r.ledger.balance(WS1)).toBe(100n);
-    expect(await ix.checkReorg()).toBe(false);
-  });
-});
+function drawer(r: Repos, rpc: FakeRpc, price: PriceService, now: () => number = () => T0, extra: { dryRun?: boolean; thresholdMicro?: bigint; priorityFee?: number; writer?: boolean; pendingGraceMs?: number } = {}): BudgetDrawer {
+  return new BudgetDrawer(
+    r,
+    rpc,
+    extra.writer === false ? undefined : rpc,
+    price,
+    {
+      cluster: 'localnet',
+      mint: MINT,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      memoProgram: MEMO_PROGRAM_ID,
+      operator: OPERATOR,
+      decimals: 6,
+      thresholdMicro: extra.thresholdMicro ?? 1n,
+      priorityFeeMicrolamports: extra.priorityFee ?? 0,
+      confirmTimeoutMs: 1000,
+      dryRun: extra.dryRun ?? false,
+      now,
+      ...(extra.pendingGraceMs === undefined ? {} : { pendingGraceMs: extra.pendingGraceMs }),
+    },
+    silentLogger,
+  );
+}
 
-describe('indexer robustness', () => {
-  it('never rewinds when the block cannot be fetched (RPC failure is not a reorg)', async () => {
-    const r = repos();
-    const chain = new FakeChain();
-    const ix = indexer(r, chain, 2);
-    chain.mine([purchase(WS1, 10_000_000n, 1)]);
-    chain.mine();
-    chain.mine();
-    await ix.step();
-    expect(r.ledger.balance(WS1)).toBe(10_000_000n);
-    expect(ix.lastBlock()).toBe(1);
-    // Partial outage: eth_blockNumber works, eth_getBlockByNumber / eth_getLogs do not.
-    const getBlock = chain.getBlock.bind(chain);
-    chain.getBlock = async () => undefined;
-    chain.getLogs = async () => {
-      throw new Error('HTTP 429');
-    };
-    expect(await ix.checkReorg()).toBe(false);
-    expect(await ix.step()).toBeUndefined(); // the chunk is deferred, nothing is rewound
-    expect(r.ledger.balance(WS1)).toBe(10_000_000n);
-    expect(ix.lastBlock()).toBe(1);
-    chain.getBlock = async () => {
-      throw new Error('ECONNRESET');
-    };
-    expect(await ix.checkReorg()).toBe(false);
-    chain.mine(); // block 2 becomes confirmed → there is a chunk to fetch
-    await expect(ix.step()).rejects.toThrow('ECONNRESET');
-    expect(r.ledger.balance(WS1)).toBe(10_000_000n);
-    expect(ix.lastBlock()).toBe(1);
-    chain.getBlock = getBlock;
-    chain.getLogs = FakeChain.prototype.getLogs.bind(chain);
-    expect(await ix.step()).toMatchObject({ events: 0 });
-    expect(await ix.checkReorg()).toBe(false);
-    expect(r.ledger.balance(WS1)).toBe(10_000_000n);
-  });
+/** A budget row for `tokenAccount` with a fresh headroom. */
+function openBudget(r: Repos, tokenAccount: string, owner: string, cap: bigint, balance: bigint, headroomMicro: bigint, workspace?: string): void {
+  r.workspaces.ensure(owner, T0);
+  r.budgets.upsert({ tokenAccount, owner, delegate: OPERATOR, cap, balance, now: T0, ...(workspace === undefined ? {} : { workspace }) });
+  r.budgets.setHeadroom(tokenAccount, cap < balance ? cap : balance, headroomMicro, null, T0);
+}
 
-  it('discards a chunk whose logs do not match the block headers (reorg between the two calls)', async () => {
-    const r = repos();
-    const chain = new FakeChain();
-    const ix = new Indexer(r, chain, { creditDesk: DESK, startBlock: 1, confirmations: 0, chunkBlocks: 100, now: () => 1 }, silentLogger);
-    chain.mine([purchase(WS1, 100n, 1)]);
-    // The logs still carry the orphaned block's hash while the header is already the canonical one.
-    const canonical: BlockInfo = { number: 1n, hash: `0x${'e'.repeat(64)}`, timestamp: 1_700_000_001n };
-    const getBlock = chain.getBlock.bind(chain);
-    chain.getBlock = async (n) => (n === 1n ? canonical : getBlock(n));
-    expect(await ix.step()).toBeUndefined();
-    expect(r.ledger.balance(WS1)).toBe(0n);
-    expect(ix.lastBlock()).toBe(0);
-    chain.getBlock = getBlock;
-    expect(await ix.step()).toEqual({ from: 1, to: 1, events: 1 });
-    expect(r.ledger.balance(WS1)).toBe(100n);
-  });
-});
-
-describe('headroom refresher', () => {
-  it('computes min(remainingCap, allowance, balance) and quotes it; stalls on allowance and price', async () => {
-    const r = repos();
-    const chain = new FakeChain();
-    const nowMs = 1_700_000_000_000;
-    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 500n * 10n ** 18n, deadline: 1_700_000_000 + 3600, openedBlock: 1, now: nowMs });
-    const refresher = new HeadroomRefresher(r, chain, { decimals: 18, now: () => nowMs }, silentLogger);
-    expect(await refresher.refreshAll()).toBe(1);
-    expect(r.budgets.get(1)).toMatchObject({ headroomTokens: 0n, headroomMicro: 0n, stalledReason: 'allowance' });
-    chain.allowances.set(WS2, 500n * 10n ** 18n);
-    chain.balances.set(WS2, 300n * 10n ** 18n);
-    await refresher.refreshAll();
-    expect(r.budgets.get(1)).toMatchObject({ headroomTokens: 300n * 10n ** 18n, headroomMicro: 3_000_000n, stalledReason: null });
-    expect(r.ledger.budgetHeadroom(WS2, 1_700_000_000)).toBe(3_000_000n);
-    chain.priceFailure = 'stale';
-    await refresher.refreshAll();
-    expect(r.budgets.get(1)).toMatchObject({ headroomMicro: 0n, stalledReason: 'price' });
-    chain.priceFailure = undefined;
-    r.budgets.setStalled(1, 'draw_failed', nowMs);
-    await refresher.refreshAll();
-    expect(r.budgets.get(1)?.stalledReason).toBeNull();
-    expect(computeHeadroom({ cap: 10n, drawn: 4n }, 100n, 5n)).toEqual({ remainingCap: 6n, headroomTokens: 5n });
-  });
-
-  it('allocates one owner\'s backing across its budgets instead of counting it once per budget', async () => {
-    const r = repos();
-    const chain = new FakeChain();
-    const nowMs = 1_700_000_000_000;
-    const deadline = 1_700_000_000 + 3600;
-    const E = 10n ** 18n;
-    // Two budgets for WS2 and one for WS1, all funded by WS2's wallet (100 tokens allowance, 100 balance).
-    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 100n * E, deadline, openedBlock: 1, now: nowMs });
-    r.budgets.upsertOpened({ budgetId: 2, owner: WS2, workspace: WS2, cap: 100n * E, deadline, openedBlock: 1, now: nowMs });
-    r.budgets.upsertOpened({ budgetId: 3, owner: WS2, workspace: WS1, cap: 100n * E, deadline, openedBlock: 1, now: nowMs });
-    chain.allowances.set(WS2, 100n * E);
-    chain.balances.set(WS2, 100n * E);
-    const refresher = new HeadroomRefresher(r, chain, { decimals: 18, now: () => nowMs }, silentLogger);
-    expect(await refresher.refreshAll()).toBe(3);
-    expect(r.budgets.get(1)).toMatchObject({ headroomTokens: 100n * E, headroomMicro: 1_000_000n, stalledReason: null });
-    expect(r.budgets.get(2)).toMatchObject({ headroomTokens: 0n, headroomMicro: 0n, stalledReason: 'allowance' });
-    expect(r.budgets.get(3)).toMatchObject({ headroomTokens: 0n, headroomMicro: 0n, stalledReason: 'allowance' });
-    // Σ headroom over the owner's budgets never exceeds quote(min(allowance, balance)).
-    expect(r.ledger.budgetHeadroom(WS2, 1_700_000_000) + r.ledger.budgetHeadroom(WS1, 1_700_000_000)).toBe(1_000_000n);
-    // A partially drawn first budget leaves the remainder to the next one.
-    r.budgets.setDrawn(1, 70n * E, nowMs);
-    await refresher.refreshAll();
-    expect(r.budgets.get(1)?.headroomTokens).toBe(30n * E);
-    expect(r.budgets.get(2)?.headroomTokens).toBe(70n * E);
-    expect(r.budgets.get(3)?.headroomTokens).toBe(0n);
-    expect(r.ledger.budgetHeadroom(WS2, 1_700_000_000)).toBe(1_000_000n);
-    // More backing than caps: everybody is fully backed.
-    chain.allowances.set(WS2, 1000n * E);
-    chain.balances.set(WS2, 1000n * E);
-    await refresher.refreshAll();
-    expect(r.budgets.get(2)?.headroomTokens).toBe(100n * E);
-    expect(r.budgets.get(3)?.headroomTokens).toBe(100n * E);
-    expect(allocateHeadroom([{ cap: 10n, drawn: 0n }, { cap: 10n, drawn: 5n }], 12n, 50n)).toEqual([
-      { remainingCap: 10n, headroomTokens: 10n },
-      { remainingCap: 5n, headroomTokens: 2n },
-    ]);
-  });
-});
-
-function usageRow(id: string, charged: bigint, createdAt: number): UsageRow {
+function usageRow(id: string, charged: bigint, createdAt: number, workspace = WS2): UsageRow {
   return {
     id,
-    workspace: WS2,
+    workspace,
     apiKeyId: 'k',
     endpoint: 'chat.completions',
     requestedModel: 'beagle/auto',
@@ -253,6 +110,428 @@ function usageRow(id: string, charged: bigint, createdAt: number): UsageRow {
   };
 }
 
+/** Puts a credit-paid debt of `micro` on `workspace` (usage rows + ledger debit). */
+function debt(r: Repos, workspace: string, rows: { id: string; charged: bigint }[]): void {
+  r.workspaces.ensure(workspace, T0);
+  let total = 0n;
+  rows.forEach((row, i) => {
+    r.usage.insert(usageRow(row.id, row.charged, T0 - rows.length + i, workspace));
+    total += row.charged;
+  });
+  r.ledger.insert({ workspace, kind: 'debit', amountMicro: -total, refType: 'usage', refId: rows.map((x) => x.id).join(','), memo: null, createdAt: T0 });
+}
+
+const txFixtures = (): Map<string, RpcParsedTransaction> =>
+  new Map(
+    ['tx-transfer', 'tx-burn', 'tx-burnchecked-memo', 'tx-approve', 'tx-draw', 'tx-two-burns'].map((name) => {
+      const tx = fixture<RpcParsedTransaction>(name);
+      return [tx.transaction.signatures[0] as string, tx];
+    }),
+  );
+
+describe('jsonParsed parsing (validator fixtures)', () => {
+  it('extracts burn / burnChecked of the mint with amounts, authority, flattened index and owner', () => {
+    const burn = fixture<RpcParsedTransaction>('tx-burn');
+    expect(extractBurns(burn, MINT)).toEqual([{ ixIndex: 0, program: 'spl-token', type: 'burn', tokenAccount: ATA1, authority: WS1, amount: 1_000_000n }]);
+    expect(resolveOwner(burn, ATA1)).toBe(WS1);
+    expect(extractMemo(burn)).toBeNull();
+
+    const checked = fixture<RpcParsedTransaction>('tx-burnchecked-memo');
+    expect(extractBurns(checked, MINT)).toEqual([{ ixIndex: 0, program: 'spl-token', type: 'burnChecked', tokenAccount: ATA1, authority: WS1, amount: 1_000_000_000n }]);
+    expect(extractMemo(checked)).toBe(META.purchaseMemo);
+
+    const draw = fixture<RpcParsedTransaction>('tx-draw');
+    expect(extractBurns(draw, MINT)).toEqual([{ ixIndex: 1, program: 'spl-token', type: 'burnChecked', tokenAccount: ATA2, authority: OPERATOR, amount: 7_000_000n }]);
+    expect(resolveOwner(draw, ATA2)).toBe(WS2);
+    expect(extractMemo(draw)).toBe(META.drawMemo);
+
+    const two = fixture<RpcParsedTransaction>('tx-two-burns');
+    expect(extractBurns(two, MINT).map((b) => [b.ixIndex, b.type, b.amount])).toEqual([
+      [0, 'burnChecked', 2_000_000n],
+      [2, 'burn', 3_000_000n],
+    ]);
+    expect(extractMemo(two)).toBe('hello world');
+    expect(extractBurns(two, testPubkey(9))).toEqual([]); // another mint
+  });
+
+  it('walks inner instructions in order and ignores transfers, approvals and revokes', () => {
+    const transfer = fixture<RpcParsedTransaction>('tx-transfer');
+    expect(flattenInstructions(transfer).map((ix) => (ix.parsed as { type?: string } | undefined)?.type)).toEqual([
+      'createIdempotent',
+      'getAccountDataSize',
+      'createAccount',
+      'initializeImmutableOwner',
+      'initializeAccount3',
+      'transferChecked',
+    ]);
+    expect(extractBurns(transfer, MINT)).toEqual([]);
+    expect(extractBurns(fixture<RpcParsedTransaction>('tx-approve'), MINT)).toEqual([]);
+    expect(extractBurns(fixture<RpcParsedTransaction>('tx-revoke'), MINT)).toEqual([]);
+    // An inner burn counts, with the flattened index.
+    const inner = makeBurnTx({ signature: testSignature(1), slot: 1, tokenAccount: ATA1, owner: WS1, amount: 5n });
+    const outer: RpcParsedTransaction = {
+      ...inner,
+      transaction: { ...inner.transaction, message: { ...inner.transaction.message, instructions: [{ programId: testPubkey(3), accounts: [], data: 'xx' }] } },
+      meta: { ...inner.meta!, innerInstructions: [{ index: 0, instructions: inner.transaction.message.instructions }] },
+    };
+    expect(extractBurns(outer, MINT)).toEqual([{ ixIndex: 1, program: 'spl-token', type: 'burnChecked', tokenAccount: ATA1, authority: WS1, amount: 5n }]);
+    expect(resolveOwner(outer, ATA1)).toBe(WS1);
+    expect(resolveOwner(outer, testPubkey(4))).toBeUndefined();
+  });
+
+  it('parses token accounts (delegated, revoked, missing) and the mint', () => {
+    const delegated = fixture<{ value: (RpcParsedAccount | null)[] }>('token-accounts-delegated').value;
+    expect(parseTokenAccount(ATA2, delegated[0])).toEqual({ address: ATA2, mint: MINT, owner: WS2, amount: 100_000_000_000n, delegate: OPERATOR, delegatedAmount: 500_000_000n, programId: TOKEN_PROGRAM_ID });
+    expect(parseTokenAccount(ATA1, delegated[1])).toMatchObject({ owner: WS1, delegate: null, delegatedAmount: 0n, amount: 98_999_000_000n });
+    expect(parseTokenAccount(testPubkey(5), delegated[2])).toBeUndefined();
+    const revoked = fixture<{ value: (RpcParsedAccount | null)[] }>('token-accounts-revoked').value;
+    expect(parseTokenAccount(ATA2, revoked[0])).toMatchObject({ delegate: null, delegatedAmount: 0n, amount: 99_993_000_000n });
+    const mint = fixture<{ value: RpcParsedAccount }>('mint-account').value;
+    expect(parseMintAccount(mint)).toEqual({ decimals: 6, supply: 999_998_987_000_000n, programId: TOKEN_PROGRAM_ID });
+    expect(parseMintAccount(delegated[0])).toBeUndefined();
+    expect(parseTokenAccount(ATA1, mint)).toBeUndefined();
+    const gpa = fixture<{ pubkey: string; account: RpcParsedAccount }[]>('gpa-delegated');
+    expect(gpa.map((e) => e.pubkey)).toEqual([ATA2]);
+    expect(delegated[0]).toMatchObject(makeTokenAccount({ owner: WS2, amount: 100_000_000_000n, delegate: OPERATOR, delegatedAmount: 500_000_000n }));
+  });
+});
+
+describe('indexer', () => {
+  it('indexes the captured session: purchases, memo credit, orphan draw, two burns in one tx; idempotent; cursor', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    const txs = txFixtures();
+    for (const [sig, tx] of txs) rpc.transactions.set(sig, tx);
+    rpc.signatures = fixture<RpcSignatureInfo[]>('signatures-for-mint').filter((s) => txs.has(s.signature));
+    rpc.slot = 130;
+    const lines: string[] = [];
+    const price = priceService(r, () => T0);
+    const ix = new Indexer(
+      r,
+      rpc,
+      price,
+      { mint: MINT, operator: OPERATOR, decimals: 6, pageLimit: 1000, fetchConcurrency: 2, indexFromSignature: undefined, creditWhenStale: true, minCreditMicro: 1000n, now: () => T0 },
+      createLogger({ level: 'warn', write: (l) => lines.push(l) }),
+    );
+    expect(ix.status()).toEqual({ lastSignature: null, lastSlot: null, headSlot: 0, lagSlots: 0, lastEventAt: null });
+
+    const res = await ix.step();
+    expect(res).toEqual({ processed: 6, events: 5 });
+    expect(r.ledger.balance(WS1)).toBe(10_000n + 20_000n + 30_000n);
+    expect(r.ledger.balance(WS2)).toBe(10_000_000n + 70_000n);
+    const purchase = r.creditEvents.get(META.sigs.burnCheckedSig, 0)!;
+    expect(purchase).toMatchObject({ kind: 'purchase', workspace: WS2, payer: WS1, tokenAccount: ATA1, authority: WS1, tokenAmount: 1_000_000_000n, usdMicro: 10_000_000n, priceE18: PRICE, pricePointId: 1, priceStale: false, memo: META.purchaseMemo, receiptHash: null, slot: 125, blockTime: 1_791_808_152 });
+    expect(r.creditEvents.get(META.sigs.burnSig, 0)).toMatchObject({ kind: 'purchase', workspace: WS1, payer: WS1, usdMicro: 10_000n, memo: null });
+    expect(r.creditEvents.get(META.sigs.drawSig, 1)).toMatchObject({ kind: 'draw', workspace: WS2, payer: WS2, authority: OPERATOR, tokenAmount: 7_000_000n, usdMicro: 70_000n, receiptHash: META.hash, memo: META.drawMemo });
+    expect(lines.some((l) => l.includes('orphan_draw'))).toBe(true);
+    expect(r.creditEvents.get(META.sigs.twoSig, 0)).toMatchObject({ usdMicro: 20_000n, memo: 'hello world', workspace: WS1 });
+    expect(r.creditEvents.get(META.sigs.twoSig, 2)).toMatchObject({ usdMicro: 30_000n, workspace: WS1 });
+    expect(r.creditEvents.get(META.sigs.twoSig, 1)).toBeUndefined();
+    expect(r.ledger.hasRef('credit_event', `${META.sigs.twoSig}:2`)).toBe(true);
+    expect(ix.status()).toEqual({ lastSignature: META.sigs.twoSig, lastSlot: 128, headSlot: 130, lagSlots: 2, lastEventAt: T0 });
+    expect(r.creditEvents.list(WS1, 10).map((e) => [e.signature, e.ixIndex])).toEqual([
+      [META.sigs.twoSig, 2],
+      [META.sigs.twoSig, 0],
+      [META.sigs.burnSig, 0],
+    ]);
+    // Transactions were fetched oldest first, in pairs.
+    const fetched = rpc.calls.filter((c) => c.method === 'getParsedTransaction').map((c) => c.args[0]);
+    expect(fetched).toEqual([META.sigs.transferSig, META.sigs.burnSig, META.sigs.burnCheckedSig, META.sigs.approveSig, META.sigs.drawSig, META.sigs.twoSig]);
+
+    // Nothing new: the next poll asks for signatures until the cursor and applies nothing.
+    rpc.calls.length = 0;
+    expect(await ix.step()).toBeUndefined();
+    expect(rpc.calls[0]).toEqual({ method: 'getSignaturesForAddress', args: [MINT, { limit: 1000, until: META.sigs.twoSig }] });
+    // Re-applying a transaction is a no-op.
+    expect(await ix.applyParsedTransaction(META.sigs.burnSig, txs.get(META.sigs.burnSig)!)).toBe(0);
+    expect(r.ledger.balance(WS1)).toBe(60_000n);
+  });
+
+  it('first run takes only the newest page; INDEX_FROM_SIGNATURE pages everything after it; failed txs advance the cursor', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    const price = priceService(r, () => T0);
+    const sigs: string[] = [];
+    for (let i = 1; i <= 5; i++) {
+      sigs.push(rpc.addTransaction(makeBurnTx({ signature: testSignature(i), slot: 100 + i, tokenAccount: ATA1, owner: WS1, amount: BigInt(i) * 1_000_000n })));
+    }
+    // Fresh database, no INDEX_FROM_SIGNATURE: the newest 2 only.
+    const fresh = indexer(r, rpc, price, { pageLimit: 2 });
+    expect(await fresh.step()).toEqual({ processed: 2, events: 2 });
+    expect(r.ledger.balance(WS1)).toBe(40_000n + 50_000n);
+    expect(fresh.lastSignature()).toBe(sigs[4]);
+    expect(rpc.calls.filter((c) => c.method === 'getSignaturesForAddress')).toHaveLength(1);
+
+    // Another database with INDEX_FROM_SIGNATURE = the first burn: pages backwards with `before` until `until`.
+    const r2 = repos();
+    const price2 = priceService(r2, () => T0);
+    rpc.calls.length = 0;
+    const from = indexer(r2, rpc, price2, { pageLimit: 2, indexFromSignature: sigs[0] });
+    expect(await from.step()).toEqual({ processed: 4, events: 4 });
+    expect(r2.ledger.balance(WS1)).toBe(20_000n + 30_000n + 40_000n + 50_000n);
+    const pages = rpc.calls.filter((c) => c.method === 'getSignaturesForAddress').map((c) => c.args[1]);
+    expect(pages).toEqual([
+      { limit: 2, until: sigs[0] },
+      { limit: 2, until: sigs[0], before: sigs[3] },
+      { limit: 2, until: sigs[0], before: sigs[1] },
+    ]);
+    // A failed transaction is skipped but moves the cursor.
+    const failed = rpc.addTransaction(makeBurnTx({ signature: testSignature(6), slot: 106, tokenAccount: ATA1, owner: WS1, amount: 1n, err: { InstructionError: [0, 'Custom'] } }));
+    expect(await from.step()).toEqual({ processed: 1, events: 0 });
+    expect(from.lastSignature()).toBe(failed);
+    expect(r2.creditEvents.get(failed, 0)).toBeUndefined();
+  });
+
+  it('stops at a transaction the RPC cannot serve yet and resumes from the cursor; owner falls back to getAccountInfo', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    const price = priceService(r, () => T0);
+    const ix = indexer(r, rpc, price);
+    const first = rpc.addTransaction(makeBurnTx({ signature: testSignature(11), slot: 111, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
+    const pending = testSignature(12);
+    rpc.addPendingSignature(pending, 112);
+    rpc.addTransaction(makeBurnTx({ signature: testSignature(13), slot: 113, tokenAccount: ATA1, owner: WS1, amount: 2_000_000n }));
+    expect(await ix.step()).toEqual({ processed: 1, events: 1 });
+    expect(ix.lastSignature()).toBe(first);
+    expect(r.ledger.balance(WS1)).toBe(10_000n);
+    // The transaction becomes available: a burn whose preTokenBalances lack the owner → account lookup.
+    const tx = makeBurnTx({ signature: pending, slot: 112, tokenAccount: ATA2, owner: WS2, amount: 3_000_000n });
+    tx.meta!.preTokenBalances = [];
+    tx.meta!.postTokenBalances = [];
+    rpc.transactions.set(pending, tx);
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 1n }));
+    expect(await ix.step()).toEqual({ processed: 2, events: 2 });
+    expect(r.creditEvents.get(pending, 0)).toMatchObject({ workspace: WS2, payer: WS2 });
+    expect(r.ledger.balance(WS1)).toBe(30_000n);
+    expect(ix.lastSignature()).toBe(testSignature(13));
+  });
+
+  it('applies the dust guard, credits at a stale price when allowed and defers otherwise', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    let nowMs = T0;
+    const price = priceService(r, () => nowMs);
+    const ix = indexer(r, rpc, price, { now: () => nowMs });
+    rpc.addTransaction(makeBurnTx({ signature: testSignature(21), slot: 121, tokenAccount: ATA1, owner: WS1, amount: 50_000n })); // $0.0005 < MIN_CREDIT_USD
+    await ix.step();
+    expect(r.creditEvents.get(testSignature(21), 0)).toMatchObject({ usdMicro: 0n });
+    expect(r.ledger.balance(WS1)).toBe(0n);
+    expect(r.ledger.hasRef('credit_event', `${testSignature(21)}:0`)).toBe(false);
+
+    nowMs += 3601 * 1000; // price is now stale
+    rpc.addTransaction(makeBurnTx({ signature: testSignature(22), slot: 122, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
+    await ix.step();
+    expect(r.creditEvents.get(testSignature(22), 0)).toMatchObject({ usdMicro: 10_000n, priceStale: true });
+    expect(r.ledger.balance(WS1)).toBe(10_000n);
+
+    const strict = indexer(r, rpc, price, { now: () => nowMs, creditWhenStale: false });
+    rpc.addTransaction(makeBurnTx({ signature: testSignature(23), slot: 123, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
+    expect(await strict.step()).toEqual({ processed: 0, events: 0 });
+    expect(strict.lastSignature()).toBe(testSignature(22));
+    price.set(PRICE); // fresh point → the deferred burn is applied
+    expect(await strict.step()).toEqual({ processed: 1, events: 1 });
+    expect(r.ledger.balance(WS1)).toBe(20_000n);
+
+    // No price point at all (feed source, nothing fetched yet) → deferred as well.
+    const r2 = repos();
+    const empty = priceService(r2, () => nowMs, { source: 'feed', feedUrl: 'https://feed.test/p' });
+    const rpc2 = new FakeRpc();
+    rpc2.addTransaction(makeBurnTx({ signature: testSignature(24), slot: 124, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
+    const noPrice = indexer(r2, rpc2, empty, { now: () => nowMs });
+    expect(await noPrice.step()).toEqual({ processed: 0, events: 0 });
+    expect(noPrice.lastSignature()).toBeUndefined();
+  });
+
+  it('confirms a draw by memo hash: batch price, confirmed status, signature, usage rows claimed', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    const price = priceService(r, () => T0);
+    const ix = indexer(r, rpc, price);
+    openBudget(r, ATA2, WS2, 500_000_000n, 100_000_000_000n, 5_000_000n);
+    r.usage.insert(usageRow('u1', 35_000n, T0 - 1));
+    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -35_000n, refType: 'usage', refId: 'u1', memo: null, createdAt: T0 });
+    const batchPrice = 5n * 10n ** 15n; // $0.005
+    const drawId = r.budgetDraws.insert({
+      tokenAccount: ATA2,
+      workspace: WS2,
+      tokenAmount: 7_000_000n,
+      usdMicro: 35_000n,
+      receiptHash: META.hash,
+      usageIds: ['u1'],
+      batchJson: JSON.stringify({ v: 1, cluster: 'localnet', mint: MINT, tokenAccount: ATA2, workspace: WS2, usageIds: ['u1'], amountMicro: '35000', priceE18: batchPrice.toString(), pricePointId: 7 }),
+      signature: null,
+      lastValidBlockHeight: null,
+      status: 'failed',
+      error: 'gave up',
+      createdAt: T0,
+      updatedAt: T0,
+    });
+    rpc.addTransaction(fixture<RpcParsedTransaction>('tx-draw'));
+    expect(await ix.step()).toEqual({ processed: 1, events: 1 });
+    expect(r.creditEvents.get(META.sigs.drawSig, 1)).toMatchObject({ kind: 'draw', workspace: WS2, usdMicro: 35_000n, priceE18: batchPrice, pricePointId: 7, priceStale: false, receiptHash: META.hash });
+    expect(r.budgetDraws.get(drawId)).toMatchObject({ status: 'confirmed', signature: META.sigs.drawSig, error: null });
+    expect(r.usage.get('u1')?.drawId).toBe(drawId);
+    expect(r.ledger.balance(WS2)).toBe(0n);
+    // A delegate burn by someone other than the operator, or without a draw memo, is a purchase for the owner.
+    rpc.addTransaction(makeBurnTx({ signature: testSignature(31), slot: 131, tokenAccount: ATA2, owner: WS2, authority: testPubkey(8), amount: 1_000_000n, memo: META.drawMemo }));
+    rpc.addTransaction(makeBurnTx({ signature: testSignature(32), slot: 132, tokenAccount: ATA2, owner: WS2, authority: OPERATOR, amount: 1_000_000n }));
+    await ix.step();
+    expect(r.creditEvents.get(testSignature(31), 0)).toMatchObject({ kind: 'purchase', workspace: WS2, authority: testPubkey(8) });
+    expect(r.creditEvents.get(testSignature(32), 0)).toMatchObject({ kind: 'purchase', workspace: WS2, authority: OPERATOR });
+    expect(r.ledger.balance(WS2)).toBe(20_000n);
+  });
+
+  it('finality sweep reverts events whose signature is gone or failed at finalized, after the grace period', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    let nowMs = T0;
+    const price = priceService(r, () => nowMs);
+    const ix = indexer(r, rpc, price, { now: () => nowMs });
+    const s1 = rpc.addTransaction(makeBurnTx({ signature: testSignature(41), slot: 150, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
+    const s2 = rpc.addTransaction(makeBurnTx({ signature: testSignature(42), slot: 151, tokenAccount: ATA1, owner: WS1, amount: 2_000_000n }));
+    // A confirmed draw that will be dropped too.
+    openBudget(r, ATA2, WS2, 500_000_000n, 100_000_000_000n, 5_000_000n);
+    r.usage.insert(usageRow('u1', 3n, T0 - 1));
+    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -3n, refType: 'usage', refId: 'u1', memo: null, createdAt: T0 });
+    const batch = { v: 1, cluster: 'localnet', mint: MINT, tokenAccount: ATA2, workspace: WS2, usageIds: ['u1'], amountMicro: '3', priceE18: PRICE.toString(), pricePointId: 1 };
+    const hash = receiptHash(batch);
+    const drawId = r.budgetDraws.insert({ tokenAccount: ATA2, workspace: WS2, tokenAmount: 300n, usdMicro: 3n, receiptHash: hash, usageIds: ['u1'], batchJson: JSON.stringify(batch), signature: testSignature(43), lastValidBlockHeight: 400, status: 'sent', error: null, createdAt: T0, updatedAt: T0 });
+    r.usage.setDrawId(['u1'], drawId);
+    const s3 = rpc.addTransaction(makeBurnTx({ signature: testSignature(43), slot: 152, tokenAccount: ATA2, owner: WS2, authority: OPERATOR, amount: 300n, memo: encodeDrawMemo({ workspace: WS2, receiptHash: hash }) }));
+    await ix.step();
+    expect(r.ledger.balance(WS1)).toBe(30_000n);
+    expect(r.ledger.balance(WS2)).toBe(0n);
+    expect(r.budgetDraws.get(drawId)?.status).toBe('confirmed');
+    // Young events are not checked yet.
+    expect(await ix.sweepFinality()).toEqual({ checked: 0, reverted: [] });
+    nowMs += 3 * 60_000;
+    rpc.statuses.set(s1, null);
+    rpc.statuses.set(s3, null);
+    const swept = await ix.sweepFinality();
+    expect(swept.checked).toBe(3);
+    expect(swept.reverted.sort()).toEqual([s1, s3].sort());
+    expect(r.creditEvents.get(s1, 0)).toBeUndefined();
+    expect(r.ledger.hasRef('credit_event', `${s1}:0`)).toBe(false);
+    expect(r.ledger.balance(WS1)).toBe(20_000n);
+    expect(r.ledger.balance(WS2)).toBe(-3n);
+    expect(r.budgetDraws.get(drawId)).toMatchObject({ status: 'failed' });
+    expect(r.usage.get('u1')?.drawId).toBeNull();
+    expect(r.budgets.get(ATA2)?.stalledReason).toBe('draw_failed');
+    // A transaction that failed at finalized is reverted too; a healthy one survives repeated sweeps.
+    rpc.statuses.set(s2, { slot: 151, confirmations: null, err: { InstructionError: [0, 'Custom'] }, confirmationStatus: 'finalized' });
+    expect((await ix.sweepFinality()).reverted).toEqual([s2]);
+    expect(r.ledger.balance(WS1)).toBe(0n);
+    expect(await ix.sweepFinality()).toEqual({ checked: 0, reverted: [] });
+    // Events outside the slot window are not re-checked.
+    rpc.statuses.clear();
+    rpc.addTransaction(makeBurnTx({ signature: testSignature(44), slot: 160, tokenAccount: ATA1, owner: WS1, amount: 1_000_000n }));
+    await ix.step();
+    nowMs += 3 * 60_000;
+    rpc.slot = 160 + 5000;
+    await ix.step();
+    expect(await ix.sweepFinality()).toEqual({ checked: 0, reverted: [] });
+    expect(r.ledger.balance(WS1)).toBe(10_000n);
+  });
+});
+
+describe('budget scanner', () => {
+  it('scans with the §3.4 getProgramAccounts filters and upserts budgets with headroom', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    const price = priceService(r, () => T0);
+    const gpa = fixture<{ pubkey: string; account: RpcParsedAccount }[]>('gpa-delegated');
+    for (const e of gpa) rpc.accounts.set(e.pubkey, e.account);
+    rpc.accounts.set(ATA1, makeTokenAccount({ owner: WS1, amount: 10n })); // not delegated → ignored
+    rpc.accounts.set(testPubkey(6), makeTokenAccount({ owner: WS1, amount: 10n, delegate: testPubkey(7), delegatedAmount: 5n })); // another delegate → ignored
+    const s = scanner(r, rpc, price);
+    expect(await s.scan()).toBe(1);
+    expect(rpc.calls[0]).toEqual({ method: 'getParsedProgramAccounts', args: [TOKEN_PROGRAM_ID, budgetScanFilters(MINT, OPERATOR)] });
+    expect(budgetScanFilters(MINT, OPERATOR)).toEqual([{ dataSize: 165 }, { memcmp: { offset: 0, bytes: MINT } }, { memcmp: { offset: 76, bytes: OPERATOR } }]);
+    const row = r.budgets.get(ATA2)!;
+    expect(row).toMatchObject({ owner: WS2, workspace: WS2, delegate: OPERATOR, cap: 500_000_000n, balance: 100_000_000_000n, headroomTokens: 500_000_000n, headroomMicro: 5_000_000n, stalledReason: null, closed: false, registeredAt: null });
+    expect(r.ledger.budgetHeadroom(WS2)).toBe(5_000_000n);
+    expect(r.ledger.snapshot(WS2, T0)).toEqual({ balance: 0n, reserved: 0n, budgetHeadroom: 5_000_000n, available: 5_000_000n });
+    expect(r.budgets.get(ATA1)).toBeUndefined();
+    // Headroom is min(delegatedAmount, amount).
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 100_000_000n, delegate: OPERATOR, delegatedAmount: 500_000_000n }));
+    await s.refresh();
+    expect(r.budgets.get(ATA2)).toMatchObject({ headroomTokens: 100_000_000n, headroomMicro: 1_000_000n, balance: 100_000_000n });
+  });
+
+  it('refresh follows delegate changes: exhausted, revoked (closed), closed account, re-approved, price stall, draw_failed cleared', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    let nowMs = T0;
+    const price = priceService(r, () => nowMs);
+    const s = scanner(r, rpc, price, () => nowMs);
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 100_000_000_000n, delegate: OPERATOR, delegatedAmount: 500_000_000n }));
+    await s.scan();
+    expect(r.budgets.get(ATA2)?.stalledReason).toBeNull();
+    // exhausted: delegatedAmount 0 with the delegate still set
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 100_000_000_000n, delegate: OPERATOR, delegatedAmount: 0n }));
+    expect(await s.refresh()).toBe(1);
+    expect(r.budgets.get(ATA2)).toMatchObject({ closed: false, stalledReason: 'exhausted', headroomTokens: 0n, headroomMicro: 0n, cap: 0n });
+    expect(r.ledger.budgetHeadroom(WS2)).toBe(0n);
+    // revoked (the fixture of the revoked account)
+    rpc.accounts.set(ATA2, fixture<{ value: RpcParsedAccount[] }>('token-accounts-revoked').value[0]!);
+    await s.refresh();
+    expect(r.budgets.get(ATA2)).toMatchObject({ closed: true, stalledReason: 'revoked', delegate: null, headroomMicro: 0n });
+    expect(r.budgets.listOpen()).toEqual([]);
+    // re-approved → found again by the scan, reopened
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 100_000_000_000n, delegate: OPERATOR, delegatedAmount: 200_000_000n }));
+    await s.scan();
+    expect(r.budgets.get(ATA2)).toMatchObject({ closed: false, stalledReason: null, cap: 200_000_000n, headroomMicro: 2_000_000n });
+    // draw_failed is cleared by the next successful refresh
+    r.budgets.setStalled(ATA2, 'draw_failed', nowMs);
+    expect(r.budgets.listDrawable(WS2)).toEqual([]);
+    await s.refresh();
+    expect(r.budgets.get(ATA2)?.stalledReason).toBeNull();
+    expect(r.budgets.listDrawable(WS2).map((b) => b.tokenAccount)).toEqual([ATA2]);
+    // stale price → headroom_micro 0, stalled 'price' (tokens kept)
+    nowMs += 3601 * 1000;
+    await s.refresh();
+    expect(r.budgets.get(ATA2)).toMatchObject({ stalledReason: 'price', headroomTokens: 200_000_000n, headroomMicro: 0n });
+    price.set(PRICE);
+    await s.refresh();
+    expect(r.budgets.get(ATA2)?.stalledReason).toBeNull();
+    // account closed entirely
+    rpc.accounts.set(ATA2, null);
+    await s.refresh();
+    expect(r.budgets.get(ATA2)).toMatchObject({ closed: true, stalledReason: 'revoked' });
+    // pure rule
+    expect(computeHeadroom({ delegate: OPERATOR, delegatedAmount: 10n, amount: 4n }, OPERATOR, { id: 1, priceE18: PRICE, source: 'manual', observedAt: 0, stale: false }, 6)).toEqual({ closed: false, headroomTokens: 4n, headroomMicro: 0n, stalledReason: null });
+    expect(computeHeadroom({ delegate: OPERATOR, delegatedAmount: 10n ** 9n, amount: 10n ** 12n }, OPERATOR, { id: 1, priceE18: PRICE, source: 'manual', observedAt: 0, stale: false }, 6)).toEqual({ closed: false, headroomTokens: 10n ** 9n, headroomMicro: 10_000_000n, stalledReason: null });
+    expect(computeHeadroom({ delegate: null, delegatedAmount: 0n, amount: 5n }, OPERATOR, undefined, 6)).toEqual({ closed: true, headroomTokens: 0n, headroomMicro: 0n, stalledReason: 'revoked' });
+    expect(computeHeadroom({ delegate: OPERATOR, delegatedAmount: 5n, amount: 5n }, undefined, undefined, 6).closed).toBe(true);
+  });
+
+  it('register validates the account and lets the owner fund another workspace; scans keep the registration', async () => {
+    const r = repos();
+    const rpc = new FakeRpc();
+    const price = priceService(r, () => T0);
+    const s = scanner(r, rpc, price);
+    await expect(s.register(ATA2)).rejects.toMatchObject({ code: 'not_found' });
+    rpc.accounts.set(ATA2, fixture<{ value: RpcParsedAccount }>('mint-account').value);
+    await expect(s.register(ATA2)).rejects.toMatchObject({ code: 'not_token_account' });
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 1n, mint: testPubkey(9), delegate: OPERATOR, delegatedAmount: 1n }));
+    await expect(s.register(ATA2)).rejects.toMatchObject({ code: 'wrong_mint' });
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 1n }));
+    await expect(s.register(ATA2)).rejects.toBeInstanceOf(BudgetRegisterError);
+    await expect(s.register(ATA2)).rejects.toMatchObject({ code: 'not_delegated' });
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 100_000_000_000n, delegate: OPERATOR, delegatedAmount: 500_000_000n }));
+    const row = await s.register(ATA2, WS1);
+    expect(row).toMatchObject({ tokenAccount: ATA2, owner: WS2, workspace: WS1, cap: 500_000_000n, headroomMicro: 5_000_000n, stalledReason: null, registeredAt: T0 });
+    expect(r.ledger.budgetHeadroom(WS1)).toBe(5_000_000n);
+    expect(r.ledger.budgetHeadroom(WS2)).toBe(0n);
+    await s.scan();
+    expect(r.budgets.get(ATA2)).toMatchObject({ workspace: WS1, registeredAt: T0 });
+    expect((await s.register(ATA2)).workspace).toBe(WS1); // re-register without a workspace keeps it
+    const noOperator = new BudgetScanner(r, rpc, price, { mint: MINT, operator: undefined, tokenProgram: TOKEN_PROGRAM_ID, decimals: 6, now: () => T0 }, silentLogger);
+    await expect(noOperator.register(ATA2)).rejects.toMatchObject({ code: 'not_delegated' });
+    expect(await noOperator.scan()).toBe(0);
+  });
+});
+
 describe('budget drawer', () => {
   it('selectBatch takes oldest rows until the deficit is covered, capped by headroom', () => {
     const rows = [usageRow('a', 3n, 1), usageRow('b', 4n, 2), usageRow('c', 5n, 3)];
@@ -261,281 +540,304 @@ describe('budget drawer', () => {
     expect(selectBatch(rows, 100n, 8n)).toEqual({ usageIds: ['a', 'b'], amountMicro: 7n });
     expect(selectBatch(rows, 100n, 2n)).toBeUndefined();
     expect(selectBatch([], 1n, 100n)).toBeUndefined();
-    // An oversized oldest row is skipped, not a stop: the smaller rows behind it still settle.
     const oversize = [usageRow('big', 10n, 1), usageRow('b', 2n, 2), usageRow('c', 3n, 3)];
     expect(selectBatch(oversize, 100n, 5n)).toEqual({ usageIds: ['b', 'c'], amountMicro: 5n });
     expect(selectBatch(oversize, 100n, 4n)).toEqual({ usageIds: ['b'], amountMicro: 2n });
   });
 
-  it('draws for a workspace in deficit, records pending → sent, and the indexer confirms it', async () => {
+  it('builds [ComputeBudget?, BurnChecked(delegate = operator), Memo] with the operator as memo signer', () => {
+    const memo = encodeDrawMemo({ workspace: WS2, receiptHash: META.hash });
+    const base = { tokenAccount: ATA2, mint: MINT, operator: OPERATOR, amount: 7_000_000n, decimals: 6, tokenProgram: TOKEN_PROGRAM_ID, memoProgram: MEMO_PROGRAM_ID, memo };
+    const plain = buildDrawInstructions({ ...base, priorityFeeMicrolamports: 0 });
+    expect(plain.map((ix) => ix.programId.toBase58())).toEqual([TOKEN_PROGRAM_ID, MEMO_PROGRAM_ID]);
+    const burn = plain[0]!;
+    expect(burn.keys.map((k) => [k.pubkey.toBase58(), k.isSigner, k.isWritable])).toEqual([
+      [ATA2, false, true],
+      [MINT, false, true],
+      [OPERATOR, true, false],
+    ]);
+    expect(burn.data[0]).toBe(15); // BurnChecked
+    expect(burn.data.readBigUInt64LE(1)).toBe(7_000_000n);
+    expect(burn.data[9]).toBe(6);
+    const memoIx = plain[1]!;
+    expect(memoIx.keys).toHaveLength(1);
+    expect(memoIx.keys[0]!.pubkey.toBase58()).toBe(OPERATOR);
+    expect(memoIx.keys[0]!.isSigner).toBe(true);
+    expect(memoIx.data.toString('utf8')).toBe(memo);
+    const withFee = buildDrawInstructions({ ...base, priorityFeeMicrolamports: 1000 });
+    expect(withFee.map((ix) => ix.programId.toBase58())).toEqual([COMPUTE_BUDGET_PROGRAM_ID, TOKEN_PROGRAM_ID, MEMO_PROGRAM_ID]);
+    expect(withFee[0]!.data[0]).toBe(3); // SetComputeUnitPrice
+  });
+
+  it('draws for a workspace in deficit: pending → sent with signature and block height; the indexer confirms it by memo hash', async () => {
     const r = repos();
-    const chain = new FakeChain();
-    const nowMs = 1_700_000_000_000;
-    r.workspaces.ensure(WS2, nowMs);
-    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 500n * 10n ** 18n, deadline: 1_700_000_000 + 7200, openedBlock: 1, now: nowMs });
-    r.budgets.setHeadroom(1, 500n * 10n ** 18n, 5_000_000n, null, nowMs);
-    r.usage.insert(usageRow('u1', 2n, nowMs - 2));
-    r.usage.insert(usageRow('u2', 1n, nowMs - 1));
-    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -3n, refType: 'usage', refId: 'u1', memo: null, createdAt: nowMs });
-    const drawer = new BudgetDrawer(r, chain, chain, { chainId: 31337, creditDesk: DESK, decimals: 18, thresholdMicro: 1n, dryRun: false, now: () => nowMs }, silentLogger);
-    const attempts = await drawer.tick();
+    const rpc = new FakeRpc();
+    const price = priceService(r, () => T0);
+    openBudget(r, ATA2, WS2, 500_000_000n, 100_000_000_000n, 5_000_000n);
+    debt(r, WS2, [
+      { id: 'u1', charged: 2n },
+      { id: 'u2', charged: 1n },
+    ]);
+    const d = drawer(r, rpc, price);
+    const attempts = await d.tick();
     expect(attempts).toHaveLength(1);
     const a = attempts[0]!;
-    expect(a.status).toBe('sent');
-    expect(a.amountMicro).toBe(3n);
-    expect(a.tokens).toBe(tokensForUsdMicro(3n, 10n ** 16n));
-    expect(chain.draws).toHaveLength(1);
+    expect(a).toMatchObject({ workspace: WS2, tokenAccount: ATA2, status: 'sent', amountMicro: 3n, tokens: tokensForUsdMicro(3n, PRICE, 6) });
+    expect(a.tokens).toBe(300n);
+    expect(rpc.sent).toHaveLength(1);
+    expect(rpc.sent[0]!.signature).toBe(a.signature);
+    expect(rpc.sent[0]!.recent).toEqual(rpc.blockhash);
     const draw = r.budgetDraws.get(a.drawId!)!;
-    expect(draw.status).toBe('sent');
-    expect(draw.txHash).toBe(chain.draws[0]!.txHash);
-    expect(draw.usageIds).toEqual(['u1', 'u2']);
+    expect(draw).toMatchObject({ status: 'sent', signature: a.signature, lastValidBlockHeight: 400, usageIds: ['u1', 'u2'], tokenAmount: 300n, usdMicro: 3n });
     const batch = DrawBatchSchema.parse(JSON.parse(draw.batchJson));
-    expect(batch).toMatchObject({ v: 1, chainId: 31337, desk: DESK, budgetId: 1, workspace: WS2, usageIds: ['u1', 'u2'], amountMicro: 3n, priceE18: 10n ** 16n });
+    expect(batch).toEqual({ v: 1, cluster: 'localnet', mint: MINT, tokenAccount: ATA2, workspace: WS2, usageIds: ['u1', 'u2'], amountMicro: 3n, priceE18: PRICE, pricePointId: 1 });
     expect(receiptHash(JSON.parse(draw.batchJson))).toBe(draw.receiptHash);
     expect(receiptHash(batch)).toBe(draw.receiptHash);
+    const memoIx = rpc.sent[0]!.instructions[1]!;
+    expect(memoIx.data.toString('utf8')).toBe(encodeDrawMemo({ workspace: WS2, receiptHash: draw.receiptHash }));
     expect(r.usage.get('u1')?.drawId).toBe(draw.id);
     // A second tick does not double-draw while the first is in flight.
-    expect(await drawer.tick()).toEqual([]);
-    // The indexer sees BudgetDrawn with the same hash → confirmed + ledger credit.
-    chain.mine([drawn(1, 1, WS2, a.tokens, 3n, draw.receiptHash)]);
-    const ix = new Indexer(r, chain, { creditDesk: DESK, startBlock: 1, confirmations: 0, chunkBlocks: 10, now: () => nowMs }, silentLogger);
+    expect(await d.tick()).toEqual([]);
+    // The indexer sees the delegate burn with the memo → confirmed + ledger credit (≥ the deficit).
+    rpc.addTransaction(makeBurnTx({ signature: a.signature!, slot: 300, tokenAccount: ATA2, owner: WS2, authority: OPERATOR, amount: a.tokens, memo: encodeDrawMemo({ workspace: WS2, receiptHash: draw.receiptHash }) }));
+    const ix = indexer(r, rpc, price);
     await ix.step();
-    expect(r.budgetDraws.get(draw.id)?.status).toBe('confirmed');
+    expect(r.budgetDraws.get(draw.id)).toMatchObject({ status: 'confirmed', signature: a.signature });
     expect(r.ledger.balance(WS2)).toBe(0n);
-    expect(r.budgets.get(1)?.drawn).toBe(a.tokens);
-    expect(await drawer.tick()).toEqual([]);
+    expect(await d.tick()).toEqual([]);
+    expect(r.creditEvents.get(a.signature!, 0)).toMatchObject({ kind: 'draw', usdMicro: 3n, receiptHash: draw.receiptHash });
   });
 
-  it('skips below the threshold unless the budget expires within an hour; dry run sends nothing', async () => {
+  it('skips below the threshold, in dry run, without an operator key, on a stale price, and when the headroom tokens lag', async () => {
     const r = repos();
-    const chain = new FakeChain();
-    const nowMs = 1_700_000_000_000;
-    r.workspaces.ensure(WS2, nowMs);
-    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 10n ** 21n, deadline: 1_700_000_000 + 7200, openedBlock: 1, now: nowMs });
-    r.budgets.setHeadroom(1, 10n ** 21n, 5_000_000n, null, nowMs);
-    r.usage.insert(usageRow('u1', 5n, nowMs));
-    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -5n, refType: 'usage', refId: 'u1', memo: null, createdAt: nowMs });
-    const drawer = new BudgetDrawer(r, chain, chain, { chainId: 31337, creditDesk: DESK, decimals: 18, thresholdMicro: 1_000_000n, dryRun: false, now: () => nowMs }, silentLogger);
-    expect(await drawer.tick()).toEqual([]);
-    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 10n ** 21n, deadline: 1_700_000_000 + 1800, openedBlock: 1, now: nowMs });
-    expect((await drawer.tick())[0]?.status).toBe('sent');
-    const dry = new BudgetDrawer(repos(), chain, chain, { chainId: 31337, creditDesk: DESK, decimals: 18, thresholdMicro: 1n, dryRun: true, now: () => nowMs }, silentLogger);
-    expect(await dry.tick()).toEqual([]);
+    const rpc = new FakeRpc();
+    let nowMs = T0;
+    const price = priceService(r, () => nowMs);
+    openBudget(r, ATA2, WS2, 500_000_000n, 100_000_000_000n, 5_000_000n);
+    debt(r, WS2, [{ id: 'u1', charged: 5n }]);
+    expect(await drawer(r, rpc, price, () => nowMs, { thresholdMicro: 1_000_000n }).tick()).toEqual([]);
+    expect((await drawer(r, rpc, price, () => nowMs, { dryRun: true }).tick())[0]?.status).toBe('dry_run');
+    expect((await drawer(r, rpc, price, () => nowMs, { writer: false }).tick())[0]?.status).toBe('dry_run');
+    expect(rpc.sent).toEqual([]);
+    expect(r.budgetDraws.listInFlight()).toEqual([]);
+    nowMs += 3601 * 1000;
+    expect(await drawer(r, rpc, price, () => nowMs).tick()).toEqual([]); // stale price
+    price.set(PRICE);
+    r.budgets.setHeadroom(ATA2, 100n, 5_000_000n, null, nowMs); // tokens below the batch → wait for the refresh
+    expect(await drawer(r, rpc, price, () => nowMs).tick()).toEqual([]);
+    r.budgets.setHeadroom(ATA2, 500_000_000n, 5_000_000n, null, nowMs);
+    expect((await drawer(r, rpc, price, () => nowMs).tick())[0]?.status).toBe('sent');
   });
 
-  it('marks failed draws, un-marks usage rows and stalls the budget', async () => {
+  it('a failed send, an on-chain error or an expired blockhash fail the draw, release the rows and stall the budget', async () => {
     const r = repos();
-    const chain = new FakeChain();
-    const nowMs = 1_700_000_000_000;
-    r.workspaces.ensure(WS2, nowMs);
-    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 10n ** 21n, deadline: 1_700_000_000 + 7200, openedBlock: 1, now: nowMs });
-    r.budgets.setHeadroom(1, 10n ** 21n, 5_000_000n, null, nowMs);
-    r.usage.insert(usageRow('u1', 5n, nowMs));
-    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -5n, refType: 'usage', refId: 'u1', memo: null, createdAt: nowMs });
-    chain.failDraw = new Error('execution reverted: BudgetExceeded');
-    const drawer = new BudgetDrawer(r, chain, chain, { chainId: 31337, creditDesk: DESK, decimals: 18, thresholdMicro: 1n, dryRun: false, now: () => nowMs }, silentLogger);
-    const [a] = await drawer.tick();
+    const rpc = new FakeRpc();
+    const price = priceService(r, () => T0);
+    openBudget(r, ATA2, WS2, 500_000_000n, 100_000_000_000n, 5_000_000n);
+    debt(r, WS2, [{ id: 'u1', charged: 5n }]);
+    rpc.failSend = new Error('Transaction simulation failed: insufficient funds for fee');
+    const d = drawer(r, rpc, price);
+    const [a] = await d.tick();
     expect(a?.status).toBe('failed');
-    expect(a?.error).toContain('BudgetExceeded');
+    expect(a?.error).toContain('insufficient funds');
     expect(r.budgetDraws.get(a!.drawId!)?.status).toBe('failed');
     expect(r.usage.get('u1')?.drawId).toBeNull();
-    expect(r.budgets.get(1)?.stalledReason).toBe('draw_failed');
-    expect(await drawer.tick()).toEqual([]); // stalled budgets are skipped
-    chain.failDraw = undefined;
-    chain.receiptStatus = 'reverted';
-    r.budgets.setStalled(1, null, nowMs);
-    const [b] = await drawer.tick();
+    expect(r.budgets.get(ATA2)?.stalledReason).toBe('draw_failed');
+    expect(await d.tick()).toEqual([]); // stalled budgets are skipped
+    rpc.failSend = undefined;
+    rpc.confirmOutcome = { status: 'failed', err: { InstructionError: [0, { Custom: 1 }] } };
+    r.budgets.setStalled(ATA2, null, T0);
+    const [b] = await d.tick();
     expect(b?.status).toBe('failed');
-    expect(b?.error).toBe('transaction reverted');
-  });
-
-  it('a receipt timeout keeps the draw sent; the indexer confirms it later and the rows are never drawn twice', async () => {
-    const r = repos();
-    const chain = new FakeChain();
-    const nowMs = 1_700_000_000_000;
-    r.workspaces.ensure(WS2, nowMs);
-    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 10n ** 21n, deadline: 1_700_000_000 + 7200, openedBlock: 1, now: nowMs });
-    r.budgets.setHeadroom(1, 10n ** 21n, 5_000_000n, null, nowMs);
-    r.usage.insert(usageRow('u1', 2n, nowMs - 2));
-    r.usage.insert(usageRow('u2', 1n, nowMs - 1));
-    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -3n, refType: 'usage', refId: 'u1', memo: null, createdAt: nowMs });
-    chain.failReceipt = new Error('Timed out while waiting for transaction');
-    const drawer = new BudgetDrawer(r, chain, chain, { chainId: 31337, creditDesk: DESK, decimals: 18, thresholdMicro: 1n, dryRun: false, now: () => nowMs }, silentLogger);
-    const [a] = await drawer.tick();
-    expect(a?.status).toBe('sent');
-    expect(a?.error).toContain('Timed out');
-    const draw = r.budgetDraws.get(a!.drawId!)!;
-    expect(draw.status).toBe('sent');
-    expect(draw.error).toContain('Timed out');
-    expect(r.usage.get('u1')?.drawId).toBe(draw.id);
-    expect(r.usage.get('u2')?.drawId).toBe(draw.id);
-    expect(r.budgets.get(1)?.stalledReason).toBeNull();
-    expect(chain.draws).toHaveLength(1);
-    // While in flight nothing else is drawn for the workspace.
-    r.usage.insert(usageRow('u3', 2n, nowMs));
-    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -2n, refType: 'usage', refId: 'u3', memo: null, createdAt: nowMs });
-    expect(await drawer.tick()).toEqual([]);
-    // The transaction lands: the indexer confirms the draw and keeps the rows marked.
-    chain.mine([drawn(1, 1, WS2, a!.tokens, 3n, draw.receiptHash)]);
-    const ix = new Indexer(r, chain, { creditDesk: DESK, startBlock: 1, confirmations: 0, chunkBlocks: 10, now: () => nowMs }, silentLogger);
-    await ix.step();
-    expect(r.budgetDraws.get(draw.id)?.status).toBe('confirmed');
-    expect(r.ledger.balance(WS2)).toBe(-2n);
-    expect(r.usage.get('u1')?.drawId).toBe(draw.id);
-    expect(r.usage.get('u2')?.drawId).toBe(draw.id);
-    // The next draw covers u3 only — u1/u2 are settled.
-    chain.failReceipt = undefined;
-    const [c] = await drawer.tick();
-    expect(c?.status).toBe('sent');
-    expect(r.budgetDraws.get(c!.drawId!)?.usageIds).toEqual(['u3']);
-    expect(chain.draws).toHaveLength(2);
+    expect(b?.error).toContain('failed on chain');
+    expect(b?.signature).toBe(rpc.sent[0]!.signature);
+    rpc.confirmOutcome = { status: 'expired' };
+    r.budgets.setStalled(ATA2, null, T0);
+    const [c] = await d.tick();
+    expect(c?.status).toBe('failed');
+    expect(c?.error).toContain('blockhash expired');
+    // A confirmation timeout keeps the draw sent (the chain decides later).
+    rpc.confirmOutcome = { status: 'timeout' };
+    r.budgets.setStalled(ATA2, null, T0);
+    const [t] = await d.tick();
+    expect(t?.status).toBe('sent');
+    expect(r.budgetDraws.get(t!.drawId!)?.status).toBe('sent');
+    expect(r.usage.get('u1')?.drawId).toBe(t!.drawId);
+    // The same batch (same hash) is re-used after a failure instead of inserting a duplicate.
+    expect(r.budgetDraws.listByTokenAccount(ATA2)).toHaveLength(1);
   });
 
   it('a draw confirmed by the indexer while the drawer still waits is never flipped to failed', async () => {
     const r = repos();
-    const nowMs = 1_700_000_000_000;
-    const ix = { current: undefined as Indexer | undefined };
-    class RacyChain extends FakeChain {
-      override async waitForReceipt(): Promise<{ status: 'success' | 'reverted'; blockNumber: bigint }> {
-        // The event is indexed before the receipt wait gives up.
+    const price = priceService(r, () => T0);
+    const ixRef = { current: undefined as Indexer | undefined };
+    class RacyRpc extends FakeRpc {
+      override async confirm(): Promise<{ status: 'failed'; err: unknown }> {
         const d = r.budgetDraws.listInFlight()[0]!;
-        this.mine([drawn(1, 1, WS2, d.tokenAmount, d.usdMicro, d.receiptHash)]);
-        await ix.current!.step();
-        throw new Error('receipt wait timed out');
+        this.addTransaction(makeBurnTx({ signature: d.signature!, slot: 300, tokenAccount: ATA2, owner: WS2, authority: OPERATOR, amount: d.tokenAmount, memo: encodeDrawMemo({ workspace: WS2, receiptHash: d.receiptHash }) }));
+        await ixRef.current!.step();
+        return { status: 'failed', err: 'bogus' };
       }
     }
-    const chain = new RacyChain();
-    ix.current = new Indexer(r, chain, { creditDesk: DESK, startBlock: 1, confirmations: 0, chunkBlocks: 10, now: () => nowMs }, silentLogger);
-    r.workspaces.ensure(WS2, nowMs);
-    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 10n ** 21n, deadline: 1_700_000_000 + 7200, openedBlock: 1, now: nowMs });
-    r.budgets.setHeadroom(1, 10n ** 21n, 5_000_000n, null, nowMs);
-    r.usage.insert(usageRow('u1', 3n, nowMs));
-    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -3n, refType: 'usage', refId: 'u1', memo: null, createdAt: nowMs });
-    const drawer = new BudgetDrawer(r, chain, chain, { chainId: 31337, creditDesk: DESK, decimals: 18, thresholdMicro: 1n, dryRun: false, now: () => nowMs }, silentLogger);
-    const [a] = await drawer.tick();
-    expect(a?.status).toBe('confirmed');
-    expect(r.budgetDraws.get(a!.drawId!)?.status).toBe('confirmed');
+    const rpc = new RacyRpc();
+    ixRef.current = indexer(r, rpc, price);
+    openBudget(r, ATA2, WS2, 500_000_000n, 100_000_000_000n, 5_000_000n);
+    debt(r, WS2, [{ id: 'u1', charged: 3n }]);
+    const [a] = await drawer(r, rpc, price).tick();
+    expect(a?.status).toBe('failed'); // what the drawer saw…
+    expect(r.budgetDraws.get(a!.drawId!)?.status).toBe('confirmed'); // …but the row stays confirmed
     expect(r.usage.get('u1')?.drawId).toBe(a!.drawId);
     expect(r.ledger.balance(WS2)).toBe(0n);
-    expect(await drawer.tick()).toEqual([]);
-    expect(chain.draws).toHaveLength(1);
+    expect(r.budgets.get(ATA2)?.stalledReason).toBeNull();
   });
 
-  it('reconciles in-flight rows left by a crash: stale pending → failed, reverted → failed, mined → kept, unknown → failed after the grace', async () => {
+  it('reconciles in-flight rows: stale pending → failed; sent unknown → failed once the blockhash expired; on-chain error → failed; landed → kept', async () => {
     const r = repos();
-    const chain = new FakeChain();
-    let nowMs = 1_700_000_000_000;
-    r.workspaces.ensure(WS2, nowMs);
-    r.workspaces.ensure(WS1, nowMs);
-    r.budgets.upsertOpened({ budgetId: 1, owner: WS2, workspace: WS2, cap: 10n ** 21n, deadline: 1_700_000_000 + 7200, openedBlock: 1, now: nowMs });
-    r.budgets.setHeadroom(1, 10n ** 21n, 5_000_000n, null, nowMs);
-    r.usage.insert(usageRow('u1', 5n, nowMs));
-    r.ledger.insert({ workspace: WS2, kind: 'debit', amountMicro: -5n, refType: 'usage', refId: 'u1', memo: null, createdAt: nowMs });
-    // An orphaned pending row (insert happened, the process died before `draw` was sent).
-    const orphan = r.budgetDraws.insert({ budgetId: 1, workspace: WS2, tokenAmount: 500n, usdMicro: 5n, receiptHash: '0x01', usageIds: ['u1'], batchJson: '{}', txHash: null, status: 'pending', error: null, createdAt: nowMs - 1000, updatedAt: nowMs - 1000 });
+    const rpc = new FakeRpc();
+    let nowMs = T0;
+    const price = priceService(r, () => nowMs);
+    openBudget(r, ATA2, WS2, 500_000_000n, 100_000_000_000n, 5_000_000n);
+    debt(r, WS2, [{ id: 'u1', charged: 5n }]);
+    const orphan = r.budgetDraws.insert({ tokenAccount: ATA2, workspace: WS2, tokenAmount: 500n, usdMicro: 5n, receiptHash: `0x${'01'.repeat(32)}`, usageIds: ['u1'], batchJson: '{}', signature: null, lastValidBlockHeight: null, status: 'pending', error: null, createdAt: nowMs - 1000, updatedAt: nowMs - 1000 });
     r.usage.setDrawId(['u1'], orphan);
-    const drawer = new BudgetDrawer(r, chain, chain, { chainId: 31337, creditDesk: DESK, decimals: 18, thresholdMicro: 1n, dryRun: false, pendingGraceMs: 60_000, sentGraceMs: 600_000, now: () => nowMs }, silentLogger);
-    expect(await drawer.tick()).toEqual([]); // blocked while the orphan is young
+    const d = drawer(r, rpc, price, () => nowMs, { pendingGraceMs: 60_000 });
+    expect(await d.tick()).toEqual([]); // blocked while the orphan is young
     nowMs += 61_000;
-    const attempts = await drawer.tick(); // orphan fails and releases u1, then a fresh draw goes out
+    expect(await d.tick()).toEqual([]); // orphan fails, the budget is stalled until the next refresh
     expect(r.budgetDraws.get(orphan)).toMatchObject({ status: 'failed' });
     expect(r.budgetDraws.get(orphan)?.error).toContain('no transaction sent');
-    expect(attempts).toEqual([]); // the budget is stalled (draw_failed) until the next headroom refresh
-    expect(r.budgets.get(1)?.stalledReason).toBe('draw_failed');
+    expect(r.budgets.get(ATA2)?.stalledReason).toBe('draw_failed');
     expect(r.usage.get('u1')?.drawId).toBeNull();
-    r.budgets.setStalled(1, null, nowMs);
-    const [fresh] = await drawer.tick();
+    r.budgets.setStalled(ATA2, null, nowMs);
+    const [fresh] = await d.tick();
     expect(fresh?.status).toBe('sent');
     expect(r.usage.get('u1')?.drawId).toBe(fresh!.drawId);
-    // Sent rows of another workspace: reverted → failed; mined → untouched; unknown → failed after the grace.
-    r.budgets.upsertOpened({ budgetId: 2, owner: WS1, workspace: WS1, cap: 10n ** 21n, deadline: 1_700_000_000 + 7200, openedBlock: 1, now: nowMs });
-    const reverted = r.budgetDraws.insert({ budgetId: 2, workspace: WS1, tokenAmount: 1n, usdMicro: 1n, receiptHash: '0x02', usageIds: ['x1'], batchJson: '{}', txHash: '0xaa', status: 'sent', error: null, createdAt: nowMs, updatedAt: nowMs });
-    const mined = r.budgetDraws.insert({ budgetId: 2, workspace: WS1, tokenAmount: 1n, usdMicro: 1n, receiptHash: '0x03', usageIds: ['x2'], batchJson: '{}', txHash: '0xbb', status: 'sent', error: null, createdAt: nowMs, updatedAt: nowMs });
-    const unknown = r.budgetDraws.insert({ budgetId: 2, workspace: WS1, tokenAmount: 1n, usdMicro: 1n, receiptHash: '0x04', usageIds: ['x3'], batchJson: '{}', txHash: '0xcc', status: 'sent', error: null, createdAt: nowMs, updatedAt: nowMs });
-    chain.receipts.set('0xaa', { status: 'reverted', blockNumber: 1n });
-    chain.receipts.set('0xbb', { status: 'success', blockNumber: 1n });
-    await drawer.reconcile();
-    expect(r.budgetDraws.get(reverted)?.status).toBe('failed');
-    expect(r.budgetDraws.get(mined)?.status).toBe('sent');
-    expect(r.budgetDraws.get(unknown)?.status).toBe('sent');
-    nowMs += 600_001;
-    await drawer.reconcile();
-    expect(r.budgetDraws.get(mined)?.status).toBe('sent');
-    expect(r.budgetDraws.get(unknown)?.status).toBe('failed');
-    expect(r.budgetDraws.get(unknown)?.error).toContain('not seen by the node');
+
+    // Sent rows of another workspace.
+    openBudget(r, ATA1, WS1, 10n ** 9n, 10n ** 9n, 10_000_000n);
+    const mk = (n: number, lastValid: number) =>
+      r.budgetDraws.insert({ tokenAccount: ATA1, workspace: WS1, tokenAmount: 1n, usdMicro: 1n, receiptHash: `0x${n.toString(16).padStart(64, '0')}`, usageIds: [`x${n}`], batchJson: '{}', signature: testSignature(500 + n), lastValidBlockHeight: lastValid, status: 'sent', error: null, createdAt: nowMs, updatedAt: nowMs });
+    const unknownAlive = mk(2, 1000);
+    const unknownExpired = mk(3, 150);
+    const errored = mk(4, 1000);
+    const landed = mk(5, 1000);
+    rpc.statuses.set(testSignature(504), { slot: 199, confirmations: null, err: { InstructionError: [1, 'Custom'] }, confirmationStatus: 'confirmed' });
+    rpc.statuses.set(testSignature(505), { slot: 199, confirmations: 3, err: null, confirmationStatus: 'confirmed' });
+    rpc.blockHeight = 200;
+    await d.reconcile();
+    expect(r.budgetDraws.get(unknownAlive)?.status).toBe('sent');
+    expect(r.budgetDraws.get(unknownExpired)?.status).toBe('failed');
+    expect(r.budgetDraws.get(unknownExpired)?.error).toContain('blockhash expired');
+    expect(r.budgetDraws.get(errored)?.status).toBe('failed');
+    expect(r.budgetDraws.get(landed)?.status).toBe('sent');
+    expect(rpc.calls.filter((c) => c.method === 'getSignatureStatuses').at(-1)?.args[0]).toEqual([fresh!.signature, testSignature(502), testSignature(503), testSignature(504), testSignature(505)]);
+    rpc.blockHeight = 1001;
+    await d.reconcile();
+    expect(r.budgetDraws.get(unknownAlive)?.status).toBe('failed');
+    expect(r.budgetDraws.get(landed)?.status).toBe('sent');
   });
 });
 
-describe('price service and poster', () => {
-  it('reads, caches and quotes; reports stale/unavailable', async () => {
-    const chain = new FakeChain();
-    let now = 1_700_000_000_000;
-    chain.priceUpdatedAt = 1_700_000_000;
-    const svc = new PriceService({ reader: chain, source: 'manual', decimals: 18, now: () => now, ttlMs: 1000 });
-    const dto = await svc.priceDto();
-    expect(dto).toMatchObject({ priceE18: '10000000000000000', stale: false, source: 'manual', maxPriceAge: 3600, usdPerToken: '0.01', tokensPerUsd: '100' });
-    expect(await svc.quote({ tokens: 1000n * 10n ** 18n })).toMatchObject({ usdMicro: '10000000', tokens: (1000n * 10n ** 18n).toString() });
-    expect(await svc.quote({ usdMicro: 2_500_000n })).toMatchObject({ tokens: (250n * 10n ** 18n).toString() });
-    chain.priceE18 = 0n;
-    expect((await svc.priceDto()).priceE18).toBe('10000000000000000'); // cached
-    now += 2000;
-    expect((await svc.priceDto()).stale).toBe(true);
-    await expect(svc.quote({ tokens: 1n })).rejects.toMatchObject({ status: 503 });
-    const none = new PriceService({ reader: undefined, source: 'unknown', decimals: 18 });
-    expect(await none.priceDto()).toMatchObject({ priceE18: '0', stale: true, source: 'unknown' });
+describe('price service', () => {
+  it('bootstraps the manual price, reports staleness, quotes both ways and serves the history', () => {
+    const r = repos();
+    let nowMs = T0;
+    const svc = priceService(r, () => nowMs);
+    expect(svc.current()).toEqual({ id: 1, priceE18: PRICE, source: 'manual', observedAt: Math.floor(T0 / 1000), stale: false });
+    expect(svc.priceDto()).toEqual({ pricePointId: 1, priceE18: PRICE.toString(), observedAt: Math.floor(T0 / 1000), stale: false, source: 'manual', maxAgeS: 3600, usdPerToken: '0.01', tokensPerUsd: '100' });
+    expect(svc.quote({ tokens: 1_000_000_000n })).toEqual({ tokens: '1000000000', usdMicro: '10000000', priceE18: PRICE.toString(), pricePointId: 1, stale: false });
+    expect(svc.quote({ usdMicro: 2_500_000n })).toEqual({ tokens: '250000000', usdMicro: '2500000', priceE18: PRICE.toString(), pricePointId: 1, stale: false });
+    expect(() => svc.quote({})).toThrow();
+    expect(() => svc.quote({ tokens: 1n, usdMicro: 1n })).toThrow();
+    nowMs += 3601 * 1000;
+    expect(svc.current()?.stale).toBe(true);
+    expect(svc.isStale()).toBe(true);
+    expect(svc.quote({ tokens: 1n }).stale).toBe(true); // quotes keep working while stale
+    const p2 = svc.set(2n * PRICE);
+    expect(p2.id).toBe(2);
+    expect(svc.current()?.stale).toBe(false);
+    expect(svc.history(10).map((p) => p.id)).toEqual([2, 1]);
+    expect(svc.historyDto(1)[0]).toMatchObject({ pricePointId: 2, priceE18: (2n * PRICE).toString(), stale: false });
+    // A second instance over the same database starts from the last point without re-bootstrapping.
+    const again = priceService(r, () => nowMs);
+    expect(again.current()?.id).toBe(2);
+    // No point yet: zero DTO, 503 on quotes.
+    const empty = priceService(repos(), () => nowMs, { source: 'feed', feedUrl: 'https://feed.test/p' });
+    expect(empty.current()).toBeUndefined();
+    expect(empty.priceDto()).toEqual({ pricePointId: 0, priceE18: '0', observedAt: 0, stale: true, source: 'feed', maxAgeS: 3600, usdPerToken: '0', tokensPerUsd: '0' });
+    expect(() => empty.quote({ tokens: 1n })).toThrow(expect.objectContaining({ status: 503, code: 'price_unavailable' }));
   });
 
-  it('poster clamps steps, respects minInterval and the 0.5% band, records posts', async () => {
-    expect(usdToPriceE18(0.01)).toBe(10n ** 16n);
-    expect(usdStringToPriceE18('0.0025')).toBe(2_500_000_000_000_000n);
-    expect(clampStep(100n, 200n, 2500)).toBe(125n);
-    expect(clampStep(100n, 10n, 2500)).toBe(75n);
-    expect(clampStep(0n, 10n, 2500)).toBe(10n);
+  it('observe applies the step bound, the min-change band and the keep-alive; set bypasses the bound', () => {
     const r = repos();
-    const chain = new FakeChain();
-    let nowSec = 1_700_000_000;
-    chain.priceUpdatedAt = nowSec;
-    let feed = 0.02;
-    const fetchImpl = async (): Promise<Response> => new Response(JSON.stringify({ priceUsd: feed }), { status: 200 });
-    const poster = new PricePoster(r, chain, chain, { feedUrl: 'https://feed.example/price', dryRun: false, fetch: fetchImpl, now: () => nowSec * 1000 }, silentLogger);
-    expect(await poster.tick()).toEqual({ action: 'skipped', reason: 'within minInterval' });
-    nowSec += 61;
-    const posted = await poster.tick();
-    chain.priceUpdatedAt = nowSec;
-    expect(posted.action).toBe('posted');
-    if (posted.action === 'posted') expect(posted.priceE18).toBe(12_500_000_000_000_000n); // clamped +25 %
-    expect(r.pricePosts.latest()).toMatchObject({ priceE18: 12_500_000_000_000_000n, status: 'sent' });
-    nowSec += 61;
-    feed = 0.012501;
-    expect(await poster.tick()).toEqual({ action: 'skipped', reason: 'change below 0.5%' });
-    const dry = new PricePoster(r, chain, undefined, { feedUrl: 'x', dryRun: true, fetch: fetchImpl, now: () => (nowSec + 100) * 1000 }, silentLogger);
-    feed = 0.014;
-    expect((await dry.tick()).action).toBe('dry_run');
+    let nowMs = T0;
+    const lines: string[] = [];
+    const svc = new PriceService(
+      r,
+      { source: 'manual', initialPriceE18: PRICE, jupiterUrl: 'x', minChangeBps: 50, maxStepBps: 2500, maxAgeS: 3600, decimals: 6, now: () => nowMs },
+      createLogger({ level: 'info', write: (l) => lines.push(l) }),
+    );
+    svc.init();
+    expect(svc.observe((PRICE * 10_010n) / 10_000n, 'feed')).toEqual({ action: 'skipped', reason: 'change below PRICE_MIN_CHANGE_BPS' });
+    expect(svc.observe((PRICE * 13_000n) / 10_000n, 'feed')).toEqual({ action: 'rejected', priceE18: (PRICE * 13_000n) / 10_000n, lastPriceE18: PRICE });
+    expect(lines.some((l) => l.includes('price_rejected'))).toBe(true);
+    expect(svc.current()?.id).toBe(1);
+    const up = svc.observe((PRICE * 11_000n) / 10_000n, 'feed');
+    expect(up).toMatchObject({ action: 'appended', keepAlive: false, point: { id: 2, source: 'feed' } });
+    expect(svc.current()?.priceE18).toBe((PRICE * 11_000n) / 10_000n);
+    // Keep-alive: the same price is re-appended once the last point is older than PRICE_MAX_AGE_S / 2.
+    nowMs += 1801 * 1000;
+    expect(svc.observe((PRICE * 11_000n) / 10_000n, 'feed')).toMatchObject({ action: 'appended', keepAlive: true, point: { id: 3 } });
+    expect(svc.observe(0n, 'feed')).toEqual({ action: 'failed', error: 'price must be positive' });
+    // set() ignores the step bound (admin / CLI).
+    expect(svc.set(10n * PRICE).id).toBe(4);
+    expect(lines.some((l) => l.includes('price_set'))).toBe(true);
+    expect(() => svc.set(0n)).toThrow();
   });
 
-  it('poster re-posts a flat price before the on-chain quote goes stale (keep-alive)', async () => {
+  it('refreshes from the manual keep-alive, a JSON feed and the Jupiter price API through the injected fetch', async () => {
     const r = repos();
-    const chain = new FakeChain(); // maxPriceAge 3600, price $0.01
-    let nowSec = 1_700_000_000;
-    const fetchImpl = async (): Promise<Response> => new Response(JSON.stringify({ priceUsd: 0.01 }), { status: 200 });
-    const poster = new PricePoster(r, chain, chain, { feedUrl: 'https://feed.example/price', dryRun: false, fetch: fetchImpl, postIntervalMs: 300_000, now: () => nowSec * 1000 }, silentLogger);
-    // Fresh quote, identical feed price → the 0.5 % band skips.
-    chain.priceUpdatedAt = nowSec - 2999;
-    expect(await poster.tick()).toEqual({ action: 'skipped', reason: 'change below 0.5%' });
-    // Within two post intervals of maxPriceAge → posted even though nothing changed.
-    chain.priceUpdatedAt = nowSec - 3000;
-    const posted = await poster.tick();
-    expect(posted).toMatchObject({ action: 'posted', priceE18: 10n ** 16n, keepAlive: true });
-    expect(r.pricePosts.latest()).toMatchObject({ priceE18: 10n ** 16n, status: 'sent' });
-    // Already stale (> maxPriceAge) → still posted.
-    chain.priceUpdatedAt = nowSec - 3700;
-    expect(await poster.tick()).toMatchObject({ action: 'posted', keepAlive: true });
-    // The keep-alive never bypasses minInterval (the contract would revert).
-    chain.priceUpdatedAt = nowSec - 30;
-    expect(await poster.tick()).toEqual({ action: 'skipped', reason: 'within minInterval' });
-    expect(needsKeepAlive(1000, 0, 3600, 300_000)).toBe(false);
-    expect(needsKeepAlive(4000, 1000, 3600, 300_000)).toBe(true);
-    expect(needsKeepAlive(3999, 1000, 3600, 300_000)).toBe(false);
-    nowSec += 1;
+    let nowMs = T0;
+    const manual = priceService(r, () => nowMs);
+    expect(await manual.refresh()).toEqual({ action: 'skipped', reason: 'change below PRICE_MIN_CHANGE_BPS' });
+    nowMs += 1801 * 1000;
+    expect(await manual.refresh()).toMatchObject({ action: 'appended', keepAlive: true });
+    const unset = new PriceService(repos(), { source: 'manual', jupiterUrl: 'x', minChangeBps: 50, maxStepBps: 2500, maxAgeS: 3600, decimals: 6, now: () => nowMs }, silentLogger);
+    unset.init();
+    expect(await unset.refresh()).toEqual({ action: 'skipped', reason: 'no manual price set yet' });
+
+    const requests: string[] = [];
+    let feedBody: unknown = { priceUsd: 0.02 };
+    let status = 200;
+    const fetchImpl = async (input: string): Promise<Response> => {
+      requests.push(input);
+      return new Response(JSON.stringify(feedBody), { status });
+    };
+    const feed = priceService(repos(), () => nowMs, { source: 'feed', feedUrl: 'https://feed.test/price', fetch: fetchImpl });
+    expect(await feed.refresh()).toMatchObject({ action: 'appended', point: { priceE18: 2n * PRICE, source: 'feed' } });
+    expect(requests).toEqual(['https://feed.test/price']);
+    feedBody = { priceUsd: '0.0201' }; // strings are accepted; +0.5 % → appended
+    expect(await feed.refresh()).toMatchObject({ action: 'appended' });
+    feedBody = { nope: 1 };
+    expect(await feed.refresh()).toMatchObject({ action: 'failed', error: expect.stringContaining('priceUsd') });
+    status = 502;
+    expect(await feed.refresh()).toMatchObject({ action: 'failed', error: 'price feed HTTP 502' });
+    expect(feed.current()?.priceE18).toBe(20_100_000_000_000_000n);
+
+    status = 200;
+    feedBody = { [MINT]: { usdPrice: 0.03, blockId: 1 } }; // v3 layout
+    const jup = priceService(repos(), () => nowMs, { source: 'jupiter', jupiterUrl: 'https://lite-api.jup.ag/price/v3', fetch: fetchImpl });
+    expect(await jup.refresh()).toMatchObject({ action: 'appended', point: { priceE18: 3n * PRICE, source: 'jupiter' } });
+    expect(requests.at(-1)).toBe(`https://lite-api.jup.ag/price/v3?ids=${MINT}`);
+    feedBody = { data: { [MINT]: { usdPrice: 0.0305 } } }; // v2 layout (`data` wrapper)
+    expect(await jup.refresh()).toMatchObject({ action: 'appended' });
+    feedBody = { data: {} };
+    expect(await jup.refresh()).toMatchObject({ action: 'failed' });
+
+    expect(usdToPriceE18(0.01)).toBe(PRICE);
+    expect(usdToPriceE18(1e-9)).toBe(10n ** 9n);
+    expect(usdToPriceE18(1234.5)).toBe(1234_500_000_000_000_000_000n);
+    expect(() => usdToPriceE18(0)).toThrow();
+    expect(() => usdToPriceE18(Number.NaN)).toThrow();
   });
 });

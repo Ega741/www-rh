@@ -1,28 +1,32 @@
 import { describe, expect, it } from 'vitest';
 import { isHttpsUrl, parseAddressInput, parseHours, parseName } from './validate.js';
 
+const KEY = 'BEJQY85xuHoT2NyAT5eXF9ftMv6RnSM7LQSujxm8BAbZ';
+
 describe('validate', () => {
-  it('addresses', () => {
-    expect(parseAddressInput(' 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266 ')).toBe('0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266');
-    expect(parseAddressInput('0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266')).toBe('0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266');
-    expect(parseAddressInput('0xF39Fd6e51aad88F6F4ce6aB8827279cffFb92266')).toBeUndefined(); // bad checksum
-    expect(parseAddressInput('0x123')).toBeUndefined();
+  it('parseAddressInput accepts 32-byte base58 keys only', () => {
+    expect(parseAddressInput(` ${KEY} `)).toBe(KEY);
+    expect(parseAddressInput('11111111111111111111111111111111')).toBe('11111111111111111111111111111111');
+    expect(parseAddressInput(KEY.slice(0, 20))).toBeUndefined();
+    expect(parseAddressInput(`${KEY}A`)).toBeUndefined();
+    expect(parseAddressInput('0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266')).toBeUndefined();
+    expect(parseAddressInput('BEJQY85xuHoT2NyAT5eXF9ftMv6RnSM7LQSujxm8BAbO')).toBeUndefined();
     expect(parseAddressInput('')).toBeUndefined();
   });
-  it('https urls', () => {
-    expect(isHttpsUrl('https://api.openai.com/v1')).toBe(true);
-    expect(isHttpsUrl('http://api.openai.com/v1')).toBe(false);
+  it('isHttpsUrl', () => {
+    expect(isHttpsUrl('https://api.example.com/v1')).toBe(true);
+    expect(isHttpsUrl('http://api.example.com')).toBe(false);
+    expect(isHttpsUrl('nope')).toBe(false);
     expect(isHttpsUrl('')).toBe(false);
-    expect(isHttpsUrl('api.openai.com')).toBe(false);
   });
-  it('hours', () => {
-    expect(parseHours('24', 720)).toEqual({ ok: true, hours: 24 });
-    expect(parseHours('0', 720).ok).toBe(false);
-    expect(parseHours('721', 720)).toEqual({ ok: false, error: 'At most 720 hours' });
-    expect(parseHours('1.5', 168).ok).toBe(false);
-    expect(parseHours('', 168).ok).toBe(false);
+  it('parseHours', () => {
+    expect(parseHours('24', 168)).toEqual({ ok: true, hours: 24 });
+    expect(parseHours('', 168)).toMatchObject({ ok: false });
+    expect(parseHours('1.5', 168)).toMatchObject({ ok: false, error: 'Hours must be a whole number' });
+    expect(parseHours('0', 168)).toMatchObject({ ok: false, error: 'At least 1 hour' });
+    expect(parseHours('169', 168)).toMatchObject({ ok: false, error: 'At most 168 hours' });
   });
-  it('names', () => {
+  it('parseName', () => {
     expect(parseName('  ')).toBe('default');
     expect(parseName(' ci ')).toBe('ci');
     expect(parseName('x'.repeat(65))).toBeUndefined();

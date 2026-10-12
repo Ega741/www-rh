@@ -10,7 +10,18 @@
  *
  * @module canonical
  */
-import { sha256, stringToBytes, type Hex } from 'viem';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
+
+/** A `0x`-prefixed hex string (receipt hashes are `0x` + 64 lowercase hex characters). */
+export type Hex = `0x${string}`;
+
+const encoder = new TextEncoder();
+
+/** UTF-8 bytes of `input`. */
+export function utf8Bytes(input: string): Uint8Array {
+  return encoder.encode(input);
+}
 
 /** Primitive values {@link canonicalJson} accepts. */
 export type CanonicalPrimitive = null | boolean | number | string | bigint;
@@ -88,10 +99,10 @@ export function canonicalJson(value: unknown): string {
 
 /** SHA-256 of the UTF-8 bytes of `input`, as 64 lowercase hex characters without `0x`. */
 export function sha256Hex(input: string): string {
-  return sha256(stringToBytes(input), 'hex').slice(2);
+  return bytesToHex(sha256(utf8Bytes(input)));
 }
 
-/** `'0x' + sha256Hex(canonicalJson(obj))`: the `bytes32` receipt hash of SPEC §4.7. */
+/** `'0x' + sha256Hex(canonicalJson(obj))`: the 32-byte receipt hash of SPEC §4.7 (memo `h=`). */
 export function receiptHash(obj: unknown): Hex {
   return `0x${sha256Hex(canonicalJson(obj))}`;
 }

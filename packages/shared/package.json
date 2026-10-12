@@ -1,7 +1,7 @@
 {
   "name": "@beagle/shared",
   "version": "0.1.0",
-  "description": "Shared Beagle library: Robinhood Chain definitions, deployment addresses, contract ABIs, credit math, model catalog, routing policy, difficulty heuristic, canonical JSON hashing and API/OpenAI DTOs",
+  "description": "Shared Beagle library: Solana cluster definitions, program ids and deployment addresses, SPL memo grammar, Sign-In-With-Solana messages, base58 schemas and token layouts, credit math, model catalog, routing policy, difficulty heuristic, canonical JSON hashing and API/OpenAI DTOs",
   "type": "module",
   "license": "MIT",
   "sideEffects": false,

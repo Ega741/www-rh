@@ -1,10 +1,15 @@
 /**
  * Environment configuration (SPEC §5.1), validated with zod. Empty strings count as unset; USD
- * values become `bigint` µUSD; the zero address counts as "no override".
+ * values become `bigint` µUSD; `INITIAL_PRICE_USD` becomes `priceE18`; the operator secret key is
+ * accepted as base58 (64-byte secret key or 32-byte seed) or as the JSON byte array written by
+ * `solana-keygen`.
  *
  * @module config
  */
+import { parseCluster, type Cluster } from '@beagle/shared/clusters';
 import { parseUsdToMicro } from '@beagle/shared/credit';
+import { decodeBase58, isBase58Pubkey, isBase58Signature } from '@beagle/shared/solana';
+import nacl from 'tweetnacl';
 import { z } from 'zod';
 import { isLogLevel, type LogLevel } from './log.js';
 
@@ -32,32 +37,116 @@ const usd = (def: string) =>
       return 0n;
     }
   });
-const hexKey = z.preprocess(blankToUndefined, z.string().regex(/^0x[0-9a-fA-F]{64}$/, 'expected 0x + 64 hex chars').optional());
-const address = z.preprocess(blankToUndefined, z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'expected an address').optional());
+const pubkey = z.preprocess(blankToUndefined, z.string().trim().refine(isBase58Pubkey, 'expected a base58 public key').optional());
+const signature = z.preprocess(blankToUndefined, z.string().trim().refine(isBase58Signature, 'expected a base58 transaction signature').optional());
+const cluster = z.preprocess(blankToUndefined, z.string().optional()).transform((s, ctx): Cluster => {
+  try {
+    return parseCluster(s);
+  } catch (e) {
+    ctx.addIssue({ code: 'custom', message: e instanceof Error ? e.message : String(e) });
+    return 'localnet';
+  }
+});
+
+/**
+ * Parses a USD price per whole token (`"0.01"`, `"$0.0025"`) into `priceE18` (18-decimal fixed
+ * point). Up to 18 fraction digits; the price must be positive.
+ */
+export function parsePriceUsdE18(input: string): bigint {
+  const m = /^\s*\$?\s*(\d*)(?:\.(\d*))?\s*$/.exec(input);
+  if (!m || ((m[1] ?? '') === '' && (m[2] ?? '') === '')) throw new SyntaxError(`invalid USD price: ${JSON.stringify(input)}`);
+  const whole = m[1] === undefined || m[1] === '' ? '0' : m[1];
+  const frac = m[2] ?? '';
+  if (frac.length > 18) throw new RangeError(`USD price has more than 18 fraction digits: ${JSON.stringify(input)}`);
+  const value = BigInt(whole) * 10n ** 18n + BigInt(frac.padEnd(18, '0') || '0');
+  if (value <= 0n) throw new RangeError('USD price must be positive');
+  return value;
+}
+
+/**
+ * Parses `OPERATOR_SECRET_KEY`: a JSON byte array (`[12, 34, …]`, 64 bytes) or base58 text that
+ * decodes to a 64-byte secret key or a 32-byte seed. Returns the 64-byte Ed25519 secret key.
+ */
+export function parseSecretKey(input: string): Uint8Array {
+  const text = input.trim();
+  let bytes: Uint8Array | undefined;
+  if (text.startsWith('[')) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new SyntaxError('OPERATOR_SECRET_KEY: invalid JSON byte array');
+    }
+    if (!Array.isArray(parsed) || !parsed.every((b) => Number.isInteger(b) && b >= 0 && b <= 255)) {
+      throw new TypeError('OPERATOR_SECRET_KEY: expected a JSON array of bytes');
+    }
+    bytes = Uint8Array.from(parsed as number[]);
+  } else {
+    bytes = decodeBase58(text);
+    if (bytes === undefined) throw new TypeError('OPERATOR_SECRET_KEY: expected base58 or a JSON byte array');
+  }
+  if (bytes.length === 32) return nacl.sign.keyPair.fromSeed(bytes).secretKey;
+  if (bytes.length !== 64) throw new RangeError(`OPERATOR_SECRET_KEY: expected 64 bytes (or a 32-byte seed), got ${bytes.length}`);
+  // Validate: the public half must match the seed half.
+  const derived = nacl.sign.keyPair.fromSeed(bytes.subarray(0, 32)).secretKey;
+  for (let i = 32; i < 64; i++) if (derived[i] !== bytes[i]) throw new RangeError('OPERATOR_SECRET_KEY: public key does not match the seed');
+  return bytes;
+}
+
+const secretKey = z.preprocess(blankToUndefined, z.string().optional()).transform((s, ctx) => {
+  if (s === undefined) return undefined;
+  try {
+    return parseSecretKey(s);
+  } catch (e) {
+    ctx.addIssue({ code: 'custom', message: e instanceof Error ? e.message : String(e) });
+    return undefined;
+  }
+});
+const priceUsd = z.preprocess(blankToUndefined, z.string().optional()).transform((s, ctx) => {
+  if (s === undefined) return undefined;
+  try {
+    return parsePriceUsdE18(s);
+  } catch (e) {
+    ctx.addIssue({ code: 'custom', message: e instanceof Error ? e.message : String(e) });
+    return undefined;
+  }
+});
 
 /** Zod schema of the environment (keys of SPEC §5.1). */
 export const EnvSchema = z.object({
   NODE_ENV: str('development'),
-  // chain
-  CHAIN_ID: int(31337, 1),
+  // cluster
+  CLUSTER: cluster,
   RPC_URL: optStr(),
-  CREDIT_DESK_ADDRESS: address,
-  START_BLOCK: z.preprocess(blankToUndefined, z.coerce.number().int().min(0).optional()),
-  CONFIRMATIONS: int(0),
+  RPC_WS_URL: optStr(),
+  MINT_ADDRESS: pubkey,
+  TOKEN_PROGRAM: pubkey,
+  COMMITMENT: z.preprocess(blankToUndefined, z.enum(['confirmed', 'finalized']).default('confirmed')),
+  INDEX_FROM_SIGNATURE: signature,
+  INDEX_PAGE_LIMIT: int(1000, 1),
   POLL_INTERVAL_MS: int(2000, 100),
-  LOG_CHUNK_BLOCKS: int(2000, 1),
+  TX_FETCH_CONCURRENCY: int(4, 1),
   // operator
-  OPERATOR_PRIVATE_KEY: z.preprocess((v) => (typeof v === 'string' && /^(0x)?$/i.test(v.trim()) ? undefined : v), hexKey),
+  OPERATOR_SECRET_KEY: secretKey,
   DRY_RUN: bool(true),
-  // price poster
-  PRICE_POSTER_ENABLED: bool(false),
-  PRICE_SOURCE_ADDRESS: address,
+  PRIORITY_FEE_MICROLAMPORTS: int(0),
+  // price
+  PRICE_SOURCE: z.preprocess(blankToUndefined, z.enum(['manual', 'feed', 'jupiter']).default('manual')),
+  INITIAL_PRICE_USD: priceUsd,
   PRICE_FEED_URL: optStr(),
-  PRICE_POST_INTERVAL_MS: int(300_000, 1000),
+  JUPITER_PRICE_URL: str('https://lite-api.jup.ag/price/v3'),
+  PRICE_REFRESH_MS: int(60_000, 1000),
+  PRICE_MIN_CHANGE_BPS: int(50),
+  PRICE_MAX_STEP_BPS: int(2500, 1),
+  PRICE_MAX_AGE_S: int(3600, 1),
+  CREDIT_WHEN_STALE: bool(true),
+  MIN_CREDIT_USD: usd('0.001'),
   // budgets
+  BUDGET_SCAN_INTERVAL_MS: int(30_000, 100),
+  BUDGET_HEADROOM_REFRESH_MS: int(15_000, 100),
   DRAW_THRESHOLD_USD: usd('1'),
   DRAW_INTERVAL_MS: int(30_000, 100),
-  BUDGET_HEADROOM_REFRESH_MS: int(15_000, 100),
+  DRAW_CONFIRM_TIMEOUT_MS: int(90_000, 1000),
   // server
   PORT: int(8787, 0),
   HOST: str('0.0.0.0'),
@@ -105,27 +194,60 @@ export const EnvSchema = z.object({
 /** Raw parsed env. */
 export type Env = z.output<typeof EnvSchema>;
 
+/** Where price points come from (SPEC §3.3). */
+export type PriceSourceKind = 'manual' | 'feed' | 'jupiter';
+/** RPC commitment used for reads and confirmations. */
+export type CommitmentLevel = 'confirmed' | 'finalized';
+
 /** The validated gateway configuration. */
 export interface Config {
   nodeEnv: string;
   isProduction: boolean;
-  chain: {
-    chainId: number;
+  cluster: {
+    name: Cluster;
+    /** `RPC_URL` override (the cluster default applies when unset). */
     rpcUrl: string | undefined;
-    creditDeskAddress: string | undefined;
-    startBlock: number | undefined;
-    confirmations: number;
+    wsUrl: string | undefined;
+    /** `MINT_ADDRESS` override of the deployment mint. */
+    mint: string | undefined;
+    tokenProgram: string | undefined;
+    commitment: CommitmentLevel;
+    indexFromSignature: string | undefined;
+    indexPageLimit: number;
     pollIntervalMs: number;
-    logChunkBlocks: number;
+    txFetchConcurrency: number;
   };
-  operator: { privateKey: `0x${string}` | undefined; dryRun: boolean };
-  poster: { enabled: boolean; priceSourceAddress: string | undefined; feedUrl: string | undefined; intervalMs: number };
-  budgets: { drawThresholdMicro: bigint; drawIntervalMs: number; headroomRefreshMs: number };
+  operator: {
+    /** 64-byte Ed25519 secret key; `undefined` → draws disabled. */
+    secretKey: Uint8Array | undefined;
+    dryRun: boolean;
+    priorityFeeMicrolamports: number;
+  };
+  price: {
+    source: PriceSourceKind;
+    /** `INITIAL_PRICE_USD` as `priceE18` (manual bootstrap). */
+    initialPriceE18: bigint | undefined;
+    feedUrl: string | undefined;
+    jupiterUrl: string;
+    refreshMs: number;
+    minChangeBps: number;
+    maxStepBps: number;
+    maxAgeS: number;
+    creditWhenStale: boolean;
+    minCreditMicro: bigint;
+  };
+  budgets: {
+    scanIntervalMs: number;
+    headroomRefreshMs: number;
+    drawThresholdMicro: bigint;
+    drawIntervalMs: number;
+    drawConfirmTimeoutMs: number;
+  };
   server: {
     port: number;
     host: string;
     publicUrl: string;
-    /** Host (authority) of `PUBLIC_URL`, the SIWE domain. */
+    /** Host (authority) of `PUBLIC_URL`, the SIWS domain. */
     publicHost: string;
     webOrigins: string[];
     dbPath: string;
@@ -191,7 +313,8 @@ function hostOf(url: string): string {
 
 /**
  * Parses `env` (default `process.env`) into a {@link Config}. Throws {@link ConfigError} on invalid
- * values; `SESSION_SECRET` is required in production, `KEYRING_MASTER_KEY` only when BYOK is used.
+ * values; `SESSION_SECRET` is required in production, `KEYRING_MASTER_KEY` only when BYOK is used,
+ * `PRICE_FEED_URL` when `PRICE_SOURCE=feed`.
  */
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const parsed = EnvSchema.safeParse(env);
@@ -204,33 +327,57 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (!isLogLevel(e.LOG_LEVEL)) throw new ConfigError(`LOG_LEVEL must be one of debug|info|warn|error (got ${e.LOG_LEVEL})`);
   if (isProduction && e.SESSION_SECRET === undefined) throw new ConfigError('SESSION_SECRET is required in production');
   if (e.MIN_RESERVE_USD > e.MAX_RESERVE_USD) throw new ConfigError('MIN_RESERVE_USD must be ≤ MAX_RESERVE_USD');
-  if (e.PRICE_POSTER_ENABLED && e.PRICE_FEED_URL === undefined) throw new ConfigError('PRICE_FEED_URL is required when PRICE_POSTER_ENABLED=true');
+  if (e.PRICE_SOURCE === 'feed' && e.PRICE_FEED_URL === undefined) throw new ConfigError('PRICE_FEED_URL is required when PRICE_SOURCE=feed');
   if (e.WARM_DRIVER === 'http' && e.WARM_WEBHOOK_URL === undefined) throw new ConfigError('WARM_WEBHOOK_URL is required when WARM_DRIVER=http');
+  for (const [key, value] of [
+    ['RPC_URL', e.RPC_URL],
+    ['PRICE_FEED_URL', e.PRICE_FEED_URL],
+    ['JUPITER_PRICE_URL', e.JUPITER_PRICE_URL],
+  ] as const) {
+    if (value === undefined) continue;
+    try {
+      const u = new URL(value);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('not http(s)');
+    } catch {
+      throw new ConfigError(`${key} must be an http(s) URL (got ${JSON.stringify(value)})`);
+    }
+  }
   const sessionSecret = e.SESSION_SECRET ?? DEV_SESSION_SECRET;
   const masterHex = e.KEYRING_MASTER_KEY === undefined ? undefined : e.KEYRING_MASTER_KEY.replace(/^0x/, '');
   return {
     nodeEnv: e.NODE_ENV,
     isProduction,
-    chain: {
-      chainId: e.CHAIN_ID,
-      rpcUrl: e.RPC_URL,
-      creditDeskAddress: e.CREDIT_DESK_ADDRESS,
-      startBlock: e.START_BLOCK,
-      confirmations: e.CONFIRMATIONS,
+    cluster: {
+      name: e.CLUSTER,
+      rpcUrl: e.RPC_URL?.replace(/\/+$/, ''),
+      wsUrl: e.RPC_WS_URL,
+      mint: e.MINT_ADDRESS,
+      tokenProgram: e.TOKEN_PROGRAM,
+      commitment: e.COMMITMENT,
+      indexFromSignature: e.INDEX_FROM_SIGNATURE,
+      indexPageLimit: Math.min(e.INDEX_PAGE_LIMIT, 1000),
       pollIntervalMs: e.POLL_INTERVAL_MS,
-      logChunkBlocks: e.LOG_CHUNK_BLOCKS,
+      txFetchConcurrency: e.TX_FETCH_CONCURRENCY,
     },
-    operator: { privateKey: e.OPERATOR_PRIVATE_KEY as `0x${string}` | undefined, dryRun: e.DRY_RUN },
-    poster: {
-      enabled: e.PRICE_POSTER_ENABLED,
-      priceSourceAddress: e.PRICE_SOURCE_ADDRESS,
+    operator: { secretKey: e.OPERATOR_SECRET_KEY, dryRun: e.DRY_RUN, priorityFeeMicrolamports: e.PRIORITY_FEE_MICROLAMPORTS },
+    price: {
+      source: e.PRICE_SOURCE,
+      initialPriceE18: e.INITIAL_PRICE_USD,
       feedUrl: e.PRICE_FEED_URL,
-      intervalMs: e.PRICE_POST_INTERVAL_MS,
+      jupiterUrl: e.JUPITER_PRICE_URL.replace(/\/+$/, ''),
+      refreshMs: e.PRICE_REFRESH_MS,
+      minChangeBps: e.PRICE_MIN_CHANGE_BPS,
+      maxStepBps: e.PRICE_MAX_STEP_BPS,
+      maxAgeS: e.PRICE_MAX_AGE_S,
+      creditWhenStale: e.CREDIT_WHEN_STALE,
+      minCreditMicro: e.MIN_CREDIT_USD,
     },
     budgets: {
+      scanIntervalMs: e.BUDGET_SCAN_INTERVAL_MS,
+      headroomRefreshMs: e.BUDGET_HEADROOM_REFRESH_MS,
       drawThresholdMicro: e.DRAW_THRESHOLD_USD,
       drawIntervalMs: e.DRAW_INTERVAL_MS,
-      headroomRefreshMs: e.BUDGET_HEADROOM_REFRESH_MS,
+      drawConfirmTimeoutMs: e.DRAW_CONFIRM_TIMEOUT_MS,
     },
     server: {
       port: e.PORT,
@@ -285,7 +432,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   };
 }
 
-/** A complete test configuration: in-memory DB, no chain, no providers unless overridden. */
+/** A complete test configuration: in-memory DB, localnet, manual price, no providers unless overridden. */
 export function testConfig(overrides: Record<string, string | undefined> = {}): Config {
   return loadConfig({
     NODE_ENV: 'test',

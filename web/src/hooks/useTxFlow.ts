@@ -1,102 +1,78 @@
 /**
- * Runs a sequence of wallet transactions (approve → burnForCreditMin, approve → openBudget) and
- * tracks each step with the pure reducer of `lib/steps.ts`: sign → pending → confirmed, or failed.
- * A step may carry a `simulate` dry run: it is awaited before the wallet prompt (so a sure revert
- * such as `SlippageExceeded` is decoded instead of costing a signature) and re-run after an
- * on-chain revert to explain it.
+ * Runs wallet transactions one step at a time (each step = one transaction = one wallet
+ * confirmation) and tracks them with the pure reducer of `lib/steps.ts`: sign → pending →
+ * confirmed, or failed. A step provides its instructions; the hook wraps them in a legacy
+ * `Transaction` with a fresh blockhash, sends it through the wallet adapter's `sendTransaction`
+ * (the wallet simulates, signs and submits) and confirms with the blockhash / lastValidBlockHeight
+ * pair (SPEC §7).
  */
 import { useCallback, useReducer } from 'react';
-import { usePublicClient } from 'wagmi';
-import type { Hex } from 'viem';
-import { config } from '../config.js';
-import { describeError, revertName } from '../lib/errors.js';
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
+import { Transaction, type TransactionInstruction } from '@solana/web3.js';
+import { TransactionFailedError, WalletUnavailableError, describeError, errorLogs, errorSignature } from '../lib/errors.js';
 import { EMPTY_FLOW, reduceFlow, type FlowState } from '../lib/steps.js';
 
 /** One step to execute. */
 export interface TxStep {
   id: string;
   label: string;
-  /** Skip this step (e.g. allowance already sufficient). */
+  /** Skip this step (nothing to do on chain). */
   skip?: boolean;
-  /**
-   * Dry run of the call (`publicClient.simulateContract`), rejecting with the decoded contract error.
-   * Awaited before {@link write}; re-run when the mined transaction reverted, to name the reason.
-   */
-  simulate?: (() => Promise<unknown>) | undefined;
-  /** Sends the transaction and resolves with its hash. */
-  write(): Promise<Hex>;
-  /** Called once the step is confirmed (refresh reads). */
-  onConfirmed?(): void | Promise<unknown>;
+  /** Builds the instructions of this transaction (called when the step starts). */
+  instructions(): TransactionInstruction[] | Promise<TransactionInstruction[]>;
+  /** Called once the step is confirmed (refresh reads, register with the gateway). */
+  onConfirmed?(signature: string): void | Promise<unknown>;
 }
 
 /** What {@link useTxFlow} returns. */
 export interface TxFlow {
   state: FlowState;
   running: boolean;
-  /** Runs `steps` in order; resolves `true` when every step confirmed. */
-  run(steps: TxStep[]): Promise<boolean>;
+  /** Runs `steps` in order; resolves the signature of the last transaction, or `undefined` when a step failed. */
+  run(steps: TxStep[]): Promise<string | undefined>;
   reset(): void;
 }
 
-/**
- * Dry run before the wallet prompt. A decoded contract revert (`SlippageExceeded`, `PriceStale`,
- * `BurnTooSmall`, …) is fatal: the transaction would fail and the message is better than a
- * wallet's. Anything else (RPC hiccup, undecodable failure) defers to the wallet's own estimate.
- */
-async function preflight(simulate: () => Promise<unknown>): Promise<void> {
-  try {
-    await simulate();
-  } catch (e) {
-    if (revertName(e) !== undefined) throw e;
-  }
-}
+/** Commitment of the send preflight and the confirmation. */
+export const TX_COMMITMENT = 'confirmed' as const;
 
-/**
- * Why a mined transaction reverted: the decoded contract error of a re-simulation when the step
- * has one and it still reverts with a custom error, else a generic error.
- */
-async function explainRevert(step: TxStep): Promise<unknown> {
-  if (step.simulate !== undefined) {
-    try {
-      await step.simulate();
-    } catch (e) {
-      if (revertName(e) !== undefined) return e;
-    }
-  }
-  return new Error('Transaction reverted on chain');
-}
-
-/** Transaction flow runner bound to the app chain's public client. */
+/** Transaction flow runner bound to the wallet adapter and the cluster connection. */
 export function useTxFlow(): TxFlow {
-  const client = usePublicClient({ chainId: config.chainId });
+  const { connection } = useConnection();
+  const { publicKey, sendTransaction, connected } = useWallet();
   const [state, dispatch] = useReducer(reduceFlow, EMPTY_FLOW);
 
   const run = useCallback(
-    async (steps: TxStep[]): Promise<boolean> => {
+    async (steps: TxStep[]): Promise<string | undefined> => {
       dispatch({ type: 'init', steps: steps.map((s) => ({ id: s.id, label: s.label })) });
+      let last: string | undefined;
       for (const step of steps) {
         if (step.skip === true) {
           dispatch({ type: 'skip', id: step.id });
           continue;
         }
         dispatch({ type: 'signing', id: step.id });
+        let signature: string | undefined;
         try {
-          if (step.simulate !== undefined) await preflight(step.simulate);
-          const hash = await step.write();
-          dispatch({ type: 'sent', id: step.id, hash });
-          if (client === undefined) throw new Error('No RPC client for the app chain');
-          const receipt = await client.waitForTransactionReceipt({ hash, confirmations: 1, timeout: 180_000 });
-          if (receipt.status !== 'success') throw await explainRevert(step);
+          if (!connected || publicKey === null) throw new WalletUnavailableError('Connect a wallet first');
+          const instructions = await step.instructions();
+          const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash(TX_COMMITMENT);
+          const tx = new Transaction({ feePayer: publicKey, blockhash, lastValidBlockHeight }).add(...instructions);
+          signature = await sendTransaction(tx, connection, { preflightCommitment: TX_COMMITMENT });
+          dispatch({ type: 'sent', id: step.id, signature });
+          const result = await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, TX_COMMITMENT);
+          if (result.value.err !== null) throw new TransactionFailedError(signature, result.value.err);
           dispatch({ type: 'confirmed', id: step.id });
-          await step.onConfirmed?.();
+          last = signature;
+          await step.onConfirmed?.(signature);
         } catch (e) {
-          dispatch({ type: 'failed', id: step.id, error: describeError(e), revert: revertName(e) });
-          return false;
+          dispatch({ type: 'failed', id: step.id, error: describeError(e), signature: signature ?? errorSignature(e), logs: errorLogs(e) });
+          return undefined;
         }
       }
-      return true;
+      return last;
     },
-    [client],
+    [connection, connected, publicKey, sendTransaction],
   );
 
   const reset = useCallback(() => dispatch({ type: 'reset' }), []);

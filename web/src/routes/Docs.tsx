@@ -1,10 +1,13 @@
-/** `/docs`: quick start, SDK snippets, MCP config, headers, aliases, 402 semantics. */
+/** `/docs`: quick start, SDK snippets, MCP config, headers, aliases, credit & 402, budgets, chain, receipts. */
 import { Link } from 'react-router';
-import { publicGatewayUrl } from '../config.js';
+import { config, publicGatewayUrl } from '../config.js';
 import { Card, Code } from '../components/ui.jsx';
+import { useDeployment } from '../hooks/useDeployment.js';
+import { fmtUsd } from '../lib/amounts.js';
 import {
   ALIAS_DOCS,
-  CREDIT_FLOOR_DOC,
+  BUDGET_DOC,
+  CREDIT_DOC,
   HEADER_DOCS,
   INSUFFICIENT_CREDIT_BODY,
   MCP_BUILD_COMMAND,
@@ -14,13 +17,17 @@ import {
   claudeCodeMcpCommand,
   curlMessagesSnippet,
   curlSnippet,
-  mcpEnvSnippet,
   mcpBinPath,
+  mcpEnvSnippet,
   mcpHttpConfig,
   mcpStdioConfig,
   nodeOpenAiSnippet,
   openAiBaseUrl,
+  priceHistorySnippet,
   pythonOpenAiSnippet,
+  splTokenBudgetSnippet,
+  splTokenBurnSnippet,
+  verifyReceiptSnippet,
 } from '../lib/docs.js';
 
 const TOC = [
@@ -30,11 +37,16 @@ const TOC = [
   ['headers', 'Headers'],
   ['aliases', 'Aliases & routing'],
   ['credit', 'Credit & 402'],
+  ['budgets', 'Budgets = delegation'],
+  ['chain', 'From the command line'],
+  ['receipts', 'Receipts'],
 ] as const;
 
 /** Docs page. */
 export function Docs() {
   const base = publicGatewayUrl();
+  const dep = useDeployment();
+  const chainCtx = { cluster: config.cluster, rpcUrl: config.rpcUrl, mint: dep.mint, operator: dep.operator, decimals: dep.decimals, symbol: dep.symbol };
   return (
     <div className="grid gap-8 lg:grid-cols-[12rem_1fr]">
       <aside className="lg:sticky lg:top-20 lg:self-start">
@@ -53,7 +65,7 @@ export function Docs() {
       <article className="prose-doc min-w-0">
         <h1 className="text-2xl font-semibold tracking-tight">Docs</h1>
         <p>
-          Gateway base URL for this deployment: <span className="font-mono text-fg">{base}</span>. Everything below is copy-pasteable with that URL already filled in.
+          Gateway base URL for this deployment: <span className="font-mono text-fg">{base}</span>, Solana cluster <span className="font-mono text-fg">{config.cluster}</span>. Everything below is copy-pasteable with those values already filled in.
         </p>
 
         <h2 id="quick-start">Quick start</h2>
@@ -62,7 +74,7 @@ export function Docs() {
             <Link className="link" to="/app">
               Sign in
             </Link>{' '}
-            with your wallet (SIWE), then burn BEAGLE on the Credits page or have an agent open a budget.
+            with your Solana wallet (Sign-In-With-Solana: a signed message, no transaction), then burn {dep.symbol} on the Credits page or have an agent open a budget.
           </li>
           <li>
             Create an API key on the Keys page. Keys look like <span className="font-mono">bgl_…</span> and are shown once.
@@ -98,7 +110,7 @@ export function Docs() {
 
         <h2 id="mcp">MCP for agents</h2>
         <p>
-          The <span className="font-mono">beagle-mcp</span> server (workspace package <span className="font-mono">@beagle/mcp</span> of this repository, not published to npm) gives agents balance, models, quotes, inference, usage, compute purchase and budgets. It reads <span className="font-mono">BEAGLE_API_URL</span> and <span className="font-mono">BEAGLE_API_KEY</span>; with an optional <span className="font-mono">BEAGLE_AGENT_PRIVATE_KEY</span> (+ <span className="font-mono">BEAGLE_RPC_URL</span>) the wallet tools execute approve → burn / openBudget themselves, otherwise they return unsigned transactions.
+          The <span className="font-mono">beagle-mcp</span> server (workspace package <span className="font-mono">@beagle/mcp</span> of this repository, not published to npm) gives agents balance, models, quotes, inference, usage, compute purchase and budgets. It reads <span className="font-mono">BEAGLE_API_URL</span> and <span className="font-mono">BEAGLE_API_KEY</span>; with an optional <span className="font-mono">BEAGLE_AGENT_SECRET_KEY</span> (a Solana keypair as base58 or a solana-keygen JSON array, + <span className="font-mono">BEAGLE_RPC_URL</span>) the wallet tools execute burn + memo / approve / revoke themselves, otherwise they return unsigned transactions for the agent's own wallet to sign.
         </p>
         <p>
           Run it from a checkout: build once with <span className="font-mono text-fg">{MCP_BUILD_COMMAND}</span>, then launch <span className="font-mono text-fg">node {mcpBinPath()}</span>, replacing <span className="font-mono">{REPO_PLACEHOLDER}</span> with the path of the checkout. Without a checkout, use the Streamable HTTP config below: the gateway serves the same tools.
@@ -113,7 +125,7 @@ export function Docs() {
         </p>
         <Code code={mcpHttpConfig(base)} lang="json" title="mcp.json" />
         <h3>By hand</h3>
-        <Code code={mcpEnvSnippet(base)} lang="bash" title="shell" />
+        <Code code={mcpEnvSnippet(base, config.rpcUrl)} lang="bash" title="shell" />
 
         <h2 id="headers">Headers</h2>
         <Card>
@@ -150,6 +162,16 @@ export function Docs() {
         </p>
 
         <h2 id="credit">Credit & 402</h2>
+        <h3>How credit is computed</h3>
+        <p>
+          A purchase is any successful transaction that burns {dep.symbol} (SPL <span className="font-mono">Burn</span> / <span className="font-mono">BurnChecked</span> on the mint) from a token account you own. There is no custom program and nothing to approve: the gateway watches the mint's transactions and credits the token account owner. {CREDIT_DOC.sentence} With the mint's decimals:
+        </p>
+        <Code code={`${CREDIT_DOC.formula}\n// 6 decimals: ${CREDIT_DOC.sixDecimals}\n// ${CREDIT_DOC.example}`} lang="text" title="credit per burn" />
+        <p>
+          Every credit event stores the price point it was priced with (<span className="font-mono">pricePointId</span>, <span className="font-mono">priceE18</span>), and the price history is public, so anyone can recompute every credit from the burn amount. To credit a workspace other than the burning wallet, add an SPL Memo <span className="font-mono text-fg">{CREDIT_DOC.memo}</span> to the same transaction (the Credits page does this for "credit another workspace"). Burns quoting below the minimum credit{dep.minCreditMicro === undefined ? '' : ` (${fmtUsd(dep.minCreditMicro, { maxFractionDigits: 6 })})`} are recorded with no credit; burns observed while the price is stale are credited at the last point and flagged.
+        </p>
+        <Code code={priceHistorySnippet(base)} lang="bash" title="published price" />
+        <h3>402</h3>
         <p>
           Every credit-paid request reserves an estimate, then settles the real upstream cost plus the platform markup. When <span className="font-mono">available = balance − reserved + budgetHeadroom</span> drops below the minimum reserve, inference returns <span className="font-mono">402</span> with this body and the headers <span className="font-mono">x-beagle-balance-micro</span> and <span className="font-mono">x-beagle-credits-url</span>:
         </p>
@@ -163,12 +185,30 @@ export function Docs() {
           <Link className="link" to="/app/budgets">
             open a budget
           </Link>
-          . Each request has a verifiable receipt at <span className="font-mono">/api/receipts/&lt;request id&gt;</span> returning <span className="font-mono">{'{ receipt, hash }'}</span>; <span className="font-mono">hash = sha256(canonicalJson(receipt))</span> and can be recomputed with <span className="font-mono">receiptHash</span> from <span className="font-mono">@beagle/shared/canonical</span> in this repository (every receipt page shows the script).
+          .
         </p>
-        <h3>Credit floor on burns</h3>
+
+        <h2 id="budgets">Budgets = SPL delegation</h2>
         <p>
-          The Credits page and the MCP wallet tools burn through <span className="font-mono">{CREDIT_FLOOR_DOC.minFn}</span> with <span className="font-mono">{CREDIT_FLOOR_DOC.floorFormula}</span> (the tolerance is adjustable on the Credits page). If a price post lands between the quote and the transaction and the credit would fall below that floor, the desk reverts <span className="font-mono">{CREDIT_FLOOR_DOC.revert}</span> instead of crediting less: nothing is burned and you re-quote. A burn that succeeds is final and credits exactly the emitted <span className="font-mono">usdMicro</span>. Plain <span className="font-mono">{CREDIT_FLOOR_DOC.plainFn}</span> has no floor and stays available for third-party integrations.
+          A budget authorises the operator to burn from your token account as usage accrues, up to a cap, and nothing else. It is the plain SPL delegation of the Token program: one delegate per account, a new approval replaces the previous cap, <span className="font-mono">Revoke</span> clears it at any time, and every delegate burn decrements the delegated amount. No deadline: the budget lives until revoked or exhausted. The budget id is the token account address.
         </p>
+        <Code code={`open:  ${BUDGET_DOC.open}\ndraw:  ${BUDGET_DOC.draw}\nclose: ${BUDGET_DOC.close}\n${BUDGET_DOC.headroom}`} lang="text" title="instructions" />
+        <p>
+          The operator's only signed instruction is a delegate <span className="font-mono">BurnChecked</span> bounded by the delegated amount, with the memo <span className="font-mono">{BUDGET_DOC.drawMemo}</span> naming the hash of the usage batch it settles; the indexer confirms each draw by that hash. After approving, register the token account with <span className="font-mono">POST /api/budgets/register</span> (the Budgets page and the MCP tools do; the gateway's scanner also finds delegations to the operator on its own).
+        </p>
+
+        <h2 id="chain">From the command line</h2>
+        <p>
+          Nothing here requires the web app: the Solana CLI (<span className="font-mono">spl-token</span> 5.x) can burn for credit and delegate a budget directly. Mint: <span className="font-mono text-fg">{dep.mint ?? '—'}</span>, operator: <span className="font-mono text-fg">{dep.operator ?? '—'}</span>, RPC: <span className="font-mono text-fg">{config.rpcUrl}</span>.
+        </p>
+        <Code code={splTokenBurnSnippet(chainCtx)} lang="bash" title="burn for credit" />
+        <Code code={splTokenBudgetSnippet(chainCtx)} lang="bash" title="budget" />
+
+        <h2 id="receipts">Receipts</h2>
+        <p>
+          Each request has a verifiable receipt at <span className="font-mono">/api/receipts/&lt;request id&gt;</span> returning <span className="font-mono">{'{ receipt, hash }'}</span>; <span className="font-mono">hash = sha256(canonicalJson(receipt))</span> and can be recomputed with <span className="font-mono">receiptHash</span> from <span className="font-mono">@beagle/shared/canonical</span> in this repository (every receipt page shows the script). Burns and draws of your workspace are listed by <span className="font-mono">GET /api/receipts</span> with their signature, slot, amount, credit and price point.
+        </p>
+        <Code code={verifyReceiptSnippet(base, 'req_…')} lang="typescript" title="verify.mjs" />
       </article>
     </div>
   );

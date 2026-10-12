@@ -1,23 +1,88 @@
 /**
  * Shared test fixtures: an in-process OpenAI-compatible mock provider (mirrors
- * `scripts/mock-provider.mjs`), a fake chain reader/writer, and a service factory bound to an
- * in-memory database. No network access anywhere.
+ * `scripts/mock-provider.mjs`), an in-memory fake Solana RPC with a scripted ledger of
+ * signatures / transactions / accounts (shapes captured from a real validator under
+ * `test/fixtures`), and a service factory bound to an in-memory database. No network anywhere.
  */
+import { readFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import type { Address, Hex } from 'viem';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { MEMO_PROGRAM_ID, TOKEN_PROGRAM_ID, resolveDeployment } from '@beagle/shared/addresses';
+import { CLUSTERS } from '@beagle/shared/clusters';
+import { encodeBase58 } from '@beagle/shared/solana';
+import type { TransactionInstruction } from '@solana/web3.js';
 import { createApp } from '../src/api/server.js';
-import type { BlockInfo, ChainContext, ChainReader, ChainWriter, DeskLog, ReceiptInfo } from '../src/chain/clients.js';
+import type {
+  ChainContext,
+  ChainReader,
+  ChainWriter,
+  ConfirmOutcome,
+  RecentBlockhash,
+  RpcAccountFilter,
+  RpcParsedAccount,
+  RpcParsedTransaction,
+  RpcProgramAccount,
+  RpcSignatureInfo,
+  RpcSignatureStatus,
+} from '../src/chain/rpc.js';
 import { testConfig, type Config } from '../src/config.js';
 import { silentLogger } from '../src/log.js';
 import { createServices, type ServiceDeps, type Services } from '../src/services.js';
-import { anvilChain } from '@beagle/shared/chains';
 
-/** Well-known anvil accounts. */
-export const WS1 = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8';
-export const WS2 = '0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc';
-export const DESK: Address = '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0';
-export const TOKEN: Address = '0x5FbDB2315678afecb367f032d93F642f64180aa3';
+const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
+
+/** Loads a JSON fixture captured from `solana-test-validator` (jsonParsed shapes as web3.js serializes them). */
+export function fixture<T = unknown>(name: string): T {
+  return JSON.parse(readFileSync(join(FIXTURES, `${name}.json`), 'utf8')) as T;
+}
+
+/** Keys of the captured session (`meta.json`). */
+export interface FixtureMeta {
+  mint: string;
+  operator: string;
+  a1: string;
+  a2: string;
+  ata1: string;
+  ata2: string;
+  deployer: string;
+  ataDeployer: string;
+  sigs: { transferSig: string; burnSig: string; burnCheckedSig: string; approveSig: string; drawSig: string; twoSig: string; revokeSig: string };
+  purchaseMemo: string;
+  drawMemo: string;
+  hash: string;
+  slot: number;
+  blockHeight: number;
+}
+
+export const META = fixture<FixtureMeta>('meta');
+/** The localnet mint of the committed deployment (also the fixtures' mint). */
+export const MINT = META.mint;
+/** The deployment operator (`solana/keys/operator.json`). */
+export const OPERATOR = META.operator;
+/** Two agent wallets of the captured session. */
+export const WS1 = META.a1;
+export const WS2 = META.a2;
+export const ATA1 = META.ata1;
+export const ATA2 = META.ata2;
+
+/** A deterministic base58 public key (32 bytes) for test wallets. */
+export function testPubkey(seed: number): string {
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) bytes[i] = ((i * 53 + seed * 97 + 7) % 251) + 1;
+  return encodeBase58(bytes);
+}
+
+/** A deterministic, well-formed base58 transaction signature (64 bytes). */
+export function testSignature(seed: number): string {
+  const bytes = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) bytes[i] = ((i * 31 + seed * 17 + 3) % 253) + 1;
+  return encodeBase58(bytes);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mock OpenAI-compatible provider
 
 /** Options of {@link startMockProvider}. */
 export interface MockOptions {
@@ -93,7 +158,6 @@ export async function startMockProvider(options: MockOptions = {}): Promise<Mock
       send(chunk({ role: 'assistant', content: '' }));
       if (tool) {
         send(chunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: tool.name, arguments: '' } }] }));
-        // split the arguments across two frames, one of them split mid-way to exercise partial frames
         const half = Math.ceil(tool.arguments.length / 2);
         const frame = `data: ${JSON.stringify(chunk({ tool_calls: [{ index: 0, function: { arguments: tool.arguments.slice(0, half) } }] }))}\n\n`;
         res.write(frame.slice(0, 10));
@@ -142,114 +206,266 @@ export async function startMockProvider(options: MockOptions = {}): Promise<Mock
   return state;
 }
 
-/** Mutable fake chain for indexer / drawer / headroom tests. */
-export class FakeChain implements ChainReader, ChainWriter {
-  head = 0n;
-  blocks = new Map<string, BlockInfo>();
-  logs: DeskLog[] = [];
-  priceE18 = 10n ** 16n; // $0.01
-  priceUpdatedAt = Math.floor(Date.now() / 1000);
-  maxAge = 3600;
-  priceFailure: 'stale' | 'unavailable' | undefined;
-  allowances = new Map<string, bigint>();
+// ---------------------------------------------------------------------------------------------
+// Fake Solana RPC
+
+/** Inputs of {@link makeBurnTx}. */
+export interface BurnTxInput {
+  signature: string;
+  slot: number;
+  blockTime?: number | null;
+  tokenAccount: string;
+  owner: string;
+  /** Burn authority (default the owner; the operator for draws). */
+  authority?: string;
+  amount: bigint;
+  /** `burnChecked` (default) or plain `burn`. */
+  checked?: boolean;
+  memo?: string;
+  mint?: string;
+  /** Extra burns `{ amount, checked? }` appended after the first (same token account / authority). */
+  extraBurns?: { amount: bigint; checked?: boolean }[];
+  /** Put the memo instruction first (before the burn). */
+  memoFirst?: boolean;
+  err?: unknown;
+}
+
+function burnIx(input: { tokenAccount: string; mint: string; authority: string; amount: bigint; checked: boolean }): RpcParsedTransaction['transaction']['message']['instructions'][number] {
+  const info = input.checked
+    ? { account: input.tokenAccount, authority: input.authority, mint: input.mint, tokenAmount: { amount: input.amount.toString(), decimals: 6, uiAmount: Number(input.amount) / 1e6, uiAmountString: (Number(input.amount) / 1e6).toString() } }
+    : { account: input.tokenAccount, amount: input.amount.toString(), authority: input.authority, mint: input.mint };
+  return { parsed: { info, type: input.checked ? 'burnChecked' : 'burn' }, program: 'spl-token', programId: TOKEN_PROGRAM_ID, stackHeight: 1 };
+}
+
+/** Builds a jsonParsed burn transaction in the exact layout of `fixtures/tx-burnchecked-memo.json`. */
+export function makeBurnTx(input: BurnTxInput): RpcParsedTransaction {
+  const mint = input.mint ?? MINT;
+  const authority = input.authority ?? input.owner;
+  const burns = [{ amount: input.amount, checked: input.checked ?? true }, ...(input.extraBurns ?? []).map((b) => ({ amount: b.amount, checked: b.checked ?? true }))];
+  const instructions = burns.map((b) => burnIx({ tokenAccount: input.tokenAccount, mint, authority, amount: b.amount, checked: b.checked }));
+  if (input.memo !== undefined) {
+    const memoIx = { parsed: input.memo, program: 'spl-memo', programId: MEMO_PROGRAM_ID, stackHeight: 1 };
+    if (input.memoFirst) instructions.unshift(memoIx);
+    else instructions.splice(1, 0, memoIx);
+  }
+  const total = burns.reduce((s, b) => s + b.amount, 0n);
+  const pre = 100_000_000_000n;
+  const accountKeys = [
+    { pubkey: authority, signer: true, source: 'transaction', writable: true },
+    { pubkey: input.tokenAccount, signer: false, source: 'transaction', writable: true },
+    { pubkey: mint, signer: false, source: 'transaction', writable: true },
+    ...(input.memo === undefined ? [] : [{ pubkey: MEMO_PROGRAM_ID, signer: false, source: 'transaction', writable: false }]),
+    { pubkey: TOKEN_PROGRAM_ID, signer: false, source: 'transaction', writable: false },
+  ];
+  const balance = (amount: bigint) => ({
+    accountIndex: 1,
+    mint,
+    owner: input.owner,
+    programId: TOKEN_PROGRAM_ID,
+    uiTokenAmount: { amount: amount.toString(), decimals: 6, uiAmount: Number(amount) / 1e6, uiAmountString: (Number(amount) / 1e6).toString() },
+  });
+  return {
+    blockTime: input.blockTime === undefined ? 1_791_808_152 : input.blockTime,
+    meta: {
+      err: input.err ?? null,
+      fee: 5000,
+      innerInstructions: [],
+      logMessages: [],
+      preTokenBalances: [balance(pre)],
+      postTokenBalances: [balance(pre - total)],
+    },
+    slot: input.slot,
+    transaction: { message: { accountKeys, instructions, recentBlockhash: 'F8xnY7JPhFVNvzEqBaDGyQ7CmSqdAwWs82Fr9k8TciJ7' }, signatures: [input.signature] },
+    version: 'legacy',
+  };
+}
+
+/** Builds a jsonParsed SPL token account in the layout of `fixtures/token-accounts-delegated.json`. */
+export function makeTokenAccount(input: { mint?: string; owner: string; amount: bigint; delegate?: string; delegatedAmount?: bigint; programId?: string }): RpcParsedAccount {
+  const mint = input.mint ?? MINT;
+  const ui = (a: bigint) => ({ amount: a.toString(), decimals: 6, uiAmount: Number(a) / 1e6, uiAmountString: (Number(a) / 1e6).toString() });
+  const info: Record<string, unknown> = { isNative: false, mint, owner: input.owner, state: 'initialized', tokenAmount: ui(input.amount) };
+  if (input.delegate !== undefined) {
+    info['delegate'] = input.delegate;
+    info['delegatedAmount'] = ui(input.delegatedAmount ?? 0n);
+  }
+  return {
+    data: { parsed: { info, type: 'account' }, program: 'spl-token', space: 165 },
+    executable: false,
+    lamports: 2_039_280,
+    owner: input.programId ?? TOKEN_PROGRAM_ID,
+    space: 165,
+  };
+}
+
+/** Mutable fake RPC for indexer / scanner / drawer tests: a scripted ledger plus the writer side. */
+export class FakeRpc implements ChainReader, ChainWriter {
+  slot = 200;
+  blockHeight = 200;
+  readonly address: string;
+  /** Newest first (what `getSignaturesForAddress(mint)` returns). */
+  signatures: RpcSignatureInfo[] = [];
+  transactions = new Map<string, RpcParsedTransaction>();
+  accounts = new Map<string, RpcParsedAccount | null>();
+  /** Overrides of `getSignatureStatuses` (default: known transactions are `finalized`, unknown → null). */
+  statuses = new Map<string, RpcSignatureStatus | null>();
   balances = new Map<string, bigint>();
-  draws: { budgetId: bigint; tokens: bigint; receiptHash: Hex; txHash: Hex }[] = [];
-  receiptStatus: 'success' | 'reverted' = 'success';
-  /** Receipts `getTransactionReceipt` answers with (tests populate it; absent = not mined). */
-  receipts = new Map<string, ReceiptInfo>();
-  failDraw: Error | undefined;
-  /** When set, `waitForReceipt` rejects with it (RPC failure / timeout). */
-  failReceipt: Error | undefined;
-  readonly address: Address = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
-  private nextTx = 1;
+  blockhash: RecentBlockhash = { blockhash: 'D9xXKaQ8SQZfLgWpomSxv9VZMDfZrCxhJYdYxXKoWn1z', lastValidBlockHeight: 400 };
+  sent: { signature: string; instructions: TransactionInstruction[]; recent: RecentBlockhash }[] = [];
+  confirmOutcome: ConfirmOutcome = { status: 'confirmed' };
+  failSend: Error | undefined;
+  failConfirm: Error | undefined;
+  calls: { method: string; args: unknown[] }[] = [];
+  private nextSig = 1;
 
-  /** Appends a block with `logs` and returns its number. */
-  mine(logs: Omit<DeskLog, 'blockNumber' | 'blockHash' | 'transactionHash' | 'logIndex'>[] = [], hashSalt = ''): bigint {
-    this.head += 1n;
-    const number = this.head;
-    const hash = `0x${(number.toString(16) + hashSalt).padStart(64, 'a')}` as Hex;
-    this.blocks.set(number.toString(), { number, hash, timestamp: BigInt(1_700_000_000 + Number(number)) });
-    logs.forEach((l, i) => this.logs.push({ ...l, blockNumber: number, blockHash: hash, transactionHash: this.txHash(), logIndex: i }));
-    return number;
+  constructor(operator: string = OPERATOR) {
+    this.address = operator;
   }
 
-  txHash(): Hex {
-    return `0x${(this.nextTx++).toString(16).padStart(64, 'b')}` as Hex;
-  }
-
-  /** Replaces block `number` with a different hash and drops its logs (simulated reorg). */
-  reorg(number: bigint): void {
-    const hash = `0x${(number.toString(16) + 'ff').padStart(64, 'c')}` as Hex;
-    this.blocks.set(number.toString(), { number, hash, timestamp: BigInt(1_700_000_000 + Number(number)) });
-    this.logs = this.logs.filter((l) => l.blockNumber !== number);
-  }
-
-  async getBlockNumber(): Promise<bigint> {
-    return this.head;
-  }
-  async getBlock(number: bigint): Promise<BlockInfo | undefined> {
-    return this.blocks.get(number.toString());
-  }
-  async getLogs(fromBlock: bigint, toBlock: bigint): Promise<DeskLog[]> {
-    return this.logs.filter((l) => l.blockNumber >= fromBlock && l.blockNumber <= toBlock);
-  }
-  async getTransactionReceipt(hash: Hex): Promise<ReceiptInfo | undefined> {
-    return this.receipts.get(hash.toLowerCase());
-  }
-  async quote(amount: bigint): Promise<{ usdMicro: bigint; priceE18: bigint; updatedAt: number }> {
-    if (this.priceFailure !== undefined) {
-      const { PriceError } = await import('../src/chain/clients.js');
-      throw new PriceError(this.priceFailure, `price ${this.priceFailure}`);
+  /** Registers a transaction as the newest entry of the mint's signature list. */
+  addTransaction(tx: RpcParsedTransaction, extra: Partial<RpcSignatureInfo> = {}): string {
+    const signature = tx.transaction.signatures[0] as string;
+    this.transactions.set(signature, tx);
+    this.signatures.unshift({ signature, slot: tx.slot, err: tx.meta?.err ?? null, memo: null, blockTime: tx.blockTime ?? null, confirmationStatus: 'confirmed', ...extra });
+    if (tx.slot > this.slot) {
+      this.slot = tx.slot;
+      this.blockHeight = tx.slot;
     }
-    return { usdMicro: (amount * this.priceE18) / 10n ** 30n, priceE18: this.priceE18, updatedAt: this.priceUpdatedAt };
-  }
-  async latestPrice(): Promise<{ priceE18: bigint; updatedAt: number }> {
-    return { priceE18: this.priceFailure === 'unavailable' ? 0n : this.priceE18, updatedAt: this.priceUpdatedAt };
-  }
-  async maxPriceAge(): Promise<number> {
-    return this.maxAge;
-  }
-  async allowance(owner: Address): Promise<bigint> {
-    return this.allowances.get(owner.toLowerCase()) ?? 0n;
-  }
-  async balanceOf(owner: Address): Promise<bigint> {
-    return this.balances.get(owner.toLowerCase()) ?? 0n;
-  }
-  async priceSourceBounds(): Promise<{ maxStepBps: number; minInterval: number }> {
-    return { maxStepBps: 2500, minInterval: 60 };
-  }
-  async draw(budgetId: bigint, tokens: bigint, receiptHash: Hex): Promise<Hex> {
-    if (this.failDraw) throw this.failDraw;
-    const txHash = this.txHash();
-    this.draws.push({ budgetId, tokens, receiptHash, txHash });
-    return txHash;
-  }
-  async postPrice(priceE18: bigint): Promise<Hex> {
-    this.priceE18 = priceE18;
-    return this.txHash();
-  }
-  async waitForReceipt(): Promise<{ status: 'success' | 'reverted'; blockNumber: bigint }> {
-    if (this.failReceipt) throw this.failReceipt;
-    return { status: this.receiptStatus, blockNumber: this.head };
+    return signature;
   }
 
-  /** A {@link ChainContext} over this fake. */
-  context(withWriter = true): ChainContext {
+  /** Lists a signature without a fetchable transaction (not yet available at the commitment). */
+  addPendingSignature(signature: string, slot: number): void {
+    this.signatures.unshift({ signature, slot, err: null, memo: null, blockTime: null, confirmationStatus: 'confirmed' });
+  }
+
+  /** A fresh, well-formed signature. */
+  newSignature(): string {
+    return testSignature(1000 + this.nextSig++);
+  }
+
+  async getSignaturesForAddress(address: string, options: { before?: string; until?: string; limit: number }): Promise<RpcSignatureInfo[]> {
+    this.calls.push({ method: 'getSignaturesForAddress', args: [address, options] });
+    let list = this.signatures;
+    if (options.before !== undefined) {
+      const i = list.findIndex((s) => s.signature === options.before);
+      list = i === -1 ? [] : list.slice(i + 1);
+    }
+    const out: RpcSignatureInfo[] = [];
+    for (const s of list) {
+      if (s.signature === options.until) break;
+      out.push({ ...s });
+      if (out.length >= options.limit) break;
+    }
+    return out;
+  }
+
+  async getParsedTransaction(signature: string): Promise<RpcParsedTransaction | null> {
+    this.calls.push({ method: 'getParsedTransaction', args: [signature] });
+    const tx = this.transactions.get(signature);
+    return tx === undefined ? null : (JSON.parse(JSON.stringify(tx)) as RpcParsedTransaction);
+  }
+
+  async getSlot(): Promise<number> {
+    return this.slot;
+  }
+
+  async getBlockHeight(): Promise<number> {
+    return this.blockHeight;
+  }
+
+  async getSignatureStatuses(signatures: readonly string[]): Promise<(RpcSignatureStatus | null)[]> {
+    this.calls.push({ method: 'getSignatureStatuses', args: [[...signatures]] });
+    return signatures.map((s) => {
+      if (this.statuses.has(s)) return this.statuses.get(s) ?? null;
+      const tx = this.transactions.get(s);
+      return tx === undefined ? null : { slot: tx.slot, confirmations: null, err: tx.meta?.err ?? null, confirmationStatus: 'finalized' };
+    });
+  }
+
+  async getMultipleParsedAccounts(addresses: readonly string[]): Promise<(RpcParsedAccount | null)[]> {
+    this.calls.push({ method: 'getMultipleParsedAccounts', args: [[...addresses]] });
+    return addresses.map((a) => {
+      const acct = this.accounts.get(a);
+      return acct === undefined || acct === null ? null : (JSON.parse(JSON.stringify(acct)) as RpcParsedAccount);
+    });
+  }
+
+  private tokenAccounts(): RpcProgramAccount[] {
+    const out: RpcProgramAccount[] = [];
+    for (const [pubkey, account] of this.accounts) {
+      if (account !== null && account.data !== null && account.data.program === 'spl-token') out.push({ pubkey, account: JSON.parse(JSON.stringify(account)) as RpcParsedAccount });
+    }
+    return out;
+  }
+
+  async getParsedProgramAccounts(programId: string, filters: readonly RpcAccountFilter[]): Promise<RpcProgramAccount[]> {
+    this.calls.push({ method: 'getParsedProgramAccounts', args: [programId, filters] });
+    return this.tokenAccounts().filter(({ account }) => {
+      if (account.owner !== programId) return false;
+      const info = (account.data?.parsed as { info: Record<string, unknown> }).info;
+      return filters.every((f) => {
+        if ('dataSize' in f) return account.space === f.dataSize;
+        if (f.memcmp.offset === 0) return info['mint'] === f.memcmp.bytes;
+        if (f.memcmp.offset === 76) return info['delegate'] === f.memcmp.bytes;
+        return false;
+      });
+    });
+  }
+
+  async getParsedTokenAccountsByOwner(owner: string, mint: string): Promise<RpcProgramAccount[]> {
+    this.calls.push({ method: 'getParsedTokenAccountsByOwner', args: [owner, mint] });
+    return this.tokenAccounts().filter(({ account }) => {
+      const info = (account.data?.parsed as { info: Record<string, unknown> }).info;
+      return info['owner'] === owner && info['mint'] === mint;
+    });
+  }
+
+  async getBalance(address: string): Promise<bigint> {
+    return this.balances.get(address) ?? 0n;
+  }
+
+  async getLatestBlockhash(): Promise<RecentBlockhash> {
+    return { ...this.blockhash };
+  }
+
+  async signAndSend(instructions: readonly TransactionInstruction[], recent: RecentBlockhash): Promise<string> {
+    if (this.failSend) throw this.failSend;
+    const signature = this.newSignature();
+    this.sent.push({ signature, instructions: [...instructions], recent });
+    return signature;
+  }
+
+  async confirm(): Promise<ConfirmOutcome> {
+    if (this.failConfirm) throw this.failConfirm;
+    return this.confirmOutcome;
+  }
+
+  /** A {@link ChainContext} over this fake (localnet deployment facts). */
+  context(options: { writer?: boolean; operator?: string | undefined } = {}): ChainContext {
+    const withWriter = options.writer ?? true;
+    const operator = 'operator' in options ? options.operator : this.address;
     return {
-      chainId: 31337,
-      chain: anvilChain,
-      deployment: { chainId: 31337, overridden: [], creditDesk: DESK, token: TOKEN, tokenSymbol: 'BEAGLE', tokenDecimals: 18, nativeBurn: true, priceSourceKind: 'manual', deployBlock: 0 },
-      creditDesk: DESK,
-      token: { address: TOKEN, symbol: 'BEAGLE', decimals: 18, nativeBurn: true },
-      priceSource: '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512',
-      explorer: undefined,
-      startBlock: 1,
+      cluster: 'localnet',
+      deployment: resolveDeployment('localnet', {}),
+      rpcUrl: CLUSTERS.localnet.rpcUrl,
+      commitment: 'confirmed',
+      mint: MINT,
+      decimals: 6,
+      symbol: 'BEAGLE',
+      tokenProgram: TOKEN_PROGRAM_ID,
+      memoProgram: MEMO_PROGRAM_ID,
+      operator,
+      operatorKeyConfigured: withWriter,
+      explorer: CLUSTERS.localnet.explorer,
       reader: this,
       writer: withWriter ? this : undefined,
-      publicClient: undefined,
     };
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Harness
 
 /** Test harness: services + app over an in-memory DB. */
 export interface Harness {
@@ -257,6 +473,8 @@ export interface Harness {
   services: Services;
   app: ReturnType<typeof createApp>;
   mock: MockProvider | undefined;
+  /** The fake RPC behind `services.chain` (when the harness was built with one). */
+  rpc: FakeRpc | undefined;
   /** Credits `workspace` with `micro` µUSD via an admin adjustment. */
   credit(workspace: string, micro: bigint): void;
   /** Creates an API key for `workspace`. */
@@ -266,17 +484,30 @@ export interface Harness {
   close(): Promise<void>;
 }
 
-/** Builds a harness. `env` overrides the test env; `deps` go to `createServices`. */
-export async function makeHarness(env: Record<string, string | undefined> = {}, deps: ServiceDeps = {}, withMock = true): Promise<Harness> {
+/** Options of {@link makeHarness}. */
+export interface HarnessOptions {
+  /** A fake RPC to enable the chain workers (default: chain disabled). */
+  rpc?: FakeRpc;
+  /** Give the fake context a writer (default true when `rpc` is set). */
+  writer?: boolean;
+}
+
+/**
+ * Builds a harness. `env` overrides the test env (manual price `$0.01` by default); `deps` go to
+ * `createServices`; `withMock` starts the mock house provider.
+ */
+export async function makeHarness(env: Record<string, string | undefined> = {}, deps: ServiceDeps = {}, withMock = true, options: HarnessOptions = {}): Promise<Harness> {
   const mock = withMock ? await startMockProvider() : undefined;
-  const config = testConfig({ ...(mock === undefined ? {} : { HOUSE_BASE_URL: mock.url }), ...env });
-  const services = createServices(config, { logger: silentLogger, chain: null, ...deps });
+  const config = testConfig({ INITIAL_PRICE_USD: '0.01', ...(mock === undefined ? {} : { HOUSE_BASE_URL: mock.url }), ...env });
+  const chain = options.rpc === undefined ? null : options.rpc.context({ writer: options.writer ?? true });
+  const services = createServices(config, { logger: silentLogger, chain, ...deps });
   const app = createApp(services);
   return {
     config,
     services,
     app,
     mock,
+    rpc: options.rpc,
     credit: (workspace, micro) => void services.ledger.adjust(workspace, micro, 'test credit'),
     key: (workspace) => services.apiKeys.create(workspace, 'test').key,
     session: (workspace) => {

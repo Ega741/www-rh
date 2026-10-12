@@ -13,8 +13,11 @@ import {
   BalanceDtoSchema,
   BudgetDtoSchema,
   ConfigDtoSchema,
+  CreditEventListDtoSchema,
   ErrorDtoSchema,
   ModelsDtoSchema,
+  PriceDtoSchema,
+  PriceHistoryDtoSchema,
   QuoteDtoSchema,
   StatusDtoSchema,
   UpgradeDtoSchema,
@@ -23,8 +26,11 @@ import {
   type BalanceDto,
   type BudgetDto,
   type ConfigDto,
+  type CreditEventDto,
   type ModelDto,
+  type PriceDto,
   type QuoteDto,
+  type RegisterBudgetRequest,
   type StatusDto,
   type UpgradeDto,
   type UsageRowDto,
@@ -54,6 +60,20 @@ export interface UsageQuery {
 export interface UsageResult {
   rows: UsageRowDto[];
   summary: UsageSummaryDto;
+}
+
+/** Query of {@link BeagleApi.receipts} (`GET /api/receipts?limit&before`, newest first). */
+export interface ReceiptsQuery {
+  /** Rows to return, 1–200; the gateway default is 50. */
+  limit?: number;
+  /** Cursor: rows recorded by the gateway before this `created_at` timestamp (unix milliseconds; several events can share a slot), from the previous page's `nextBefore`. */
+  before?: number;
+}
+
+/** Result of {@link BeagleApi.receipts}. */
+export interface ReceiptsResult {
+  rows: CreditEventDto[];
+  nextBefore: number | null;
 }
 
 /**
@@ -103,7 +123,7 @@ export interface BeagleApi {
   balance(): Promise<BalanceDto>;
   /** `GET /api/models`: the catalog with live availability (aliases are static, see `@beagle/shared/models`). */
   models(): Promise<ModelDto[]>;
-  /** `GET /api/quote`: tokens → µUSD or µUSD → tokens at the desk's current price. */
+  /** `GET /api/quote`: tokens → µUSD or µUSD → tokens at the current published price point. */
   quote(q: QuoteQuery): Promise<QuoteDto>;
   /**
    * `POST /v1/chat/completions` (non-streaming). Costs credit unless the route is BYOK. The result
@@ -112,14 +132,26 @@ export interface BeagleApi {
   complete(req: ChatCompletionRequest, options?: CompletionOptions): Promise<BeagleChatCompletion>;
   /** `GET /api/usage` + `GET /api/usage/summary`. */
   usage(q: UsageQuery): Promise<UsageResult>;
-  /** `GET /api/budgets`: the workspace's on-chain budgets with headroom and draws. */
+  /** `GET /api/budgets`: the workspace's delegation budgets with headroom and draws. */
   budgets(): Promise<BudgetDto[]>;
+  /**
+   * `POST /api/budgets/register`: tells the gateway about a token account just delegated to the
+   * operator (SPEC §3.4 discovery (a)); `workspace` funds another workspace than the owner.
+   * Fails with `not_delegated` (400) when the account is not delegated to the operator.
+   */
+  registerBudget(req: RegisterBudgetRequest): Promise<BudgetDto>;
   /** `POST /api/upgrades`: buys `pro` periods or `warm` hours with credit (402 when short). */
   upgrade(kind: 'pro' | 'warm', quantity: number): Promise<UpgradeDto>;
-  /** `GET /api/status`: chain, indexer, provider health, house model, operator. */
+  /** `GET /api/status`: cluster, mint, indexer, price, provider health, house model, operator. */
   status(): Promise<StatusDto>;
-  /** `GET /api/config`: chain id, desk / token / price source addresses, aliases, fees, upgrade prices. */
+  /** `GET /api/config`: cluster, RPC, mint / token program / operator, explorer, aliases, fees, upgrade prices. */
   config(): Promise<ConfigDto>;
+  /** `GET /api/price`: the current published price point and whether it is stale (SPEC §3.3). */
+  price(): Promise<PriceDto>;
+  /** `GET /api/price/history?limit`: price points, newest first. */
+  priceHistory(q?: { limit?: number }): Promise<PriceDto[]>;
+  /** `GET /api/receipts`: the workspace's credit events (burns and draws), newest first. */
+  receipts(q?: ReceiptsQuery): Promise<ReceiptsResult>;
 }
 
 /**
@@ -370,6 +402,12 @@ export function createRestBeagleApi(options: RestBeagleApiOptions): BeagleApi {
 
     budgets: () => get('/api/budgets', BudgetsResponseSchema),
 
+    registerBudget: async (req) => {
+      const body = { tokenAccount: req.tokenAccount, ...(req.workspace === undefined ? {} : { workspace: req.workspace }) };
+      const res = await request({ method: 'POST', path: '/api/budgets/register', body, timeoutMs });
+      return parse(BudgetDtoSchema, res.body, 'POST /api/budgets/register', res.status);
+    },
+
     upgrade: async (kind, quantity) => {
       const res = await request({ method: 'POST', path: '/api/upgrades', body: { kind, quantity }, timeoutMs });
       return parse(UpgradeDtoSchema, res.body, 'POST /api/upgrades', res.status);
@@ -378,5 +416,14 @@ export function createRestBeagleApi(options: RestBeagleApiOptions): BeagleApi {
     status: () => get('/api/status', StatusDtoSchema),
 
     config: () => get('/api/config', ConfigDtoSchema),
+
+    price: () => get('/api/price', PriceDtoSchema),
+
+    priceHistory: (q) => get('/api/price/history', PriceHistoryDtoSchema, q?.limit === undefined ? undefined : { limit: q.limit }),
+
+    receipts: async (q) => {
+      const query = { ...(q?.limit === undefined ? {} : { limit: q.limit }), ...(q?.before === undefined ? {} : { before: q.before }) };
+      return get('/api/receipts', CreditEventListDtoSchema, Object.keys(query).length === 0 ? undefined : query);
+    },
   };
 }

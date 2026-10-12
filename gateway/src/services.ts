@@ -1,23 +1,23 @@
 /**
- * Service container: wires config, database, auth, providers, router, metering, upgrades and chain
- * workers together. Every external dependency (clock, fetch, Anthropic client factory, DNS, chain
- * access, SIWE verifier) is injectable so tests run fully offline against an in-memory database.
- * Nothing here starts timers or listens; `main.ts` does that.
+ * Service container: wires config, database, auth, providers, router, metering, upgrades, the
+ * price service and the chain workers together. Every external dependency (clock, fetch,
+ * Anthropic client factory, DNS, chain access) is injectable so tests run fully offline against
+ * an in-memory database. Nothing here starts timers or listens; `main.ts` does that.
  *
  * @module services
  */
 import { readFileSync } from 'node:fs';
+import { clusterCaip } from '@beagle/shared/clusters';
 import { DEFAULT_CATALOG, mergeCatalog, type ModelSpec, type Provider } from '@beagle/shared/models';
 import { ApiKeyService } from './auth/apiKeys.js';
 import { Keyring } from './auth/crypto.js';
 import { SessionService } from './auth/session.js';
-import { SiweService, type SiweVerifier } from './auth/siwe.js';
-import { HeadroomRefresher } from './chain/budgets.js';
-import { createChainContext, type ChainContext } from './chain/clients.js';
+import { SiwsService } from './auth/siws.js';
+import { BudgetScanner } from './chain/budgets.js';
 import { BudgetDrawer } from './chain/drawer.js';
 import { Indexer } from './chain/indexer.js';
-import { PricePoster } from './chain/poster.js';
 import { PriceService } from './chain/price.js';
+import { createChainContext, resolveChainInfo, type ChainContext, type ChainInfo } from './chain/rpc.js';
 import type { Config } from './config.js';
 import { Repos } from './db/repos.js';
 import { migrate } from './db/schema.js';
@@ -42,18 +42,23 @@ export const GATEWAY_VERSION = '0.1.0';
 export interface ServiceDeps {
   logger?: Logger;
   now?: () => number;
-  /** Fetch used by the OpenAI-compatible adapter, the poster and the warm driver. */
+  /** Fetch used by the OpenAI-compatible adapter, the price feeds and the warm driver. */
   fetch?: FetchLike;
   anthropicClientFactory?: AnthropicClientFactory;
   lookup?: DnsLookup;
-  /** `null` disables the chain entirely; `undefined` builds it from the config. */
+  /** `null` disables chain access (workers off); `undefined` builds it from the config. */
   chain?: ChainContext | null;
-  siweVerifier?: SiweVerifier;
   adapters?: Partial<Record<Provider, ProviderAdapter>>;
   catalog?: readonly ModelSpec[];
   warmDriver?: WarmDriver;
   /** An already opened database (tests); otherwise `DB_PATH` is opened. */
   db?: Db;
+}
+
+/** Mutable runtime facts refreshed by the loops. */
+export interface RuntimeState {
+  /** Lamports of the operator wallet, refreshed by housekeeping; `undefined` until read. */
+  operatorSolBalance: bigint | undefined;
 }
 
 /** Everything the HTTP layer, the CLI and the workers use. */
@@ -66,7 +71,7 @@ export interface Services {
   catalog: readonly ModelSpec[];
   apiKeys: ApiKeyService;
   sessions: SessionService;
-  siwe: SiweService;
+  siws: SiwsService;
   keyring: Keyring | undefined;
   registry: ProviderRegistry;
   health: HealthStore;
@@ -77,11 +82,14 @@ export interface Services {
   upgrades: UpgradeService;
   warm: WarmService;
   price: PriceService;
+  /** Static chain facts (always present, from the deployment record and the env). */
+  chainInfo: ChainInfo;
+  /** RPC access and the operator key; `undefined` when the mint is unknown or chain access was disabled. */
   chain: ChainContext | undefined;
   indexer: Indexer | undefined;
-  headroom: HeadroomRefresher | undefined;
+  budgets: BudgetScanner | undefined;
   drawer: BudgetDrawer | undefined;
-  poster: PricePoster | undefined;
+  runtime: RuntimeState;
   version: string;
   /** Closes the database and stops driver timers. */
   close(): void;
@@ -101,7 +109,7 @@ export function loadCatalog(config: Config): ModelSpec[] {
   return catalog;
 }
 
-/** Builds the services (opens and migrates the database). */
+/** Builds the services (opens and migrates the database, bootstraps the price). */
 export function createServices(config: Config, deps: ServiceDeps = {}): Services {
   const logger = deps.logger ?? createLogger({ level: config.server.logLevel });
   const now = deps.now ?? (() => Date.now());
@@ -116,15 +124,11 @@ export function createServices(config: Config, deps: ServiceDeps = {}): Services
   if (deps.chain === null) chain = undefined;
   else if (deps.chain !== undefined) chain = deps.chain;
   else chain = createChainContext(config, logger);
+  const chainInfo: ChainInfo = chain ?? resolveChainInfo(config, logger);
 
   const apiKeys = new ApiKeyService(repos.apiKeys, repos.workspaces, now);
   const sessions = new SessionService(repos.sessions, config.secrets.sessionSecret, now);
-  const siwe = new SiweService(repos.nonces, {
-    domain: config.server.publicHost,
-    now,
-    ...(deps.siweVerifier === undefined ? {} : { verifier: deps.siweVerifier }),
-    publicClientFor: (chainId) => (chain !== undefined && chain.chainId === chainId ? chain.publicClient : undefined),
-  });
+  const siws = new SiwsService(repos.nonces, { domain: config.server.publicHost, uri: config.server.publicUrl, chainId: clusterCaip(config.cluster.name), now });
   const registry = new ProviderRegistry({
     config,
     providerKeys: repos.providerKeys,
@@ -140,35 +144,71 @@ export function createServices(config: Config, deps: ServiceDeps = {}): Services
   const reservations = new ReservationService(repos, { minReserveMicro: config.economics.minReserveMicro, ttlMs: config.economics.reservationTtlMs }, now);
   const settlement = new SettlementService(repos, { markupBps: config.economics.markupBps, byokFeeBps: config.economics.byokFeeBps }, now);
   const executor = new Executor({ config, repos, catalog, registry, health, reservations, settlement, logger, now });
-  const warmDriver = deps.warmDriver ?? createWarmDriver(config, logger, deps.fetch === undefined ? undefined : (i, init) => deps.fetch!(i, init ?? {}));
+  const fetchForDrivers = deps.fetch === undefined ? undefined : (i: string, init?: RequestInit) => deps.fetch!(i, init ?? {});
+  const warmDriver = deps.warmDriver ?? createWarmDriver(config, logger, fetchForDrivers);
   const warm = new WarmService(repos, warmDriver, now);
   const upgrades = new UpgradeService(repos, config, warm, now);
-  const decimals = chain?.token?.decimals ?? 18;
-  const price = new PriceService({ reader: chain?.reader, source: chain?.deployment.priceSourceKind ?? 'unknown', decimals, now });
+  const price = new PriceService(
+    repos,
+    {
+      source: config.price.source,
+      ...(config.price.initialPriceE18 === undefined ? {} : { initialPriceE18: config.price.initialPriceE18 }),
+      ...(config.price.feedUrl === undefined ? {} : { feedUrl: config.price.feedUrl }),
+      jupiterUrl: config.price.jupiterUrl,
+      ...(chainInfo.mint === undefined ? {} : { mint: chainInfo.mint }),
+      minChangeBps: config.price.minChangeBps,
+      maxStepBps: config.price.maxStepBps,
+      maxAgeS: config.price.maxAgeS,
+      decimals: chainInfo.decimals,
+      ...(fetchForDrivers === undefined ? {} : { fetch: fetchForDrivers }),
+      now,
+    },
+    logger,
+  );
+  price.init();
 
   let indexer: Indexer | undefined;
-  let headroom: HeadroomRefresher | undefined;
+  let budgets: BudgetScanner | undefined;
   let drawer: BudgetDrawer | undefined;
-  let poster: PricePoster | undefined;
   if (chain !== undefined) {
-    indexer = new Indexer(repos, chain.reader, { creditDesk: chain.creditDesk, startBlock: chain.startBlock, confirmations: config.chain.confirmations, chunkBlocks: config.chain.logChunkBlocks, now }, logger);
-    headroom = new HeadroomRefresher(repos, chain.reader, { decimals, now }, logger);
+    indexer = new Indexer(
+      repos,
+      chain.reader,
+      price,
+      {
+        mint: chain.mint,
+        operator: chain.operator,
+        decimals: chain.decimals,
+        pageLimit: config.cluster.indexPageLimit,
+        fetchConcurrency: config.cluster.txFetchConcurrency,
+        indexFromSignature: config.cluster.indexFromSignature,
+        creditWhenStale: config.price.creditWhenStale,
+        minCreditMicro: config.price.minCreditMicro,
+        now,
+      },
+      logger,
+    );
+    budgets = new BudgetScanner(repos, chain.reader, price, { mint: chain.mint, operator: chain.operator, tokenProgram: chain.tokenProgram, decimals: chain.decimals, now }, logger);
     drawer = new BudgetDrawer(
       repos,
       chain.reader,
       chain.writer,
-      { chainId: chain.chainId, creditDesk: chain.creditDesk, decimals, thresholdMicro: config.budgets.drawThresholdMicro, dryRun: config.operator.dryRun, now },
+      price,
+      {
+        cluster: chain.cluster,
+        mint: chain.mint,
+        tokenProgram: chain.tokenProgram,
+        memoProgram: chain.memoProgram,
+        operator: chain.operator,
+        decimals: chain.decimals,
+        thresholdMicro: config.budgets.drawThresholdMicro,
+        priorityFeeMicrolamports: config.operator.priorityFeeMicrolamports,
+        confirmTimeoutMs: config.budgets.drawConfirmTimeoutMs,
+        dryRun: config.operator.dryRun,
+        now,
+      },
       logger,
     );
-    if (config.poster.enabled && config.poster.feedUrl !== undefined) {
-      poster = new PricePoster(
-        repos,
-        chain.reader,
-        chain.writer,
-        { feedUrl: config.poster.feedUrl, dryRun: config.operator.dryRun, postIntervalMs: config.poster.intervalMs, now, ...(deps.fetch === undefined ? {} : { fetch: (i: string, init?: RequestInit) => deps.fetch!(i, init ?? {}) }) },
-        logger,
-      );
-    }
   }
 
   return {
@@ -180,7 +220,7 @@ export function createServices(config: Config, deps: ServiceDeps = {}): Services
     catalog,
     apiKeys,
     sessions,
-    siwe,
+    siws,
     keyring,
     registry,
     health,
@@ -191,11 +231,12 @@ export function createServices(config: Config, deps: ServiceDeps = {}): Services
     upgrades,
     warm,
     price,
+    chainInfo,
     chain,
     indexer,
-    headroom,
+    budgets,
     drawer,
-    poster,
+    runtime: { operatorSolBalance: undefined },
     version: GATEWAY_VERSION,
     close() {
       warm.stop();

@@ -1,40 +1,28 @@
-/** Addresses and hashes with explorer links and copy. */
-import type { Chain } from 'viem';
+/** Public keys, signatures and hashes with explorer links and copy. */
 import { config } from '../config.js';
-import { addressLink, checksum, shortAddress, shortHash, txLink } from '../lib/explorer.js';
+import { addressLink, shortAddress, shortHash, shortSignature, txLink } from '../lib/explorer.js';
 import { CopyButton } from './ui.jsx';
 
-/** Address shortened, checksummed, linked to the explorer when one exists. */
-export function AddressText({ address, chain = config.chain, full = false, copy = false }: { address: string; chain?: Chain; full?: boolean; copy?: boolean }) {
-  const text = full ? checksum(address) : shortAddress(address);
-  const href = addressLink(chain, address);
+/** Public key shortened (`Abcd…wxyz`) and linked to the explorer. */
+export function AddressText({ address, full = false, copy = false }: { address: string; full?: boolean; copy?: boolean }) {
+  const text = full ? address : shortAddress(address);
+  const href = addressLink(config.cluster, address, config.rpcUrl);
   return (
     <span className="inline-flex items-center gap-1 font-mono text-[0.92em]">
-      {href === undefined ? (
-        <span title={checksum(address)}>{text}</span>
-      ) : (
-        <a className="link" href={href} target="_blank" rel="noreferrer" title={checksum(address)}>
-          {text}
-        </a>
-      )}
-      {copy ? <CopyButton text={checksum(address)} /> : null}
+      <a className="link" href={href} target="_blank" rel="noreferrer" title={address}>
+        {text}
+      </a>
+      {copy ? <CopyButton text={address} /> : null}
     </span>
   );
 }
 
-/** Transaction hash with explorer link. */
-export function TxLink({ hash, chain = config.chain, label }: { hash: string; chain?: Chain; label?: string }) {
-  const href = txLink(chain, hash);
-  const text = label ?? shortHash(hash);
-  if (href === undefined) {
-    return (
-      <span className="font-mono text-[0.92em]" title={hash}>
-        {text}
-      </span>
-    );
-  }
+/** Transaction signature with explorer link (`href` overrides the built link, e.g. `CreditEventDto.explorerUrl`). */
+export function TxLink({ signature, label, href }: { signature: string; label?: string; href?: string | null | undefined }) {
+  const url = href ?? txLink(config.cluster, signature, config.rpcUrl);
+  const text = label ?? shortSignature(signature);
   return (
-    <a className="link font-mono text-[0.92em]" href={href} target="_blank" rel="noreferrer" title={hash}>
+    <a className="link font-mono text-[0.92em]" href={url} target="_blank" rel="noreferrer" title={signature}>
       {text}
     </a>
   );

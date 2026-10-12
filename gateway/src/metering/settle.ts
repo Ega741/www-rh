@@ -86,7 +86,7 @@ export class SettlementService {
       }
       const row: UsageRow = {
         id: input.requestId,
-        workspace: input.workspace.toLowerCase(),
+        workspace: input.workspace,
         apiKeyId: input.apiKeyId,
         endpoint: input.endpoint,
         requestedModel: input.requestedModel,

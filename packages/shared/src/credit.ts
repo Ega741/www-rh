@@ -1,9 +1,11 @@
 /**
- * Integer-only credit math (SPEC §1, §4.3), mirroring the Solidity `CreditMath` library.
+ * Integer-only credit math (SPEC §1, §4.3).
  *
- * All money is `bigint`: µUSD (`1 USD = 1_000_000 µUSD`), raw token units and `priceE18`
- * (USD per whole token scaled by `1e18`). Nothing here touches floating point except the
- * token-count inputs of {@link costMicroUsd}, which are safe integers.
+ * All money is `bigint`: µUSD (`1 USD = 1_000_000 µUSD`), raw token units of the SPL mint and
+ * `priceE18` (USD per whole token scaled by `1e18`). Nothing here touches floating point except
+ * the token-count inputs of {@link costMicroUsd}, which are safe integers. Token `decimals`
+ * default to {@link DEFAULT_DECIMALS} (6: pump.fun-style mints and the local test mint); callers
+ * that know the mint pass its real value.
  *
  * @module credit
  */
@@ -13,7 +15,9 @@ import type { ModelPrice } from './models.js';
 export const MICRO_USD = 1_000_000n;
 /** Scale of `priceE18` (USD per whole token × 1e18). */
 export const PRICE_SCALE = 10n ** 18n;
-/** Upper bound of token `decimals` accepted by the desk and by this module (SPEC §3.1). */
+/** Decimals of the BEAGLE mint on every cluster (SPEC §1, §3.1); the default of the quote helpers. */
+export const DEFAULT_DECIMALS = 6;
+/** Upper bound of token `decimals` accepted by this module (SPL mints use ≤ 9; fixtures go to 18). */
 export const MAX_TOKEN_DECIMALS = 36;
 /** Basis-point denominator. */
 export const BPS_DENOMINATOR = 10_000n;
@@ -44,9 +48,10 @@ export function ceilDiv(a: bigint, b: bigint): bigint {
 
 /**
  * µUSD credited for burning `amount` raw token units at `priceE18`
- * (`floor(amount · priceE18 / 10^(decimals + 12))`, SPEC §1). Mirrors `CreditMath.usdMicro`.
+ * (`floor(amount · priceE18 / 10^(decimals + 12))`, SPEC §1). For 6 decimals this is
+ * `amount · priceE18 / 1e18`: `1_000_000_000 raw` (1000 BEAGLE) at `1e16` ($0.01) → `10_000_000 µUSD`.
  */
-export function quoteUsdMicro(amount: bigint, priceE18: bigint, decimals = 18): bigint {
+export function quoteUsdMicro(amount: bigint, priceE18: bigint, decimals: number = DEFAULT_DECIMALS): bigint {
   assertNonNegative('amount', amount);
   assertNonNegative('priceE18', priceE18);
   assertDecimals(decimals);
@@ -56,9 +61,8 @@ export function quoteUsdMicro(amount: bigint, priceE18: bigint, decimals = 18): 
 /**
  * Raw token units needed to receive `usdMicro` at `priceE18`
  * (`ceil(usdMicro · 10^(decimals + 12) / priceE18)`, SPEC §1). Throws when `priceE18` is zero.
- * Mirrors `CreditMath.tokensForUsdMicro`.
  */
-export function tokensForUsdMicro(usdMicro: bigint, priceE18: bigint, decimals = 18): bigint {
+export function tokensForUsdMicro(usdMicro: bigint, priceE18: bigint, decimals: number = DEFAULT_DECIMALS): bigint {
   assertNonNegative('usdMicro', usdMicro);
   assertNonNegative('priceE18', priceE18);
   assertDecimals(decimals);
@@ -181,9 +185,9 @@ export function parseUsdToMicro(input: string): bigint {
 }
 
 /**
- * Formats raw token units as a decimal string (`1000e18, 18` → `"1000"`, `15e17, 18` → `"1.5"`),
+ * Formats raw token units as a decimal string (`1_000_000_000n, 6` → `"1000"`, `1_500_000n, 6` → `"1.5"`),
  * truncating (not rounding) to `maxFractionDigits` (4) and trimming trailing zeros. Negative dust
- * that truncates to zero prints unsigned (`-1n, 18` → `"0"`).
+ * that truncates to zero prints unsigned (`-1n, 6` → `"0"`).
  */
 export function formatTokenAmount(raw: bigint, decimals: number, maxFractionDigits = 4): string {
   assertDecimals(decimals);
@@ -220,6 +224,6 @@ export function formatPriceE18(priceE18: bigint, options: FormatOptions = {}): s
 }
 
 /** Raw token units bought by one USD at `priceE18` (`tokensForUsdMicro(1_000_000n, …)`). */
-export function tokensPerUsd(priceE18: bigint, decimals = 18): bigint {
+export function tokensPerUsd(priceE18: bigint, decimals: number = DEFAULT_DECIMALS): bigint {
   return tokensForUsdMicro(MICRO_USD, priceE18, decimals);
 }

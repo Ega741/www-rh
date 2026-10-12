@@ -1,43 +1,39 @@
 /**
- * Pure configuration loader for the web app (SPEC §7 env). `loadConfig` reads a plain record so
- * it can be unit-tested; `src/config.ts` evaluates it against `import.meta.env`.
+ * Pure configuration loader for the web app (SPEC §7 env): `VITE_CLUSTER`, `VITE_RPC_URL`,
+ * `VITE_GATEWAY_URL`, `VITE_MINT_ADDRESS`. `loadConfig` reads a plain record so it can be
+ * unit-tested; `src/config.ts` evaluates it against `import.meta.env`. The mint, decimals, symbol,
+ * token program and operator the pages use come from `GET /api/config`, reconciled with the
+ * committed deployment by {@link reconcileDeployment}: a disagreement disables burning and says why.
  */
-import { getAddress, type Address, type Chain } from 'viem';
-import { anvilChain, chainById, withMulticall3 } from '@beagle/shared/chains';
+import { DEFAULT_CLUSTER, CLUSTERS, parseCluster, type Cluster } from '@beagle/shared/clusters';
 import { resolveDeployment, type ResolvedDeployment } from '@beagle/shared/addresses';
+import { DEFAULT_DECIMALS } from '@beagle/shared/solana';
 
 /** The `VITE_*` keys the app reads. */
 export interface WebEnv {
-  VITE_CHAIN_ID?: string | undefined;
-  VITE_GATEWAY_URL?: string | undefined;
-  VITE_CREDIT_DESK_ADDRESS?: string | undefined;
+  VITE_CLUSTER?: string | undefined;
   VITE_RPC_URL?: string | undefined;
-  VITE_WALLETCONNECT_PROJECT_ID?: string | undefined;
-  VITE_MULTICALL?: string | undefined;
+  VITE_GATEWAY_URL?: string | undefined;
+  VITE_MINT_ADDRESS?: string | undefined;
 }
 
 /** Resolved, validated app configuration. */
 export interface AppConfig {
-  /** Chain id the app is bound to (default 31337). */
-  chainId: number;
-  /** viem chain definition (with Multicall3 declared when `VITE_MULTICALL` is on). */
-  chain: Chain;
-  /** Committed deployment with `VITE_CREDIT_DESK_ADDRESS` applied. */
+  /** Cluster the app is bound to (default `localnet`). */
+  cluster: Cluster;
+  /** Display name (`Localnet`, `Devnet`, `Mainnet Beta`). */
+  clusterName: string;
+  /** Committed deployment with `VITE_MINT_ADDRESS` / `VITE_RPC_URL` applied. */
   deployment: ResolvedDeployment;
-  /** RPC override for the wallet transport; `undefined` = chain default. */
-  rpcUrl: string | undefined;
+  /** JSON-RPC endpoint of the wallet connection (`VITE_RPC_URL` or the cluster default). */
+  rpcUrl: string;
   /** Public gateway URL (`VITE_GATEWAY_URL`), without trailing slash; `''` = same origin. */
   gatewayUrl: string;
   /** Prefix for `fetch` calls: `''` in development (Vite proxy) or when the gateway is same-origin. */
   apiBase: string;
-  walletConnectProjectId: string | undefined;
-  /** Aggregate `eth_call`s through Multicall3. */
-  multicall: boolean;
   /** Human-readable configuration problems to surface in the UI (the app still boots). */
   errors: string[];
 }
-
-const DEFAULT_CHAIN_ID = 31337;
 
 function clean(value: string | undefined): string | undefined {
   const v = value?.trim();
@@ -49,57 +45,49 @@ export function stripSlash(url: string): string {
   return url.replace(/\/+$/, '');
 }
 
-/** `true` for `1`, `true`, `yes`, `on` (case-insensitive). */
-export function envFlag(value: string | undefined): boolean {
-  const v = clean(value)?.toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
-}
-
 /**
- * Builds the {@link AppConfig} from `env`. Never throws: unknown chain ids fall back to anvil and
- * bad overrides are reported in `errors`.
+ * Builds the {@link AppConfig} from `env`. Never throws: an unknown cluster falls back to
+ * `localnet` and bad overrides are reported in `errors` (the override is then ignored).
  */
 export function loadConfig(env: WebEnv, opts: { dev: boolean }): AppConfig {
   const errors: string[] = [];
-  const rawChainId = clean(env.VITE_CHAIN_ID);
-  let chainId = DEFAULT_CHAIN_ID;
-  if (rawChainId !== undefined) {
-    const n = Number(rawChainId);
-    if (Number.isInteger(n) && n > 0) chainId = n;
-    else errors.push(`VITE_CHAIN_ID is not a chain id: ${JSON.stringify(rawChainId)}`);
+  let cluster: Cluster = DEFAULT_CLUSTER;
+  try {
+    cluster = parseCluster(env.VITE_CLUSTER);
+  } catch (e) {
+    errors.push(`VITE_CLUSTER: ${e instanceof Error ? e.message : String(e)}; using ${DEFAULT_CLUSTER}`);
   }
-  let chain = chainById(chainId);
-  if (chain === undefined) {
-    errors.push(`VITE_CHAIN_ID ${chainId} is not a supported chain (4663, 46630, 31337); using anvil`);
-    chainId = anvilChain.id;
-    chain = anvilChain;
-  }
-  const multicall = envFlag(env.VITE_MULTICALL);
-  if (multicall) chain = withMulticall3(chain);
 
   let deployment: ResolvedDeployment;
   try {
-    deployment = resolveDeployment(chainId, { creditDesk: clean(env.VITE_CREDIT_DESK_ADDRESS) });
+    deployment = resolveDeployment(cluster, { mint: clean(env.VITE_MINT_ADDRESS), rpcUrl: clean(env.VITE_RPC_URL) });
   } catch (e) {
     errors.push(e instanceof Error ? e.message : String(e));
-    deployment = resolveDeployment(chainId);
-  }
-  if (deployment.creditDesk === undefined) {
-    errors.push(`No CreditDesk deployment is known for chain ${chainId}; set VITE_CREDIT_DESK_ADDRESS`);
+    // Keep whichever override is valid on its own.
+    let partial: ResolvedDeployment | undefined;
+    try {
+      partial = resolveDeployment(cluster, { rpcUrl: clean(env.VITE_RPC_URL) });
+    } catch {
+      partial = undefined;
+    }
+    try {
+      partial ??= resolveDeployment(cluster, { mint: clean(env.VITE_MINT_ADDRESS) });
+    } catch {
+      partial = undefined;
+    }
+    deployment = partial ?? resolveDeployment(cluster);
   }
 
   const gatewayUrl = stripSlash(clean(env.VITE_GATEWAY_URL) ?? '');
   const apiBase = opts.dev ? '' : gatewayUrl;
 
   return {
-    chainId,
-    chain,
+    cluster,
+    clusterName: CLUSTERS[cluster].name,
     deployment,
-    rpcUrl: clean(env.VITE_RPC_URL),
+    rpcUrl: deployment.rpcUrl,
     gatewayUrl,
     apiBase,
-    walletConnectProjectId: clean(env.VITE_WALLETCONNECT_PROJECT_ID),
-    multicall,
     errors,
   };
 }
@@ -109,37 +97,53 @@ export function publicGatewayUrl(cfg: Pick<AppConfig, 'gatewayUrl'>, pageOrigin:
   return cfg.gatewayUrl !== '' ? cfg.gatewayUrl : stripSlash(pageOrigin);
 }
 
-/** Where the web app will send burns and budgets, reconciled with the desk the gateway indexes. */
-export interface DeskResolution {
-  /** The desk to call, `undefined` when unknown or when the two sources disagree. */
-  desk: Address | undefined;
-  /** Human-readable explanation when the committed/`VITE_CREDIT_DESK_ADDRESS` desk and the gateway's differ. */
+/** The subset of `GET /api/config` the reconciliation reads. */
+export interface GatewayDeployment {
+  cluster: string;
+  mint: string;
+  decimals: number;
+  symbol: string;
+  tokenProgram: string;
+  memoProgram: string;
+  operator: string | null;
+}
+
+/** What the pages need to build burns and budgets, after reconciling the build with the gateway. */
+export interface DeploymentView {
+  /** The mint to burn, `undefined` when unknown or when the two sources disagree. */
+  mint: string | undefined;
+  decimals: number;
+  symbol: string;
+  tokenProgram: string;
+  memoProgram: string;
+  /** The delegate of every budget; `undefined` while the gateway has no operator (draws disabled). */
+  operator: string | undefined;
+  /** Human-readable explanation when the build and the gateway disagree (mint or cluster). */
   mismatch: string | undefined;
 }
 
-/** Checksummed address or `undefined` for null/invalid input. */
-export function asAddress(s: string | null | undefined): Address | undefined {
-  if (s === null || s === undefined) return undefined;
-  try {
-    return getAddress(s);
-  } catch {
-    return undefined;
-  }
-}
-
 /**
- * Picks the CreditDesk address. The committed deployment (with `VITE_CREDIT_DESK_ADDRESS`) wins
- * only when the gateway agrees or reports none: a burn against a desk the gateway's indexer does
- * not watch would never be credited, so a disagreement disables the flows instead of proceeding.
+ * Picks the deployment the pages use. The gateway's `/api/config` is the source of truth for the
+ * token facts (decimals, symbol, token program, memo program, operator); the committed deployment
+ * (with `VITE_MINT_ADDRESS`) only serves as a fallback and as a cross-check: a burn of a mint the
+ * gateway's indexer does not watch would never be credited, and a gateway on another cluster would
+ * never see the transaction, so either disagreement disables the flows instead of proceeding.
  */
-export function reconcileDesk(committed: Address | undefined, fromGateway: string | null | undefined): DeskResolution {
-  const gateway = asAddress(fromGateway);
-  if (committed === undefined) return { desk: gateway, mismatch: undefined };
-  if (gateway !== undefined && gateway.toLowerCase() !== committed.toLowerCase()) {
-    return {
-      desk: undefined,
-      mismatch: `This web build targets CreditDesk ${committed} but the gateway indexes ${gateway}. Burns and budgets are disabled until the two agree (check VITE_CREDIT_DESK_ADDRESS / deployments.generated.ts against the gateway's CREDIT_DESK_ADDRESS).`,
-    };
+export function reconcileDeployment(committed: ResolvedDeployment, gateway: GatewayDeployment | undefined): DeploymentView {
+  let mismatch: string | undefined;
+  if (gateway !== undefined && gateway.cluster !== committed.cluster) {
+    mismatch = `This web build targets ${committed.cluster} but the gateway runs on ${gateway.cluster}. Burns and budgets are disabled until the two agree (VITE_CLUSTER vs the gateway's CLUSTER).`;
+  } else if (gateway !== undefined && committed.mint !== undefined && gateway.mint !== committed.mint) {
+    mismatch = `This web build targets mint ${committed.mint} but the gateway indexes ${gateway.mint}. Burns and budgets are disabled until the two agree (check VITE_MINT_ADDRESS / deployments.generated.ts against the gateway's MINT_ADDRESS).`;
   }
-  return { desk: committed, mismatch: undefined };
+  const operator = gateway !== undefined ? (gateway.operator ?? undefined) : committed.operator;
+  return {
+    mint: mismatch !== undefined ? undefined : (gateway?.mint ?? committed.mint),
+    decimals: gateway?.decimals ?? committed.decimals ?? DEFAULT_DECIMALS,
+    symbol: gateway?.symbol ?? committed.symbol ?? 'BEAGLE',
+    tokenProgram: gateway?.tokenProgram ?? committed.tokenProgram,
+    memoProgram: gateway?.memoProgram ?? committed.memoProgram,
+    operator,
+    mismatch,
+  };
 }

@@ -18,8 +18,8 @@ const CARDS = [
     text: 'beagle/auto estimates difficulty, moves easy requests to cheaper models, downgrades as credit or provider limits run down and falls back to the house GPU when everything else is spent.',
   },
   {
-    title: 'Paid by burning BEAGLE',
-    text: 'Burn the token through the CreditDesk contract; the on-chain event says exactly how many dollars of credit you get. No e-mail, no card: sign in with your wallet.',
+    title: 'Paid by burning BEAGLE from your Solana wallet',
+    text: 'A plain SPL burn from your own wallet, no custom program. The gateway sees the burn and credits your workspace at the published price. No e-mail, no card: sign in with your wallet.',
   },
 ] as const;
 
@@ -28,7 +28,7 @@ function providerTone(state: 'ok' | 'degraded' | 'down', configured: boolean): '
   return state === 'ok' ? 'ok' : state === 'degraded' ? 'warn' : 'err';
 }
 
-/** Live strip: token price, indexer height, provider health. */
+/** Live strip: token price, indexer head slot and lag, provider health. */
 function LiveStrip() {
   const status = useStatus();
   const price = usePrice();
@@ -43,12 +43,13 @@ function LiveStrip() {
         ) : (
           <>
             <p className="font-mono text-xl font-semibold">
-              {fmtPrice(price.data.priceE18)} <span className="text-sm text-muted">/ {status.data?.token?.symbol ?? 'BEAGLE'}</span>
+              {fmtPrice(price.data.priceE18)} <span className="text-sm text-muted">/ {status.data?.token.symbol ?? 'BEAGLE'}</span>
             </p>
             <p className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted">
               {price.data.stale ? <Badge tone="warn">stale</Badge> : <Badge tone="ok">fresh</Badge>}
-              <span>updated {relativeTime(price.data.updatedAt * 1000, now)}</span>
+              <span>observed {relativeTime(price.data.observedAt * 1000, now)}</span>
               <span>· {price.data.source}</span>
+              <span>· point #{price.data.pricePointId}</span>
             </p>
           </>
         )}
@@ -60,11 +61,11 @@ function LiveStrip() {
           <p className="text-sm text-muted">gateway unreachable</p>
         ) : (
           <>
-            <p className="font-mono text-xl font-semibold">#{fmtCount(status.data.indexer.lastBlock)}</p>
+            <p className="font-mono text-xl font-semibold">{status.data.indexer.lastSlot === null ? 'slot —' : `slot ${fmtCount(status.data.indexer.lastSlot)}`}</p>
             <p className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted">
-              <Badge tone={status.data.indexer.lagBlocks > 20 ? 'warn' : 'ok'}>lag {status.data.indexer.lagBlocks}</Badge>
-              <span>head #{fmtCount(status.data.indexer.head)}</span>
-              <span>· chain {status.data.chainId}</span>
+              <Badge tone={status.data.indexer.lagSlots > 50 ? 'warn' : 'ok'}>lag {fmtCount(status.data.indexer.lagSlots)}</Badge>
+              <span>head {fmtCount(status.data.indexer.headSlot)}</span>
+              <span>· {status.data.cluster}</span>
             </p>
           </>
         )}
@@ -100,14 +101,14 @@ export function Landing() {
   return (
     <div className="space-y-10">
       <section className="pt-6 text-center sm:pt-12">
-        <p className="font-mono text-xs uppercase tracking-[0.3em] text-accent">{config.chain.name}</p>
+        <p className="font-mono text-xs uppercase tracking-[0.3em] text-accent">Solana · {config.clusterName}</p>
         <h1 className="mx-auto mt-3 max-w-3xl text-4xl font-semibold tracking-tight sm:text-6xl">
           Compute for agents.
           <br />
           <span className="text-muted">Burn becomes compute.</span>
         </h1>
         <p className="mx-auto mt-5 max-w-2xl text-base text-muted sm:text-lg">
-          One API key for every model and an MCP server for your agents. Access is paid by burning <span className="font-mono text-fg">BEAGLE</span> from your wallet; the contract quotes the burn in USD and the gateway credits exactly that.
+          One API key for every model and an MCP server for your agents. Access is paid by burning <span className="font-mono text-fg">BEAGLE</span> from your Solana wallet; credit is computed from the published price when the gateway observes the burn.
         </p>
         <div className="mt-7 flex flex-wrap justify-center gap-3">
           <Link to="/app" className="btn-primary">

@@ -2,14 +2,13 @@
 FROM node:22-alpine AS build
 RUN corepack enable && corepack prepare pnpm@10.28.0 --activate
 WORKDIR /app
-ARG VITE_CHAIN_ID=4663
+# Vite build-time env (docs/SPEC.md §7): cluster, optional RPC override, gateway base URL (empty = same origin behind
+# nginx) and an optional mint override of the committed deployment. Everything else comes from GET /api/config.
+ARG VITE_CLUSTER=mainnet-beta
 ARG VITE_GATEWAY_URL=
-ARG VITE_CREDIT_DESK_ADDRESS=0x0000000000000000000000000000000000000000
 ARG VITE_RPC_URL=
-ARG VITE_WALLETCONNECT_PROJECT_ID=
-ARG VITE_MULTICALL=
-ENV VITE_CHAIN_ID=$VITE_CHAIN_ID VITE_GATEWAY_URL=$VITE_GATEWAY_URL VITE_CREDIT_DESK_ADDRESS=$VITE_CREDIT_DESK_ADDRESS \
-    VITE_RPC_URL=$VITE_RPC_URL VITE_WALLETCONNECT_PROJECT_ID=$VITE_WALLETCONNECT_PROJECT_ID VITE_MULTICALL=$VITE_MULTICALL
+ARG VITE_MINT_ADDRESS=
+ENV VITE_CLUSTER=$VITE_CLUSTER VITE_GATEWAY_URL=$VITE_GATEWAY_URL VITE_RPC_URL=$VITE_RPC_URL VITE_MINT_ADDRESS=$VITE_MINT_ADDRESS
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc tsconfig.base.json ./
 COPY packages/shared/package.json packages/shared/
 COPY web/package.json web/

@@ -1,10 +1,12 @@
 /**
  * Repositories over the SPEC §5.2 tables. Every method is synchronous (node:sqlite) and uses
  * prepared statements; monetary columns are read as `bigint`. Timestamps are unix milliseconds
- * except on-chain mirrors (`budgets.deadline`, `credit_events.block_time`), which are seconds.
+ * except chain mirrors (`credit_events.block_time`) and `price_points.observed_at`, which are seconds.
+ * Workspaces, owners, token accounts and signatures are base58 and stored verbatim (case-sensitive).
  *
  * @module db/repos
  */
+import type { PriceSource } from '@beagle/shared/api';
 import type { Plan, Provider, Tier } from '@beagle/shared/models';
 import { big, blob, num, optNum, optText, text, type Db, type Row } from './sqlite.js';
 
@@ -52,22 +54,37 @@ export interface LedgerRow {
   createdAt: number;
 }
 
-/** `credit_events` row. */
+/** `credit_events` row: one indexed burn instruction (SPEC §3.2, §5.4). */
 export interface CreditEventRow {
-  txHash: string;
-  logIndex: number;
+  signature: string;
+  ixIndex: number;
   kind: 'purchase' | 'draw';
-  receiptId: number;
   workspace: string;
+  /** Owner of the burned token account (null when unresolvable). */
   payer: string | null;
+  tokenAccount: string;
+  /** The burn authority (owner or delegate). */
+  authority: string | null;
   tokenAmount: bigint;
   usdMicro: bigint;
   priceE18: bigint;
-  budgetId: number | null;
+  pricePointId: number | null;
+  priceStale: boolean;
+  memo: string | null;
   receiptHash: string | null;
-  blockNumber: number;
-  blockHash: string;
-  blockTime: number;
+  slot: number;
+  /** Unix seconds, or null when the RPC reported none. */
+  blockTime: number | null;
+  createdAt: number;
+}
+
+/** `price_points` row. */
+export interface PricePointRow {
+  id: number;
+  priceE18: bigint;
+  source: PriceSource;
+  /** Unix seconds. */
+  observedAt: number;
   createdAt: number;
 }
 
@@ -125,28 +142,33 @@ export interface ProviderKeyRow {
   createdAt: number;
 }
 
-/** `budgets` row. */
+/** Why a budget cannot back credit right now (SPEC §5.4). */
+export type BudgetStalledReason = 'price' | 'revoked' | 'exhausted' | 'draw_failed';
+
+/** `budgets` row: one SPL token account delegated to the operator (SPEC §3.4). */
 export interface BudgetRow {
-  budgetId: number;
+  tokenAccount: string;
   owner: string;
   workspace: string;
+  delegate: string | null;
+  /** `delegatedAmount` (raw token units). */
   cap: bigint;
-  drawn: bigint;
-  /** Unix seconds. */
-  deadline: number;
-  closed: boolean;
+  /** The account's token amount (raw). */
+  balance: bigint;
   headroomTokens: bigint;
   headroomMicro: bigint;
   headroomCheckedAt: number | null;
-  stalledReason: 'price' | 'allowance' | 'draw_failed' | null;
-  openedBlock: number | null;
+  stalledReason: BudgetStalledReason | null;
+  closed: boolean;
+  registeredAt: number | null;
+  lastSeenSlot: number | null;
   updatedAt: number;
 }
 
 /** `budget_draws` row. */
 export interface BudgetDrawRow {
   id: number;
-  budgetId: number;
+  tokenAccount: string;
   workspace: string;
   tokenAmount: bigint;
   usdMicro: bigint;
@@ -154,7 +176,8 @@ export interface BudgetDrawRow {
   usageIds: string[];
   /** The canonical `DrawBatch` as JSON (wire form). */
   batchJson: string;
-  txHash: string | null;
+  signature: string | null;
+  lastValidBlockHeight: number | null;
   status: 'pending' | 'sent' | 'confirmed' | 'failed';
   error: string | null;
   createdAt: number;
@@ -181,16 +204,6 @@ export interface ProviderHealthRow {
   openedAt: number | null;
   openForMs: number;
   updatedAt: number;
-}
-
-/** `price_posts` row. */
-export interface PricePostRow {
-  id: number;
-  priceE18: bigint;
-  source: string;
-  txHash: string | null;
-  status: string;
-  createdAt: number;
 }
 
 /** Credit position of a workspace (SPEC §5.2 balance definitions). */
@@ -252,20 +265,30 @@ const mapLedger = (r: Row): LedgerRow => ({
 });
 
 const mapCreditEvent = (r: Row): CreditEventRow => ({
-  txHash: text(r['tx_hash']),
-  logIndex: num(r['log_index']),
+  signature: text(r['signature']),
+  ixIndex: num(r['ix_index']),
   kind: text(r['kind']) as CreditEventRow['kind'],
-  receiptId: num(r['receipt_id']),
   workspace: text(r['workspace']),
   payer: optText(r['payer']),
+  tokenAccount: text(r['token_account']),
+  authority: optText(r['authority']),
   tokenAmount: big(r['token_amount']),
   usdMicro: big(r['usd_micro']),
   priceE18: big(r['price_e18']),
-  budgetId: optNum(r['budget_id']),
+  pricePointId: optNum(r['price_point_id']),
+  priceStale: num(r['price_stale']) === 1,
+  memo: optText(r['memo']),
   receiptHash: optText(r['receipt_hash']),
-  blockNumber: num(r['block_number']),
-  blockHash: text(r['block_hash']),
-  blockTime: num(r['block_time']),
+  slot: num(r['slot']),
+  blockTime: optNum(r['block_time']),
+  createdAt: num(r['created_at']),
+});
+
+const mapPricePoint = (r: Row): PricePointRow => ({
+  id: num(r['id']),
+  priceE18: big(r['price_e18']),
+  source: text(r['source']) as PriceSource,
+  observedAt: num(r['observed_at']),
   createdAt: num(r['created_at']),
 });
 
@@ -320,31 +343,33 @@ const mapProviderKey = (r: Row): ProviderKeyRow => ({
 });
 
 const mapBudget = (r: Row): BudgetRow => ({
-  budgetId: num(r['budget_id']),
+  tokenAccount: text(r['token_account']),
   owner: text(r['owner']),
   workspace: text(r['workspace']),
+  delegate: optText(r['delegate']),
   cap: big(r['cap']),
-  drawn: big(r['drawn']),
-  deadline: num(r['deadline']),
-  closed: num(r['closed']) === 1,
+  balance: big(r['balance']),
   headroomTokens: big(r['headroom_tokens']),
   headroomMicro: big(r['headroom_micro']),
   headroomCheckedAt: optNum(r['headroom_checked_at']),
   stalledReason: optText(r['stalled_reason']) as BudgetRow['stalledReason'],
-  openedBlock: optNum(r['opened_block']),
+  closed: num(r['closed']) === 1,
+  registeredAt: optNum(r['registered_at']),
+  lastSeenSlot: optNum(r['last_seen_slot']),
   updatedAt: num(r['updated_at']),
 });
 
 const mapBudgetDraw = (r: Row): BudgetDrawRow => ({
   id: num(r['id']),
-  budgetId: num(r['budget_id']),
+  tokenAccount: text(r['token_account']),
   workspace: text(r['workspace']),
   tokenAmount: big(r['token_amount']),
   usdMicro: big(r['usd_micro']),
   receiptHash: text(r['receipt_hash']),
   usageIds: parseJsonArray(text(r['usage_ids'])),
   batchJson: text(r['batch_json']),
-  txHash: optText(r['tx_hash']),
+  signature: optText(r['signature']),
+  lastValidBlockHeight: optNum(r['last_valid_block_height']),
   status: text(r['status']) as BudgetDrawRow['status'],
   error: optText(r['error']),
   createdAt: num(r['created_at']),
@@ -371,18 +396,9 @@ const mapHealth = (r: Row): ProviderHealthRow => ({
   updatedAt: num(r['updated_at']),
 });
 
-const mapPricePost = (r: Row): PricePostRow => ({
-  id: num(r['id']),
-  priceE18: big(r['price_e18']),
-  source: text(r['source']),
-  txHash: optText(r['tx_hash']),
-  status: text(r['status']),
-  createdAt: num(r['created_at']),
-});
-
-/** Lowercases a workspace id (SPEC §1). */
+/** Normalizes a workspace id: base58 is case-sensitive, so only surrounding whitespace is dropped (SPEC §1). */
 export function normalizeWorkspace(address: string): string {
-  return address.trim().toLowerCase();
+  return address.trim();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -495,22 +511,27 @@ export class SessionRepo {
   }
 }
 
-/** `siwe_nonces`. */
+/** `siws_nonces`. */
 export class NonceRepo {
   constructor(private readonly db: Db) {}
 
   insert(nonce: string, now: number, expiresAt: number): void {
-    this.db.run('INSERT INTO siwe_nonces(nonce, created_at, expires_at) VALUES (?, ?, ?)', [nonce, now, expiresAt]);
+    this.db.run('INSERT INTO siws_nonces(nonce, created_at, expires_at) VALUES (?, ?, ?)', [nonce, now, expiresAt]);
+  }
+
+  /** `true` when the nonce is known and unexpired (not consumed). */
+  peek(nonce: string, now: number): boolean {
+    return this.db.get('SELECT 1 AS x FROM siws_nonces WHERE nonce = ? AND expires_at > ?', [nonce, now]) !== undefined;
   }
 
   /** Consumes the nonce (single use); `false` when unknown or expired. */
   consume(nonce: string, now: number): boolean {
-    return this.db.run('DELETE FROM siwe_nonces WHERE nonce = ? AND expires_at > ?', [nonce, now]).changes > 0;
+    return this.db.run('DELETE FROM siws_nonces WHERE nonce = ? AND expires_at > ?', [nonce, now]).changes > 0;
   }
 
   /** Deletes expired nonces (housekeeping; indexed on `expires_at`). */
   purgeExpired(now: number): number {
-    return this.db.run('DELETE FROM siwe_nonces WHERE expires_at <= ?', [now]).changes;
+    return this.db.run('DELETE FROM siws_nonces WHERE expires_at <= ?', [now]).changes;
   }
 }
 
@@ -549,10 +570,11 @@ export class LedgerRepo {
     return r === undefined ? 0n : big(r['s']);
   }
 
-  budgetHeadroom(workspace: string, nowSec: number): bigint {
+  /** Σ `headroom_micro` over the open, non-stalled budgets of `workspace` (SPEC §5.2). */
+  budgetHeadroom(workspace: string): bigint {
     const r = this.db.get(
-      'SELECT COALESCE(SUM(headroom_micro), 0) AS s FROM budgets WHERE workspace = ? AND closed = 0 AND deadline > ? AND stalled_reason IS NULL',
-      [normalizeWorkspace(workspace), nowSec],
+      'SELECT COALESCE(SUM(headroom_micro), 0) AS s FROM budgets WHERE workspace = ? AND closed = 0 AND stalled_reason IS NULL',
+      [normalizeWorkspace(workspace)],
       true,
     );
     return r === undefined ? 0n : big(r['s']);
@@ -561,7 +583,7 @@ export class LedgerRepo {
   snapshot(workspace: string, now: number): BalanceSnapshot {
     const balance = this.balance(workspace);
     const reserved = this.reserved(workspace, now);
-    const budgetHeadroom = this.budgetHeadroom(workspace, Math.floor(now / 1000));
+    const budgetHeadroom = this.budgetHeadroom(workspace);
     return { balance, reserved, budgetHeadroom, available: balance - reserved + budgetHeadroom };
   }
 
@@ -600,64 +622,104 @@ export class LedgerRepo {
 export class CreditEventRepo {
   constructor(private readonly db: Db) {}
 
-  exists(txHash: string, logIndex: number): boolean {
-    return this.db.get('SELECT 1 AS x FROM credit_events WHERE tx_hash = ? AND log_index = ?', [txHash, logIndex]) !== undefined;
+  exists(signature: string, ixIndex: number): boolean {
+    return this.db.get('SELECT 1 AS x FROM credit_events WHERE signature = ? AND ix_index = ?', [signature, ixIndex]) !== undefined;
+  }
+
+  get(signature: string, ixIndex: number): CreditEventRow | undefined {
+    const r = this.db.get('SELECT * FROM credit_events WHERE signature = ? AND ix_index = ?', [signature, ixIndex], true);
+    return r === undefined ? undefined : mapCreditEvent(r);
   }
 
   insert(row: CreditEventRow): void {
     this.db.run(
-      `INSERT INTO credit_events(tx_hash, log_index, kind, receipt_id, workspace, payer, token_amount, usd_micro, price_e18, budget_id, receipt_hash,
-         block_number, block_hash, block_time, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO credit_events(signature, ix_index, kind, workspace, payer, token_account, authority, token_amount, usd_micro, price_e18,
+         price_point_id, price_stale, memo, receipt_hash, slot, block_time, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        row.txHash,
-        row.logIndex,
+        row.signature,
+        row.ixIndex,
         row.kind,
-        row.receiptId,
         normalizeWorkspace(row.workspace),
-        row.payer === null ? null : normalizeWorkspace(row.payer),
+        row.payer,
+        row.tokenAccount,
+        row.authority,
         row.tokenAmount.toString(),
         row.usdMicro,
         row.priceE18.toString(),
-        row.budgetId,
+        row.pricePointId,
+        row.priceStale ? 1 : 0,
+        row.memo,
         row.receiptHash,
-        row.blockNumber,
-        row.blockHash,
+        row.slot,
         row.blockTime,
         row.createdAt,
       ],
     );
   }
 
+  /** Events of `workspace`, newest first, with a `created_at` cursor. */
   list(workspace: string, limit: number, before?: number): CreditEventRow[] {
     const rows =
       before === undefined
-        ? this.db.all('SELECT * FROM credit_events WHERE workspace = ? ORDER BY block_number DESC, log_index DESC LIMIT ?', [normalizeWorkspace(workspace), limit], true)
+        ? this.db.all('SELECT * FROM credit_events WHERE workspace = ? ORDER BY created_at DESC, slot DESC, ix_index DESC LIMIT ?', [normalizeWorkspace(workspace), limit], true)
         : this.db.all(
-            'SELECT * FROM credit_events WHERE workspace = ? AND block_number < ? ORDER BY block_number DESC, log_index DESC LIMIT ?',
+            'SELECT * FROM credit_events WHERE workspace = ? AND created_at < ? ORDER BY created_at DESC, slot DESC, ix_index DESC LIMIT ?',
             [normalizeWorkspace(workspace), before, limit],
             true,
           );
     return rows.map(mapCreditEvent);
   }
 
-  /** Events above `blockNumber` (for the reorg rewind). */
-  listAbove(blockNumber: number): CreditEventRow[] {
-    return this.db.all('SELECT * FROM credit_events WHERE block_number > ?', [blockNumber], true).map(mapCreditEvent);
+  listBySignature(signature: string): CreditEventRow[] {
+    return this.db.all('SELECT * FROM credit_events WHERE signature = ? ORDER BY ix_index ASC', [signature], true).map(mapCreditEvent);
   }
 
-  deleteAbove(blockNumber: number): number {
-    return this.db.run('DELETE FROM credit_events WHERE block_number > ?', [blockNumber]).changes;
+  /** Distinct signatures of events applied at or before `maxCreatedAt` with `slot ≥ minSlot`, newest first (finality sweep). */
+  signaturesForSweep(minSlot: number, maxCreatedAt: number, limit: number): { signature: string; slot: number }[] {
+    return this.db
+      .all('SELECT signature, MAX(slot) AS slot FROM credit_events WHERE slot >= ? AND created_at <= ? GROUP BY signature ORDER BY slot DESC LIMIT ?', [minSlot, maxCreatedAt, limit])
+      .map((r) => ({ signature: text(r['signature']), slot: num(r['slot']) }));
   }
 
-  /** Sum of drawn token amounts per budget from the remaining draw events. */
-  drawnByBudget(budgetId: number): bigint {
-    const rows = this.db.all('SELECT token_amount FROM credit_events WHERE kind = ? AND budget_id = ?', ['draw', budgetId]);
-    return rows.reduce((sum, r) => sum + big(r['token_amount']), 0n);
+  deleteBySignature(signature: string): number {
+    return this.db.run('DELETE FROM credit_events WHERE signature = ?', [signature]).changes;
   }
 
-  lastEventAt(): number | null {
+  /** Unix seconds of the newest block time seen, or null. */
+  lastBlockTime(): number | null {
     const r = this.db.get('SELECT MAX(block_time) AS t FROM credit_events');
     return r === undefined ? null : optNum(r['t']);
+  }
+}
+
+/** `price_points`. */
+export class PricePointRepo {
+  constructor(private readonly db: Db) {}
+
+  insert(row: Omit<PricePointRow, 'id'>): PricePointRow {
+    const r = this.db.run('INSERT INTO price_points(price_e18, source, observed_at, created_at) VALUES (?, ?, ?, ?)', [
+      row.priceE18.toString(),
+      row.source,
+      row.observedAt,
+      row.createdAt,
+    ]);
+    return { ...row, id: Number(r.lastInsertRowid) };
+  }
+
+  latest(): PricePointRow | undefined {
+    const r = this.db.get('SELECT * FROM price_points ORDER BY id DESC LIMIT 1');
+    return r === undefined ? undefined : mapPricePoint(r);
+  }
+
+  get(id: number): PricePointRow | undefined {
+    const r = this.db.get('SELECT * FROM price_points WHERE id = ?', [id]);
+    return r === undefined ? undefined : mapPricePoint(r);
+  }
+
+  /** Newest first. */
+  list(limit: number): PricePointRow[] {
+    return this.db.all('SELECT * FROM price_points ORDER BY id DESC LIMIT ?', [limit]).map(mapPricePoint);
   }
 }
 
@@ -878,68 +940,100 @@ export class ProviderKeyRepo {
   }
 }
 
+/** On-chain facts of a delegated token account, as written by the scanner / register (SPEC §3.4). */
+export interface BudgetUpsert {
+  tokenAccount: string;
+  owner: string;
+  /** Workspace to fund; when omitted an existing row keeps its workspace and a new row funds the owner. */
+  workspace?: string;
+  delegate: string | null;
+  cap: bigint;
+  balance: bigint;
+  lastSeenSlot?: number;
+  /** Set by `POST /api/budgets/register`; the scanner leaves it untouched. */
+  registeredAt?: number;
+  now: number;
+}
+
 /** `budgets`. */
 export class BudgetRepo {
   constructor(private readonly db: Db) {}
 
-  /** Upsert from `BudgetOpened` (keeps headroom fields when re-applied). */
-  upsertOpened(row: { budgetId: number; owner: string; workspace: string; cap: bigint; deadline: number; openedBlock: number; now: number }): void {
+  /** Inserts or refreshes the chain facts of a budget (headroom fields are left to `setHeadroom`). */
+  upsert(row: BudgetUpsert): BudgetRow {
+    const existing = this.get(row.tokenAccount);
+    const workspace = normalizeWorkspace(row.workspace ?? existing?.workspace ?? row.owner);
+    const registeredAt = row.registeredAt ?? existing?.registeredAt ?? null;
+    const lastSeenSlot = row.lastSeenSlot ?? existing?.lastSeenSlot ?? null;
     this.db.run(
-      `INSERT INTO budgets(budget_id, owner, workspace, cap, drawn, deadline, closed, opened_block, updated_at)
-       VALUES (?, ?, ?, ?, '0', ?, 0, ?, ?)
-       ON CONFLICT(budget_id) DO UPDATE SET owner = excluded.owner, workspace = excluded.workspace, cap = excluded.cap, deadline = excluded.deadline,
-         opened_block = excluded.opened_block, updated_at = excluded.updated_at`,
-      [row.budgetId, normalizeWorkspace(row.owner), normalizeWorkspace(row.workspace), row.cap.toString(), row.deadline, row.openedBlock, row.now],
+      `INSERT INTO budgets(token_account, owner, workspace, delegate, cap, balance, closed, registered_at, last_seen_slot, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+       ON CONFLICT(token_account) DO UPDATE SET owner = excluded.owner, workspace = excluded.workspace, delegate = excluded.delegate, cap = excluded.cap,
+         balance = excluded.balance, registered_at = excluded.registered_at, last_seen_slot = excluded.last_seen_slot, updated_at = excluded.updated_at`,
+      [row.tokenAccount, normalizeWorkspace(row.owner), workspace, row.delegate, row.cap.toString(), row.balance.toString(), registeredAt, lastSeenSlot, row.now],
     );
+    return this.get(row.tokenAccount) as BudgetRow;
   }
 
-  get(budgetId: number): BudgetRow | undefined {
-    const r = this.db.get('SELECT * FROM budgets WHERE budget_id = ?', [budgetId]);
+  get(tokenAccount: string): BudgetRow | undefined {
+    const r = this.db.get('SELECT * FROM budgets WHERE token_account = ?', [tokenAccount], true);
     return r === undefined ? undefined : mapBudget(r);
   }
 
+  /** Budgets funding `workspace`, newest registration first. */
   list(workspace: string): BudgetRow[] {
-    return this.db.all('SELECT * FROM budgets WHERE workspace = ? ORDER BY budget_id DESC', [normalizeWorkspace(workspace)]).map(mapBudget);
+    return this.db
+      .all('SELECT * FROM budgets WHERE workspace = ? ORDER BY COALESCE(registered_at, updated_at) DESC, token_account ASC', [normalizeWorkspace(workspace)], true)
+      .map(mapBudget);
   }
 
-  /** Open, unexpired budgets (all workspaces) for the headroom refresher. */
-  listOpen(nowSec: number): BudgetRow[] {
-    return this.db.all('SELECT * FROM budgets WHERE closed = 0 AND deadline > ? ORDER BY budget_id ASC', [nowSec]).map(mapBudget);
+  /** Budgets whose token account belongs to `owner`. */
+  listByOwner(owner: string): BudgetRow[] {
+    return this.db.all('SELECT * FROM budgets WHERE owner = ? ORDER BY token_account ASC', [normalizeWorkspace(owner)], true).map(mapBudget);
   }
 
-  /** Open, unexpired, non-stalled budgets of one workspace (drawer candidates). */
-  listDrawable(workspace: string, nowSec: number): BudgetRow[] {
+  /** Open budgets (all workspaces) for the headroom refresh. */
+  listOpen(): BudgetRow[] {
+    return this.db.all('SELECT * FROM budgets WHERE closed = 0 ORDER BY token_account ASC', [], true).map(mapBudget);
+  }
+
+  /** Distinct owners with an open budget. */
+  openOwners(): string[] {
+    return this.db.all('SELECT DISTINCT owner FROM budgets WHERE closed = 0 ORDER BY owner ASC').map((r) => text(r['owner']));
+  }
+
+  /** Open, non-stalled budgets of one workspace, largest headroom first (drawer candidates). */
+  listDrawable(workspace: string): BudgetRow[] {
     return this.db
       .all(
-        'SELECT * FROM budgets WHERE workspace = ? AND closed = 0 AND deadline > ? AND stalled_reason IS NULL ORDER BY headroom_micro DESC, budget_id ASC',
-        [normalizeWorkspace(workspace), nowSec],
+        'SELECT * FROM budgets WHERE workspace = ? AND closed = 0 AND stalled_reason IS NULL ORDER BY headroom_micro DESC, token_account ASC',
+        [normalizeWorkspace(workspace)],
+        true,
       )
       .map(mapBudget);
   }
 
-  addDrawn(budgetId: number, amount: bigint, now: number): void {
-    const row = this.get(budgetId);
-    if (row === undefined) return;
-    this.db.run('UPDATE budgets SET drawn = ?, updated_at = ? WHERE budget_id = ?', [(row.drawn + amount).toString(), now, budgetId]);
-  }
-
-  setDrawn(budgetId: number, drawn: bigint, now: number): void {
-    this.db.run('UPDATE budgets SET drawn = ?, updated_at = ? WHERE budget_id = ?', [drawn.toString(), now, budgetId]);
-  }
-
-  setClosed(budgetId: number, closed: boolean, now: number): void {
-    this.db.run('UPDATE budgets SET closed = ?, updated_at = ? WHERE budget_id = ?', [closed ? 1 : 0, now, budgetId]);
-  }
-
-  setHeadroom(budgetId: number, headroomTokens: bigint, headroomMicro: bigint, stalledReason: BudgetRow['stalledReason'], now: number): void {
+  setHeadroom(tokenAccount: string, headroomTokens: bigint, headroomMicro: bigint, stalledReason: BudgetStalledReason | null, now: number): void {
     this.db.run(
-      'UPDATE budgets SET headroom_tokens = ?, headroom_micro = ?, stalled_reason = ?, headroom_checked_at = ?, updated_at = ? WHERE budget_id = ?',
-      [headroomTokens.toString(), headroomMicro, stalledReason, now, now, budgetId],
+      'UPDATE budgets SET headroom_tokens = ?, headroom_micro = ?, stalled_reason = ?, headroom_checked_at = ?, updated_at = ? WHERE token_account = ?',
+      [headroomTokens.toString(), headroomMicro, stalledReason, now, now, tokenAccount],
     );
   }
 
-  setStalled(budgetId: number, stalledReason: BudgetRow['stalledReason'], now: number): void {
-    this.db.run('UPDATE budgets SET stalled_reason = ?, updated_at = ? WHERE budget_id = ?', [stalledReason, now, budgetId]);
+  /** Marks a budget closed (`revoked`) or reopens it; a closed budget backs no credit, so its headroom is zeroed. */
+  setClosed(tokenAccount: string, closed: boolean, stalledReason: BudgetStalledReason | null, now: number): void {
+    this.db.run(
+      `UPDATE budgets SET closed = ?, stalled_reason = ?, headroom_tokens = '0', headroom_micro = 0, headroom_checked_at = ?, updated_at = ? WHERE token_account = ?`,
+      [closed ? 1 : 0, stalledReason, now, now, tokenAccount],
+    );
+  }
+
+  setStalled(tokenAccount: string, stalledReason: BudgetStalledReason | null, now: number): void {
+    this.db.run('UPDATE budgets SET stalled_reason = ?, updated_at = ? WHERE token_account = ?', [stalledReason, now, tokenAccount]);
+  }
+
+  setWorkspace(tokenAccount: string, workspace: string, registeredAt: number, now: number): void {
+    this.db.run('UPDATE budgets SET workspace = ?, registered_at = ?, updated_at = ? WHERE token_account = ?', [normalizeWorkspace(workspace), registeredAt, now, tokenAccount]);
   }
 }
 
@@ -949,17 +1043,18 @@ export class BudgetDrawRepo {
 
   insert(row: Omit<BudgetDrawRow, 'id'>): number {
     const r = this.db.run(
-      `INSERT INTO budget_draws(budget_id, workspace, token_amount, usd_micro, receipt_hash, usage_ids, batch_json, tx_hash, status, error, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO budget_draws(token_account, workspace, token_amount, usd_micro, receipt_hash, usage_ids, batch_json, signature, last_valid_block_height, status, error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        row.budgetId,
+        row.tokenAccount,
         normalizeWorkspace(row.workspace),
         row.tokenAmount.toString(),
         row.usdMicro,
-        row.receiptHash,
+        row.receiptHash.toLowerCase(),
         JSON.stringify(row.usageIds),
         row.batchJson,
-        row.txHash,
+        row.signature,
+        row.lastValidBlockHeight,
         row.status,
         row.error,
         row.createdAt,
@@ -975,12 +1070,17 @@ export class BudgetDrawRepo {
   }
 
   byReceiptHash(hash: string): BudgetDrawRow | undefined {
-    const r = this.db.get('SELECT * FROM budget_draws WHERE receipt_hash = ?', [hash], true);
+    const r = this.db.get('SELECT * FROM budget_draws WHERE receipt_hash = ?', [hash.toLowerCase()], true);
     return r === undefined ? undefined : mapBudgetDraw(r);
   }
 
-  listByBudget(budgetId: number): BudgetDrawRow[] {
-    return this.db.all('SELECT * FROM budget_draws WHERE budget_id = ? ORDER BY id DESC', [budgetId], true).map(mapBudgetDraw);
+  bySignature(signature: string): BudgetDrawRow | undefined {
+    const r = this.db.get('SELECT * FROM budget_draws WHERE signature = ?', [signature], true);
+    return r === undefined ? undefined : mapBudgetDraw(r);
+  }
+
+  listByTokenAccount(tokenAccount: string): BudgetDrawRow[] {
+    return this.db.all('SELECT * FROM budget_draws WHERE token_account = ? ORDER BY id DESC', [tokenAccount], true).map(mapBudgetDraw);
   }
 
   /** Draws still `pending`/`sent` (not yet confirmed by the indexer). */
@@ -988,12 +1088,18 @@ export class BudgetDrawRepo {
     return this.db.all(`SELECT * FROM budget_draws WHERE status IN ('pending','sent') ORDER BY id ASC`, [], true).map(mapBudgetDraw);
   }
 
-  setStatus(id: number, status: BudgetDrawRow['status'], now: number, fields: { txHash?: string | null; error?: string | null } = {}): void {
+  setStatus(
+    id: number,
+    status: BudgetDrawRow['status'],
+    now: number,
+    fields: { signature?: string | null; lastValidBlockHeight?: number | null; error?: string | null } = {},
+  ): void {
     const row = this.get(id);
     if (row === undefined) return;
-    this.db.run('UPDATE budget_draws SET status = ?, tx_hash = ?, error = ?, updated_at = ? WHERE id = ?', [
+    this.db.run('UPDATE budget_draws SET status = ?, signature = ?, last_valid_block_height = ?, error = ?, updated_at = ? WHERE id = ?', [
       status,
-      fields.txHash === undefined ? row.txHash : fields.txHash,
+      fields.signature === undefined ? row.signature : fields.signature,
+      fields.lastValidBlockHeight === undefined ? row.lastValidBlockHeight : fields.lastValidBlockHeight,
       fields.error === undefined ? row.error : fields.error,
       now,
       id,
@@ -1068,31 +1174,6 @@ export class KvRepo {
   }
 }
 
-/** `price_posts`. */
-export class PricePostRepo {
-  constructor(private readonly db: Db) {}
-
-  insert(row: Omit<PricePostRow, 'id'>): number {
-    const r = this.db.run('INSERT INTO price_posts(price_e18, source, tx_hash, status, created_at) VALUES (?, ?, ?, ?, ?)', [
-      row.priceE18.toString(),
-      row.source,
-      row.txHash,
-      row.status,
-      row.createdAt,
-    ]);
-    return Number(r.lastInsertRowid);
-  }
-
-  latest(): PricePostRow | undefined {
-    const r = this.db.get('SELECT * FROM price_posts ORDER BY id DESC LIMIT 1');
-    return r === undefined ? undefined : mapPricePost(r);
-  }
-
-  setStatus(id: number, status: string, txHash: string | null): void {
-    this.db.run('UPDATE price_posts SET status = ?, tx_hash = ? WHERE id = ?', [status, txHash, id]);
-  }
-}
-
 /** `rate_limits`: fixed window per API key (SPEC §5.7). */
 export class RateLimitRepo {
   constructor(private readonly db: Db) {}
@@ -1125,6 +1206,7 @@ export class Repos {
   readonly nonces: NonceRepo;
   readonly ledger: LedgerRepo;
   readonly creditEvents: CreditEventRepo;
+  readonly pricePoints: PricePointRepo;
   readonly reservations: ReservationRepo;
   readonly usage: UsageRepo;
   readonly providerKeys: ProviderKeyRepo;
@@ -1134,7 +1216,6 @@ export class Repos {
   readonly health: ProviderHealthRepo;
   readonly indexerState: KvRepo;
   readonly settings: KvRepo;
-  readonly pricePosts: PricePostRepo;
   readonly rateLimits: RateLimitRepo;
 
   constructor(readonly db: Db) {
@@ -1144,6 +1225,7 @@ export class Repos {
     this.nonces = new NonceRepo(db);
     this.ledger = new LedgerRepo(db);
     this.creditEvents = new CreditEventRepo(db);
+    this.pricePoints = new PricePointRepo(db);
     this.reservations = new ReservationRepo(db);
     this.usage = new UsageRepo(db);
     this.providerKeys = new ProviderKeyRepo(db);
@@ -1153,7 +1235,6 @@ export class Repos {
     this.health = new ProviderHealthRepo(db);
     this.indexerState = new KvRepo(db, 'indexer_state');
     this.settings = new KvRepo(db, 'settings');
-    this.pricePosts = new PricePostRepo(db);
     this.rateLimits = new RateLimitRepo(db);
   }
 

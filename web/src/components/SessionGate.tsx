@@ -1,8 +1,7 @@
 /** Gate for `/app/*`: shows the sign-in panel until a session exists, then the app sub-nav. */
 import { NavLink, Outlet } from 'react-router';
-import { useConnection } from 'wagmi';
+import { useWallet } from '@solana/wallet-adapter-react';
 import { useSession } from '../hooks/useSession.jsx';
-import { checksum } from '../lib/explorer.js';
 import { phaseLabel } from '../lib/session.js';
 import { Button, Note, Skeleton } from './ui.jsx';
 import { WalletButton } from './WalletButton.jsx';
@@ -20,15 +19,15 @@ const APP_NAV = [
 /** Sign-in panel. */
 export function SignInPanel() {
   const session = useSession();
-  const { isConnected } = useConnection();
+  const { connected } = useWallet();
   return (
     <div className="mx-auto mt-6 max-w-md">
       <div className="card text-center">
         <p className="font-mono text-xs uppercase tracking-widest text-accent">workspace = wallet</p>
-        <h1 className="mt-2 text-xl font-semibold">Sign in with your wallet</h1>
-        <p className="mt-2 text-sm text-muted">Connect a wallet, then sign a message (no gas, no transaction). New wallets get a workspace on first sign-in. No e-mail, no card.</p>
+        <h1 className="mt-2 text-xl font-semibold">Sign in with your Solana wallet</h1>
+        <p className="mt-2 text-sm text-muted">Connect a wallet, then sign a message (Sign-In-With-Solana: no transaction, no fee). New wallets get a workspace on first sign-in. No e-mail, no card.</p>
         <div className="mt-5 flex flex-col items-center gap-2">
-          {!isConnected ? (
+          {!connected ? (
             <WalletButton />
           ) : (
             <Button variant="primary" busy={session.phase !== 'idle'} disabled={session.blocker !== undefined} reason={session.blocker} onClick={() => void session.signIn()}>
@@ -80,7 +79,7 @@ export function AppShell() {
       {session.walletMismatch && session.me !== undefined ? (
         <div className="mb-4">
           <Note tone="warn" title="Wallet differs from the signed-in workspace">
-            You are signed in as <span className="font-mono">{checksum(session.me.workspace)}</span>; the connected wallet is another account. Credits you buy and budgets you open here still go to the signed-in workspace, paid from the connected wallet. Sign out and in again to switch workspaces.
+            You are signed in as <span className="font-mono">{session.me.workspace}</span>; the connected wallet is another account. Credits you buy here still go to the signed-in workspace (the burn carries a memo naming it), paid from the connected wallet; a budget you open delegates the connected wallet's tokens to fund the signed-in workspace. Sign out and in again to switch workspaces.
           </Note>
         </div>
       ) : null}

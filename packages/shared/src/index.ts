@@ -1,12 +1,15 @@
 /**
  * `@beagle/shared`: pure, browser-safe building blocks shared by the gateway, the MCP package
- * and the web app. Each module is also available as a subpath export (`@beagle/shared/chains`, …).
+ * and the web app. Each module is also available as a subpath export (`@beagle/shared/clusters`,
+ * `@beagle/shared/siws`, …).
  *
  * @module
  */
-export * from './chains.js';
+export * from './clusters.js';
 export * from './addresses.js';
-export * from './abi.js';
+export * from './solana.js';
+export * from './memo.js';
+export * from './siws.js';
 export * from './credit.js';
 export * from './models.js';
 export * from './difficulty.js';

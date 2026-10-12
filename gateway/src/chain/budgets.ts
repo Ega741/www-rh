@@ -1,121 +1,217 @@
 /**
- * Budget headroom refresher (SPEC §5.4): for every open, unexpired budget reads
- * `remainingCap = cap − drawn`, `allowance(owner, desk)` and `balanceOf(owner)`, and computes
- * `headroom_tokens` and `headroom_micro` at the desk's current price; stalls on
- * `PriceStale`/`PriceUnavailable` (`price`) or zero headroom with cap left (`allowance`), and clears
- * `draw_failed` once headroom is back.
- *
- * Allowance and balance are one number per owner, so an owner's backing
- * `min(allowance, balance)` is **allocated across** that owner's open budgets in `budget_id` order
- * (each capped by its `remainingCap`) instead of being counted once per budget: Σ headroom over an
- * owner's budgets never exceeds what a draw could actually move.
+ * Budget scanner (SPEC §3.4, §5.4): budgets are SPL token accounts of the mint delegated to the
+ * operator. `scan()` discovers them with `getProgramAccounts` (classic Token program: 165-byte
+ * accounts, `mint` at offset 0, `delegate` at offset 76; Token-2022 accounts are found per owner
+ * with `getTokenAccountsByOwner`), `refresh()` re-reads every open budget with
+ * `getMultipleAccountsInfo` and recomputes `headroom_tokens = delegate == operator ?
+ * min(delegatedAmount, amount) : 0` and `headroom_micro` at the current price, and `register()`
+ * inserts a budget right after `POST /api/budgets/register` (validating mint and delegate).
  *
  * @module chain/budgets
  */
+import { TOKEN_PROGRAM_ID } from '@beagle/shared/addresses';
 import { quoteUsdMicro } from '@beagle/shared/credit';
-import type { Address } from 'viem';
-import type { BudgetRow, Repos } from '../db/repos.js';
+import { TOKEN_ACCOUNT_DELEGATE_OFFSET, TOKEN_ACCOUNT_MINT_OFFSET, TOKEN_ACCOUNT_SIZE } from '@beagle/shared/solana';
+import type { BudgetRow, BudgetStalledReason, Repos } from '../db/repos.js';
 import type { Logger } from '../log.js';
-import { PriceError, type ChainReader } from './clients.js';
+import type { PriceService, PriceSnapshot } from './price.js';
+import { parseTokenAccount, type ChainReader, type RpcAccountFilter, type TokenAccountState } from './rpc.js';
 
-/** Options of {@link HeadroomRefresher}. */
-export interface HeadroomOptions {
+/** Options of {@link BudgetScanner}. */
+export interface BudgetScannerOptions {
+  mint: string;
+  /** The delegate every budget must name; `undefined` → no budget can be open. */
+  operator: string | undefined;
+  tokenProgram: string;
   decimals: number;
+  /** Accounts per `getMultipleAccountsInfo` call (RPC maximum 100). */
+  batchSize?: number;
   now?: () => number;
 }
 
-/** Per-budget result of {@link allocateHeadroom}. */
-export interface HeadroomAllocation {
-  remainingCap: bigint;
+/** What {@link computeHeadroom} decides for one account. */
+export interface HeadroomDecision {
+  closed: boolean;
   headroomTokens: bigint;
+  headroomMicro: bigint;
+  stalledReason: BudgetStalledReason | null;
+}
+
+/** `getProgramAccounts` filters of the §3.4 scan. */
+export function budgetScanFilters(mint: string, operator: string): RpcAccountFilter[] {
+  return [{ dataSize: TOKEN_ACCOUNT_SIZE }, { memcmp: { offset: TOKEN_ACCOUNT_MINT_OFFSET, bytes: mint } }, { memcmp: { offset: TOKEN_ACCOUNT_DELEGATE_OFFSET, bytes: operator } }];
 }
 
 /**
- * Pure allocation of one owner's backing `min(allowance, balance)` across `budgets` (in the order
- * given, i.e. `budget_id` ascending): each budget takes `min(remainingCap, backing left)`.
+ * Pure headroom rule (SPEC §5.4): `delegate != operator` → closed (`revoked`); otherwise
+ * `min(delegatedAmount, amount)` tokens, quoted at `price` (stale or missing price → 0 µUSD,
+ * `price`); zero tokens with the delegate in place → `exhausted`.
  */
-export function allocateHeadroom(budgets: readonly Pick<BudgetRow, 'cap' | 'drawn'>[], allowance: bigint, balance: bigint): HeadroomAllocation[] {
-  let backing = allowance < balance ? allowance : balance;
-  if (backing < 0n) backing = 0n;
-  return budgets.map((budget) => {
-    const remainingCap = budget.cap > budget.drawn ? budget.cap - budget.drawn : 0n;
-    const headroomTokens = remainingCap < backing ? remainingCap : backing;
-    backing -= headroomTokens;
-    return { remainingCap, headroomTokens };
-  });
+export function computeHeadroom(state: Pick<TokenAccountState, 'delegate' | 'delegatedAmount' | 'amount'>, operator: string | undefined, price: PriceSnapshot | undefined, decimals: number): HeadroomDecision {
+  if (operator === undefined || state.delegate !== operator) return { closed: true, headroomTokens: 0n, headroomMicro: 0n, stalledReason: 'revoked' };
+  const headroomTokens = state.delegatedAmount < state.amount ? state.delegatedAmount : state.amount;
+  if (price === undefined || price.stale) return { closed: false, headroomTokens, headroomMicro: 0n, stalledReason: 'price' };
+  if (headroomTokens === 0n) return { closed: false, headroomTokens, headroomMicro: 0n, stalledReason: 'exhausted' };
+  return { closed: false, headroomTokens, headroomMicro: quoteUsdMicro(headroomTokens, price.priceE18, decimals), stalledReason: null };
 }
 
-/** Pure headroom computation for a single budget (`min(remainingCap, allowance, balance)`). */
-export function computeHeadroom(budget: Pick<BudgetRow, 'cap' | 'drawn'>, allowance: bigint, balance: bigint): HeadroomAllocation {
-  return allocateHeadroom([budget], allowance, balance)[0] as HeadroomAllocation;
+/** Why `POST /api/budgets/register` refused the account. */
+export type BudgetRegisterCode = 'not_found' | 'not_token_account' | 'wrong_mint' | 'not_delegated';
+
+/** Thrown by {@link BudgetScanner.register}. */
+export class BudgetRegisterError extends Error {
+  override readonly name = 'BudgetRegisterError';
+  constructor(
+    readonly code: BudgetRegisterCode,
+    message: string,
+  ) {
+    super(message);
+  }
 }
 
-/** Refreshes `budgets.headroom_*`. */
-export class HeadroomRefresher {
+/** Discovers and refreshes budgets. */
+export class BudgetScanner {
   private readonly now: () => number;
+  private warnedToken2022 = false;
 
   constructor(
     private readonly repos: Repos,
     private readonly reader: ChainReader,
-    private readonly options: HeadroomOptions,
+    private readonly price: PriceService,
+    private readonly options: BudgetScannerOptions,
     private readonly logger: Logger,
   ) {
     this.now = options.now ?? (() => Date.now());
   }
 
-  /** Refreshes every open budget; returns the number refreshed. */
-  async refreshAll(): Promise<number> {
-    const nowSec = Math.floor(this.now() / 1000);
-    const budgets = this.repos.budgets.listOpen(nowSec);
-    if (budgets.length === 0) return 0;
-    let price: { priceE18: bigint } | undefined;
-    let priceError: PriceError | undefined;
-    try {
-      price = await this.reader.quote(10n ** BigInt(this.options.decimals));
-    } catch (e) {
-      priceError = e instanceof PriceError ? e : new PriceError('rpc', e instanceof Error ? e.message : String(e), { cause: e });
-    }
-    const byOwner = new Map<string, BudgetRow[]>();
-    for (const budget of budgets) {
-      const list = byOwner.get(budget.owner) ?? [];
-      list.push(budget);
-      byOwner.set(budget.owner, list);
+  /** Applies on-chain facts of a token account to its budget row (upsert + headroom). */
+  applyState(state: TokenAccountState, slot?: number, extra: { workspace?: string; registeredAt?: number } = {}): BudgetRow {
+    const now = this.now();
+    return this.repos.transaction(() => {
+      this.repos.budgets.upsert({
+        tokenAccount: state.address,
+        owner: state.owner,
+        delegate: state.delegate,
+        cap: state.delegatedAmount,
+        balance: state.amount,
+        now,
+        ...(slot === undefined ? {} : { lastSeenSlot: slot }),
+        ...(extra.workspace === undefined ? {} : { workspace: extra.workspace }),
+        ...(extra.registeredAt === undefined ? {} : { registeredAt: extra.registeredAt }),
+      });
+      const decision = computeHeadroom(state, this.options.operator, this.price.current(), this.options.decimals);
+      if (decision.closed) this.repos.budgets.setClosed(state.address, true, decision.stalledReason, now);
+      else {
+        const before = this.repos.budgets.get(state.address);
+        if (before?.closed === true) this.repos.budgets.setClosed(state.address, false, null, now);
+        this.repos.budgets.setHeadroom(state.address, decision.headroomTokens, decision.headroomMicro, decision.stalledReason, now);
+      }
+      return this.repos.budgets.get(state.address) as BudgetRow;
+    });
+  }
+
+  /** The account vanished (closed): the budget is closed as `revoked`. */
+  markMissing(tokenAccount: string): void {
+    const now = this.now();
+    this.repos.transaction(() => {
+      this.repos.budgets.upsert({ tokenAccount, owner: this.repos.budgets.get(tokenAccount)?.owner ?? tokenAccount, delegate: null, cap: 0n, balance: 0n, now });
+      this.repos.budgets.setClosed(tokenAccount, true, 'revoked', now);
+    });
+  }
+
+  /**
+   * Discovery scan: every token account of the mint delegated to the operator (classic Token
+   * program via `getProgramAccounts`; Token-2022 via `getTokenAccountsByOwner` of known owners).
+   * Returns the number of accounts seen.
+   */
+  async scan(): Promise<number> {
+    const operator = this.options.operator;
+    if (operator === undefined) return 0;
+    let entries: { pubkey: string; account: Parameters<typeof parseTokenAccount>[1] }[];
+    if (this.options.tokenProgram === TOKEN_PROGRAM_ID) {
+      entries = await this.reader.getParsedProgramAccounts(this.options.tokenProgram, budgetScanFilters(this.options.mint, operator));
+    } else {
+      if (!this.warnedToken2022) {
+        this.logger.info('Token-2022 mint: budgets are discovered per owner (getTokenAccountsByOwner) and by registration', { tokenProgram: this.options.tokenProgram });
+        this.warnedToken2022 = true;
+      }
+      entries = [];
+      const owners = new Set<string>([...this.repos.budgets.openOwners(), ...this.repos.workspaces.list(1000).map((w) => w.owner)]);
+      for (const owner of owners) entries.push(...(await this.reader.getParsedTokenAccountsByOwner(owner, this.options.mint)));
     }
     let n = 0;
-    for (const [owner, owned] of byOwner) {
-      let allowance: bigint;
-      let balance: bigint;
+    for (const entry of entries) {
+      const state = parseTokenAccount(entry.pubkey, entry.account);
+      if (state === undefined || state.mint !== this.options.mint || state.delegate !== operator) continue;
+      this.applyState(state);
+      n++;
+    }
+    return n;
+  }
+
+  /** Re-reads every open budget and recomputes its headroom; returns the number refreshed. */
+  async refresh(): Promise<number> {
+    const open = this.repos.budgets.listOpen();
+    if (open.length === 0) return 0;
+    const size = Math.min(100, this.options.batchSize ?? 100);
+    let n = 0;
+    for (let i = 0; i < open.length; i += size) {
+      const chunk = open.slice(i, i + size);
+      let accounts: Awaited<ReturnType<ChainReader['getMultipleParsedAccounts']>>;
       try {
-        [allowance, balance] = await Promise.all([this.reader.allowance(owner as Address), this.reader.balanceOf(owner as Address)]);
+        accounts = await this.reader.getMultipleParsedAccounts(chunk.map((b) => b.tokenAccount));
       } catch (e) {
-        this.logger.warn('headroom refresh failed', { owner, budgetIds: owned.map((b) => b.budgetId), error: e });
+        this.logger.warn('budget refresh failed', { tokenAccounts: chunk.map((b) => b.tokenAccount), error: e });
         continue;
       }
-      const allocations = allocateHeadroom(owned, allowance, balance);
-      owned.forEach((budget, i) => {
-        try {
-          this.refreshOne(budget, allocations[i] as HeadroomAllocation, price, priceError);
+      chunk.forEach((budget, j) => {
+        const account = accounts[j] ?? null;
+        if (account === null) {
+          this.markMissing(budget.tokenAccount);
           n++;
-        } catch (e) {
-          this.logger.warn('headroom refresh failed', { budgetId: budget.budgetId, error: e });
+          return;
         }
+        const state = parseTokenAccount(budget.tokenAccount, account);
+        if (state === undefined) {
+          this.logger.warn('budget account is no longer a token account', { tokenAccount: budget.tokenAccount });
+          this.markMissing(budget.tokenAccount);
+          n++;
+          return;
+        }
+        this.applyState(state);
+        n++;
       });
     }
     return n;
   }
 
-  private refreshOne(budget: BudgetRow, { remainingCap, headroomTokens }: HeadroomAllocation, price: { priceE18: bigint } | undefined, priceError: PriceError | undefined): void {
-    const now = this.now();
-    if (price === undefined) {
-      // Keep tokens current, but the budget cannot back credit without a price.
-      const reason: BudgetRow['stalledReason'] = priceError?.code === 'rpc' ? (budget.stalledReason ?? 'price') : 'price';
-      this.repos.budgets.setHeadroom(budget.budgetId, headroomTokens, 0n, reason, now);
-      return;
+  /**
+   * Reads a token account for registration and checks that it holds the mint and is delegated to
+   * the operator. Throws {@link BudgetRegisterError} otherwise.
+   */
+  async inspect(tokenAccount: string): Promise<TokenAccountState> {
+    const [account] = await this.reader.getMultipleParsedAccounts([tokenAccount]);
+    if (account === null || account === undefined) throw new BudgetRegisterError('not_found', `token account ${tokenAccount} does not exist on this cluster`);
+    const state = parseTokenAccount(tokenAccount, account);
+    if (state === undefined) throw new BudgetRegisterError('not_token_account', `${tokenAccount} is not an SPL token account`);
+    if (state.mint !== this.options.mint) throw new BudgetRegisterError('wrong_mint', `${tokenAccount} holds ${state.mint}, not the BEAGLE mint ${this.options.mint}`);
+    if (this.options.operator === undefined || state.delegate !== this.options.operator) {
+      throw new BudgetRegisterError(
+        'not_delegated',
+        this.options.operator === undefined
+          ? 'this gateway has no operator configured; budgets are disabled'
+          : `${tokenAccount} is not delegated to the operator ${this.options.operator} (delegate: ${state.delegate ?? 'none'}); run ApproveChecked first`,
+      );
     }
-    const headroomMicro = quoteUsdMicro(headroomTokens, price.priceE18, this.options.decimals);
-    let stalled: BudgetRow['stalledReason'] = null;
-    if (headroomTokens === 0n && remainingCap > 0n) stalled = 'allowance';
-    else if (budget.stalledReason === 'draw_failed' && headroomTokens === 0n) stalled = 'draw_failed';
-    this.repos.budgets.setHeadroom(budget.budgetId, headroomTokens, headroomMicro, stalled, now);
+    return state;
+  }
+
+  /**
+   * `POST /api/budgets/register`: {@link inspect} then insert the budget (funding `workspace`,
+   * default the owner / the existing row's workspace) and return the row.
+   */
+  async register(tokenAccount: string, workspace?: string): Promise<BudgetRow> {
+    const state = await this.inspect(tokenAccount);
+    return this.applyState(state, undefined, { registeredAt: this.now(), ...(workspace === undefined ? {} : { workspace }) });
   }
 }

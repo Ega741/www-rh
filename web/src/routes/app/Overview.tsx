@@ -4,7 +4,6 @@ import { QueryGuard } from '../../components/QueryGuard.jsx';
 import { Badge, Card, PageHeader, Stat, TableWrap } from '../../components/ui.jsx';
 import { useSession } from '../../hooks/useSession.jsx';
 import { fmtCompact, fmtCount, fmtPrice, fmtUsd } from '../../lib/amounts.js';
-import { checksum } from '../../lib/explorer.js';
 import { formatDateTime, relativeTime } from '../../lib/time.js';
 import { useBalance, useUsageList, useUsageSummary } from '../../queries.js';
 
@@ -21,7 +20,7 @@ export function Overview() {
     <div className="space-y-6">
       <PageHeader
         title="Overview"
-        lead={me === undefined ? undefined : <span className="font-mono">{checksum(me.workspace)}</span>}
+        lead={me === undefined ? undefined : <span className="font-mono">{me.workspace}</span>}
         actions={
           <Link to="/app/credits" className="btn-primary">
             Buy credit
@@ -37,7 +36,7 @@ export function Overview() {
                 <Stat label="Available" value={fmtUsd(b.availableMicro)} sub="balance − reserved + budget headroom" />
                 <Stat label="Balance" value={fmtUsd(b.balanceMicro)} sub={b.balanceMicro < 0n ? 'negative: covered by a budget' : 'ledger total'} />
                 <Stat label="Reserved" value={fmtUsd(b.reservedMicro)} sub="in-flight requests" />
-                <Stat label="Budget headroom" value={fmtUsd(b.budgetHeadroomMicro)} sub="drawable from open budgets" />
+                <Stat label="Budget headroom" value={fmtUsd(b.budgetHeadroomMicro)} sub="drawable from delegated budgets" />
               </div>
             )}
           </QueryGuard>
@@ -52,7 +51,7 @@ export function Overview() {
                 </p>
                 <p className="text-xs text-muted">{b.plan === 'pro' ? 'gpt-oss-120b, 128K house context, higher rate limit.' : 'Pro unlocks the large house model, 128K house context and a higher rate limit.'}</p>
                 <p className="text-xs text-muted">
-                  1 token = <span className="font-mono text-fg">{fmtPrice(b.price.priceE18)}</span> {b.price.stale ? <Badge tone="warn">stale</Badge> : null}
+                  1 token = <span className="font-mono text-fg">{fmtPrice(b.price.priceE18)}</span> <span className="text-faint">(point #{b.price.pricePointId})</span> {b.price.stale ? <Badge tone="warn">stale</Badge> : null}
                 </p>
                 <Link to="/app/upgrades" className="link text-sm">
                   Upgrades →

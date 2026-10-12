@@ -1,58 +1,40 @@
 import { describe, expect, it } from 'vitest';
 import { IDLE_WATCH, MAX_POLL_ATTEMPTS, WATCH_POLL_MS, creditLanded, observeBalance, observeEvents, purchaseIndexed, restartWatch, startWatch } from './poll.js';
 
-const BURN_TX = `0x${'ab'.repeat(32)}` as const;
-const OTHER_TX = `0x${'cd'.repeat(32)}` as const;
+const SIG = '5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW';
+const OTHER = '4VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW';
 
 describe('credit landing watcher', () => {
   it('creditLanded', () => {
-    expect(creditLanded(100n, 100n, 50n)).toBe(false);
-    expect(creditLanded(100n, 149n, 50n)).toBe(false);
-    expect(creditLanded(100n, 150n, 50n)).toBe(true);
-    expect(creditLanded(100n, 101n, undefined)).toBe(true);
     expect(creditLanded(100n, 100n, undefined)).toBe(false);
+    expect(creditLanded(100n, 101n, undefined)).toBe(true);
+    expect(creditLanded(100n, 150n, 60n)).toBe(false);
+    expect(creditLanded(100n, 160n, 60n)).toBe(true);
+    expect(creditLanded(100n, 101n, 0n)).toBe(true);
   });
   it('polls for about two minutes as documented', () => {
-    expect((MAX_POLL_ATTEMPTS * WATCH_POLL_MS) / 1000).toBeGreaterThanOrEqual(110);
-    expect((MAX_POLL_ATTEMPTS * WATCH_POLL_MS) / 1000).toBeLessThanOrEqual(130);
+    expect((WATCH_POLL_MS * MAX_POLL_ATTEMPTS) / 1000).toBe(120);
   });
   it('state machine lands or times out on the balance', () => {
-    let s = startWatch(1_000_000n, 2_500_000n);
+    let s = startWatch(100n, 50n);
     expect(s.status).toBe('watching');
-    expect(s.txHash).toBeUndefined();
-    s = observeBalance(s, 1_000_000n);
+    s = observeBalance(s, 120n);
     expect(s).toMatchObject({ status: 'watching', attempts: 1 });
-    s = observeBalance(s, 3_500_000n);
-    expect(s.status).toBe('landed');
-    expect(observeBalance(s, 0n)).toBe(s);
-    expect(observeBalance(IDLE_WATCH, 5n)).toBe(IDLE_WATCH);
-
-    let t = startWatch(0n, 1n);
-    for (let i = 0; i < MAX_POLL_ATTEMPTS; i++) t = observeBalance(t, 0n);
-    expect(t.status).toBe('timeout');
-    const again = restartWatch(t);
-    expect(again).toMatchObject({ status: 'watching', attempts: 0, beforeMicro: 0n, expectedMicro: 1n });
+    expect(observeBalance(s, 150n).status).toBe('landed');
+    for (let i = s.attempts; i < MAX_POLL_ATTEMPTS; i++) s = observeBalance(s, 100n);
+    expect(s.status).toBe('timeout');
+    expect(observeBalance(s, 1000n)).toBe(s);
+    expect(restartWatch(s)).toEqual(startWatch(100n, 50n));
+    expect(observeBalance(IDLE_WATCH, 1n)).toBe(IDLE_WATCH);
   });
-  it('lands on the indexed purchase event even when a concurrent debit shrinks the balance delta', () => {
-    const rows = [
-      { kind: 'draw', txHash: BURN_TX },
-      { kind: 'purchase', txHash: OTHER_TX },
-    ];
-    expect(purchaseIndexed(rows, BURN_TX)).toBe(false);
-    expect(purchaseIndexed([...rows, { kind: 'purchase', txHash: BURN_TX.toUpperCase().replace('0X', '0x') }], BURN_TX)).toBe(true);
-
-    // $10.00 expected, but agent traffic settled $0.05 in the meantime: the balance grew by $9.95 only.
-    let s = startWatch(1_000_000n, 10_000_000n, BURN_TX);
-    s = observeBalance(s, 10_950_000n);
-    expect(s.status).toBe('watching');
-    expect(observeEvents(s, rows)).toBe(s);
-    s = observeEvents(s, [...rows, { kind: 'purchase', txHash: BURN_TX }]);
-    expect(s.status).toBe('landed');
-    expect(observeEvents(s, [])).toBe(s);
-  });
-  it('ignores events without a known burn tx and outside the watching state', () => {
-    const s = startWatch(0n, 1n);
-    expect(observeEvents(s, [{ kind: 'purchase', txHash: BURN_TX }])).toBe(s);
-    expect(observeEvents(IDLE_WATCH, [{ kind: 'purchase', txHash: BURN_TX }])).toBe(IDLE_WATCH);
+  it('lands on the indexed purchase event of the burn signature (exact match)', () => {
+    const s = startWatch(0n, undefined, SIG);
+    expect(purchaseIndexed([{ kind: 'draw', signature: SIG }], SIG)).toBe(false);
+    expect(purchaseIndexed([{ kind: 'purchase', signature: OTHER }], SIG)).toBe(false);
+    expect(purchaseIndexed([{ kind: 'purchase', signature: SIG }], SIG)).toBe(true);
+    expect(observeEvents(s, [{ kind: 'purchase', signature: SIG }]).status).toBe('landed');
+    expect(observeEvents(s, [{ kind: 'purchase', signature: OTHER }])).toBe(s);
+    expect(observeEvents(startWatch(0n, undefined), [{ kind: 'purchase', signature: SIG }]).status).toBe('watching');
+    expect(observeEvents(IDLE_WATCH, [])).toBe(IDLE_WATCH);
   });
 });

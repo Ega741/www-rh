@@ -1,0 +1,10 @@
+{
+  "cluster": "localnet",
+  "mint": "HBJrfAHGsn7WQYk4FaBXv3wA7fVRL4ctSriSdj3UiDND",
+  "decimals": 6,
+  "symbol": "BEAGLE",
+  "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "operator": "BEJQY85xuHoT2NyAT5eXF9ftMv6RnSM7LQSujxm8BAbZ",
+  "memoProgram": "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+  "createdSlot": 4
+}

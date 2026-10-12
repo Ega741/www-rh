@@ -1,0 +1,102 @@
+{
+  "blockTime": 1791808154,
+  "meta": {
+    "computeUnitsConsumed": 2676,
+    "costUnits": 4036,
+    "err": null,
+    "fee": 5000,
+    "innerInstructions": [],
+    "logMessages": [
+      "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [1]",
+      "Program log: Instruction: Revoke",
+      "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 2676 of 200000 compute units",
+      "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success"
+    ],
+    "postBalances": [
+      4999990000,
+      2039280,
+      929020800
+    ],
+    "postTokenBalances": [
+      {
+        "accountIndex": 1,
+        "mint": "HBJrfAHGsn7WQYk4FaBXv3wA7fVRL4ctSriSdj3UiDND",
+        "owner": "291iqs9ogyCfR8f1LKLoKpGjmb5zQQNj1MVQuZ9ChBdh",
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "uiTokenAmount": {
+          "amount": "99993000000",
+          "decimals": 6,
+          "uiAmount": 99993,
+          "uiAmountString": "99993"
+        }
+      }
+    ],
+    "preBalances": [
+      4999995000,
+      2039280,
+      929020800
+    ],
+    "preTokenBalances": [
+      {
+        "accountIndex": 1,
+        "mint": "HBJrfAHGsn7WQYk4FaBXv3wA7fVRL4ctSriSdj3UiDND",
+        "owner": "291iqs9ogyCfR8f1LKLoKpGjmb5zQQNj1MVQuZ9ChBdh",
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "uiTokenAmount": {
+          "amount": "99993000000",
+          "decimals": 6,
+          "uiAmount": 99993,
+          "uiAmountString": "99993"
+        }
+      }
+    ],
+    "rewards": [],
+    "status": {
+      "Ok": null
+    }
+  },
+  "slot": 129,
+  "transaction": {
+    "message": {
+      "accountKeys": [
+        {
+          "pubkey": "291iqs9ogyCfR8f1LKLoKpGjmb5zQQNj1MVQuZ9ChBdh",
+          "signer": true,
+          "source": "transaction",
+          "writable": true
+        },
+        {
+          "pubkey": "BKMc9j2KYEu9ojsmRetip5nqWuycg4Wwo3MYEsxds38K",
+          "signer": false,
+          "source": "transaction",
+          "writable": true
+        },
+        {
+          "pubkey": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+          "signer": false,
+          "source": "transaction",
+          "writable": false
+        }
+      ],
+      "instructions": [
+        {
+          "parsed": {
+            "info": {
+              "owner": "291iqs9ogyCfR8f1LKLoKpGjmb5zQQNj1MVQuZ9ChBdh",
+              "source": "BKMc9j2KYEu9ojsmRetip5nqWuycg4Wwo3MYEsxds38K"
+            },
+            "type": "revoke"
+          },
+          "program": "spl-token",
+          "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+          "stackHeight": 1
+        }
+      ],
+      "recentBlockhash": "gzRQEKBMZq122WruRQSvGD6b65dcyB9EhDaxCivQzb9"
+    },
+    "signatures": [
+      "2qxLb2mBBdtkcTkRekqysL9B53WTeBHAYHnHRbPVJKdUjnnZMSvRE8wyX6GoPaqPmRNkvTKvQEFSgAraHMVUZuLu"
+    ]
+  },
+  "version": "legacy"
+}

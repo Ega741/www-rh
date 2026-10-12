@@ -1,6 +1,7 @@
 /**
- * Wire DTO builders (SPEC §5.9) shared by the dashboard routes and the in-process `BeagleApi`.
- * Every monetary value is serialized with `serializeMicro`.
+ * Wire DTO builders (SPEC §5.9) shared by the dashboard routes, the CLI and the in-process
+ * `BeagleApi`. Every monetary value is serialized with `serializeMicro`; token amounts and
+ * `priceE18` are decimal strings; addresses and signatures are base58 verbatim.
  *
  * @module api/dto
  */
@@ -24,7 +25,8 @@ import type {
   UsageSummaryDtoWire,
 } from '@beagle/shared/api';
 import { serializeMicro } from '@beagle/shared/api';
-import { explorerTxUrl } from '@beagle/shared/chains';
+import { SYSTEM_PROGRAM_ID } from '@beagle/shared/addresses';
+import { explorerTxUrl } from '@beagle/shared/clusters';
 import { ALIASES, ALIAS_DESCRIPTIONS, PROVIDERS, type ModelSpec, type Plan, type Provider } from '@beagle/shared/models';
 import type { OpenAiModel, OpenAiModelList } from '@beagle/shared/openai';
 import type { ApiKeyRow, BudgetDrawRow, BudgetRow, CreditEventRow, LedgerRow, ProviderKeyRow, UsageRow, WorkspaceRow } from '../db/repos.js';
@@ -106,25 +108,31 @@ export function ledgerRowDto(row: LedgerRow): LedgerRowDtoWire {
   };
 }
 
+/** Explorer link of a signature on the configured cluster (localnet links carry the RPC URL). */
+export function explorerLink(services: Services, signature: string): string {
+  const info = services.chainInfo;
+  return explorerTxUrl(info.cluster, signature, { rpcUrl: info.rpcUrl });
+}
+
 /** `CreditEventDto` with the explorer link. */
 export function creditEventDto(services: Services, row: CreditEventRow): CreditEventDtoWire {
-  const chain = services.chain;
   return {
-    txHash: row.txHash,
-    logIndex: row.logIndex,
+    signature: row.signature,
+    ixIndex: row.ixIndex,
+    slot: row.slot,
+    blockTime: row.blockTime,
     kind: row.kind,
-    receiptId: row.receiptId,
     workspace: row.workspace,
     payer: row.payer,
+    tokenAccount: row.tokenAccount,
     tokenAmount: row.tokenAmount.toString(),
     usdMicro: serializeMicro(row.usdMicro),
     priceE18: row.priceE18.toString(),
-    budgetId: row.budgetId,
+    pricePointId: row.pricePointId,
+    priceStale: row.priceStale,
+    memo: row.memo,
     receiptHash: row.receiptHash,
-    blockNumber: row.blockNumber,
-    blockHash: row.blockHash,
-    blockTime: row.blockTime,
-    explorerTxUrl: chain === undefined ? null : (explorerTxUrl(chain.chain, row.txHash) ?? null),
+    explorerUrl: explorerLink(services, row.signature),
   };
 }
 
@@ -138,13 +146,13 @@ export function budgetDrawDto(row: BudgetDrawRow): BudgetDrawDtoWire & { batch: 
   }
   return {
     id: row.id,
-    budgetId: row.budgetId,
+    tokenAccount: row.tokenAccount,
     workspace: row.workspace,
     tokenAmount: row.tokenAmount.toString(),
     usdMicro: serializeMicro(row.usdMicro),
     receiptHash: row.receiptHash,
     usageIds: row.usageIds,
-    txHash: row.txHash,
+    signature: row.signature,
     status: row.status,
     error: row.error,
     createdAt: row.createdAt,
@@ -155,20 +163,20 @@ export function budgetDrawDto(row: BudgetDrawRow): BudgetDrawDtoWire & { batch: 
 
 /** `BudgetDto`. */
 export function budgetDto(services: Services, row: BudgetRow): BudgetDtoWire {
-  const remainingCap = row.cap > row.drawn ? row.cap - row.drawn : 0n;
   return {
-    budgetId: row.budgetId,
+    tokenAccount: row.tokenAccount,
     owner: row.owner,
     workspace: row.workspace,
+    delegate: row.delegate,
     cap: row.cap.toString(),
-    drawn: row.drawn.toString(),
-    remainingCap: remainingCap.toString(),
+    balance: row.balance.toString(),
     headroomTokens: row.headroomTokens.toString(),
     headroomMicro: serializeMicro(row.headroomMicro),
-    deadline: row.deadline,
     closed: row.closed,
     stalledReason: row.stalledReason,
-    draws: services.repos.budgetDraws.listByBudget(row.budgetId).map(budgetDrawDto),
+    registeredAt: row.registeredAt,
+    lastSeenSlot: row.lastSeenSlot,
+    draws: services.repos.budgetDraws.listByTokenAccount(row.tokenAccount).map(budgetDrawDto),
   };
 }
 
@@ -194,7 +202,7 @@ export function meDto(services: Services, ws: WorkspaceRow): MeDtoWire {
 }
 
 /** `GET /api/balance`. */
-export async function balanceDto(services: Services, workspace: string): Promise<BalanceDtoWire> {
+export function balanceDto(services: Services, workspace: string): BalanceDtoWire {
   const ws = services.repos.workspaces.ensure(workspace, services.now());
   const { plan, planUntil } = services.repos.workspaces.effectivePlan(ws, services.now());
   const snap = services.ledger.snapshot(workspace);
@@ -205,7 +213,7 @@ export async function balanceDto(services: Services, workspace: string): Promise
     availableMicro: serializeMicro(snap.available),
     plan,
     planUntil,
-    price: await services.price.priceDto(),
+    price: services.price.priceDto(),
   };
 }
 
@@ -265,36 +273,53 @@ export function openAiModelList(services: Services, plan: Plan, byok: readonly P
   return { object: 'list', data };
 }
 
+/** The mint for DTOs: the all-zero key stands for "no mint configured" (`isUnsetAddress` in `@beagle/shared`). */
+function mintOf(services: Services): string {
+  return services.chainInfo.mint ?? SYSTEM_PROGRAM_ID;
+}
+
 /** `GET /api/status`. */
 export function statusDto(services: Services): StatusDtoWire {
-  const chain = services.chain;
+  const info = services.chainInfo;
   const providers = {} as Record<Provider, { state: 'ok' | 'degraded' | 'down'; configured: boolean }>;
   for (const p of PROVIDERS) providers[p] = { state: services.health.state(p), configured: services.registry.platformConfigured(p) };
   const large = services.catalog.find((m) => m.id === 'house/gpt-oss-120b');
+  const solBalance = services.runtime.operatorSolBalance;
   return {
-    chainId: services.config.chain.chainId,
-    creditDesk: chain?.creditDesk ?? null,
-    token: chain?.token ?? null,
-    indexer: services.indexer?.status() ?? { lastBlock: -1, head: 0, lagBlocks: 0, lastEventAt: null },
+    cluster: info.cluster,
+    mint: mintOf(services),
+    token: { mint: mintOf(services), symbol: info.symbol, decimals: info.decimals, tokenProgram: info.tokenProgram },
+    indexer: services.indexer?.status() ?? { lastSignature: null, lastSlot: null, headSlot: 0, lagSlots: 0, lastEventAt: null },
+    price: services.price.priceDto(),
     providers,
     house: { enabled: services.config.providers.houseBaseUrl !== undefined, warmUntil: services.warm.warmUntil(), largeModel: large?.upstreamId ?? services.config.providers.houseModelLarge },
-    operator: { enabled: chain?.writer !== undefined, dryRun: services.config.operator.dryRun },
+    operator: {
+      address: info.operator ?? null,
+      enabled: services.chain?.writer !== undefined && !services.config.operator.dryRun,
+      dryRun: services.config.operator.dryRun,
+      ...(solBalance === undefined ? {} : { solBalance: solBalance.toString() }),
+    },
     version: services.version,
   };
 }
 
 /** `GET /api/config`. */
 export function configDto(services: Services): ConfigDtoWire {
-  const chain = services.chain;
+  const info = services.chainInfo;
   return {
-    chainId: services.config.chain.chainId,
-    creditDesk: chain?.creditDesk ?? null,
-    token: chain?.token ?? null,
-    priceSource: chain?.priceSource ?? null,
-    explorer: chain?.explorer ?? null,
+    cluster: info.cluster,
+    rpcUrl: info.rpcUrl,
+    mint: mintOf(services),
+    decimals: info.decimals,
+    symbol: info.symbol,
+    tokenProgram: info.tokenProgram,
+    memoProgram: info.memoProgram,
+    operator: info.operator ?? null,
+    explorer: info.explorer,
     aliases: [...ALIASES],
     markupBps: services.config.economics.markupBps,
     byokFeeBps: services.config.economics.byokFeeBps,
+    minCreditMicro: serializeMicro(services.config.price.minCreditMicro),
     pro: { priceMicro: serializeMicro(services.config.economics.proPriceMicro), days: services.config.economics.proDays },
     warmHourPriceMicro: serializeMicro(services.config.economics.warmHourPriceMicro),
   };

@@ -4,20 +4,21 @@
  * Environment:
  * - `BEAGLE_API_URL`  gateway origin (default `http://localhost:8787`)
  * - `BEAGLE_API_KEY`  `bgl_…` API key (required; exit code 2 without it)
- * - `BEAGLE_AGENT_PRIVATE_KEY`  optional 0x private key; with it the wallet tools sign and send
- * - `BEAGLE_RPC_URL`  optional JSON-RPC URL for the agent wallet (default: the chain's public RPC)
- * - `BEAGLE_WORKSPACE`  optional default workspace address for the wallet tools
+ * - `BEAGLE_AGENT_SECRET_KEY`  optional Solana keypair of the agent wallet: base58 or a JSON byte
+ *   array (the contents of a `solana-keygen` file); with it the wallet tools sign and send
+ * - `BEAGLE_RPC_URL`  optional JSON-RPC URL (default: the cluster RPC from `GET /api/config`)
+ * - `BEAGLE_WORKSPACE`  optional default workspace (base58 public key) for the wallet tools
  *
  * stdout carries the MCP protocol, so every log line goes to stderr.
  *
  * @module cli
  */
+import { isBase58Pubkey } from '@beagle/shared/solana';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import type { Address, Hex, Transport } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
+import type { Keypair } from '@solana/web3.js';
 import { createRestBeagleApi, type BeagleApi } from './api.js';
-import { createBeagleMcpServer, type BeagleMcpServerOptions } from './server.js';
-import { createLazyWalletExecutor, createViemWalletExecutor, WalletError, type WalletExecutor } from './wallet.js';
+import { createBeagleMcpServer, walletDeployment, type BeagleMcpServerOptions } from './server.js';
+import { createKeypairWalletExecutor, createLazyWalletExecutor, keypairFromSecret, WalletError, type SolanaRpc, type WalletExecutor } from './wallet.js';
 
 /** Default gateway URL of the stdio binary. */
 export const DEFAULT_API_URL = 'http://localhost:8787';
@@ -26,9 +27,10 @@ export const DEFAULT_API_URL = 'http://localhost:8787';
 export interface BinConfig {
   apiUrl: string;
   apiKey: string;
-  privateKey?: Hex;
+  /** The agent keypair parsed from `BEAGLE_AGENT_SECRET_KEY`; never logged. */
+  keypair?: Keypair;
   rpcUrl?: string;
-  workspace?: Address;
+  workspace?: string;
 }
 
 /** Thrown by {@link readBinConfig} for a missing or malformed variable; `exitCode` is 2. */
@@ -37,7 +39,7 @@ export class ConfigError extends Error {
   readonly exitCode = 2;
 }
 
-/** Reads and validates the environment (pure; no process access). */
+/** Reads and validates the environment (pure; no process access). Secret material never appears in errors. */
 export function readBinConfig(env: Record<string, string | undefined>): BinConfig {
   const apiKey = env['BEAGLE_API_KEY']?.trim() ?? '';
   if (apiKey === '') {
@@ -48,17 +50,25 @@ export function readBinConfig(env: Record<string, string | undefined>): BinConfi
   const apiUrl = (env['BEAGLE_API_URL']?.trim() ?? '') || DEFAULT_API_URL;
   if (!/^https?:\/\//.test(apiUrl)) throw new ConfigError(`BEAGLE_API_URL must start with http:// or https:// (got ${JSON.stringify(apiUrl)})`);
   const config: BinConfig = { apiUrl, apiKey };
-  const pk = env['BEAGLE_AGENT_PRIVATE_KEY']?.trim();
-  if (pk !== undefined && pk !== '') {
-    if (!/^0x[0-9a-fA-F]{64}$/.test(pk)) throw new ConfigError('BEAGLE_AGENT_PRIVATE_KEY must be a 0x-prefixed 32-byte hex private key');
-    config.privateKey = pk as Hex;
+  const secret = env['BEAGLE_AGENT_SECRET_KEY']?.trim();
+  if (secret !== undefined && secret !== '') {
+    try {
+      config.keypair = keypairFromSecret(secret);
+    } catch (error) {
+      throw new ConfigError(
+        `BEAGLE_AGENT_SECRET_KEY must be a Solana secret key as base58 or a JSON byte array (solana-keygen file contents): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   const rpc = env['BEAGLE_RPC_URL']?.trim();
-  if (rpc !== undefined && rpc !== '') config.rpcUrl = rpc;
+  if (rpc !== undefined && rpc !== '') {
+    if (!/^https?:\/\//.test(rpc)) throw new ConfigError(`BEAGLE_RPC_URL must start with http:// or https:// (got ${JSON.stringify(rpc)})`);
+    config.rpcUrl = rpc;
+  }
   const ws = env['BEAGLE_WORKSPACE']?.trim();
   if (ws !== undefined && ws !== '') {
-    if (!/^0x[0-9a-fA-F]{40}$/.test(ws)) throw new ConfigError('BEAGLE_WORKSPACE must be a 0x address');
-    config.workspace = ws as Address;
+    if (!isBase58Pubkey(ws)) throw new ConfigError('BEAGLE_WORKSPACE must be a base58 Solana public key');
+    config.workspace = ws;
   }
   return config;
 }
@@ -71,40 +81,40 @@ function log(message: string): void {
 export interface AgentWalletOptions {
   /** Receives one line when the wallet is ready (stderr in the binary). */
   log?: (message: string) => void;
-  /** Custom viem transport (tests); overrides `BEAGLE_RPC_URL`. */
-  transport?: Transport;
+  /** RPC connection or test fake; overrides `BEAGLE_RPC_URL`. */
+  connection?: SolanaRpc;
 }
 
 /**
- * The agent wallet of the stdio binary, or `undefined` without `BEAGLE_AGENT_PRIVATE_KEY`.
+ * The agent wallet of the stdio binary, or `undefined` without `BEAGLE_AGENT_SECRET_KEY`.
  *
- * Its address is derived from the key immediately (no network), so the wallet tools can default
- * `workspace` and describe themselves as signing from the start; the chain id and the desk / token
- * addresses are read from `GET /api/config` on the **first wallet-tool call** and retried on each
- * call until that succeeds. A gateway that is down, slow or mid-deploy when the MCP client spawns
- * the binary therefore neither delays the MCP handshake nor downgrades the session to unsigned
- * steps: the affected call fails with `wallet_unavailable` and the next one tries again.
+ * Its address comes from the keypair immediately (no network), so the wallet tools can default
+ * `workspace` and describe themselves as signing from the start; the cluster, mint, token program
+ * and operator are read from `GET /api/config` on the **first wallet-tool call** and retried on
+ * each call until that succeeds. A gateway that is down, slow or mid-deploy when the MCP client
+ * spawns the binary therefore neither delays the MCP handshake nor downgrades the session to
+ * unsigned transactions: the affected call fails with `wallet_unavailable` and the next one tries
+ * again. The RPC endpoint is `BEAGLE_RPC_URL`, else the gateway's `rpcUrl`.
  */
 export function createAgentWallet(api: BeagleApi, config: BinConfig, options: AgentWalletOptions = {}): WalletExecutor | undefined {
-  const privateKey = config.privateKey;
-  if (privateKey === undefined) return undefined;
-  const address = privateKeyToAccount(privateKey).address;
+  const keypair = config.keypair;
+  if (keypair === undefined) return undefined;
+  const address = keypair.publicKey.toBase58();
   const emit = options.log ?? (() => undefined);
   return createLazyWalletExecutor({
     address,
     build: async () => {
       const gateway = await api.config();
-      if (gateway.creditDesk === null || gateway.token === null) {
-        throw new WalletError('not_configured', 'the gateway reports no CreditDesk deployment for its chain');
-      }
-      const wallet = createViemWalletExecutor({
-        privateKey,
-        chainId: gateway.chainId,
-        deployment: { creditDesk: gateway.creditDesk as Address, token: gateway.token.address as Address },
-        ...(config.rpcUrl === undefined ? {} : { rpcUrl: config.rpcUrl }),
-        ...(options.transport === undefined ? {} : { transport: options.transport }),
+      const deployment = walletDeployment(gateway);
+      if (deployment.mint === '' ) throw new WalletError('not_configured', 'the gateway reports no mint for its cluster');
+      const rpcUrl = config.rpcUrl ?? gateway.rpcUrl;
+      const wallet = createKeypairWalletExecutor({
+        secretKey: keypair,
+        deployment,
+        rpcUrl,
+        ...(options.connection === undefined ? {} : { connection: options.connection }),
       });
-      emit(`agent wallet ${address} ready on chain ${gateway.chainId} (desk ${gateway.creditDesk})`);
+      emit(`agent wallet ${address} ready on ${gateway.cluster} (mint ${gateway.mint}, rpc ${options.connection === undefined ? rpcUrl : 'injected'})`);
       return wallet;
     },
   });
@@ -131,6 +141,7 @@ export async function main(env: Record<string, string | undefined> = process.env
     apiUrl: config.apiUrl,
     ...(wallet === undefined ? {} : { wallet }),
     ...(config.workspace === undefined ? {} : { workspace: config.workspace }),
+    ...(config.rpcUrl === undefined ? {} : { rpcUrl: config.rpcUrl }),
   };
   const server = createBeagleMcpServer(api, opts);
   const transport = new StdioServerTransport();
@@ -146,8 +157,8 @@ export async function main(env: Record<string, string | undefined> = process.env
   log(
     `serving ${config.apiUrl} over stdio${
       wallet === undefined
-        ? ' (no agent wallet: wallet tools return unsigned steps)'
-        : ` (agent wallet ${wallet.address ?? '?'}; chain and CreditDesk are read from the gateway on the first wallet call)`
+        ? ' (no agent wallet: on-chain tools return unsigned transactions)'
+        : ` (agent wallet ${wallet.address ?? '?'}; cluster and mint are read from the gateway on the first wallet call)`
     }`,
   );
 }

@@ -4,6 +4,7 @@
  * on focus and are invalidated by the mutations below.
  */
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import type { RegisterBudgetRequest } from '@beagle/shared/api';
 import type { ByokProvider } from '@beagle/shared/models';
 import { api, type UsageListParams } from './api.js';
 import type { UsageWindow } from './lib/windows.js';
@@ -172,6 +173,17 @@ export function useTestProvider() {
 /** `GET /api/budgets`, polled every 15 s (headroom refresher cadence). */
 export function useBudgets() {
   return useQuery({ queryKey: qk.budgets, queryFn: () => api.budgets.list(), refetchInterval: 15_000, staleTime: 5_000 });
+}
+
+/** `POST /api/budgets/register` (after `ApproveChecked`); refreshes the list and the balance headroom. */
+export function useRegisterBudget() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (body: RegisterBudgetRequest) => api.budgets.register(body),
+    onSuccess: async () => {
+      await Promise.all([client.invalidateQueries({ queryKey: qk.budgets }), client.invalidateQueries({ queryKey: qk.me }), client.invalidateQueries({ queryKey: qk.balance })]);
+    },
+  });
 }
 
 /** `GET /api/upgrades`. */

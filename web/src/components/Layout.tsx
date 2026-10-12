@@ -1,10 +1,9 @@
-/** App shell: header with nav + wallet button, config/chain banners, outlet, footer, toasts. */
+/** App shell: header with nav, cluster badge + wallet button, config banner, outlet, footer, toasts. */
 import { NavLink, Outlet, Link } from 'react-router';
 import { config } from '../config.js';
-import { ChainGuardBanner } from './ChainGuardBanner.jsx';
 import { ErrorBoundary } from './ErrorBoundary.jsx';
 import { Toasts } from './Toasts.jsx';
-import { Note } from './ui.jsx';
+import { Badge, Note } from './ui.jsx';
 import { WalletButton } from './WalletButton.jsx';
 
 const NAV = [
@@ -36,7 +35,12 @@ export function Layout() {
               ))}
             </nav>
           </div>
-          <WalletButton />
+          <div className="flex items-center gap-2">
+            <Badge tone={config.cluster === 'mainnet-beta' ? 'accent' : 'warn'} className="hidden sm:inline-flex" title={`This page sends transactions to Solana ${config.clusterName} (${config.rpcUrl}); the wallet must be on the same network — the page cannot detect the wallet's network.`}>
+              {config.cluster}
+            </Badge>
+            <WalletButton />
+          </div>
         </div>
       </header>
       {config.errors.length > 0 ? (
@@ -52,7 +56,6 @@ export function Layout() {
           </Note>
         </div>
       ) : null}
-      <ChainGuardBanner />
       <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-6 sm:py-8">
         <ErrorBoundary>
           <Outlet />
@@ -61,7 +64,7 @@ export function Layout() {
       <footer className="border-t border-line">
         <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-2 px-4 py-4 text-xs text-faint">
           <span>
-            Beagle · compute for agents on <span className="font-mono">{config.chain.name}</span> (chain {config.chainId})
+            Beagle · compute for agents on Solana <span className="font-mono">{config.clusterName}</span>
           </span>
           <span className="font-mono">burn becomes compute</span>
         </div>

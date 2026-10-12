@@ -10,11 +10,11 @@ build/
 .env.*
 !.env.example
 
-# foundry
-contracts/out/
-contracts/cache/
-contracts/broadcast/
-contracts/.env
+# solana
+# local validator ledgers (the e2e uses a temp dir; `solana-test-validator` without --ledger writes here)
+test-ledger/
+# per-machine deployment overrides (never collected by sync-deployments)
+solana/deployments/*.local.json
 
 # gateway data
 gateway/data/

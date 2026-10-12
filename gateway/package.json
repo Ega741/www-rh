@@ -2,7 +2,7 @@
   "name": "@beagle/gateway",
   "version": "0.1.0",
   "private": true,
-  "description": "Beagle gateway: CreditDesk indexer, model router, metering, OpenAI/Anthropic-compatible API, dashboard API, MCP over HTTP, operator jobs",
+  "description": "Beagle gateway: Solana burn indexer, budget scanner and drawer (SPL delegation), published price service, model router, metering, OpenAI/Anthropic-compatible API, dashboard API, MCP over HTTP, operator CLI",
   "type": "module",
   "license": "MIT",
   "main": "./dist/main.js",

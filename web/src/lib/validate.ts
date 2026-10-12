@@ -1,13 +1,10 @@
-/** Input validation for forms (addresses, https URLs, hour counts). */
-import { getAddress, isAddress, type Address } from 'viem';
+/** Input validation for forms (Solana public keys, https URLs, hour counts, names). */
+import { isBase58Pubkey } from '@beagle/shared/solana';
 
-/** Parses a typed address (any case, EIP-55 enforced when mixed case). `undefined` when invalid. */
-export function parseAddressInput(input: string): Address | undefined {
+/** Parses a typed public key (trimmed, base58, 32 bytes). `undefined` when invalid. */
+export function parseAddressInput(input: string): string | undefined {
   const v = input.trim();
-  if (!/^0x[0-9a-fA-F]{40}$/.test(v)) return undefined;
-  const lower = v.toLowerCase();
-  if (v === lower || v === v.toUpperCase()) return getAddress(lower);
-  return isAddress(v, { strict: true }) ? getAddress(v) : undefined;
+  return isBase58Pubkey(v) ? v : undefined;
 }
 
 /** `true` for an absolute `https:` URL (BYOK `baseUrl`, SPEC §5.9). Empty strings are not URLs. */

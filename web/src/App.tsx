@@ -1,14 +1,13 @@
-/** Providers (wagmi, TanStack Query, toasts, session) and the data router (SPEC §7 routes). */
+/** Providers (TanStack Query, toasts, Solana wallet, session) and the data router (SPEC §7 routes). */
 import { StrictMode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createBrowserRouter, RouterProvider } from 'react-router';
-import { WagmiProvider } from 'wagmi';
-import { hashFn } from 'wagmi/query';
 import { RouteError } from './components/ErrorBoundary.jsx';
 import { Layout } from './components/Layout.jsx';
 import { AppShell } from './components/SessionGate.jsx';
 import { SessionProvider } from './hooks/useSession.jsx';
 import { ToastProvider } from './hooks/useToast.jsx';
+import { SolanaProviders } from './providers/SolanaProviders.jsx';
 import { Docs } from './routes/Docs.jsx';
 import { Landing } from './routes/Landing.jsx';
 import { Models } from './routes/Models.jsx';
@@ -21,12 +20,11 @@ import { Providers } from './routes/app/Providers.jsx';
 import { Receipt } from './routes/app/Receipt.jsx';
 import { Upgrades } from './routes/app/Upgrades.jsx';
 import { Usage } from './routes/app/Usage.jsx';
-import { wagmiConfig } from './wagmi.js';
 
-/** Shared query client; `hashFn` serialises bigint in wagmi query keys. */
+/** Shared query client. Query keys hold only strings/numbers (bigint lives in the data). */
 export const queryClient = new QueryClient({
   defaultOptions: {
-    queries: { queryKeyHashFn: hashFn, retry: 1, refetchOnWindowFocus: true, staleTime: 5_000 },
+    queries: { retry: 1, refetchOnWindowFocus: true, staleTime: 5_000 },
   },
 });
 
@@ -63,15 +61,15 @@ export const router = createBrowserRouter([
 export function App() {
   return (
     <StrictMode>
-      <WagmiProvider config={wagmiConfig} reconnectOnMount>
-        <QueryClientProvider client={queryClient}>
-          <ToastProvider>
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <SolanaProviders>
             <SessionProvider>
               <RouterProvider router={router} />
             </SessionProvider>
-          </ToastProvider>
-        </QueryClientProvider>
-      </WagmiProvider>
+          </SolanaProviders>
+        </ToastProvider>
+      </QueryClientProvider>
     </StrictMode>
   );
 }

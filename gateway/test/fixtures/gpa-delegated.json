@@ -1,0 +1,38 @@
+[
+  {
+    "account": {
+      "data": {
+        "parsed": {
+          "info": {
+            "delegate": "BEJQY85xuHoT2NyAT5eXF9ftMv6RnSM7LQSujxm8BAbZ",
+            "delegatedAmount": {
+              "amount": "500000000",
+              "decimals": 6,
+              "uiAmount": 500,
+              "uiAmountString": "500"
+            },
+            "isNative": false,
+            "mint": "HBJrfAHGsn7WQYk4FaBXv3wA7fVRL4ctSriSdj3UiDND",
+            "owner": "291iqs9ogyCfR8f1LKLoKpGjmb5zQQNj1MVQuZ9ChBdh",
+            "state": "initialized",
+            "tokenAmount": {
+              "amount": "100000000000",
+              "decimals": 6,
+              "uiAmount": 100000,
+              "uiAmountString": "100000"
+            }
+          },
+          "type": "account"
+        },
+        "program": "spl-token",
+        "space": 165
+      },
+      "executable": false,
+      "lamports": 2039280,
+      "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "rentEpoch": 18446744073709552000,
+      "space": 165
+    },
+    "pubkey": "BKMc9j2KYEu9ojsmRetip5nqWuycg4Wwo3MYEsxds38K"
+  }
+]

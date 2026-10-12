@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 /**
- * Operator CLI (SPEC §5.12): `migrate`, `create-key --workspace 0x… [--name]`,
- * `credit --workspace 0x… --usd 10 [--memo] [--force]`, `post-price --usd 0.01`, `status`.
+ * Operator CLI (SPEC §5.12): `migrate`, `create-key --workspace <base58> [--name]`,
+ * `credit --workspace <base58> --usd 10 [--memo] [--force]`, `set-price --usd 0.01`,
+ * `register-budget --token-account <base58> [--workspace <base58>]`, `status`.
  * Reads the same env as the gateway and opens `DB_PATH` (WAL allows a running gateway).
  *
  * @module cli
  */
 import { parseUsdToMicro } from '@beagle/shared/credit';
-import { statusDto } from './api/dto.js';
-import { usdStringToPriceE18 } from './chain/poster.js';
-import { ConfigError, loadConfig, type Config } from './config.js';
+import { isBase58Pubkey } from '@beagle/shared/solana';
+import { budgetDto, statusDto } from './api/dto.js';
+import { BudgetRegisterError } from './chain/budgets.js';
+import { ConfigError, loadConfig, parsePriceUsdE18, type Config } from './config.js';
 import { Db } from './db/sqlite.js';
 import { migrate } from './db/schema.js';
 import { createLogger } from './log.js';
@@ -44,12 +46,14 @@ export function parseArgs(argv: readonly string[]): Cli {
 
 const USAGE = `beagle-gateway <command> [options]
 
-  migrate                                   apply database migrations
-  create-key --workspace 0x… [--name NAME]  create an API key (prints the key on stdout)
-  credit --workspace 0x… --usd 10 [--memo M] [--force]
-                                            admin ledger adjustment (refused in production without --force)
-  post-price --usd 0.01 [--force]           post a price to the ManualPriceSource with the operator key
-  status                                    print the gateway status as JSON
+  migrate                                        apply database migrations
+  create-key --workspace <base58> [--name NAME]  create an API key (prints the key on stdout)
+  credit --workspace <base58> --usd 10 [--memo M] [--force]
+                                                 admin ledger adjustment (refused in production without --force)
+  set-price --usd 0.01                           publish a manual price point
+  register-budget --token-account <base58> [--workspace <base58>]
+                                                 register a delegated token account as a budget
+  status                                         print the gateway status as JSON (indexer cursor, head slot, price, operator SOL)
 `;
 
 function flagString(flags: Cli['flags'], name: string): string | undefined {
@@ -60,6 +64,12 @@ function flagString(flags: Cli['flags'], name: string): string | undefined {
 function requireFlag(flags: Cli['flags'], name: string): string {
   const v = flagString(flags, name);
   if (v === undefined) throw new Error(`--${name} is required`);
+  return v;
+}
+
+function requirePubkey(flags: Cli['flags'], name: string): string {
+  const v = requireFlag(flags, name).trim();
+  if (!isBase58Pubkey(v)) throw new Error(`--${name} must be a base58 Solana public key`);
   return v;
 }
 
@@ -93,7 +103,8 @@ export async function runCli(argv: readonly string[], env: Record<string, string
     return 0;
   }
 
-  const services = createServices(config, { logger, ...(command === 'create-key' || command === 'credit' ? { chain: null } : {}) });
+  const offline = command === 'create-key' || command === 'credit' || command === 'set-price';
+  const services = createServices(config, { logger, ...(offline ? { chain: null } : {}) });
   try {
     return await runCommand(command, flags, config, services, out, err);
   } catch (e) {
@@ -105,53 +116,66 @@ export async function runCli(argv: readonly string[], env: Record<string, string
 }
 
 async function runCommand(command: string, flags: Cli['flags'], config: Config, services: Services, out: (s: string) => void, err: (s: string) => void): Promise<number> {
-  {
-    switch (command) {
-      case 'create-key': {
-        const workspace = requireFlag(flags, 'workspace');
-        if (!/^0x[0-9a-fA-F]{40}$/.test(workspace)) throw new Error('--workspace must be a 0x address');
-        const created = services.apiKeys.create(workspace, flagString(flags, 'name') ?? 'cli');
-        err(JSON.stringify({ id: created.id, prefix: created.prefix, name: created.name, workspace: workspace.toLowerCase(), createdAt: created.createdAt }));
-        out(created.key);
-        return 0;
-      }
-      case 'credit': {
-        const workspace = requireFlag(flags, 'workspace');
-        if (!/^0x[0-9a-fA-F]{40}$/.test(workspace)) throw new Error('--workspace must be a 0x address');
-        if (config.isProduction && flags['force'] !== true) throw new Error('refusing to adjust the ledger in production without --force');
-        const micro = parseUsdToMicro(requireFlag(flags, 'usd'));
-        const id = services.ledger.adjust(workspace, micro, flagString(flags, 'memo') ?? 'cli credit');
-        out(JSON.stringify({ ok: true, ledgerId: id, workspace: workspace.toLowerCase(), amountMicro: micro.toString(), balanceMicro: services.ledger.balance(workspace).toString() }));
-        return 0;
-      }
-      case 'post-price': {
-        const priceE18 = usdStringToPriceE18(requireFlag(flags, 'usd'));
-        const writer = services.chain?.writer;
-        if (writer === undefined) throw new Error('post-price needs RPC_URL and OPERATOR_PRIVATE_KEY');
-        if (config.operator.dryRun && flags['force'] !== true) {
-          out(JSON.stringify({ dryRun: true, priceE18: priceE18.toString() }));
-          return 0;
-        }
-        const txHash = await writer.postPrice(priceE18);
-        services.repos.pricePosts.insert({ priceE18, source: 'cli', txHash, status: 'sent', createdAt: services.now() });
-        out(JSON.stringify({ ok: true, priceE18: priceE18.toString(), txHash }));
-        return 0;
-      }
-      case 'status': {
-        if (services.indexer !== undefined) {
-          try {
-            await services.indexer.step();
-          } catch (e) {
-            err(`indexer step failed: ${e instanceof Error ? e.message : String(e)}`);
-          }
-        }
-        out(JSON.stringify(statusDto(services), null, 2));
-        return 0;
-      }
-      default:
-        err(`unknown command ${JSON.stringify(command)}\n${USAGE}`);
-        return 1;
+  switch (command) {
+    case 'create-key': {
+      const workspace = requirePubkey(flags, 'workspace');
+      const created = services.apiKeys.create(workspace, flagString(flags, 'name') ?? 'cli');
+      err(JSON.stringify({ id: created.id, prefix: created.prefix, name: created.name, workspace, createdAt: created.createdAt }));
+      out(created.key);
+      return 0;
     }
+    case 'credit': {
+      const workspace = requirePubkey(flags, 'workspace');
+      if (config.isProduction && flags['force'] !== true) throw new Error('refusing to adjust the ledger in production without --force');
+      const micro = parseUsdToMicro(requireFlag(flags, 'usd'));
+      const id = services.ledger.adjust(workspace, micro, flagString(flags, 'memo') ?? 'cli credit');
+      out(JSON.stringify({ ok: true, ledgerId: id, workspace, amountMicro: micro.toString(), balanceMicro: services.ledger.balance(workspace).toString() }));
+      return 0;
+    }
+    case 'set-price': {
+      const priceE18 = parsePriceUsdE18(requireFlag(flags, 'usd'));
+      const point = services.price.set(priceE18, 'manual');
+      out(JSON.stringify({ ok: true, price: services.price.toDto(point) }));
+      return 0;
+    }
+    case 'register-budget': {
+      const tokenAccount = requirePubkey(flags, 'token-account');
+      const workspace = flagString(flags, 'workspace');
+      if (workspace !== undefined && !isBase58Pubkey(workspace)) throw new Error('--workspace must be a base58 Solana public key');
+      if (services.budgets === undefined) throw new Error('register-budget needs chain access (a known mint for CLUSTER or MINT_ADDRESS)');
+      try {
+        const row = await services.budgets.register(tokenAccount, workspace);
+        out(JSON.stringify(budgetDto(services, row)));
+        return 0;
+      } catch (e) {
+        if (e instanceof BudgetRegisterError) throw new Error(`${e.code}: ${e.message}`);
+        throw e;
+      }
+    }
+    case 'status': {
+      const chain = services.chain;
+      let headSlot: number | null = null;
+      let operatorSol: string | null = null;
+      if (chain !== undefined) {
+        try {
+          headSlot = await chain.reader.getSlot();
+          if (chain.operator !== undefined) {
+            const lamports = await chain.reader.getBalance(chain.operator);
+            services.runtime.operatorSolBalance = lamports;
+            operatorSol = (Number(lamports) / 1e9).toFixed(9);
+          }
+        } catch (e) {
+          err(`rpc unavailable: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      const status = statusDto(services);
+      if (headSlot !== null) status.indexer = { ...status.indexer, headSlot, lagSlots: status.indexer.lastSlot === null ? 0 : Math.max(0, headSlot - status.indexer.lastSlot) };
+      out(JSON.stringify({ ...status, operatorSol }, null, 2));
+      return 0;
+    }
+    default:
+      err(`unknown command ${JSON.stringify(command)}\n${USAGE}`);
+      return 1;
   }
 }
 

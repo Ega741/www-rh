@@ -3,11 +3,14 @@ services:
     build:
       context: .
       dockerfile: docker/gateway.Dockerfile
-    # The whole .env is injected (one shared file, docs/SPEC.md §5.1); `environment` wins over `env_file`, so the
-    # deploy-only key below is blanked instead of reaching the gateway container. Keep other deploy-only secrets
-    # out of the .env used by compose (docs/DEPLOY.md §3). `required: false` lets `docker compose config` validate
-    # a fresh checkout that has no .env yet (`cp .env.example .env`, docs/DEPLOY.md §3); the image runs with
-    # NODE_ENV=production, so a gateway started without the file refuses to boot (SESSION_SECRET is required).
+    # The whole .env is injected (one shared file, docs/SPEC.md §5.1): CLUSTER (mainnet-beta | devnet | localnet),
+    # RPC_URL (use a private provider on mainnet, docs/SOLANA.md), OPERATOR_SECRET_KEY (the hot wallet that signs
+    # budget draws — base58 or the JSON byte array of a keypair file; fund it with a little SOL), PRICE_SOURCE, provider
+    # keys, SESSION_SECRET … `environment` wins over `env_file`, so the setup-only keypair paths below are blanked
+    # instead of reaching the gateway container (they are host paths used by solana/scripts/setup-cluster.sh only).
+    # `required: false` lets `docker compose config` validate a fresh checkout that has no .env yet (`cp .env.example
+    # .env`, docs/DEPLOY.md); the image runs with NODE_ENV=production, so a gateway started without the file refuses
+    # to boot (SESSION_SECRET is required).
     env_file:
       - path: .env
         required: false
@@ -15,7 +18,8 @@ services:
       HOST: 0.0.0.0
       PORT: "8787"
       DB_PATH: /app/data/gateway.sqlite
-      DEPLOYER_PRIVATE_KEY: ""
+      DEPLOYER_KEYPAIR: ""
+      MINT_KEYPAIR: ""
     volumes:
       - gateway-data:/app/data
     ports:
@@ -26,13 +30,15 @@ services:
     build:
       context: .
       dockerfile: docker/web.Dockerfile
+      # Vite build-time keys (docs/SPEC.md §7). VITE_GATEWAY_URL is empty on purpose: behind nginx the web talks to
+      # the gateway on the same origin. VITE_CLUSTER must match the gateway's CLUSTER; the mint, decimals, symbol,
+      # token program and operator come from GET /api/config at runtime (VITE_MINT_ADDRESS only overrides the
+      # committed deployment the page reconciles against).
       args:
-        VITE_CHAIN_ID: ${VITE_CHAIN_ID:-4663}
+        VITE_CLUSTER: ${VITE_CLUSTER:-mainnet-beta}
         VITE_GATEWAY_URL: ""
-        VITE_CREDIT_DESK_ADDRESS: ${VITE_CREDIT_DESK_ADDRESS:-0x0000000000000000000000000000000000000000}
         VITE_RPC_URL: ${VITE_RPC_URL:-}
-        VITE_WALLETCONNECT_PROJECT_ID: ${VITE_WALLETCONNECT_PROJECT_ID:-}
-        VITE_MULTICALL: ${VITE_MULTICALL:-}
+        VITE_MINT_ADDRESS: ${VITE_MINT_ADDRESS:-}
     depends_on:
       - gateway
     ports:

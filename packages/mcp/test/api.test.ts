@@ -1,10 +1,24 @@
-import type { BalanceDtoWire, BudgetDtoWire, ConfigDtoWire, StatusDtoWire, UpgradeDtoWire, UsageRowDtoWire, UsageSummaryDtoWire } from '@beagle/shared/api';
+import { MEMO_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@beagle/shared/addresses';
+import type {
+  BalanceDtoWire,
+  BudgetDtoWire,
+  ConfigDtoWire,
+  CreditEventDtoWire,
+  PriceDtoWire,
+  StatusDtoWire,
+  UpgradeDtoWire,
+  UsageRowDtoWire,
+  UsageSummaryDtoWire,
+} from '@beagle/shared/api';
 import { describe, expect, it } from 'vitest';
 import { BeagleApiError, completionMetaFromHeaders, createRestBeagleApi, type FetchLike } from '../src/api.js';
+import { AGENT_ATA, signatureOf } from './fake-api.js';
+import { AGENT, MINT, OPERATOR, OTHER_WORKSPACE } from './fake-connection.js';
 
 const BASE = 'http://gateway.test:8787';
 const KEY = 'bgl_testkey_0123456789';
-const WS = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8';
+const WS = AGENT;
+const SIG = signatureOf(0xab);
 
 interface Recorded {
   url: URL;
@@ -35,6 +49,17 @@ function stub(handler: Handler): { fetch: FetchLike; calls: Recorded[] } {
   return { fetch, calls };
 }
 
+const priceWire: PriceDtoWire = {
+  pricePointId: 7,
+  priceE18: '10000000000000000',
+  observedAt: 1_760_000_000,
+  stale: false,
+  source: 'manual',
+  maxAgeS: 3600,
+  usdPerToken: '0.01',
+  tokensPerUsd: '100',
+};
+
 const balanceWire: BalanceDtoWire = {
   balanceMicro: '12340000',
   reservedMicro: '10000',
@@ -42,7 +67,7 @@ const balanceWire: BalanceDtoWire = {
   availableMicro: '12330000',
   plan: 'free',
   planUntil: null,
-  price: { priceE18: '10000000000000000', updatedAt: 1_760_000_000, stale: false, usdPerToken: '0.01', tokensPerUsd: '100', source: 'manual', maxPriceAge: 3600 },
+  price: priceWire,
 };
 
 const summaryWire: UsageSummaryDtoWire = {
@@ -84,18 +109,38 @@ const rowWire: UsageRowDtoWire = {
 };
 
 const budgetWire: BudgetDtoWire = {
-  budgetId: 3,
+  tokenAccount: AGENT_ATA,
   owner: WS,
   workspace: WS,
-  cap: '500000000000000000000',
-  drawn: '0',
-  remainingCap: '500000000000000000000',
-  headroomTokens: '500000000000000000000',
+  delegate: OPERATOR,
+  cap: '500000000',
+  balance: '1000000000',
+  headroomTokens: '500000000',
   headroomMicro: '5000000',
-  deadline: 1_760_003_600,
   closed: false,
   stalledReason: null,
+  registeredAt: 1_760_000_000_000,
+  lastSeenSlot: 120,
   draws: [],
+};
+
+const receiptWire: CreditEventDtoWire = {
+  signature: SIG,
+  ixIndex: 0,
+  slot: 42,
+  blockTime: 1_760_000_000,
+  kind: 'purchase',
+  workspace: WS,
+  payer: WS,
+  tokenAccount: AGENT_ATA,
+  tokenAmount: '500000000',
+  usdMicro: '5000000',
+  priceE18: '10000000000000000',
+  pricePointId: 7,
+  priceStale: false,
+  memo: null,
+  receiptHash: null,
+  explorerUrl: `https://explorer.solana.com/tx/${SIG}?cluster=devnet`,
 };
 
 const upgradeWire: UpgradeDtoWire = {
@@ -110,10 +155,11 @@ const upgradeWire: UpgradeDtoWire = {
 };
 
 const statusWire: StatusDtoWire = {
-  chainId: 31337,
-  creditDesk: '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0',
-  token: { address: '0x5FbDB2315678afecb367f032d93F642f64180aa3', symbol: 'BEAGLE', decimals: 18, nativeBurn: true },
-  indexer: { lastBlock: 10, head: 10, lagBlocks: 0, lastEventAt: null },
+  cluster: 'devnet',
+  mint: MINT,
+  token: { mint: MINT, symbol: 'BEAGLE', decimals: 6, tokenProgram: TOKEN_PROGRAM_ID },
+  indexer: { lastSignature: SIG, lastSlot: 10, headSlot: 10, lagSlots: 0, lastEventAt: null },
+  price: priceWire,
   providers: {
     anthropic: { state: 'ok', configured: true },
     openai: { state: 'ok', configured: true },
@@ -121,19 +167,24 @@ const statusWire: StatusDtoWire = {
     house: { state: 'ok', configured: true },
   },
   house: { enabled: true, warmUntil: null, largeModel: 'house/gpt-oss-120b' },
-  operator: { enabled: false, dryRun: true },
+  operator: { address: OPERATOR, enabled: false, dryRun: true, solBalance: '1500000000' },
   version: '0.1.0',
 };
 
 const configWire: ConfigDtoWire = {
-  chainId: 31337,
-  creditDesk: '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0',
-  token: { address: '0x5FbDB2315678afecb367f032d93F642f64180aa3', symbol: 'BEAGLE', decimals: 18, nativeBurn: true },
-  priceSource: '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512',
-  explorer: null,
+  cluster: 'devnet',
+  rpcUrl: 'https://api.devnet.solana.com',
+  mint: MINT,
+  decimals: 6,
+  symbol: 'BEAGLE',
+  tokenProgram: TOKEN_PROGRAM_ID,
+  memoProgram: MEMO_PROGRAM_ID,
+  operator: OPERATOR,
+  explorer: 'https://explorer.solana.com',
   aliases: ['beagle/auto', 'beagle/best', 'beagle/cheap', 'beagle/house'],
   markupBps: 1000,
   byokFeeBps: 0,
+  minCreditMicro: '1000',
   pro: { priceMicro: '20000000', days: 30 },
   warmHourPriceMicro: '2000000',
 };
@@ -166,6 +217,7 @@ describe('createRestBeagleApi', () => {
     expect(balance.balanceMicro).toBe(12_340_000n);
     expect(balance.availableMicro).toBe(12_330_000n);
     expect(balance.price.priceE18).toBe(10n ** 16n);
+    expect(balance.price.pricePointId).toBe(7);
   });
 
   it('GET /api/models returns the models array', async () => {
@@ -199,15 +251,16 @@ describe('createRestBeagleApi', () => {
   });
 
   it('GET /api/quote with tokens= or usdMicro=', async () => {
-    const { fetch, calls } = stub(() => json({ tokens: '500000000000000000000', usdMicro: '5000000', priceE18: '10000000000000000', updatedAt: 1 }));
+    const { fetch, calls } = stub(() => json({ tokens: '500000000', usdMicro: '5000000', priceE18: '10000000000000000', pricePointId: 7, stale: false }));
     const api = createRestBeagleApi({ baseUrl: BASE, apiKey: KEY, fetch });
     const byUsd = await api.quote({ usdMicro: 5_000_000n });
     expect(calls[0]!.url.pathname).toBe('/api/quote');
     expect(calls[0]!.url.searchParams.get('usdMicro')).toBe('5000000');
     expect(calls[0]!.url.searchParams.has('tokens')).toBe(false);
-    expect(byUsd.tokens).toBe(500n * 10n ** 18n);
-    await api.quote({ tokens: 500n * 10n ** 18n });
-    expect(calls[1]!.url.searchParams.get('tokens')).toBe('500000000000000000000');
+    expect(byUsd.tokens).toBe(500_000_000n);
+    expect(byUsd.pricePointId).toBe(7);
+    await api.quote({ tokens: 500_000_000n });
+    expect(calls[1]!.url.searchParams.get('tokens')).toBe('500000000');
     await expect(api.quote({})).rejects.toMatchObject({ code: 'invalid_request', status: 400 });
     await expect(api.quote({ tokens: 1n, usdMicro: 1n })).rejects.toBeInstanceOf(BeagleApiError);
     expect(calls.length).toBe(2);
@@ -286,13 +339,62 @@ describe('createRestBeagleApi', () => {
     expect(calls.map((c) => c.url.search).sort()).toEqual(['', '']);
   });
 
-  it('GET /api/budgets', async () => {
+  it('GET /api/budgets (keyed by token account)', async () => {
     const { fetch, calls } = stub(() => json([budgetWire]));
     const api = createRestBeagleApi({ baseUrl: BASE, apiKey: KEY, fetch });
     const budgets = await api.budgets();
     expect(calls[0]!.url.pathname).toBe('/api/budgets');
-    expect(budgets[0]!.cap).toBe(500n * 10n ** 18n);
+    expect(budgets[0]!.tokenAccount).toBe(AGENT_ATA);
+    expect(budgets[0]!.delegate).toBe(OPERATOR);
+    expect(budgets[0]!.cap).toBe(500_000_000n);
     expect(budgets[0]!.headroomMicro).toBe(5_000_000n);
+  });
+
+  it('POST /api/budgets/register { tokenAccount, workspace? } and maps not_delegated', async () => {
+    const { fetch, calls } = stub(() => json({ ...budgetWire, workspace: OTHER_WORKSPACE }, { status: 201 }));
+    const api = createRestBeagleApi({ baseUrl: BASE, apiKey: KEY, fetch });
+    const budget = await api.registerBudget({ tokenAccount: AGENT_ATA, workspace: OTHER_WORKSPACE });
+    expect(calls[0]!.url.pathname).toBe('/api/budgets/register');
+    expect(calls[0]!.method).toBe('POST');
+    expect(calls[0]!.body).toEqual({ tokenAccount: AGENT_ATA, workspace: OTHER_WORKSPACE });
+    expect(budget.workspace).toBe(OTHER_WORKSPACE);
+    await api.registerBudget({ tokenAccount: AGENT_ATA });
+    expect(calls[1]!.body).toEqual({ tokenAccount: AGENT_ATA });
+
+    const rejected = createRestBeagleApi({ baseUrl: BASE, apiKey: KEY, fetch: stub(() => json({ error: { code: 'not_delegated', message: 'no delegation to the operator' } }, { status: 400 })).fetch });
+    await expect(rejected.registerBudget({ tokenAccount: AGENT_ATA })).rejects.toMatchObject({ status: 400, code: 'not_delegated' });
+  });
+
+  it('GET /api/price and /api/price/history?limit', async () => {
+    const { fetch, calls } = stub((req) => (req.url.pathname === '/api/price' ? json({ ...priceWire, stale: true }) : json([priceWire, { ...priceWire, pricePointId: 6, observedAt: 1_759_990_000 }])));
+    const api = createRestBeagleApi({ baseUrl: BASE, apiKey: KEY, fetch });
+    const price = await api.price();
+    expect(calls[0]!.url.pathname).toBe('/api/price');
+    expect(price.stale).toBe(true);
+    expect(price.priceE18).toBe(10n ** 16n);
+    expect(price.observedAt).toBe(1_760_000_000);
+    const history = await api.priceHistory({ limit: 2 });
+    expect(calls[1]!.url.pathname).toBe('/api/price/history');
+    expect(calls[1]!.url.searchParams.get('limit')).toBe('2');
+    expect(history.map((p) => p.pricePointId)).toEqual([7, 6]);
+    await api.priceHistory();
+    expect(calls[2]!.url.search).toBe('');
+  });
+
+  it('GET /api/receipts?limit&before parses credit events', async () => {
+    const { fetch, calls } = stub(() => json({ rows: [receiptWire], nextBefore: 1_759_999_000 }));
+    const api = createRestBeagleApi({ baseUrl: BASE, apiKey: KEY, fetch });
+    const page = await api.receipts({ limit: 5, before: 1_760_000_100 });
+    expect(calls[0]!.url.pathname).toBe('/api/receipts');
+    expect(calls[0]!.url.searchParams.get('limit')).toBe('5');
+    expect(calls[0]!.url.searchParams.get('before')).toBe('1760000100');
+    expect(page.nextBefore).toBe(1_759_999_000);
+    expect(page.rows[0]!.signature).toBe(SIG);
+    expect(page.rows[0]!.usdMicro).toBe(5_000_000n);
+    expect(page.rows[0]!.tokenAmount).toBe(500_000_000n);
+    expect(page.rows[0]!.pricePointId).toBe(7);
+    await api.receipts();
+    expect(calls[1]!.url.search).toBe('');
   });
 
   it('POST /api/upgrades { kind, quantity }', async () => {
@@ -311,7 +413,12 @@ describe('createRestBeagleApi', () => {
     const status = await api.status();
     const config = await api.config();
     expect(calls.map((c) => c.url.pathname)).toEqual(['/api/status', '/api/config']);
+    expect(status.cluster).toBe('devnet');
     expect(status.providers.google?.state).toBe('down');
+    expect(status.operator.solBalance).toBe(1_500_000_000n);
+    expect(config.mint).toBe(MINT);
+    expect(config.operator).toBe(OPERATOR);
+    expect(config.minCreditMicro).toBe(1_000n);
     expect(config.pro.priceMicro).toBe(20_000_000n);
     expect(config.warmHourPriceMicro).toBe(2_000_000n);
   });
@@ -333,6 +440,10 @@ describe('createRestBeagleApi', () => {
     const error = await api3.balance().catch((e: unknown) => e);
     expect(error).toMatchObject({ status: 200, code: 'invalid_response' });
     expect((error as Error).message).toMatch(/GET \/api\/balance/);
+
+    // an EVM-shaped budget (no tokenAccount) is rejected rather than leaking into the tools
+    const api4 = createRestBeagleApi({ baseUrl: BASE, apiKey: KEY, fetch: stub(() => json([{ budgetId: 3, owner: WS, cap: '1' }])).fetch });
+    await expect(api4.budgets()).rejects.toMatchObject({ code: 'invalid_response' });
   });
 
   it('maps thrown fetch errors to network_error / timeout with status 0', async () => {

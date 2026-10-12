@@ -1,7 +1,6 @@
-import { createRoot } from 'react-dom/client';
-import { App } from './App.jsx';
-import './styles.css';
+// The Buffer polyfill must be installed before `@solana/web3.js` (or anything importing it) loads.
+import { Buffer } from 'buffer';
+globalThis.Buffer ??= Buffer;
 
-const root = document.getElementById('root');
-if (root === null) throw new Error('#root not found');
-createRoot(root).render(<App />);
+const { bootstrap } = await import('./bootstrap.js');
+bootstrap();

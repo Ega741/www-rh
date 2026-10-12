@@ -1,18 +1,20 @@
 /**
- * Session state: restore via `GET /api/me`, SIWE sign-in (`nonce → createSiweMessage →
- * signMessage → verify`), logout. Exposed through a context so the whole app shares one query.
+ * Session state: restore via `GET /api/me`, SIWS sign-in (`nonce → createSiwsMessage →
+ * signMessage → verify`, SPEC §5.3), logout. Exposed through a context so the whole app shares
+ * one query. Wallets without `signMessage` but with the wallet-standard `signIn` feature sign
+ * the same fields rendered by the wallet; the gateway accepts that text too.
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useConnection, useSignMessage } from 'wagmi';
+import { useWallet } from '@solana/wallet-adapter-react';
 import type { MeDto } from '@beagle/shared/api';
 import { api, isApiError, sessionToken } from '../api.js';
-import { config, publicGatewayUrl } from '../config.js';
-import { describeError } from '../lib/errors.js';
+import { config, pageOrigin } from '../config.js';
+import { WalletUnavailableError, describeError } from '../lib/errors.js';
 import { sessionStatus, shouldResetWorkspaceCache, signInBlocker, walletMismatch, type SessionStatus, type SignInPhase } from '../lib/session.js';
-import { buildSiweMessage } from '../lib/siwe.js';
+import { buildSiwsMessage, encodeSignature, messageBytes, messageText, siwsSignInInput } from '../lib/siws.js';
 import { clearWorkspaceQueries, qk } from '../queries.js';
-import { useToast } from './useToast.js';
+import { useToast } from './useToast.jsx';
 
 /** What {@link useSession} returns. */
 export interface Session {
@@ -24,6 +26,8 @@ export interface Session {
   phase: SignInPhase;
   /** Why sign-in is unavailable right now (undefined = can sign in). */
   blocker: string | undefined;
+  /** The connected wallet (base58), if any. */
+  wallet: string | undefined;
   /** The connected wallet differs from the signed-in workspace. */
   walletMismatch: boolean;
   signIn(): Promise<void>;
@@ -33,12 +37,12 @@ export interface Session {
 
 const SessionContext = createContext<Session | undefined>(undefined);
 
-/** Provides {@link useSession}. Must sit inside Wagmi, Query and Toast providers. */
+/** Provides {@link useSession}. Must sit inside the wallet, Query and Toast providers. */
 export function SessionProvider({ children }: { children: ReactNode }) {
   const client = useQueryClient();
   const toast = useToast();
-  const { address, isConnected } = useConnection();
-  const { mutateAsync: signMessageAsync } = useSignMessage();
+  const { publicKey, connected, signMessage, signIn: walletSignIn } = useWallet();
+  const address = publicKey?.toBase58();
   const [phase, setPhase] = useState<SignInPhase>('idle');
 
   const meQuery = useQuery({
@@ -66,7 +70,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }, [meWorkspace]);
 
   const signIn = useCallback(async () => {
-    if (!isConnected || address === undefined) {
+    if (!connected || address === undefined) {
       toast.push({ kind: 'warning', title: 'Connect a wallet first' });
       return;
     }
@@ -74,17 +78,21 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       setPhase('nonce');
       const { nonce } = await api.nonce();
       setPhase('signing');
-      const message = buildSiweMessage({
-        address,
-        chainId: config.chainId,
-        nonce,
-        gatewayUrl: config.gatewayUrl,
-        pageOrigin: publicGatewayUrl(),
-        now: new Date(),
-      });
-      const signature = await signMessageAsync({ message });
+      const input = { address, cluster: config.cluster, nonce, gatewayUrl: config.gatewayUrl, pageOrigin: pageOrigin(), now: new Date() };
+      let message: string;
+      let signature: string;
+      if (signMessage !== undefined) {
+        message = buildSiwsMessage(input);
+        signature = encodeSignature(await signMessage(messageBytes(message)));
+      } else if (walletSignIn !== undefined) {
+        const out = await walletSignIn(siwsSignInInput(input));
+        message = messageText(out.signedMessage);
+        signature = encodeSignature(out.signature);
+      } else {
+        throw new WalletUnavailableError('This wallet cannot sign messages');
+      }
       setPhase('verifying');
-      const { token, workspace } = await api.verify(message, signature);
+      const { token, workspace } = await api.verify(message, signature, address);
       if (token !== '') sessionToken.set(token);
       if (shouldResetWorkspaceCache(lastWorkspace.current, workspace)) clearWorkspaceQueries(client);
       await client.invalidateQueries({ queryKey: qk.me });
@@ -94,7 +102,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     } finally {
       setPhase('idle');
     }
-  }, [address, isConnected, signMessageAsync, client, toast]);
+  }, [address, connected, signMessage, walletSignIn, client, toast]);
 
   const signOut = useCallback(async () => {
     try {
@@ -112,6 +120,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     await client.invalidateQueries({ queryKey: qk.me });
   }, [client]);
 
+  const canSign = signMessage !== undefined || walletSignIn !== undefined;
   const value = useMemo<Session>(() => {
     const me = meQuery.data ?? undefined;
     return {
@@ -119,13 +128,14 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       me,
       restoreError: meQuery.isError ? describeError(meQuery.error) : undefined,
       phase,
-      blocker: signInBlocker({ connected: isConnected, hasAddress: address !== undefined, phase }),
+      blocker: signInBlocker({ connected, hasAddress: address !== undefined, canSign, phase }),
+      wallet: address,
       walletMismatch: walletMismatch(me?.workspace, address),
       signIn,
       signOut,
       refresh,
     };
-  }, [meQuery.data, meQuery.isPending, meQuery.isError, meQuery.error, phase, isConnected, address, signIn, signOut, refresh]);
+  }, [meQuery.data, meQuery.isPending, meQuery.isError, meQuery.error, phase, connected, address, canSign, signIn, signOut, refresh]);
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
 }

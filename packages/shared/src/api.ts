@@ -1,13 +1,18 @@
 /**
- * Dashboard API DTOs (SPEC §4.8, §5.9) as zod v4 schemas with inferred types.
+ * Dashboard API DTOs (SPEC §4.8, §5.4, §5.9) as zod v4 schemas with inferred types.
  *
  * Monetary fields travel as decimal strings in JSON (`"amountMicro": "2500000"`) and parse to
- * `bigint`. For every `XDtoSchema` there are two types: `XDto` (parsed, bigint) and `XDtoWire`
- * (what the gateway serializes, strings). Use {@link serializeMicro} when building wire objects.
+ * `bigint`; so do raw token amounts and `priceE18`. For every `XDtoSchema` there are two types:
+ * `XDto` (parsed, bigint) and `XDtoWire` (what the gateway serializes, strings). Use
+ * {@link serializeMicro} when building wire objects.
  *
- * Timestamps: off-chain `*At` fields are unix **milliseconds**; fields mirroring on-chain values
- * (`PriceDto.updatedAt`, `QuoteDto.updatedAt`, `BudgetDto.deadline`, `CreditEventDto.blockTime`)
- * are unix **seconds**, as on chain.
+ * Identifiers: workspaces, owners, mints, token accounts and the operator are base58 public keys
+ * ({@link AddressSchema}); transactions are base58 signatures ({@link SignatureSchema}); receipt
+ * hashes are `0x` + 64 hex ({@link Bytes32Schema}).
+ *
+ * Timestamps: off-chain `*At` fields (`createdAt`, `registeredAt`, `lastEventAt`, …) are unix
+ * **milliseconds**; fields that mirror chain time (`blockTime`) and the price history
+ * (`PriceDto.observedAt`, compared with `maxAgeS`) are unix **seconds**.
  *
  * @module api
  */
@@ -21,24 +26,33 @@ import {
   PROVIDERS,
   TIER_ORDER,
 } from './models.js';
+import { Base58PubkeySchema, ClusterSchema, SignatureSchema, isBase58Signature } from './solana.js';
+
+export { Base58PubkeySchema, ClusterSchema, SignatureSchema };
 
 // ---------------------------------------------------------------------------------------------
 // Primitives
 
 /** Decimal integer string ↔ bigint (µUSD and other money; may be negative). */
 export const MicroSchema = z.string().regex(/^-?\d+$/, 'expected a decimal integer string').transform((s) => BigInt(s));
-/** Non-negative decimal integer string ↔ bigint (token amounts, `priceE18`, ids). */
+/** Non-negative decimal integer string ↔ bigint (token amounts, `priceE18`). */
 export const UintStringSchema = z.string().regex(/^\d+$/, 'expected a non-negative decimal integer string').transform((s) => BigInt(s));
-/** `0x` + 40 hex characters (any case). */
-export const AddressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'expected an address');
-/** `0x` + 64 hex characters (tx hash, block hash, receipt hash). */
+/** A base58 public key: workspace, owner, mint, token account, operator. */
+export const AddressSchema = Base58PubkeySchema;
+/** `0x` + 64 hex characters (receipt hash). */
 export const Bytes32Schema = z.string().regex(/^0x[0-9a-fA-F]{64}$/, 'expected a 32-byte hex string');
-/** Any `0x`-prefixed hex string. */
-export const HexSchema = z.string().regex(/^0x[0-9a-fA-F]*$/, 'expected a hex string');
 /** Non-negative integer. */
 export const UintSchema = z.number().int().nonnegative();
 /** Integer (timestamps may legitimately be any integer). */
 export const IntSchema = z.number().int();
+
+const BASE64_SIGNATURE_RE = /^[A-Za-z0-9+/]{86}==$/;
+/** `true` when `value` is a 64-byte signature in base58 (87–88 chars) or standard base64 (88 chars). */
+export function isSignatureInput(value: unknown): value is string {
+  return typeof value === 'string' && (BASE64_SIGNATURE_RE.test(value) || isBase58Signature(value));
+}
+/** A detached Ed25519 signature as sent by clients: base58 or base64 (SPEC §5.3). */
+export const SignatureInputSchema = z.string().refine(isSignatureInput, { message: 'expected a 64-byte signature in base58 or base64' });
 
 export const PlanSchema = z.enum(PLANS);
 export const ProviderSchema = z.enum(PROVIDERS);
@@ -52,9 +66,12 @@ export const UsageStatusSchema = z.enum(['ok', 'error']);
 export const LedgerKindSchema = z.enum(['credit', 'debit', 'adjustment', 'upgrade']);
 export const CreditEventKindSchema = z.enum(['purchase', 'draw']);
 export const BudgetDrawStatusSchema = z.enum(['pending', 'sent', 'confirmed', 'failed']);
-export const BudgetStalledReasonSchema = z.enum(['price', 'allowance', 'draw_failed']);
+/** Why a budget is not drawable right now (SPEC §5.4). */
+export const BudgetStalledReasonSchema = z.enum(['price', 'revoked', 'exhausted', 'draw_failed']);
 export const UpgradeKindSchema = z.enum(['pro', 'warm']);
-export const PriceSourceKindSchema = z.enum(['manual', 'chainlink', 'unknown']);
+/** Where a price point came from (SPEC §3.3). */
+export const PriceSourceSchema = z.enum(['manual', 'feed', 'jupiter']);
+export type PriceSource = z.output<typeof PriceSourceSchema>;
 
 /** Serializes a bigint money/amount field for the wire. */
 export function serializeMicro(value: bigint): string {
@@ -64,27 +81,40 @@ export function serializeMicro(value: bigint): string {
 // ---------------------------------------------------------------------------------------------
 // Public routes
 
-/** `GET /api/price`. `updatedAt` is unix seconds (on-chain). */
+/** `GET /api/price`: the current price point. `observedAt` is unix seconds; `stale = now − observedAt > maxAgeS`. */
 export const PriceDtoSchema = z.object({
+  /** `price_points.id` — every credit event references the point it was priced with. */
+  pricePointId: UintSchema,
   priceE18: UintStringSchema,
-  updatedAt: UintSchema,
+  observedAt: IntSchema,
   stale: z.boolean(),
+  source: PriceSourceSchema,
+  /** `PRICE_MAX_AGE_S`. */
+  maxAgeS: UintSchema,
   /** Human decimal, e.g. `"0.0025"`. */
   usdPerToken: z.string(),
   /** Human decimal, e.g. `"400"`. */
   tokensPerUsd: z.string(),
-  source: PriceSourceKindSchema,
-  maxPriceAge: UintSchema,
 });
 export type PriceDto = z.output<typeof PriceDtoSchema>;
 export type PriceDtoWire = z.input<typeof PriceDtoSchema>;
 
-/** `GET /api/quote?tokens=|usdMicro=`. `updatedAt` is unix seconds. */
+/** `GET /api/price/history`: points, newest first (a bare array). */
+export const PriceHistoryDtoSchema = z.array(PriceDtoSchema);
+export type PriceHistoryDto = z.output<typeof PriceHistoryDtoSchema>;
+export type PriceHistoryDtoWire = z.input<typeof PriceHistoryDtoSchema>;
+
+/** Query of `GET /api/price/history`. */
+export const PriceHistoryQuerySchema = z.object({ limit: z.coerce.number().int().min(1).max(1000).default(100) });
+export type PriceHistoryQuery = z.output<typeof PriceHistoryQuerySchema>;
+
+/** `GET /api/quote?tokens=|usdMicro=`: both sides of the conversion at the current price point. */
 export const QuoteDtoSchema = z.object({
   tokens: UintStringSchema,
   usdMicro: UintStringSchema,
   priceE18: UintStringSchema,
-  updatedAt: UintSchema,
+  pricePointId: UintSchema,
+  stale: z.boolean(),
 });
 export type QuoteDto = z.output<typeof QuoteDtoSchema>;
 export type QuoteDtoWire = z.input<typeof QuoteDtoSchema>;
@@ -97,20 +127,22 @@ export const QuoteQuerySchema = z
   });
 export type QuoteQuery = z.output<typeof QuoteQuerySchema>;
 
-/** Credit token summary used by status and config. */
+/** The credit token (SPEC §3.1), used by status. */
 export const TokenInfoDtoSchema = z.object({
-  address: AddressSchema,
+  mint: AddressSchema,
   symbol: z.string(),
   decimals: UintSchema,
-  nativeBurn: z.boolean(),
+  tokenProgram: AddressSchema,
 });
 export type TokenInfoDto = z.output<typeof TokenInfoDtoSchema>;
 
-/** Indexer progress (SPEC §5.4). */
+/** Indexer progress (SPEC §5.4); `lastSignature` / `lastSlot` are null before the first run. */
 export const IndexerStatusDtoSchema = z.object({
-  lastBlock: IntSchema,
-  head: IntSchema,
-  lagBlocks: IntSchema,
+  lastSignature: SignatureSchema.nullable(),
+  lastSlot: UintSchema.nullable(),
+  headSlot: UintSchema,
+  lagSlots: IntSchema,
+  /** Unix milliseconds of the last credit event applied, or null. */
   lastEventAt: IntSchema.nullable(),
 });
 export type IndexerStatusDto = z.output<typeof IndexerStatusDtoSchema>;
@@ -119,15 +151,25 @@ export type IndexerStatusDto = z.output<typeof IndexerStatusDtoSchema>;
 export const ProviderStatusDtoSchema = z.object({ state: ProviderHealthStateSchema, configured: z.boolean() });
 export type ProviderStatusDto = z.output<typeof ProviderStatusDtoSchema>;
 
+/** Operator (hot wallet) status; `solBalance` is lamports as a decimal string, present when known. */
+export const OperatorStatusDtoSchema = z.object({
+  address: AddressSchema.nullable(),
+  enabled: z.boolean(),
+  dryRun: z.boolean(),
+  solBalance: UintStringSchema.optional(),
+});
+export type OperatorStatusDto = z.output<typeof OperatorStatusDtoSchema>;
+
 /** `GET /api/status`. */
 export const StatusDtoSchema = z.object({
-  chainId: UintSchema,
-  creditDesk: AddressSchema.nullable(),
-  token: TokenInfoDtoSchema.nullable(),
+  cluster: ClusterSchema,
+  mint: AddressSchema,
+  token: TokenInfoDtoSchema,
   indexer: IndexerStatusDtoSchema,
+  price: PriceDtoSchema,
   providers: z.record(ProviderSchema, ProviderStatusDtoSchema),
   house: z.object({ enabled: z.boolean(), warmUntil: IntSchema.nullable(), largeModel: z.string() }),
-  operator: z.object({ enabled: z.boolean(), dryRun: z.boolean() }),
+  operator: OperatorStatusDtoSchema,
   version: z.string(),
 });
 export type StatusDto = z.output<typeof StatusDtoSchema>;
@@ -136,17 +178,25 @@ export type StatusDtoWire = z.input<typeof StatusDtoSchema>;
 /** Pro plan pricing. */
 export const ProPriceDtoSchema = z.object({ priceMicro: MicroSchema, days: UintSchema });
 
-/** `GET /api/config`. */
+/** `GET /api/config`: what a client needs to build burns and budgets (the web reconciles it with the committed deployment). */
 export const ConfigDtoSchema = z.object({
-  chainId: UintSchema,
-  creditDesk: AddressSchema.nullable(),
-  token: TokenInfoDtoSchema.nullable(),
-  priceSource: AddressSchema.nullable(),
-  /** Explorer base URL, or null (anvil). */
-  explorer: z.string().nullable(),
+  cluster: ClusterSchema,
+  /** Public RPC endpoint the gateway suggests to clients (never one carrying a secret). */
+  rpcUrl: z.string(),
+  mint: AddressSchema,
+  decimals: UintSchema,
+  symbol: z.string(),
+  tokenProgram: AddressSchema,
+  memoProgram: AddressSchema,
+  /** The delegate of every budget; null while draws are disabled (no operator key). */
+  operator: AddressSchema.nullable(),
+  /** Explorer base URL (`https://explorer.solana.com`); build links with `explorerTxUrl(cluster, …)`. */
+  explorer: z.string(),
   aliases: z.array(z.string()),
   markupBps: UintSchema,
   byokFeeBps: UintSchema,
+  /** `MIN_CREDIT_USD` in µUSD: burns quoting below it earn no credit (SPEC §3.2). */
+  minCreditMicro: MicroSchema,
   pro: ProPriceDtoSchema,
   warmHourPriceMicro: MicroSchema,
 });
@@ -186,8 +236,12 @@ export type HealthzDto = z.output<typeof HealthzDtoSchema>;
 export const NonceDtoSchema = z.object({ nonce: z.string().min(8) });
 export type NonceDto = z.output<typeof NonceDtoSchema>;
 
-/** Body of `POST /api/auth/verify`. */
-export const VerifyRequestSchema = z.object({ message: z.string().min(1), signature: HexSchema });
+/** Body of `POST /api/auth/verify` (SPEC §5.3): the exact signed text, its signature, the signer. */
+export const VerifyRequestSchema = z.object({
+  message: z.string().min(1).max(4096),
+  signature: SignatureInputSchema,
+  publicKey: AddressSchema,
+});
 export type VerifyRequest = z.output<typeof VerifyRequestSchema>;
 
 /** `POST /api/auth/verify`. */
@@ -333,25 +387,32 @@ export const LedgerListDtoSchema = z.object({ rows: z.array(LedgerRowDtoSchema),
 export type LedgerListDto = z.output<typeof LedgerListDtoSchema>;
 export type LedgerListDtoWire = z.input<typeof LedgerListDtoSchema>;
 
-/** One indexed `CreditPurchased` / `BudgetDrawn` event with explorer link (`GET /api/receipts`). */
+/**
+ * One indexed burn (`credit_events` row, SPEC §3.2, §5.9): a purchase or an operator draw, with
+ * the price point it was credited at. Event id = `<signature>:<ixIndex>`.
+ */
 export const CreditEventDtoSchema = z.object({
-  txHash: Bytes32Schema,
-  logIndex: UintSchema,
+  signature: SignatureSchema,
+  /** Index of the burn instruction within the transaction (top-level and inner, in order). */
+  ixIndex: UintSchema,
+  slot: UintSchema,
+  /** Unix seconds; null when the RPC reported no block time. */
+  blockTime: IntSchema.nullable(),
   kind: CreditEventKindSchema,
-  receiptId: UintSchema,
   workspace: AddressSchema,
-  /** `msg.sender` of the purchase; null for budget draws. */
+  /** Owner of the burned token account (null only when the account could not be resolved). */
   payer: AddressSchema.nullable(),
+  tokenAccount: AddressSchema,
   tokenAmount: UintStringSchema,
   usdMicro: MicroSchema,
   priceE18: UintStringSchema,
-  budgetId: UintSchema.nullable(),
+  pricePointId: UintSchema.nullable(),
+  priceStale: z.boolean(),
+  /** The first memo of the transaction, verbatim, or null. */
+  memo: z.string().nullable(),
+  /** Draws: the `DrawBatch` hash from the memo; purchases: null. */
   receiptHash: Bytes32Schema.nullable(),
-  blockNumber: UintSchema,
-  blockHash: Bytes32Schema,
-  /** Unix seconds (block timestamp). */
-  blockTime: UintSchema,
-  explorerTxUrl: z.string().nullable(),
+  explorerUrl: z.string().nullable(),
 });
 export type CreditEventDto = z.output<typeof CreditEventDtoSchema>;
 export type CreditEventDtoWire = z.input<typeof CreditEventDtoSchema>;
@@ -359,6 +420,7 @@ export type CreditEventDtoWire = z.input<typeof CreditEventDtoSchema>;
 /** `GET /api/receipts`. */
 export const CreditEventListDtoSchema = z.object({ rows: z.array(CreditEventDtoSchema), nextBefore: IntSchema.nullable() });
 export type CreditEventListDto = z.output<typeof CreditEventListDtoSchema>;
+export type CreditEventListDtoWire = z.input<typeof CreditEventListDtoSchema>;
 
 /** Token counts of one request (all four fields present in receipts). */
 export const UsageTokensSchema = z.object({
@@ -371,8 +433,7 @@ export type UsageTokensDto = z.output<typeof UsageTokensSchema>;
 
 /**
  * The verifiable usage receipt (SPEC §5.7). `hash = receiptHash(receipt)` over exactly these
- * fields; `workspace` is the lowercase workspace id. Hashing the parsed (bigint) and the wire
- * (string) form gives the same digest.
+ * fields. Hashing the parsed (bigint) and the wire (string) form gives the same digest.
  */
 export const UsageReceiptSchema = z.object({
   v: z.literal(1),
@@ -403,16 +464,20 @@ export const ReceiptDtoSchema = z.object({ receipt: UsageReceiptSchema, hash: By
 export type ReceiptDto = z.output<typeof ReceiptDtoSchema>;
 export type ReceiptDtoWire = z.input<typeof ReceiptDtoSchema>;
 
-/** The batch a budget draw settles (SPEC §5.4); `receiptHash(batch)` is passed to `desk.draw`. */
+/**
+ * The batch a budget draw settles (SPEC §5.4); `receiptHash(batch)` goes into the draw memo
+ * (`beagle:draw v1 ws=<workspace> h=<hash>`) and the indexer confirms the draw by it.
+ */
 export const DrawBatchSchema = z.object({
   v: z.literal(1),
-  chainId: UintSchema,
-  desk: AddressSchema,
-  budgetId: UintSchema,
+  cluster: ClusterSchema,
+  mint: AddressSchema,
+  tokenAccount: AddressSchema,
   workspace: AddressSchema,
   usageIds: z.array(z.string()),
   amountMicro: MicroSchema,
   priceE18: UintStringSchema,
+  pricePointId: UintSchema,
 });
 export type DrawBatch = z.output<typeof DrawBatchSchema>;
 export type DrawBatchWire = z.input<typeof DrawBatchSchema>;
@@ -447,18 +512,19 @@ export const ProviderTestDtoSchema = z.object({ ok: z.boolean(), model: z.string
 export type ProviderTestDto = z.output<typeof ProviderTestDtoSchema>;
 
 // ---------------------------------------------------------------------------------------------
-// Budgets
+// Budgets (SPL delegation, SPEC §3.4)
 
-/** One `budget_draws` row. */
+/** One `budget_draws` row: an operator delegate burn settling `usageIds`. */
 export const BudgetDrawDtoSchema = z.object({
   id: UintSchema,
-  budgetId: UintSchema,
+  tokenAccount: AddressSchema,
   workspace: AddressSchema,
   tokenAmount: UintStringSchema,
   usdMicro: MicroSchema,
   receiptHash: Bytes32Schema,
   usageIds: z.array(z.string()),
-  txHash: Bytes32Schema.nullable(),
+  /** Set once the draw transaction was sent. */
+  signature: SignatureSchema.nullable(),
   status: BudgetDrawStatusSchema,
   error: z.string().nullable(),
   createdAt: IntSchema,
@@ -467,24 +533,31 @@ export const BudgetDrawDtoSchema = z.object({
 export type BudgetDrawDto = z.output<typeof BudgetDrawDtoSchema>;
 export type BudgetDrawDtoWire = z.input<typeof BudgetDrawDtoSchema>;
 
-/** `GET /api/budgets/:id/draws`: a bare array (SPEC §5.9). */
+/** `GET /api/budgets/:tokenAccount/draws`: a bare array (SPEC §5.9). */
 export const BudgetDrawListDtoSchema = z.array(BudgetDrawDtoSchema);
 export type BudgetDrawListDto = z.output<typeof BudgetDrawListDtoSchema>;
 export type BudgetDrawListDtoWire = z.input<typeof BudgetDrawListDtoSchema>;
 
-/** `GET /api/budgets[/:id]`. `deadline` is unix seconds (on-chain). */
+/**
+ * `GET /api/budgets[/:tokenAccount]`. Budget id = the token account; `cap` = `delegatedAmount`,
+ * `balance` = the account's token amount, `headroomTokens = delegate == operator ?
+ * min(cap, balance) : 0`, `headroomMicro` at the current price (0 while the price is stale).
+ */
 export const BudgetDtoSchema = z.object({
-  budgetId: UintSchema,
+  tokenAccount: AddressSchema,
   owner: AddressSchema,
   workspace: AddressSchema,
+  /** The account's current delegate (the operator while open; null / another key once revoked). */
+  delegate: AddressSchema.nullable(),
   cap: UintStringSchema,
-  drawn: UintStringSchema,
-  remainingCap: UintStringSchema,
+  balance: UintStringSchema,
   headroomTokens: UintStringSchema,
   headroomMicro: MicroSchema,
-  deadline: UintSchema,
   closed: z.boolean(),
   stalledReason: BudgetStalledReasonSchema.nullable(),
+  /** Unix milliseconds of `POST /api/budgets/register`, or null when the scanner found it. */
+  registeredAt: IntSchema.nullable(),
+  lastSeenSlot: UintSchema.nullable(),
   draws: z.array(BudgetDrawDtoSchema),
 });
 export type BudgetDto = z.output<typeof BudgetDtoSchema>;
@@ -494,6 +567,13 @@ export type BudgetDtoWire = z.input<typeof BudgetDtoSchema>;
 export const BudgetListDtoSchema = z.array(BudgetDtoSchema);
 export type BudgetListDto = z.output<typeof BudgetListDtoSchema>;
 export type BudgetListDtoWire = z.input<typeof BudgetListDtoSchema>;
+
+/** Body of `POST /api/budgets/register`: the delegated token account; `workspace` to fund another workspace. */
+export const RegisterBudgetRequestSchema = z.object({
+  tokenAccount: AddressSchema,
+  workspace: AddressSchema.optional(),
+});
+export type RegisterBudgetRequest = z.output<typeof RegisterBudgetRequestSchema>;
 
 // ---------------------------------------------------------------------------------------------
 // Upgrades
@@ -540,7 +620,7 @@ export const AdminCreditRequestSchema = z.object({
 });
 export type AdminCreditRequest = z.output<typeof AdminCreditRequestSchema>;
 
-/** Body of `POST /api/admin/price`. */
+/** Body of `POST /api/admin/price` (a manual price point, SPEC §3.3). */
 export const AdminPriceRequestSchema = z.object({ priceE18: UintStringSchema });
 export type AdminPriceRequest = z.output<typeof AdminPriceRequestSchema>;
 

@@ -5,7 +5,7 @@ import { billableUsage, maxTokensWithinBound } from '../src/router/execute.js';
 import { HEALTH_OPEN_MS, HealthStore } from '../src/router/health.js';
 import { networkError, ProviderError, type ProviderAdapter } from '../src/providers/types.js';
 import type { InternalChunk, InternalRequestBase } from '../src/translate/internal.js';
-import { jsonRequest, makeHarness, parseSse, WS1, WS2, type Harness } from './helpers.js';
+import { ATA1, jsonRequest, makeHarness, OPERATOR, parseSse, WS1, WS2, type Harness } from './helpers.js';
 
 const BASE: InternalRequestBase = { messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }], maxTokens: 16, stream: false };
 
@@ -407,8 +407,8 @@ describe('client disconnects, BYOK failures and provider health', () => {
     const key = h.key(WS1);
     const nowMs = h.services.now();
     h.services.repos.workspaces.ensure(WS1, nowMs);
-    h.services.repos.budgets.upsertOpened({ budgetId: 1, owner: WS1, workspace: WS1, cap: 10n ** 24n, deadline: Math.floor(nowMs / 1000) + 7200, openedBlock: 1, now: nowMs });
-    h.services.repos.budgets.setHeadroom(1, 10n ** 24n, 5_000_000n, null, nowMs);
+    h.services.repos.budgets.upsert({ tokenAccount: ATA1, owner: WS1, delegate: OPERATOR, cap: 10n ** 12n, balance: 10n ** 12n, now: nowMs });
+    h.services.repos.budgets.setHeadroom(ATA1, 10n ** 12n, 5_000_000n, null, nowMs);
     const body = { model: 'anthropic/claude-fable-5-1', max_tokens: 128_000, messages: [{ role: 'user', content: 'hello fable' }] };
     const res = await h.app.request(jsonRequest('POST', '/v1/chat/completions', body, { authorization: `Bearer ${key}` }));
     expect(res.status).toBe(200);

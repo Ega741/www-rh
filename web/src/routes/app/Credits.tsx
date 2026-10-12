@@ -1,97 +1,90 @@
 /**
- * `/app/credits`: amount in USD or tokens, live on-chain quote, wallet balance/allowance,
- * Approve → Burn with progress + explorer links, then poll `/api/receipts` and `/api/balance`
- * until the credit lands. The credit goes to the signed-in workspace by default (SPEC §7), even
- * when the connected wallet that pays the burn is another account.
- *
- * The burn goes through `burnForCreditMin(workspace, amount, minUsdMicro)` with the floor derived
- * from the live quote and the chosen price tolerance (default 1 %): a price post landing between
- * the quote and the transaction reverts `SlippageExceeded` instead of crediting less. The approve
- * is cumulative (`allowance + amount`) so open budgets of the wallet keep their allowance.
+ * `/app/credits`: amount in USD or tokens, live conversion at the published price (`/api/price`,
+ * refreshed every 15 s, disabled while stale), wallet token balance (the ATA, with a "no token
+ * account" state), one wallet confirmation (`BurnChecked` + optional memo naming another
+ * workspace), confirmation by blockhash / last valid block height, then polling `/api/receipts`
+ * and `/api/balance` until the indexer credits the burn (SPEC §3.2, §7). The credit goes to the
+ * signed-in workspace by default, even when the connected wallet that burns is another account.
  */
 import { useEffect, useRef, useState } from 'react';
-import { useConnection, usePublicClient, useWriteContract } from 'wagmi';
-import type { Hex } from 'viem';
-import { CREDIT_DESK_ABI, ERC20_ABI } from '@beagle/shared/abi';
+import { useQueryClient } from '@tanstack/react-query';
+import { useWallet } from '@solana/wallet-adapter-react';
 import { AmountInput } from '../../components/AmountInput.jsx';
 import { AddressText, TxLink } from '../../components/Hash.jsx';
 import { QueryGuard } from '../../components/QueryGuard.jsx';
 import { StepList } from '../../components/StepList.jsx';
-import { Badge, Button, Card, Field, Input, Note, PageHeader, Segmented, Skeleton, Stat, TableWrap } from '../../components/ui.jsx';
-import { config } from '../../config.js';
-import { useChainGuard } from '../../hooks/useChainGuard.js';
-import { useDesk } from '../../hooks/useDesk.js';
-import { useDeskParams, useQuote } from '../../hooks/useQuote.js';
+import { Badge, Button, Card, Field, Input, Note, PageHeader, Skeleton, Stat, TableWrap } from '../../components/ui.jsx';
+import { useDeployment } from '../../hooks/useDeployment.js';
 import { useSession } from '../../hooks/useSession.jsx';
 import { useToast } from '../../hooks/useToast.jsx';
-import { useTokenAccount } from '../../hooks/useTokenAccount.js';
+import { useInvalidateTokenAccounts, useTokenAccount } from '../../hooks/useTokenAccount.js';
 import { useTxFlow } from '../../hooks/useTxFlow.js';
 import { convertAmount, fmtPrice, fmtTokens, fmtUsd, parseAmount, type AmountMode } from '../../lib/amounts.js';
-import { sameAddress } from '../../lib/explorer.js';
+import { sameAddress, shortAddress } from '../../lib/explorer.js';
 import { IDLE_WATCH, WATCH_POLL_MS, observeBalance, observeEvents, restartWatch, startWatch, type WatchState } from '../../lib/poll.js';
 import { defaultTargetWorkspace } from '../../lib/session.js';
-import { DEFAULT_TOLERANCE_BPS, SHARED_ALLOWANCE_NOTE, TOLERANCE_CHOICES_BPS, TOLERANCE_HELP, approveLabel, describeBlocker, failedWith, formatBps, planBurn } from '../../lib/steps.js';
+import { describeBlocker, minCreditTokens, planBurn } from '../../lib/steps.js';
 import { ageSeconds, formatDuration, formatUnixSeconds } from '../../lib/time.js';
+import { buildPurchaseInstructions, purchaseMemoFor } from '../../lib/tx.js';
 import { parseAddressInput } from '../../lib/validate.js';
 import { invalidateBalances, useBalance, useCreditEvents, usePrice } from '../../queries.js';
-import { useQueryClient } from '@tanstack/react-query';
+
+/** The sentence every client shows (SPEC §3.2). */
+const OBSERVED_SENTENCE = 'Credit is computed from the published price when the gateway observes the burn.';
 
 /** Credits page. */
 export function Credits() {
   const session = useSession();
   const me = session.me;
-  const { address, isConnected } = useConnection();
-  const guard = useChainGuard();
+  const { publicKey, connected } = useWallet();
+  const address = publicKey?.toBase58();
   const toast = useToast();
   const client = useQueryClient();
-  const { desk, token, loading: deskLoading, error: deskError } = useDesk();
-  const decimals = token?.decimals ?? 18;
-  const symbol = token?.symbol ?? 'BEAGLE';
-  const params = useDeskParams(desk, token?.decimals);
+  const dep = useDeployment();
+  const { mint, decimals, symbol, tokenProgram, memoProgram, minCreditMicro } = dep;
   const apiPrice = usePrice();
+  const price = apiPrice.data;
+  const priceE18 = price === undefined || price.priceE18 <= 0n ? undefined : price.priceE18;
+  const priceStale = price?.stale === true;
+  const priceAvailable = priceE18 !== undefined;
 
   const [mode, setMode] = useState<AmountMode>('usd');
   const [input, setInput] = useState('');
   const [otherWorkspace, setOtherWorkspace] = useState(false);
   const [workspaceInput, setWorkspaceInput] = useState('');
-  const [toleranceBps, setToleranceBps] = useState<number>(DEFAULT_TOLERANCE_BPS);
 
   const parsed = parseAmount(input, mode, decimals);
-  const priceE18 = params.priceE18 ?? apiPrice.data?.priceE18;
   const converted = parsed.ok && priceE18 !== undefined ? convertAmount(mode, parsed.value, priceE18, decimals) : undefined;
   const tokens = converted?.tokens;
-  const quote = useQuote(desk, tokens);
-  const account = useTokenAccount(token?.address, address, desk);
+  const usdMicro = converted?.usdMicro;
+  const account = useTokenAccount(mint, address, tokenProgram);
+  const invalidateTokenAccounts = useInvalidateTokenAccounts();
 
   const defaultWorkspace = defaultTargetWorkspace(me?.workspace, address);
   const workspace = otherWorkspace ? parseAddressInput(workspaceInput) : defaultWorkspace;
   const creditsOwnWorkspace = workspace !== undefined && me !== undefined && sameAddress(workspace, me.workspace);
-
-  const priceStale = params.priceError === 'PriceStale' || quote.revert === 'PriceStale' || apiPrice.data?.stale === true;
-  const priceAvailable = params.priceError !== 'PriceUnavailable' && quote.revert !== 'PriceUnavailable' && (params.priceE18 !== undefined || params.loading || apiPrice.data !== undefined);
+  const memo = address !== undefined && workspace !== undefined ? purchaseMemoFor(address, workspace) : undefined;
 
   const plan = planBurn({
-    connected: isConnected,
-    rightChain: !guard.wrongChain,
-    deskKnown: desk !== undefined && token !== undefined,
-    paused: params.paused,
+    connected,
+    deploymentKnown: mint !== undefined,
+    configMismatch: dep.mismatch !== undefined,
     workspaceValid: workspace !== undefined,
+    accountKnown: account.settled,
+    hasTokenAccount: account.account?.exists === true,
+    balance: account.balance,
     amount: tokens,
-    usdMicro: quote.usdMicro,
-    toleranceBps,
+    usdMicro,
     priceAvailable,
     priceStale,
-    minBurn: params.minBurn,
-    balance: account.balance,
-    allowance: account.allowance,
+    minCreditMicro,
   });
-  const blockerCtx = { chainName: config.chain.name, ...(params.minBurn === undefined ? {} : { minBurnText: fmtTokens(params.minBurn, decimals, symbol) }) };
+  const minTokens = minCreditMicro === undefined ? undefined : minCreditTokens(minCreditMicro, priceE18, decimals);
+  const minCreditText = minCreditMicro === undefined ? undefined : `${fmtUsd(minCreditMicro, { maxFractionDigits: 6 })}${minTokens === undefined ? '' : ` ≈ ${fmtTokens(minTokens, decimals, symbol, 6)}`}`;
+  const blockerCtx = { symbol, minCreditText };
   const firstBlocker = plan.blockers[0];
 
   const flow = useTxFlow();
-  const write = useWriteContract();
-  const publicClient = usePublicClient({ chainId: config.chainId });
-  const slippage = failedWith(flow.state, 'SlippageExceeded');
   const [watch, setWatch] = useState<WatchState>(IDLE_WATCH);
   const watchRef = useRef(watch);
   watchRef.current = watch;
@@ -105,7 +98,7 @@ export function Credits() {
       toast.push({ kind: 'success', title: 'Credit landed', message: balance.data === undefined ? 'The ledger shows the purchase.' : `Balance is now ${fmtUsd(balance.data.balanceMicro)}` });
       void invalidateBalances(client);
     } else if (next.status === 'timeout') {
-      toast.push({ kind: 'warning', title: 'Still waiting for the indexer', message: 'The burn is confirmed on chain; the ledger will update once the indexer catches up.' });
+      toast.push({ kind: 'warning', title: 'Still waiting for the indexer', message: 'The burn is confirmed on chain; the ledger will update once the indexer observes it.' });
     }
   };
 
@@ -126,52 +119,37 @@ export function Credits() {
   }, [events.dataUpdatedAt]);
 
   const onBurn = async () => {
-    if (!plan.canRun || tokens === undefined || workspace === undefined || desk === undefined || token === undefined) return;
-    const expected = quote.usdMicro;
-    const minUsdMicro = plan.minUsdMicro;
-    // Both are set when `canRun`: `quote_pending` blocks without a quote, `allowance_unknown` without an allowance.
-    if (expected === undefined || minUsdMicro === undefined) return;
-    const approveAmount = plan.approveAmount ?? tokens;
+    const tokenAccount = account.address;
+    if (!plan.canRun || tokens === undefined || usdMicro === undefined || workspace === undefined || mint === undefined || address === undefined || tokenAccount === undefined) return;
+    const expected = usdMicro;
     const before = balance.data?.balanceMicro ?? me?.balanceMicro ?? 0n;
-    let burnHash: Hex | undefined;
     setWatch(IDLE_WATCH);
-    const ok = await flow.run([
-      {
-        id: 'approve',
-        label: approveLabel(approveAmount, account.allowance, tokens, decimals, symbol),
-        skip: !plan.needsApprove,
-        write: () => write.mutateAsync({ abi: ERC20_ABI, address: token.address, functionName: 'approve', args: [desk, approveAmount], chainId: config.chainId }),
-        onConfirmed: () => account.refetch(),
-      },
+    const signature = await flow.run([
       {
         id: 'burn',
-        label: `Burn ${fmtTokens(tokens, decimals, symbol)} for ${fmtUsd(expected)} of credit (floor ${fmtUsd(minUsdMicro)}, −${formatBps(toleranceBps)})`,
-        simulate: publicClient === undefined ? undefined : () => publicClient.simulateContract({ account: address, abi: CREDIT_DESK_ABI, address: desk, functionName: 'burnForCreditMin', args: [workspace, tokens, minUsdMicro] }),
-        write: async () => {
-          burnHash = await write.mutateAsync({ abi: CREDIT_DESK_ABI, address: desk, functionName: 'burnForCreditMin', args: [workspace, tokens, minUsdMicro], chainId: config.chainId });
-          return burnHash;
-        },
-        onConfirmed: () => Promise.all([account.refetch(), client.invalidateQueries({ queryKey: ['receipts'] })]),
+        label: `Burn ${fmtTokens(tokens, decimals, symbol)} ≈ ${fmtUsd(expected)} of credit${memo === undefined ? '' : ` for ${shortAddress(workspace)} (memo)`}`,
+        instructions: () => buildPurchaseInstructions({ tokenAccount, mint, owner: address, amount: tokens, decimals, tokenProgram, memoProgram, workspace }),
+        onConfirmed: () => Promise.all([invalidateTokenAccounts(), client.invalidateQueries({ queryKey: ['receipts'] })]),
       },
     ]);
-    if (ok) {
-      if (creditsOwnWorkspace) setWatch(startWatch(before, expected, burnHash));
-      else toast.push({ kind: 'success', title: 'Burn confirmed', message: 'The credited workspace will see the balance once the indexer processes the event.' });
+    if (signature !== undefined) {
+      if (creditsOwnWorkspace) setWatch(startWatch(before, expected, signature));
+      else toast.push({ kind: 'success', title: 'Burn confirmed', message: 'The credited workspace will see the balance once the indexer observes the burn.' });
       setInput('');
     }
   };
 
-  const priceAge = params.priceUpdatedAt === undefined ? undefined : ageSeconds(params.priceUpdatedAt, Date.now());
+  const priceAge = price === undefined ? undefined : ageSeconds(price.observedAt, Date.now());
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Credits" lead={`Burn ${symbol} through the CreditDesk contract. The contract quotes the burn in USD from the on-chain price and the gateway credits your workspace exactly the emitted amount.`} />
+      <PageHeader title="Credits" lead={`Burn ${symbol} from your Solana wallet with a plain SPL burn: no custom program, no approval. The gateway indexes the burn and credits your workspace at its published price. A burn is final.`} />
 
-      {deskError !== undefined ? <Note tone="err" title="Credit desk unavailable">{deskError}</Note> : null}
+      {dep.error !== undefined ? <Note tone="err" title="Deployment unavailable">{dep.error}</Note> : null}
 
       <div className="grid gap-4 lg:grid-cols-[1.3fr_1fr]">
         <Card title="Buy credit">
-          {deskLoading ? (
+          {dep.loading ? (
             <div className="space-y-2">
               <Skeleton className="h-10 w-full" />
               <Skeleton className="h-4 w-1/2" />
@@ -192,9 +170,11 @@ export function Credits() {
                 error={input.trim() !== '' && !parsed.ok ? parsed.error : undefined}
                 converted={
                   converted === undefined
-                    ? priceE18 === undefined
-                      ? 'Waiting for the on-chain price…'
-                      : undefined
+                    ? apiPrice.isPending
+                      ? 'Waiting for the published price…'
+                      : priceE18 === undefined
+                        ? 'Token price is unavailable'
+                        : undefined
                     : mode === 'usd'
                       ? `≈ ${fmtTokens(converted.tokens, decimals, symbol)} burned`
                       : `≈ ${fmtUsd(converted.usdMicro)} of credit`
@@ -204,50 +184,30 @@ export function Credits() {
 
               <div className="rounded-lg border border-line bg-elevated/50 px-3 py-2 text-sm">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-muted">Live quote (desk.quote)</span>
-                  {quote.loading ? (
+                  <span className="text-muted">Published price</span>
+                  {apiPrice.isPending ? (
                     <Skeleton className="h-4 w-20" />
-                  ) : quote.usdMicro !== undefined && tokens !== undefined ? (
+                  ) : price !== undefined ? (
                     <span className="font-mono">
-                      {fmtTokens(tokens, decimals, symbol)} → <span className="text-accent">{fmtUsd(quote.usdMicro)}</span>
+                      1 {symbol} = <span className="text-accent">{fmtPrice(price.priceE18)}</span>
                     </span>
-                  ) : quote.error !== undefined ? (
-                    <span className="text-xs text-err">{quote.error}</span>
                   ) : (
-                    <span className="font-mono text-faint">—</span>
+                    <span className="text-xs text-err">unavailable</span>
                   )}
                 </div>
                 <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted">
-                  <span>
-                    1 {symbol} = <span className="font-mono text-fg">{priceE18 === undefined ? '—' : fmtPrice(priceE18)}</span>
-                  </span>
-                  {priceAge !== undefined ? <span>· price updated {formatDuration(priceAge)} ago</span> : null}
-                  {params.maxPriceAge !== undefined ? <span>· max age {formatDuration(params.maxPriceAge)}</span> : null}
-                  {priceStale ? <Badge tone="warn">stale</Badge> : null}
-                  {params.paused === true ? <Badge tone="err">paused</Badge> : null}
-                  {params.minBurn !== undefined && params.minBurn > 0n ? <span>· min burn {fmtTokens(params.minBurn, decimals, symbol)}</span> : null}
-                </div>
-              </div>
-
-              <div>
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="label mb-0">Price tolerance</span>
-                  <Segmented
-                    ariaLabel="Price tolerance"
-                    value={String(toleranceBps)}
-                    onChange={(v) => setToleranceBps(Number(v))}
-                    options={TOLERANCE_CHOICES_BPS.map((bps) => ({ value: String(bps), label: formatBps(bps) }))}
-                  />
-                </div>
-                <p className="mt-1 text-xs text-muted">
-                  {TOLERANCE_HELP}
-                  {plan.minUsdMicro !== undefined && quote.usdMicro !== undefined && tokens !== undefined ? (
+                  {price !== undefined ? (
                     <>
-                      {' '}
-                      Floor for this burn: <span className="font-mono text-fg">{fmtUsd(plan.minUsdMicro)}</span> of credit (quote {fmtUsd(quote.usdMicro)} − {formatBps(toleranceBps)}).
+                      <span>point #{price.pricePointId}</span>
+                      <span>· {price.source}</span>
+                      {priceAge !== undefined ? <span>· observed {formatDuration(priceAge)} ago</span> : null}
+                      <span>· max age {formatDuration(price.maxAgeS)}</span>
+                      {priceStale ? <Badge tone="warn">stale</Badge> : <Badge tone="ok">fresh</Badge>}
                     </>
                   ) : null}
-                </p>
+                  {minCreditText !== undefined ? <span>· minimum {minCreditText}</span> : null}
+                </div>
+                <p className="mt-1 text-xs text-muted">{OBSERVED_SENTENCE} The event records the price point it was priced with; the figures above are what applies if the point does not change before then.</p>
               </div>
 
               <div>
@@ -257,8 +217,8 @@ export function Credits() {
                 </label>
                 {otherWorkspace ? (
                   <div className="mt-2">
-                    <Field label="Workspace address" error={workspaceInput.trim() !== '' && workspace === undefined ? 'Not a valid address (check the EIP-55 checksum)' : undefined} htmlFor="burn-workspace">
-                      <Input id="burn-workspace" mono placeholder="0x…" value={workspaceInput} onChange={(e) => setWorkspaceInput(e.target.value)} disabled={flow.running} />
+                    <Field label="Workspace public key" error={workspaceInput.trim() !== '' && workspace === undefined ? 'Not a valid Solana public key (base58, 32 bytes)' : undefined} hint={memo === undefined ? undefined : <span className="font-mono">memo: {memo}</span>} htmlFor="burn-workspace">
+                      <Input id="burn-workspace" mono placeholder="base58 public key" value={workspaceInput} onChange={(e) => setWorkspaceInput(e.target.value)} disabled={flow.running} />
                     </Field>
                   </div>
                 ) : (
@@ -267,7 +227,7 @@ export function Credits() {
                     {session.walletMismatch && address !== undefined ? (
                       <>
                         {' '}
-                        (your signed-in workspace); the tokens are burned from the connected wallet <AddressText address={address} />.
+                        (your signed-in workspace, named in the burn's memo); the tokens are burned from the connected wallet <AddressText address={address} />.
                       </>
                     ) : (
                       '.'
@@ -278,48 +238,19 @@ export function Credits() {
 
               {priceStale ? (
                 <Note tone="warn" title="Price is stale">
-                  The desk rejects burns while the price is older than its maximum age. Wait for the poster to publish a fresh price.
-                </Note>
-              ) : null}
-              {params.paused === true ? (
-                <Note tone="err" title="Credit desk paused">
-                  Burns and budgets are disabled by the operator right now.
+                  The gateway has not published a fresh price point for longer than its maximum age ({price === undefined ? '—' : formatDuration(price.maxAgeS)}). Burning is disabled here until a new point lands; a burn sent anyway would be credited at the last point and flagged.
                 </Note>
               ) : null}
 
               <div className="flex flex-wrap items-center gap-3">
                 <Button variant="primary" busy={flow.running} disabled={!plan.canRun} reason={firstBlocker === undefined ? undefined : describeBlocker(firstBlocker, blockerCtx)} onClick={() => void onBurn()}>
-                  {plan.needsApprove ? 'Approve → Burn' : 'Burn for credit'}
+                  Burn for credit
                 </Button>
-                {firstBlocker !== undefined ? <span className="text-xs text-muted">{describeBlocker(firstBlocker, blockerCtx)}</span> : plan.needsApprove ? <span className="text-xs text-muted">Two wallet confirmations: approve (your current allowance + this amount), then burn.</span> : <span className="text-xs text-muted">One wallet confirmation: burn.</span>}
-                {guard.wrongChain ? (
-                  <Button size="sm" busy={guard.switching} onClick={() => void guard.switchToAppChain().catch(() => undefined)}>
-                    Switch chain
-                  </Button>
-                ) : null}
+                {firstBlocker !== undefined ? <span className="text-xs text-muted">{describeBlocker(firstBlocker, blockerCtx)}</span> : <span className="text-xs text-muted">One wallet confirmation: burn{memo === undefined ? '' : ' + memo'}.</span>}
               </div>
-              {plan.canRun && !plan.needsApprove ? <p className="text-xs text-muted">{SHARED_ALLOWANCE_NOTE}</p> : null}
 
               <StepList flow={flow.state} />
-              {slippage !== undefined ? (
-                <Note
-                  tone="warn"
-                  title="Price moved before the transaction landed"
-                  actions={
-                    <Button
-                      size="sm"
-                      onClick={() => {
-                        flow.reset();
-                        void quote.refetch();
-                      }}
-                    >
-                      Re-quote
-                    </Button>
-                  }
-                >
-                  The desk compared the quote at inclusion time with your floor and refused to burn for less (details on the step above). Re-quote to refresh the price, then burn again or pick a wider tolerance.
-                </Note>
-              ) : flow.state.status === 'failed' ? (
+              {flow.state.status === 'failed' || flow.state.status === 'done' ? (
                 <Button size="sm" variant="ghost" onClick={flow.reset}>
                   Dismiss
                 </Button>
@@ -327,11 +258,17 @@ export function Credits() {
 
               {watch.status === 'watching' ? (
                 <Note tone="info" title="Waiting for the indexer to credit the burn…">
-                  Polling your credit events and balance every {WATCH_POLL_MS / 1000} s (attempt {watch.attempts + 1}). Indexer lag shows on the landing page.
+                  Polling your credit events and balance every {WATCH_POLL_MS / 1000} s (attempt {watch.attempts + 1}). The indexer usually observes a burn within 2–10 s; its lag shows on the landing page.
                 </Note>
               ) : watch.status === 'landed' ? (
                 <Note tone="ok" title="Credit landed">
                   Balance: <span className="font-mono">{balance.data === undefined ? '—' : fmtUsd(balance.data.balanceMicro)}</span>
+                  {watch.signature !== undefined ? (
+                    <>
+                      {' · '}
+                      <TxLink signature={watch.signature} />
+                    </>
+                  ) : null}
                 </Note>
               ) : watch.status === 'timeout' ? (
                 <Note
@@ -343,7 +280,7 @@ export function Credits() {
                     </Button>
                   }
                 >
-                  The burn is final on chain{watch.txHash === undefined ? '' : <> (<TxLink hash={watch.txHash} />)</>}. The ledger credit appears as soon as the gateway indexes the block.
+                  The burn is final on chain{watch.signature === undefined ? '' : <> (<TxLink signature={watch.signature} />)</>}. The ledger credit appears as soon as the gateway observes the transaction.
                 </Note>
               ) : null}
             </div>
@@ -352,29 +289,33 @@ export function Credits() {
 
         <div className="space-y-4">
           <Card title="Wallet">
-            {!isConnected ? (
-              <p className="text-sm text-muted">Connect a wallet to see its {symbol} balance and allowance.</p>
+            {!connected || address === undefined ? (
+              <p className="text-sm text-muted">Connect a wallet to see its {symbol} balance.</p>
             ) : account.loading ? (
               <Skeleton className="h-10 w-full" />
+            ) : account.account !== undefined && !account.account.exists ? (
+              <Note tone="info" title={`No ${symbol} token account`}>
+                This wallet never received {symbol}: its associated token account does not exist yet. Acquire {symbol} first; the account is created when tokens arrive.
+              </Note>
             ) : (
               <div className="grid grid-cols-2 gap-3">
                 <Stat label={`${symbol} balance`} value={account.balance === undefined ? '—' : fmtTokens(account.balance, decimals)} />
-                <Stat label="Allowance → desk" value={account.allowance === undefined ? '—' : fmtTokens(account.allowance, decimals)} />
+                <Stat label="Delegated to operator" value={account.account === undefined ? '—' : account.account.delegate !== null && sameAddress(account.account.delegate, dep.operator) ? fmtTokens(account.account.delegatedAmount, decimals) : '0'} sub="budget cap, see Budgets" />
               </div>
             )}
             {account.error !== undefined ? <p className="mt-2 text-xs text-err">{account.error}</p> : null}
             <dl className="mt-3 space-y-1 text-xs text-muted">
               <div className="flex justify-between gap-2">
-                <dt>Credit desk</dt>
-                <dd>{desk === undefined ? '—' : <AddressText address={desk} />}</dd>
+                <dt>Mint</dt>
+                <dd>{mint === undefined ? '—' : <AddressText address={mint} />}</dd>
               </div>
               <div className="flex justify-between gap-2">
-                <dt>Token</dt>
-                <dd>{token === undefined ? '—' : <AddressText address={token.address} />}</dd>
+                <dt>Token account</dt>
+                <dd>{account.address === undefined ? '—' : <AddressText address={account.address} />}</dd>
               </div>
               <div className="flex justify-between gap-2">
-                <dt>Burn mode</dt>
-                <dd className="font-mono">{token === undefined ? '—' : token.nativeBurn ? 'burn()' : 'transfer to 0x…dEaD'}</dd>
+                <dt>Token program</dt>
+                <dd className="font-mono">{tokenProgram.startsWith('Tokenz') ? 'Token-2022' : 'Token'}</dd>
               </div>
             </dl>
           </Card>
@@ -403,24 +344,35 @@ export function Credits() {
                     <th>Kind</th>
                     <th>Burned</th>
                     <th>Credited</th>
-                    <th>Price</th>
-                    <th>Receipt</th>
+                    <th>Price point</th>
+                    <th>Slot</th>
                     <th>Tx</th>
                   </tr>
                 </thead>
                 <tbody>
                   {d.rows.map((e) => (
-                    <tr key={`${e.txHash}:${e.logIndex}`}>
-                      <td className="text-muted">{formatUnixSeconds(e.blockTime)}</td>
+                    <tr key={`${e.signature}:${e.ixIndex}`}>
+                      <td className="text-muted">{e.blockTime === null ? '—' : formatUnixSeconds(e.blockTime)}</td>
                       <td>
-                        <Badge tone={e.kind === 'purchase' ? 'accent' : 'info'}>{e.kind === 'purchase' ? 'burn' : `draw #${e.budgetId ?? '?'}`}</Badge>
+                        <Badge tone={e.kind === 'purchase' ? 'accent' : 'info'} title={e.memo ?? undefined}>
+                          {e.kind === 'purchase' ? 'burn' : 'draw'}
+                        </Badge>
                       </td>
                       <td className="font-mono">{fmtTokens(e.tokenAmount, decimals, symbol)}</td>
                       <td className="font-mono text-accent">{fmtUsd(e.usdMicro)}</td>
-                      <td className="font-mono text-muted">{fmtPrice(e.priceE18)}</td>
-                      <td className="font-mono text-muted">#{e.receiptId}</td>
+                      <td className="font-mono text-muted">
+                        {fmtPrice(e.priceE18)}
+                        {e.pricePointId === null ? '' : ` #${e.pricePointId}`}
+                        {e.priceStale ? (
+                          <>
+                            {' '}
+                            <Badge tone="warn">stale</Badge>
+                          </>
+                        ) : null}
+                      </td>
+                      <td className="font-mono text-muted">{e.slot}</td>
                       <td>
-                        <TxLink hash={e.txHash} />
+                        <TxLink signature={e.signature} href={e.explorerUrl} />
                       </td>
                     </tr>
                   ))}

@@ -1,11 +1,11 @@
 /**
- * Pure state machines for the multi-transaction flows of the Credits and Budgets pages
- * (approve → burnForCreditMin, approve → openBudget), their preflight checks, the credit floor
- * (`minUsdMicro`) passed to the desk and the cumulative `approve` value.
+ * Pure state machines for the wallet flows of the Credits and Budgets pages (one transaction
+ * each on Solana: burn + memo, approve, revoke), their preflight checks, and the state labels of
+ * budgets. No price floor and no allowance exist here: a burn is final and credited at the
+ * published price when observed (SPEC §3.2), a budget is an SPL delegation (SPEC §3.4).
  */
-import type { Hex } from 'viem';
-import { BPS_DENOMINATOR, ceilDiv } from '@beagle/shared/credit';
-import { fmtTokens } from './amounts.js';
+import { tokensForUsdMicro } from '@beagle/shared/credit';
+import type { BudgetDto } from '@beagle/shared/api';
 
 /** Status of one transaction step. */
 export type StepStatus = 'idle' | 'skipped' | 'signing' | 'pending' | 'confirmed' | 'failed';
@@ -15,10 +15,11 @@ export interface StepState {
   id: string;
   label: string;
   status: StepStatus;
-  hash?: Hex;
+  /** Transaction signature once sent. */
+  signature?: string;
   error?: string;
-  /** Name of the contract custom error a failed step reverted with (e.g. `SlippageExceeded`), when decodable. */
-  revert?: string;
+  /** Program logs of a failed send / simulation, when the RPC returned them. */
+  logs?: readonly string[];
 }
 
 /** Overall flow status. */
@@ -35,9 +36,9 @@ export type FlowEvent =
   | { type: 'init'; steps: { id: string; label: string }[] }
   | { type: 'skip'; id: string }
   | { type: 'signing'; id: string }
-  | { type: 'sent'; id: string; hash: Hex }
+  | { type: 'sent'; id: string; signature: string }
   | { type: 'confirmed'; id: string }
-  | { type: 'failed'; id: string; error: string; revert?: string | undefined }
+  | { type: 'failed'; id: string; error: string; signature?: string | undefined; logs?: readonly string[] | undefined }
   | { type: 'reset' };
 
 /** Empty flow. */
@@ -72,22 +73,32 @@ export function reduceFlow(state: FlowState, event: FlowEvent): FlowState {
     case 'signing':
       return patch(state, event.id, (s) => ({ id: s.id, label: s.label, status: 'signing' }));
     case 'sent':
-      return patch(state, event.id, (s) => ({ id: s.id, label: s.label, status: 'pending', hash: event.hash }));
+      return patch(state, event.id, (s) => ({ id: s.id, label: s.label, status: 'pending', signature: event.signature }));
     case 'confirmed':
       return patch(state, event.id, (s) => ({ ...s, status: 'confirmed' }));
     case 'failed':
-      return patch(state, event.id, (s) => ({ ...s, status: 'failed', error: event.error, ...(event.revert === undefined ? {} : { revert: event.revert }) }));
+      return patch(state, event.id, (s) => ({
+        ...s,
+        status: 'failed',
+        error: event.error,
+        ...(event.signature === undefined ? {} : { signature: event.signature }),
+        ...(event.logs === undefined || event.logs.length === 0 ? {} : { logs: event.logs }),
+      }));
   }
-}
-
-/** The failed step that reverted with the contract error `name`, if any. */
-export function failedWith(state: FlowState, name: string): StepState | undefined {
-  return state.steps.find((s) => s.status === 'failed' && s.revert === name);
 }
 
 /** The step currently waiting on the wallet or the chain, if any. */
 export function activeStep(state: FlowState): StepState | undefined {
   return state.steps.find((s) => s.status === 'signing' || s.status === 'pending');
+}
+
+/** The signature of the last confirmed step, if any (the burn / approve / revoke transaction). */
+export function lastSignature(state: FlowState): string | undefined {
+  for (let i = state.steps.length - 1; i >= 0; i--) {
+    const s = state.steps[i];
+    if (s !== undefined && s.signature !== undefined) return s.signature;
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -96,222 +107,128 @@ export function activeStep(state: FlowState): StepState | undefined {
 /** Reasons a flow cannot start. */
 export type BlockerCode =
   | 'not_connected'
-  | 'wrong_chain'
   | 'no_session'
-  | 'paused'
+  | 'deployment_unknown'
+  | 'config_mismatch'
+  | 'operator_unknown'
   | 'price_unavailable'
   | 'price_stale'
   | 'bad_workspace'
   | 'no_amount'
-  | 'below_min_burn'
+  | 'below_min_credit'
   | 'quote_zero'
-  | 'quote_pending'
+  | 'no_token_account'
   | 'insufficient_balance'
-  | 'allowance_unknown'
-  | 'bad_hours'
-  | 'desk_unknown';
-
-// ---------------------------------------------------------------------------------------------
-// Credit floor (SlippageExceeded) and cumulative approvals
-
-/** Default price tolerance of a burn: 100 bps = 1 %. */
-export const DEFAULT_TOLERANCE_BPS = 100;
-
-/** Tolerances the Credits page offers (0.5 %, 1 %, 2 %, 5 %). */
-export const TOLERANCE_CHOICES_BPS = [50, 100, 200, 500] as const;
-
-/** One-line explanation of the tolerance control. */
-export const TOLERANCE_HELP = 'If the on-chain price moves against you by more than this before the transaction lands, it reverts instead of burning for less credit.';
-
-/** Shown when the approve step is skipped: the allowance is not private to this flow. */
-export const SHARED_ALLOWANCE_NOTE = 'Your allowance already covers this amount, so no approve is needed. Open budgets of this wallet draw from the same allowance: a burn spends it and a budget relies on it.';
-
-/** `2^256 − 1`, the largest `approve` value. */
-export const UINT256_MAX = (1n << 256n) - 1n;
-
-/**
- * Credit floor passed to `burnForCreditMin`: `quoted − ceil(quoted · toleranceBps / 10 000)` in µUSD.
- * `0` disables the floor on chain, which happens for `toleranceBps >= 10 000` and for quotes so small
- * that the tolerance rounds up to the whole quote (e.g. 1 µUSD at 1 %). `toleranceBps` must be a
- * non-negative safe integer; `quotedUsdMicro` must be `>= 0`.
- */
-export function creditFloor(quotedUsdMicro: bigint, toleranceBps: number = DEFAULT_TOLERANCE_BPS): bigint {
-  if (quotedUsdMicro < 0n) throw new RangeError(`quotedUsdMicro must be ≥ 0 (got ${quotedUsdMicro})`);
-  if (!Number.isSafeInteger(toleranceBps) || toleranceBps < 0) throw new RangeError(`toleranceBps must be a non-negative integer (got ${toleranceBps})`);
-  const bps = BigInt(toleranceBps);
-  if (bps >= BPS_DENOMINATOR) return 0n;
-  return quotedUsdMicro - ceilDiv(quotedUsdMicro * bps, BPS_DENOMINATOR);
-}
-
-/** `100` → `1 %`, `50` → `0.5 %`, `25` → `0.25 %`. */
-export function formatBps(bps: number): string {
-  if (!Number.isSafeInteger(bps) || bps < 0) throw new RangeError(`bps must be a non-negative integer (got ${bps})`);
-  const whole = Math.floor(bps / 100);
-  const frac = (bps % 100).toString().padStart(2, '0').replace(/0+$/, '');
-  return `${whole}${frac === '' ? '' : `.${frac}`} %`;
-}
-
-/**
- * Value of the `approve` that precedes a burn or a budget: `allowance + amount`, capped at
- * `uint256.max`. The same `allowance(owner, desk)` backs every open budget of the wallet
- * (headroom = min(cap − drawn, allowance, balance)) and a burn spends it, so approving exactly
- * `amount` would silently shrink or stall those budgets. Mirrors the MCP wallet executor.
- */
-export function cumulativeApproval(allowance: bigint, amount: bigint): bigint {
-  if (allowance < 0n || amount < 0n) throw new RangeError('allowance and amount must be ≥ 0');
-  const sum = allowance + amount;
-  return sum > UINT256_MAX ? UINT256_MAX : sum;
-}
-
-/**
- * Approve decision for `amount` given the wallet's current `allowance`: skip when the allowance
- * already covers it, otherwise approve {@link cumulativeApproval}. `undefined` allowance (still
- * loading or unreadable) yields `needsApprove: true` with no amount: the flow cannot start, since
- * a non-cumulative approve could clobber what open budgets rely on.
- */
-export function approvalFor(allowance: bigint | undefined, amount: bigint): { needsApprove: boolean; approveAmount: bigint | undefined } {
-  if (allowance === undefined) return { needsApprove: true, approveAmount: undefined };
-  if (allowance >= amount) return { needsApprove: false, approveAmount: undefined };
-  return { needsApprove: true, approveAmount: cumulativeApproval(allowance, amount) };
-}
-
-/**
- * Label of the approve step: the cumulative value, with its breakdown when the wallet already has
- * an allowance (`Approve 1,500 BEAGLE for the credit desk (500 already allowed + 1,000)`).
- */
-export function approveLabel(approveAmount: bigint, allowance: bigint | undefined, amount: bigint, decimals: number, symbol: string): string {
-  const total = fmtTokens(approveAmount, decimals, symbol);
-  if (allowance === undefined || allowance === 0n) return `Approve ${total} for the credit desk`;
-  return `Approve ${total} for the credit desk (${fmtTokens(allowance, decimals)} already allowed + ${fmtTokens(amount, decimals)})`;
-}
+  | 'account_pending';
 
 /** Common environment of both plans. */
 export interface FlowEnv {
   connected: boolean;
-  rightChain: boolean;
-  deskKnown: boolean;
-  paused: boolean | undefined;
+  /** The mint (and token program) are known. */
+  deploymentKnown: boolean;
+  /** The build and the gateway disagree on the mint or the cluster. */
+  configMismatch: boolean;
   workspaceValid: boolean;
+  /** `false` while the wallet's token account is still being read. */
+  accountKnown: boolean;
+  /** The wallet has a token account of the mint (`false` = never received BEAGLE). */
+  hasTokenAccount: boolean;
+  /** Raw token balance of that account. */
+  balance: bigint | undefined;
 }
 
 /** Inputs of {@link planBurn}. */
 export interface BurnPlanInput extends FlowEnv {
   /** Raw token amount to burn, `undefined` when the input is empty/invalid. */
   amount: bigint | undefined;
-  /** Live `desk.quote(amount)` in µUSD, `undefined` while unknown (the floor needs it). */
+  /** µUSD the burn quotes at the published price (`undefined` without a price). */
   usdMicro: bigint | undefined;
-  /** Price tolerance in bps for {@link creditFloor} (default {@link DEFAULT_TOLERANCE_BPS}). */
-  toleranceBps?: number;
   priceAvailable: boolean;
   priceStale: boolean;
-  minBurn: bigint | undefined;
-  balance: bigint | undefined;
-  allowance: bigint | undefined;
+  /** `MIN_CREDIT_USD` in µUSD (burns quoting below it earn no credit). */
+  minCreditMicro: bigint | undefined;
 }
 
 /** What a flow preflight decided. */
 export interface Plan {
   canRun: boolean;
   blockers: BlockerCode[];
-  /** An `approve` step is required before the main call. */
-  needsApprove: boolean;
-  /**
-   * Value of that `approve`: `allowance + amount` ({@link cumulativeApproval}). `undefined` when no
-   * approve is needed, or when the allowance is unknown (then `allowance_unknown` blocks the flow).
-   */
-  approveAmount: bigint | undefined;
-}
-
-/** {@link Plan} of a burn, with the floor for `burnForCreditMin`. */
-export interface BurnPlan extends Plan {
-  /** `minUsdMicro` for `burnForCreditMin`: {@link creditFloor} of the quote, `undefined` without a quote. */
-  minUsdMicro: bigint | undefined;
 }
 
 function envBlockers(env: FlowEnv): BlockerCode[] {
   const out: BlockerCode[] = [];
   if (!env.connected) out.push('not_connected');
-  else if (!env.rightChain) out.push('wrong_chain');
-  if (!env.deskKnown) out.push('desk_unknown');
-  if (env.paused === true) out.push('paused');
+  if (env.configMismatch) out.push('config_mismatch');
+  else if (!env.deploymentKnown) out.push('deployment_unknown');
   if (!env.workspaceValid) out.push('bad_workspace');
   return out;
 }
 
+function accountBlockers(env: FlowEnv, amount: bigint): BlockerCode[] {
+  if (!env.connected || !env.deploymentKnown || env.configMismatch) return [];
+  if (!env.accountKnown) return ['account_pending'];
+  if (!env.hasTokenAccount) return ['no_token_account'];
+  if (env.balance !== undefined && env.balance < amount) return ['insufficient_balance'];
+  return [];
+}
+
 /**
- * Preflight of approve → burnForCreditMin. The live quote is required: without it there is no
- * floor to pass (`quote_pending`), and the price blockers come first so a stale/unavailable price
- * is not reported as a pending quote.
+ * Preflight of the burn. The price blockers come first so a stale/unavailable price is not
+ * reported as a missing quote; the minimum is enforced in µUSD at the published price
+ * (SPEC §3.2: burns quoting below `MIN_CREDIT_USD` are recorded with no credit).
  */
-export function planBurn(input: BurnPlanInput): BurnPlan {
+export function planBurn(input: BurnPlanInput): Plan {
   const blockers = envBlockers(input);
   if (!input.priceAvailable) blockers.push('price_unavailable');
   else if (input.priceStale) blockers.push('price_stale');
   const { amount, usdMicro } = input;
-  const minUsdMicro = usdMicro === undefined ? undefined : creditFloor(usdMicro, input.toleranceBps ?? DEFAULT_TOLERANCE_BPS);
   if (amount === undefined || amount <= 0n) {
     blockers.push('no_amount');
-    return { canRun: false, blockers, needsApprove: false, approveAmount: undefined, minUsdMicro };
+    return { canRun: false, blockers };
   }
-  if (input.minBurn !== undefined && amount < input.minBurn) blockers.push('below_min_burn');
-  if (usdMicro === undefined) {
-    if (input.priceAvailable && !input.priceStale) blockers.push('quote_pending');
-  } else if (usdMicro === 0n) blockers.push('quote_zero');
-  if (input.balance !== undefined && input.balance < amount) blockers.push('insufficient_balance');
-  const approval = approvalFor(input.allowance, amount);
-  if (approval.needsApprove && approval.approveAmount === undefined) blockers.push('allowance_unknown');
-  return { canRun: blockers.length === 0, blockers, ...approval, minUsdMicro };
+  if (usdMicro !== undefined) {
+    if (usdMicro === 0n) blockers.push('quote_zero');
+    else if (input.minCreditMicro !== undefined && usdMicro < input.minCreditMicro) blockers.push('below_min_credit');
+  }
+  blockers.push(...accountBlockers(input, amount));
+  return { canRun: blockers.length === 0, blockers };
 }
-
-/** Longest budget allowed by the desk (`MAX_BUDGET_DURATION = 30 days`). */
-export const MAX_BUDGET_HOURS = 720;
 
 /** Inputs of {@link planBudget}. */
 export interface BudgetPlanInput extends FlowEnv {
   /** Raw token cap, `undefined` when the input is empty/invalid. */
   cap: bigint | undefined;
-  hours: number | undefined;
-  balance: bigint | undefined;
-  allowance: bigint | undefined;
+  /** The operator (delegate) is known; `false` while the gateway has no operator key. */
+  operatorKnown: boolean;
+}
+
+/** {@link Plan} of an approval, with the advisory flag for a cap above the balance. */
+export interface BudgetPlan extends Plan {
+  /** The cap exceeds the wallet balance: allowed (headroom = min(cap, balance)) but worth a note. */
+  capAboveBalance: boolean;
 }
 
 /**
- * Preflight of approve(allowance + cap) → openBudget. The balance is advisory: budgets may exceed
- * it (draws fail later).
+ * Preflight of `ApproveChecked(ata, operator, cap)`. The balance is advisory: the delegation may
+ * exceed it (headroom is `min(cap, balance)`), but the token account must exist for the
+ * instruction to succeed.
  */
-export function planBudget(input: BudgetPlanInput): Plan {
+export function planBudget(input: BudgetPlanInput): BudgetPlan {
   const blockers = envBlockers(input);
+  if (input.deploymentKnown && !input.configMismatch && !input.operatorKnown) blockers.push('operator_unknown');
   const { cap } = input;
-  const noCap = cap === undefined || cap <= 0n;
-  if (noCap) blockers.push('no_amount');
-  if (input.hours === undefined || !Number.isInteger(input.hours) || input.hours < 1 || input.hours > MAX_BUDGET_HOURS) blockers.push('bad_hours');
-  const approval = cap === undefined || cap <= 0n ? { needsApprove: false, approveAmount: undefined } : approvalFor(input.allowance, cap);
-  if (approval.needsApprove && approval.approveAmount === undefined) blockers.push('allowance_unknown');
-  return { canRun: blockers.length === 0, blockers, ...approval };
-}
-
-/**
- * Seconds kept below the desk's `MAX_BUDGET_DURATION` (30 days). The desk checks
- * `deadline <= block.timestamp + 30 days` against the inclusion block, so a deadline computed as
- * exactly now + 30 days on the browser clock reverts `BadBudgetParams` whenever that block's
- * timestamp is behind the browser clock.
- */
-export const DEADLINE_SAFETY_SECONDS = 300;
-
-/**
- * Unix-seconds deadline for a budget of `hours` opened at `nowMs` (as `bigint` for `uint64`).
- * The maximum duration is shortened by {@link DEADLINE_SAFETY_SECONDS}.
- */
-export function budgetDeadline(nowMs: number, hours: number): bigint {
-  const seconds = Math.min(hours * 3600, MAX_BUDGET_HOURS * 3600 - DEADLINE_SAFETY_SECONDS);
-  return BigInt(Math.floor(nowMs / 1000) + seconds);
+  if (cap === undefined || cap <= 0n) {
+    blockers.push('no_amount');
+    return { canRun: false, blockers, capAboveBalance: false };
+  }
+  blockers.push(...accountBlockers(input, 0n));
+  return { canRun: blockers.length === 0, blockers, capAboveBalance: input.balance !== undefined && cap > input.balance };
 }
 
 /** Context for {@link describeBlocker}. */
 export interface BlockerContext {
-  chainName: string;
-  minBurnText?: string;
-  maxHours?: number;
+  symbol: string;
+  minCreditText?: string | undefined;
 }
 
 /** English text for a blocker. */
@@ -319,33 +236,69 @@ export function describeBlocker(code: BlockerCode, ctx: BlockerContext): string 
   switch (code) {
     case 'not_connected':
       return 'Connect a wallet';
-    case 'wrong_chain':
-      return `Switch your wallet to ${ctx.chainName}`;
     case 'no_session':
       return 'Sign in first';
-    case 'desk_unknown':
-      return 'Credit desk address is not configured';
-    case 'paused':
-      return 'The credit desk is paused';
+    case 'deployment_unknown':
+      return 'The mint is not configured';
+    case 'config_mismatch':
+      return 'This build and the gateway disagree on the deployment';
+    case 'operator_unknown':
+      return 'Budgets are unavailable: the gateway has no operator wallet';
     case 'price_unavailable':
-      return 'Token price is unavailable on chain';
+      return 'Token price is unavailable';
     case 'price_stale':
-      return 'Token price is stale; burns are disabled until a fresh price is posted';
+      return 'Token price is stale; burns are disabled until the gateway publishes a fresh price point';
     case 'bad_workspace':
-      return 'Enter a valid workspace address';
+      return 'Enter a valid workspace public key';
     case 'no_amount':
       return 'Enter an amount';
-    case 'below_min_burn':
-      return ctx.minBurnText === undefined ? 'Amount is below the minimum burn' : `Minimum burn is ${ctx.minBurnText}`;
+    case 'below_min_credit':
+      return ctx.minCreditText === undefined ? 'Amount is below the minimum credit' : `Minimum credit is ${ctx.minCreditText}`;
     case 'quote_zero':
       return 'Amount is too small to credit anything';
-    case 'quote_pending':
-      return 'Waiting for the on-chain quote';
+    case 'no_token_account':
+      return `This wallet has no ${ctx.symbol} token account`;
     case 'insufficient_balance':
-      return 'Insufficient token balance';
-    case 'allowance_unknown':
-      return 'Reading the wallet allowance for the credit desk';
-    case 'bad_hours':
-      return `Hours must be a whole number between 1 and ${ctx.maxHours ?? MAX_BUDGET_HOURS}`;
+      return `Insufficient ${ctx.symbol} balance`;
+    case 'account_pending':
+      return 'Reading the wallet token account';
   }
+}
+
+/**
+ * Smallest raw token amount that quotes at least `minCreditMicro` (`ceil`), for the "minimum
+ * amount" hint; `undefined` without a price.
+ */
+export function minCreditTokens(minCreditMicro: bigint, priceE18: bigint | undefined, decimals: number): bigint | undefined {
+  if (priceE18 === undefined || priceE18 <= 0n) return undefined;
+  return tokensForUsdMicro(minCreditMicro, priceE18, decimals);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Budget display
+
+/** Text for `BudgetDto.stalledReason`. */
+export const STALLED_TEXT: Readonly<Record<NonNullable<BudgetDto['stalledReason']>, string>> = {
+  price: 'price stale or unavailable',
+  revoked: 'delegation revoked',
+  exhausted: 'cap or balance exhausted',
+  draw_failed: 'last draw failed',
+};
+
+/** Badge tones the budget state uses. */
+export type BudgetTone = 'ok' | 'warn' | 'err' | 'neutral';
+
+/** Label and tone of a budget row. */
+export function budgetState(b: Pick<BudgetDto, 'closed' | 'stalledReason' | 'headroomTokens' | 'delegate'>, operator: string | undefined): { label: string; tone: BudgetTone } {
+  if (b.closed) return { label: 'closed', tone: 'neutral' };
+  if (b.stalledReason !== null) return { label: `stalled: ${STALLED_TEXT[b.stalledReason]}`, tone: 'warn' };
+  if (operator !== undefined && b.delegate !== operator) return { label: b.delegate === null ? 'revoked' : 'delegated elsewhere', tone: 'neutral' };
+  if (b.headroomTokens === 0n) return { label: 'exhausted', tone: 'neutral' };
+  return { label: 'open', tone: 'ok' };
+}
+
+/** Note shown when the wallet already delegates to the operator: SPL keeps one delegate per account. */
+export function replacesCapNote(existingCap: bigint, capText: string): string | undefined {
+  if (existingCap <= 0n) return undefined;
+  return `This wallet's token account already delegates ${capText} to the operator. SPL keeps one delegate per account: the new approval replaces that cap (it does not add to it).`;
 }

@@ -2,10 +2,9 @@
  * Pure helpers for "wait until the indexer credits the burn" polling (SPEC §7, Credits page).
  * The landing is detected from two signals: the indexed `purchase` credit event of the burn
  * transaction (`GET /api/receipts`, authoritative) and the workspace balance growing by at least
- * the quoted amount (`GET /api/balance`, a hint that fails when a concurrent debit or a lower
- * execution price shrinks the delta).
+ * the quoted amount (`GET /api/balance`, a hint that fails when a concurrent debit or a price
+ * change between the quote and the observation shrinks the delta).
  */
-import type { Hex } from 'viem';
 
 /**
  * `true` once the ledger reflects a purchase: the balance grew by at least `expectedMicro`
@@ -19,13 +18,12 @@ export function creditLanded(beforeMicro: bigint, afterMicro: bigint, expectedMi
 /** A credit event row as far as the watcher cares (`CreditEventDto`). */
 export interface PurchaseLike {
   kind: string;
-  txHash: string;
+  signature: string;
 }
 
-/** `true` when the indexed credit events contain the `purchase` of `txHash`. */
-export function purchaseIndexed(rows: readonly PurchaseLike[], txHash: Hex): boolean {
-  const h = txHash.toLowerCase();
-  return rows.some((r) => r.kind === 'purchase' && r.txHash.toLowerCase() === h);
+/** `true` when the indexed credit events contain a `purchase` of `signature` (exact match). */
+export function purchaseIndexed(rows: readonly PurchaseLike[], signature: string): boolean {
+  return rows.some((r) => r.kind === 'purchase' && r.signature === signature);
 }
 
 /** Interval in ms between balance / credit-event polls while watching. */
@@ -39,22 +37,22 @@ export interface WatchState {
   status: 'idle' | 'watching' | 'landed' | 'timeout';
   beforeMicro: bigint;
   expectedMicro: bigint | undefined;
-  /** The burn transaction whose indexed `CreditPurchased` event marks the landing, when known. */
-  txHash: Hex | undefined;
+  /** The burn transaction whose indexed purchase event marks the landing, when known. */
+  signature: string | undefined;
   attempts: number;
 }
 
 /** Initial watcher state. */
-export const IDLE_WATCH: WatchState = { status: 'idle', beforeMicro: 0n, expectedMicro: undefined, txHash: undefined, attempts: 0 };
+export const IDLE_WATCH: WatchState = { status: 'idle', beforeMicro: 0n, expectedMicro: undefined, signature: undefined, attempts: 0 };
 
-/** Starts watching from `beforeMicro` for `expectedMicro`, landing on the `purchase` event of `txHash` when given. */
-export function startWatch(beforeMicro: bigint, expectedMicro: bigint | undefined, txHash?: Hex): WatchState {
-  return { status: 'watching', beforeMicro, expectedMicro, txHash, attempts: 0 };
+/** Starts watching from `beforeMicro` for `expectedMicro`, landing on the `purchase` event of `signature` when given. */
+export function startWatch(beforeMicro: bigint, expectedMicro: bigint | undefined, signature?: string): WatchState {
+  return { status: 'watching', beforeMicro, expectedMicro, signature, attempts: 0 };
 }
 
 /** Restarts a timed-out watch with the same targets ("check again"). */
 export function restartWatch(state: WatchState): WatchState {
-  return startWatch(state.beforeMicro, state.expectedMicro, state.txHash);
+  return startWatch(state.beforeMicro, state.expectedMicro, state.signature);
 }
 
 /** Feeds a fresh balance into the watcher; returns the next state. */
@@ -66,8 +64,8 @@ export function observeBalance(state: WatchState, balanceMicro: bigint): WatchSt
   return { ...state, attempts };
 }
 
-/** Feeds the latest indexed credit events into the watcher; lands when the burn tx is among them. */
+/** Feeds the latest indexed credit events into the watcher; lands when the burn signature is among them. */
 export function observeEvents(state: WatchState, rows: readonly PurchaseLike[]): WatchState {
-  if (state.status !== 'watching' || state.txHash === undefined) return state;
-  return purchaseIndexed(rows, state.txHash) ? { ...state, status: 'landed' } : state;
+  if (state.status !== 'watching' || state.signature === undefined) return state;
+  return purchaseIndexed(rows, state.signature) ? { ...state, status: 'landed' } : state;
 }

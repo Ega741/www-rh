@@ -1,0 +1,25 @@
+{
+  "mint": "HBJrfAHGsn7WQYk4FaBXv3wA7fVRL4ctSriSdj3UiDND",
+  "operator": "BEJQY85xuHoT2NyAT5eXF9ftMv6RnSM7LQSujxm8BAbZ",
+  "a1": "46WBYp3PQAdDmjJ2MH3Duz3nm6WN7ZZMDhxZqcB9XF2k",
+  "a2": "291iqs9ogyCfR8f1LKLoKpGjmb5zQQNj1MVQuZ9ChBdh",
+  "ata1": "3ZDN7D9r76TJuVHMYXx3T4vwsMwLhURZTQCTFCTtsRFp",
+  "ata2": "BKMc9j2KYEu9ojsmRetip5nqWuycg4Wwo3MYEsxds38K",
+  "deployer": "31fhf3nEnm99pxViSHMt7Se2wm7ZE6iXdXMv87QN69RB",
+  "ataDeployer": "6wQBYGxAbASsrgSRjRqv5XZuNDrVFnbstr4ivDzsKRdZ",
+  "sigs": {
+    "transferSig": "3JTAsaTLqPhUncoHDrjRnhwQLjHrY1dkdRAvi6YTZUhAJXBAM7XoZLUVMDnSWvx9Z4a7BTdAFpX8azzXYPeDeVo2",
+    "burnSig": "59BQTMaJYEeCSG5EZ3zzed4opQgSo8bR5fKuR7sHf6Hk4KfycrB7RqRrWt3ApwZ64GixU21g1XrDBet3myxPrvvk",
+    "burnCheckedSig": "4f7isabapLgTjcyHXNKS2QLJEgwxx9LJHWkg8JPDDk13BqM4e5rErb9LkKZvu9zgRVkrUvMYX1Ct6dRCsDC6CEi2",
+    "approveSig": "2nLCnQk6B4eDuUH9Z1Qf26YtogpNAdNuxNTm8vZSGEL4NQ1uRgF9rYoSZhk2R6Zk8bPF3atnQnp5hLAu2h7sCgx6",
+    "drawSig": "DTNyPTaJD1ewqDDkTv3NqEmQ19rcQ1qxWfwa7NW4uvb9gvbstEuKoGD1gg1idA87bcesBRHoXhBynnARHCfNxDH",
+    "twoSig": "5X31v1NFMMuZdh6dipB1DmvM2Ysn31ww62f3dauoqaPUi1JfdgdDH6hjdGER8HQeg46WzyxPoktbiD22a5r2Ee3j",
+    "revokeSig": "2qxLb2mBBdtkcTkRekqysL9B53WTeBHAYHnHRbPVJKdUjnnZMSvRE8wyX6GoPaqPmRNkvTKvQEFSgAraHMVUZuLu"
+  },
+  "purchaseMemo": "beagle:v1 ws=291iqs9ogyCfR8f1LKLoKpGjmb5zQQNj1MVQuZ9ChBdh",
+  "drawMemo": "beagle:draw v1 ws=291iqs9ogyCfR8f1LKLoKpGjmb5zQQNj1MVQuZ9ChBdh h=0xabababababababababababababababababababababababababababababababab",
+  "hash": "0xabababababababababababababababababababababababababababababababab",
+  "slot": 129,
+  "blockHeight": 129,
+  "balanceOperator": 9999994999
+}

@@ -57,7 +57,7 @@ export function requireApiKey(services: Services): MiddlewareHandler<AppEnv> {
 export function requireSession(services: Services, keyOk = false): MiddlewareHandler<AppEnv> {
   return async (c, next) => {
     const principal = authenticateSession(services, c.req.raw.headers) ?? (keyOk ? authenticateKey(services, c.req.raw.headers) : undefined);
-    if (principal === undefined) throw new ApiError(401, 'unauthorized', keyOk ? 'Sign in or send an API key.' : 'Sign in first (SIWE).');
+    if (principal === undefined) throw new ApiError(401, 'unauthorized', keyOk ? 'Sign in or send an API key.' : 'Sign in first (SIWS).');
     c.set('principal', principal);
     await next();
   };

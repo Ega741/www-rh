@@ -1,157 +1,169 @@
 import { readFileSync } from 'node:fs';
-import { getAddress } from 'viem';
+import bs58 from 'bs58';
 import { describe, expect, it } from 'vitest';
 import {
-  ADDRESSES,
-  ANVIL_ADDRESSES,
-  DEAD_ADDRESS,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  COMPUTE_BUDGET_PROGRAM_ID,
   DEPLOYMENTS,
-  PONS,
-  PONS_ADDRESSES,
-  ROBINHOOD_ADDRESSES,
-  ROBINHOOD_TESTNET_ADDRESSES,
-  ZERO_ADDRESS,
-  addressesFor,
+  MEMO_PROGRAM_ID,
+  SYSTEM_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  TOKEN_PROGRAM_IDS,
   deploymentFor,
+  isTokenProgramId,
   isUnsetAddress,
-  ponsAddressesFor,
   resolveDeployment,
+  type Deployment,
 } from '../src/addresses.js';
+import { CLUSTERS, CLUSTER_NAMES, isCluster } from '../src/clusters.js';
+import { isBase58Pubkey } from '../src/solana.js';
 
-const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const MINT = bs58.encode(Uint8Array.from({ length: 32 }, (_, i) => i + 1)); // 4wBqpZM9xaSheZzJSMawUKKwhdpChKbZ5eu5ky4Vigw
+const OPERATOR = bs58.encode(new Uint8Array(32).fill(1)); // 4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi
 
-function checksummedValues(obj: Record<string, unknown>): void {
-  for (const [key, value] of Object.entries(obj)) {
-    if (typeof value !== 'string' || key.endsWith('InitCodeHash')) continue;
-    expect(value, key).toMatch(ADDRESS_RE);
-    expect(getAddress(value), `${key} must be EIP-55 checksummed`).toBe(value);
-  }
-}
-
-describe('constants', () => {
-  it('zero and dead addresses', () => {
-    expect(ZERO_ADDRESS).toBe('0x0000000000000000000000000000000000000000');
-    expect(DEAD_ADDRESS).toBe('0x000000000000000000000000000000000000dEaD');
-    expect(getAddress(DEAD_ADDRESS)).toBe(DEAD_ADDRESS);
+describe('program ids (SPEC §1, §10)', () => {
+  it('match the spec and are 32-byte keys', () => {
+    expect(TOKEN_PROGRAM_ID).toBe('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+    expect(TOKEN_2022_PROGRAM_ID).toBe('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+    expect(ASSOCIATED_TOKEN_PROGRAM_ID).toBe('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+    expect(MEMO_PROGRAM_ID).toBe('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
+    expect(SYSTEM_PROGRAM_ID).toBe('11111111111111111111111111111111');
+    expect(COMPUTE_BUDGET_PROGRAM_ID).toBe('ComputeBudget111111111111111111111111111111');
+    for (const id of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, MEMO_PROGRAM_ID, SYSTEM_PROGRAM_ID, COMPUTE_BUDGET_PROGRAM_ID]) {
+      expect(isBase58Pubkey(id), id).toBe(true);
+    }
+    expect(Array.from(bs58.decode(SYSTEM_PROGRAM_ID))).toEqual(new Array(32).fill(0));
   });
 
-  it('protocol addresses are checksummed and match docs/ROBINHOOD_CHAIN.md', () => {
-    checksummedValues(ROBINHOOD_ADDRESSES);
-    checksummedValues(ROBINHOOD_TESTNET_ADDRESSES);
-    expect(ROBINHOOD_ADDRESSES.weth9).toBe('0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73');
-    expect(ROBINHOOD_ADDRESSES.permit2).toBe('0x000000000022D473030F116dDEE9F6B43aC78BA3');
-    expect(ROBINHOOD_ADDRESSES.universalRouter).toBe('0x204FAca1764B154221e35c0d20aBb3c525710498');
-    expect(ROBINHOOD_ADDRESSES.uniswapV3Factory).toBe('0x1f7d7550B1b028f7571E69A784071F0205FD2EfA');
-    expect(ROBINHOOD_ADDRESSES.uniswapV2Factory).toBe('0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f');
-    expect(ROBINHOOD_ADDRESSES.uniswapV4PoolManager).toBe('0x8366a39CC670B4001A1121B8F6A443A643e40951');
-    expect(ROBINHOOD_ADDRESSES.uniswapV4Quoter?.toLowerCase()).toBe('0x8dc178efb8111bb0973dd9d722ebeff267c98f94');
-    expect(ROBINHOOD_ADDRESSES.uniswapV3PoolInitCodeHash).toBe('0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54');
-    expect(ROBINHOOD_ADDRESSES.uniswapV2PairInitCodeHash).toBe('0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f');
-    expect(ROBINHOOD_TESTNET_ADDRESSES.weth9).toBe('0x7943e237c7F95DA44E0301572D358911207852Fa');
-    expect(ROBINHOOD_TESTNET_ADDRESSES.uniswapV3Factory).toBeUndefined();
-    expect(Object.keys(ANVIL_ADDRESSES)).toEqual([]);
-  });
-
-  it('Pons V2 addresses are checksummed and match the doc', () => {
-    checksummedValues(PONS);
-    expect(PONS.factory).toBe('0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e');
-    expect(PONS.router.toLowerCase()).toBe('0xe33e9e479df8802cb0866d5d05258bec4cf62948');
-    expect(PONS.factoryV1).toBe('0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB');
-    expect(PONS.poolManager).toBe(ROBINHOOD_ADDRESSES.uniswapV4PoolManager);
-  });
-
-  it('lookups by chain id', () => {
-    expect(addressesFor(4663)).toBe(ROBINHOOD_ADDRESSES);
-    expect(addressesFor(46630)).toBe(ROBINHOOD_TESTNET_ADDRESSES);
-    expect(addressesFor(31337)).toBe(ANVIL_ADDRESSES);
-    expect(addressesFor(1)).toBeUndefined();
-    expect(Object.keys(ADDRESSES).map(Number).sort((a, b) => a - b)).toEqual([4663, 31337, 46630]);
-    expect(ponsAddressesFor(4663)).toBe(PONS);
-    expect(ponsAddressesFor(46630)).toBeUndefined();
-    expect(Object.keys(PONS_ADDRESSES)).toEqual(['4663']);
-    expect(Object.isFrozen(ROBINHOOD_ADDRESSES)).toBe(true);
+  it('isTokenProgramId', () => {
+    expect(TOKEN_PROGRAM_IDS).toEqual([TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]);
+    expect(isTokenProgramId(TOKEN_PROGRAM_ID)).toBe(true);
+    expect(isTokenProgramId(TOKEN_2022_PROGRAM_ID)).toBe(true);
+    expect(isTokenProgramId(MEMO_PROGRAM_ID)).toBe(false);
+    expect(isTokenProgramId(undefined)).toBe(false);
   });
 });
 
 describe('isUnsetAddress', () => {
-  it('treats undefined, null, blank and the zero address as unset', () => {
+  it('treats undefined, null, blank and the all-zero key as unset', () => {
     expect(isUnsetAddress(undefined)).toBe(true);
     expect(isUnsetAddress(null)).toBe(true);
     expect(isUnsetAddress('')).toBe(true);
     expect(isUnsetAddress('   ')).toBe(true);
-    expect(isUnsetAddress(ZERO_ADDRESS)).toBe(true);
-    expect(isUnsetAddress(ZERO_ADDRESS.toUpperCase().replace('0X', '0x'))).toBe(true);
-    expect(isUnsetAddress(DEAD_ADDRESS)).toBe(false);
+    expect(isUnsetAddress(SYSTEM_PROGRAM_ID)).toBe(true);
+    expect(isUnsetAddress(` ${SYSTEM_PROGRAM_ID} `)).toBe(true);
+    expect(isUnsetAddress(MINT)).toBe(false);
     expect(isUnsetAddress('not-an-address')).toBe(false);
+    expect(isUnsetAddress('11111111111111111111111111111112')).toBe(false);
   });
 });
 
-describe('deployments', () => {
+describe('deployments (SPEC §4.2)', () => {
   it('deployments.generated.ts has the shape sync-deployments.mjs writes', () => {
     const src = readFileSync(new URL('../src/deployments.generated.ts', import.meta.url), 'utf8');
     const lines = src.split('\n');
-    expect(lines[0]).toBe('// Generated by scripts/sync-deployments.mjs from contracts/deployments/*.json — do not edit by hand.');
-    expect(lines[1]).toBe("import type { Deployment } from './addresses.js';");
-    expect(src).toContain('export const DEPLOYMENTS: Readonly<Record<number, Deployment>> = {');
+    expect(lines[0]).toBe('// Generated by scripts/sync-deployments.mjs from solana/deployments/*.json — do not edit by hand.');
+    expect(lines[1]).toBe("import type { Cluster } from './clusters.js';");
+    expect(lines[2]).toBe("import type { Deployment } from './addresses.js';");
+    expect(src).toContain('export const DEPLOYMENTS: Readonly<Partial<Record<Cluster, Deployment>>> = {');
   });
 
   it('every committed deployment is consistent', () => {
-    for (const [key, d] of Object.entries(DEPLOYMENTS)) {
-      expect(Number(key)).toBe(d.chainId);
-      for (const field of ['token', 'creditDesk', 'priceSource', 'owner', 'operator', 'poster'] as const) {
-        expect(d[field], `${key}.${field}`).toMatch(ADDRESS_RE);
+    for (const [key, d] of Object.entries(DEPLOYMENTS) as Array<[string, Deployment]>) {
+      expect(isCluster(key)).toBe(true);
+      expect(d.cluster).toBe(key);
+      for (const field of ['mint', 'tokenProgram', 'operator', 'memoProgram'] as const) {
+        expect(isBase58Pubkey(d[field]), `${key}.${field}`).toBe(true);
       }
-      expect(['manual', 'chainlink']).toContain(d.priceSourceKind);
-      expect(d.tokenDecimals).toBeGreaterThanOrEqual(0);
-      expect(d.deployBlock).toBeGreaterThanOrEqual(0);
-      expect(deploymentFor(d.chainId)).toBe(d);
+      expect(isTokenProgramId(d.tokenProgram)).toBe(true);
+      expect(d.memoProgram).toBe(MEMO_PROGRAM_ID);
+      expect(d.decimals).toBe(6);
+      expect(d.symbol).toBe('BEAGLE');
+      if (d.createdSlot !== undefined) expect(d.createdSlot).toBeGreaterThanOrEqual(0);
+      expect(deploymentFor(d.cluster)).toBe(d);
     }
   });
 
-  it('deploymentFor returns undefined for unknown chains', () => {
-    expect(deploymentFor(999_999)).toBeUndefined();
+  it('deploymentFor returns undefined for clusters without a record', () => {
+    for (const c of CLUSTER_NAMES) {
+      if (!(c in DEPLOYMENTS)) expect(deploymentFor(c)).toBeUndefined();
+    }
+    expect(deploymentFor('testnet' as never)).toBeUndefined();
   });
 });
 
 describe('resolveDeployment', () => {
-  const CHAIN = 999_999; // no committed record
+  // devnet has no committed record in this tree; the assertions below hold either way where noted
+  const CLUSTER = (CLUSTER_NAMES.find((c) => !(c in DEPLOYMENTS)) ?? 'devnet') as (typeof CLUSTER_NAMES)[number];
 
-  it('returns only chainId when nothing is known', () => {
-    expect(resolveDeployment(CHAIN)).toEqual({ chainId: CHAIN, overridden: [] });
-    expect(resolveDeployment(CHAIN, {})).toEqual({ chainId: CHAIN, overridden: [] });
-  });
-
-  it('ignores blank and zero-address overrides', () => {
-    expect(resolveDeployment(CHAIN, { creditDesk: '', token: '  ', priceSource: ZERO_ADDRESS })).toEqual({
-      chainId: CHAIN,
+  it('falls back to cluster defaults when nothing is known', () => {
+    const r = resolveDeployment(CLUSTER);
+    expect(r).toEqual({
+      cluster: CLUSTER,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      memoProgram: MEMO_PROGRAM_ID,
+      rpcUrl: CLUSTERS[CLUSTER].rpcUrl,
+      wsUrl: CLUSTERS[CLUSTER].wsUrl,
       overridden: [],
     });
-    expect(resolveDeployment(CHAIN, { creditDesk: null, token: undefined })).toEqual({ chainId: CHAIN, overridden: [] });
+    expect(r.mint).toBeUndefined();
+    expect(r.operator).toBeUndefined();
+    expect(r.decimals).toBeUndefined();
+    expect(resolveDeployment(CLUSTER, {})).toEqual(r);
   });
 
-  it('applies and checksums overrides', () => {
-    const r = resolveDeployment(CHAIN, { creditDesk: ' 0x0bd7d308f8e1639fab988df18a8011f41eacad73 ', token: DEAD_ADDRESS });
-    expect(r.creditDesk).toBe('0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73');
-    expect(r.token).toBe(DEAD_ADDRESS);
-    expect(r.priceSource).toBeUndefined();
-    expect(r.overridden).toEqual(['creditDesk', 'token']);
+  it('ignores blank and all-zero overrides', () => {
+    const r = resolveDeployment(CLUSTER, { mint: '', operator: '  ', tokenProgram: SYSTEM_PROGRAM_ID, rpcUrl: '', wsUrl: null });
+    expect(r.overridden).toEqual([]);
+    expect(r.mint).toBeUndefined();
+    expect(r.tokenProgram).toBe(TOKEN_PROGRAM_ID);
+    expect(resolveDeployment(CLUSTER, { mint: null, operator: undefined }).overridden).toEqual([]);
+  });
+
+  it('applies and trims address overrides', () => {
+    const r = resolveDeployment(CLUSTER, { mint: ` ${MINT} `, operator: OPERATOR, tokenProgram: TOKEN_2022_PROGRAM_ID });
+    expect(r.mint).toBe(MINT);
+    expect(r.operator).toBe(OPERATOR);
+    expect(r.tokenProgram).toBe(TOKEN_2022_PROGRAM_ID);
+    expect(r.overridden).toEqual(['mint', 'operator', 'tokenProgram']);
+    expect(r.rpcUrl).toBe(CLUSTERS[CLUSTER].rpcUrl);
+  });
+
+  it('applies endpoint overrides and derives the WebSocket endpoint', () => {
+    const r = resolveDeployment('localnet', { rpcUrl: 'http://validator:8899' });
+    expect(r.rpcUrl).toBe('http://validator:8899');
+    expect(r.wsUrl).toBe('ws://validator:8900');
+    expect(r.overridden).toEqual(['rpcUrl']);
+    const both = resolveDeployment('devnet', { rpcUrl: ' https://rpc.example.com/key ', wsUrl: 'wss://ws.example.com' });
+    expect(both.rpcUrl).toBe('https://rpc.example.com/key');
+    expect(both.wsUrl).toBe('wss://ws.example.com');
+    expect(both.overridden).toEqual(['rpcUrl', 'wsUrl']);
+    const wsOnly = resolveDeployment('devnet', { wsUrl: 'wss://ws.example.com' });
+    expect(wsOnly.rpcUrl).toBe(CLUSTERS.devnet.rpcUrl);
+    expect(wsOnly.wsUrl).toBe('wss://ws.example.com');
   });
 
   it('keeps the committed record fields when present', () => {
-    for (const d of Object.values(DEPLOYMENTS)) {
-      const r = resolveDeployment(d.chainId);
-      expect(r).toEqual({ ...d, overridden: [] });
-      const o = resolveDeployment(d.chainId, { creditDesk: DEAD_ADDRESS });
-      expect(o.creditDesk).toBe(DEAD_ADDRESS);
-      expect(o.token).toBe(d.token);
-      expect(o.overridden).toEqual(['creditDesk']);
+    for (const d of Object.values(DEPLOYMENTS) as Deployment[]) {
+      const r = resolveDeployment(d.cluster);
+      const { cluster: _c, ...rest } = d;
+      expect(r).toEqual({ ...rest, cluster: d.cluster, rpcUrl: CLUSTERS[d.cluster].rpcUrl, wsUrl: CLUSTERS[d.cluster].wsUrl, overridden: [] });
+      const o = resolveDeployment(d.cluster, { mint: MINT });
+      expect(o.mint).toBe(MINT);
+      expect(o.operator).toBe(d.operator);
+      expect(o.decimals).toBe(d.decimals);
+      expect(o.overridden).toEqual(['mint']);
     }
   });
 
   it('throws on malformed overrides', () => {
-    expect(() => resolveDeployment(CHAIN, { creditDesk: '0x1234' })).toThrow(/override creditDesk is not an address/);
-    expect(() => resolveDeployment(CHAIN, { token: 'hello' })).toThrow(/override token/);
-    // wrong checksum
-    expect(() => resolveDeployment(CHAIN, { priceSource: '0x0bd7d308f8e1639fab988df18a8011f41eacaD73' })).toThrow();
+    expect(() => resolveDeployment(CLUSTER, { mint: '0x1234' })).toThrow(/override mint is not a base58 public key/);
+    expect(() => resolveDeployment(CLUSTER, { operator: 'hello' })).toThrow(/override operator/);
+    expect(() => resolveDeployment(CLUSTER, { tokenProgram: bs58.encode(new Uint8Array(31)) })).toThrow(/override tokenProgram/);
+    expect(() => resolveDeployment(CLUSTER, { mint: `${MINT}0` })).toThrow(TypeError);
+    expect(() => resolveDeployment(CLUSTER, { rpcUrl: 'not a url' })).toThrow(/override rpcUrl is not a URL/);
+    expect(() => resolveDeployment(CLUSTER, { rpcUrl: 'ws://127.0.0.1:8900' })).toThrow(/override rpcUrl must be http: or https:/);
+    expect(() => resolveDeployment(CLUSTER, { wsUrl: 'http://127.0.0.1:8899' })).toThrow(/override wsUrl must be ws: or wss:/);
   });
 });

@@ -1,6 +1,6 @@
 /**
  * Typed client of the dashboard API (SPEC §5.9). Wire DTOs are parsed with the zod schemas of
- * `@beagle/shared/api`, so every monetary field arrives as `bigint`. Requests send the session
+ * `@beagle/shared/api`, so every monetary field, token amount and `priceE18` arrives as `bigint`. Requests send the session
  * cookie (`credentials: 'include'`) and, when the gateway is on another origin, the session token
  * returned by `POST /api/auth/verify` as a bearer header.
  */
@@ -17,6 +17,7 @@ import {
   ModelsDtoSchema,
   NonceDtoSchema,
   PriceDtoSchema,
+  PriceHistoryDtoSchema,
   ProviderKeyDtoSchema,
   ProviderTestDtoSchema,
   QuoteDtoSchema,
@@ -40,7 +41,9 @@ import type {
   ModelsDto,
   NonceDto,
   PriceDto,
+  PriceHistoryDto,
   ProviderKeyDto,
+  RegisterBudgetRequest,
   ProviderTestDto,
   QuoteDto,
   ReceiptDto,
@@ -183,13 +186,15 @@ export const api = {
   status: (signal?: AbortSignal): Promise<StatusDto> => request('/api/status', StatusDtoSchema, { ...(signal ? { signal } : {}) }),
   config: (): Promise<ConfigDto> => request('/api/config', ConfigDtoSchema),
   price: (): Promise<PriceDto> => request('/api/price', PriceDtoSchema),
+  priceHistory: (limit = 100): Promise<PriceHistoryDto> => request(`/api/price/history${queryString({ limit })}`, PriceHistoryDtoSchema),
   models: (): Promise<ModelsDto> => request('/api/models', ModelsDtoSchema),
   quote: (q: { tokens?: bigint; usdMicro?: bigint }): Promise<QuoteDto> => request(`/api/quote${queryString(q)}`, QuoteDtoSchema),
 
   // auth
   nonce: (): Promise<NonceDto> => request('/api/auth/nonce', NonceDtoSchema),
-  verify: (message: string, signature: string): Promise<VerifyDto> =>
-    request('/api/auth/verify', VerifyDtoSchema, { method: 'POST', json: { message, signature } }),
+  /** SIWS: the exact signed text, its detached signature (base58) and the signer (base58). */
+  verify: (message: string, signature: string, publicKey: string): Promise<VerifyDto> =>
+    request('/api/auth/verify', VerifyDtoSchema, { method: 'POST', json: { message, signature, publicKey } }),
   logout: (): Promise<void> => request('/api/auth/logout', voidParser, { method: 'POST' }),
   me: (): Promise<MeDto> => request('/api/me', MeDtoSchema),
 
@@ -218,8 +223,12 @@ export const api = {
   },
   budgets: {
     list: (): Promise<BudgetDto[]> => request('/api/budgets', listOf(BudgetDtoSchema, 'budgets')),
-    get: (id: number): Promise<BudgetDto> => request(`/api/budgets/${id}`, BudgetDtoSchema),
-    draws: (id: number): Promise<BudgetDrawDto[]> => request(`/api/budgets/${id}/draws`, listOf(BudgetDrawDtoSchema, 'draws')),
+    /** Budget id = the delegated token account (base58). */
+    get: (tokenAccount: string): Promise<BudgetDto> => request(`/api/budgets/${encodeURIComponent(tokenAccount)}`, BudgetDtoSchema),
+    draws: (tokenAccount: string): Promise<BudgetDrawDto[]> => request(`/api/budgets/${encodeURIComponent(tokenAccount)}/draws`, listOf(BudgetDrawDtoSchema, 'draws')),
+    /** `POST /api/budgets/register` right after `ApproveChecked` (201 with the dto, or 400 `not_delegated`). */
+    register: (body: RegisterBudgetRequest): Promise<BudgetDto> =>
+      request('/api/budgets/register', BudgetDtoSchema, { method: 'POST', json: { tokenAccount: body.tokenAccount, ...(body.workspace === undefined ? {} : { workspace: body.workspace }) } }),
   },
   upgrades: {
     list: (): Promise<UpgradeDto[]> => request('/api/upgrades', listOf(UpgradeDtoSchema, 'upgrades')),

@@ -2,7 +2,7 @@
   "name": "beagle",
   "private": true,
   "version": "0.1.0",
-  "description": "Beagle: compute for agents on Robinhood Chain. One API key for every model, paid for by burning BEAGLE.",
+  "description": "Beagle: compute for agents on Solana. One API key for every model, paid for by burning BEAGLE.",
   "packageManager": "pnpm@10.28.0",
   "engines": {
     "node": ">=22.13"
@@ -14,11 +14,9 @@
     "lint": "pnpm -r run lint",
     "dev:gateway": "pnpm --filter @beagle/gateway dev",
     "dev:web": "pnpm --filter @beagle/web dev",
-    "contracts:build": "cd contracts && forge build",
-    "contracts:test": "cd contracts && forge test -vv",
-    "abi:sync": "node scripts/sync-abi.mjs",
     "deployments:sync": "node scripts/sync-deployments.mjs",
+    "cluster:setup": "bash solana/scripts/setup-cluster.sh localnet",
     "mock:provider": "node scripts/mock-provider.mjs",
-    "anvil:e2e": "bash scripts/anvil-e2e.sh"
+    "solana:e2e": "bash scripts/solana-e2e.sh"
   }
 }

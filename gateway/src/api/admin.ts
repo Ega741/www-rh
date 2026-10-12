@@ -1,6 +1,6 @@
 /**
  * Admin routes (SPEC §5.9): `x-admin-token` (constant-time compare); disabled when `ADMIN_TOKEN` is
- * unset. `POST /api/admin/credit`, `POST /api/admin/price`, `GET /api/admin/workspaces`.
+ * unset. `POST /api/admin/credit`, `POST /api/admin/price` (a manual price point), `GET /api/admin/workspaces`.
  *
  * @module api/admin
  */
@@ -36,13 +36,9 @@ export function mountAdmin(app: Hono<AppEnv>, services: Services): void {
 
   app.post('/api/admin/price', async (c) => {
     const body = parseOr400(AdminPriceRequestSchema, await c.req.json().catch(() => ({})));
-    const writer = services.chain?.writer;
-    if (writer === undefined) throw new ApiError(503, 'operator_disabled', 'no operator key configured');
-    if (services.config.operator.dryRun) return c.json({ ok: true, dryRun: true, priceE18: body.priceE18.toString() });
-    const txHash = await writer.postPrice(body.priceE18);
-    services.repos.pricePosts.insert({ priceE18: body.priceE18, source: 'admin', txHash, status: 'sent', createdAt: services.now() });
-    services.price.invalidate();
-    return c.json({ ok: true, txHash, priceE18: body.priceE18.toString() });
+    if (body.priceE18 <= 0n) throw new ApiError(400, 'invalid_request', 'priceE18 must be positive');
+    const point = services.price.set(body.priceE18, 'manual');
+    return c.json({ ok: true, price: services.price.toDto(point) });
   });
 
   app.get('/api/admin/workspaces', (c) => c.json(services.repos.workspaces.list().map((w) => adminWorkspaceDto(services, w))));

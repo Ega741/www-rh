@@ -27,8 +27,7 @@ gateway/data
 **/*.sqlite-shm
 **/*.db
 
-# foundry (not copied by any Dockerfile; keeps the context small)
-contracts/out
-contracts/cache
-contracts/broadcast
-contracts/lib
+# solana (not copied by any Dockerfile; the images read the mint from packages/shared/src/deployments.generated.ts)
+solana/keys
+solana/scripts
+**/test-ledger

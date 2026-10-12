@@ -14,7 +14,7 @@ const REQ: InternalRequest = {
   messages: [{ role: 'user', content: [{ type: 'text', text: 'hello there' }] }],
   maxTokens: 20,
   stream: false,
-  metadata: { requestId: 'req_t', workspace: '0x70997970c51812dc3a010c7d01b50e0d17dc79c8' },
+  metadata: { requestId: 'req_t', workspace: '46WBYp3PQAdDmjJ2MH3Duz3nm6WN7ZZMDhxZqcB9XF2k' },
 };
 
 async function collect(it: AsyncIterable<InternalChunk>): Promise<InternalChunk[]> {

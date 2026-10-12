@@ -1,10 +1,12 @@
+import { MEMO_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@beagle/shared/addresses';
 import { receiptHash } from '@beagle/shared/canonical';
-import { privateKeyToAccount } from 'viem/accounts';
-import { createSiweMessage } from 'viem/siwe';
+import { createSiwsMessage, siwsExpiration, siwsTimestamp } from '@beagle/shared/siws';
+import { encodeBase58 } from '@beagle/shared/solana';
+import nacl from 'tweetnacl';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { MAX_ACTIVE_KEYS } from '../src/api/dashboard.js';
 import { headerSafe } from '../src/api/inference.js';
-import { jsonRequest, makeHarness, parseSse, WS1, WS2, type Harness } from './helpers.js';
+import { ATA1, ATA2, FakeRpc, jsonRequest, makeBurnTx, makeHarness, makeTokenAccount, META, MINT, OPERATOR, parseSse, testPubkey, testSignature, WS1, WS2, type Harness } from './helpers.js';
 
 describe('HTTP flows (house model via mock provider)', () => {
   let h: Harness;
@@ -67,7 +69,7 @@ describe('HTTP flows (house model via mock provider)', () => {
     const receipt = await h.app.request(`/api/receipts/${body.id}`, { headers: { authorization: `Bearer ${key1}` } });
     expect(receipt.status).toBe(200);
     const r = (await receipt.json()) as { receipt: Record<string, unknown>; hash: string };
-    expect(Object.keys(r).sort()).toEqual(['hash', 'receipt']); // ReceiptDto = { receipt, hash }, nothing flattened
+    expect(Object.keys(r).sort()).toEqual(['hash', 'receipt']);
     expect(r.hash).toHaveLength(66);
     expect(receiptHash(r.receipt)).toBe(r.hash);
     expect(r.receipt).toMatchObject({ v: 1, requestId: body.id, workspace: WS1, servedModel: 'house/gpt-oss-20b', provider: 'house', paidBy: 'credit', chargedMicro: cost.toString(), markupBps: 1000 });
@@ -76,7 +78,7 @@ describe('HTTP flows (house model via mock provider)', () => {
     expect(h.mock?.requests.at(-1)?.body['max_tokens']).toBe(64);
   });
 
-  it('GET /api/balance with a key returns decimal strings and price', async () => {
+  it('GET /api/balance with a key returns decimal strings and the published price', async () => {
     const res = await h.app.request('/api/balance', { headers: { authorization: `Bearer ${key1}` } });
     expect(res.status).toBe(200);
     const b = (await res.json()) as Record<string, unknown>;
@@ -84,7 +86,7 @@ describe('HTTP flows (house model via mock provider)', () => {
     expect(b['balanceMicro']).toMatch(/^-?\d+$/);
     expect(b['budgetHeadroomMicro']).toBe('0');
     expect(b['plan']).toBe('free');
-    expect(b['price']).toMatchObject({ priceE18: '0', stale: true });
+    expect(b['price']).toMatchObject({ pricePointId: 1, priceE18: '10000000000000000', stale: false, source: 'manual', maxAgeS: 3600, usdPerToken: '0.01', tokensPerUsd: '100' });
   });
 
   it('SSE stream: chunks, final cost/balance comment, [DONE]; settles the usage row', async () => {
@@ -238,22 +240,61 @@ describe('HTTP flows (house model via mock provider)', () => {
     expect(pre.headers.get('access-control-expose-headers')?.toLowerCase()).toContain('x-beagle-cost-micro');
   });
 
-  it('public routes: status, config, models, price, quote', async () => {
+  it('public routes: status, config, models, price, price history, quote', async () => {
     const status = (await (await h.app.request('/api/status')).json()) as Record<string, unknown>;
-    expect(status['chainId']).toBe(31337);
-    expect(status['creditDesk']).toBeNull();
-    expect(status['providers']).toMatchObject({ house: { configured: true, state: 'ok' }, anthropic: { configured: false } });
+    expect(status).toMatchObject({
+      cluster: 'localnet',
+      mint: MINT,
+      token: { mint: MINT, symbol: 'BEAGLE', decimals: 6, tokenProgram: TOKEN_PROGRAM_ID },
+      indexer: { lastSignature: null, lastSlot: null, headSlot: 0, lagSlots: 0, lastEventAt: null },
+      price: { pricePointId: 1, stale: false, source: 'manual' },
+      providers: { house: { configured: true, state: 'ok' }, anthropic: { configured: false } },
+      operator: { address: OPERATOR, enabled: false, dryRun: true },
+      version: '0.1.0',
+    });
     const config = (await (await h.app.request('/api/config')).json()) as Record<string, unknown>;
-    expect(config).toMatchObject({ chainId: 31337, markupBps: 1000, pro: { priceMicro: '20000000', days: 30 }, warmHourPriceMicro: '2000000' });
+    expect(config).toEqual({
+      cluster: 'localnet',
+      rpcUrl: 'http://127.0.0.1:8899',
+      mint: MINT,
+      decimals: 6,
+      symbol: 'BEAGLE',
+      tokenProgram: TOKEN_PROGRAM_ID,
+      memoProgram: MEMO_PROGRAM_ID,
+      operator: OPERATOR,
+      explorer: 'https://explorer.solana.com',
+      aliases: ['beagle/auto', 'beagle/best', 'beagle/cheap', 'beagle/house'],
+      markupBps: 1000,
+      byokFeeBps: 0,
+      minCreditMicro: '1000',
+      pro: { priceMicro: '20000000', days: 30 },
+      warmHourPriceMicro: '2000000',
+    });
     const models = (await (await h.app.request('/api/models')).json()) as { models: unknown[]; aliases: unknown[] };
     expect(models.models.length).toBe(12);
     expect(models.aliases.length).toBe(4);
     const price = (await (await h.app.request('/api/price')).json()) as Record<string, unknown>;
-    expect(price).toMatchObject({ priceE18: '0', stale: true, source: 'unknown' });
-    const quote = await h.app.request('/api/quote?tokens=1000');
-    expect(quote.status).toBe(503);
-    const badQuote = await h.app.request('/api/quote');
-    expect(badQuote.status).toBe(400);
+    expect(price).toMatchObject({ pricePointId: 1, priceE18: '10000000000000000', stale: false, source: 'manual', usdPerToken: '0.01', tokensPerUsd: '100' });
+    const history = (await (await h.app.request('/api/price/history?limit=5')).json()) as { pricePointId: number }[];
+    expect(history.map((p) => p.pricePointId)).toEqual([1]);
+    expect((await h.app.request('/api/price/history?limit=0')).status).toBe(400);
+    const quote = await h.app.request('/api/quote?tokens=1000000000');
+    expect(quote.status).toBe(200);
+    expect(await quote.json()).toEqual({ tokens: '1000000000', usdMicro: '10000000', priceE18: '10000000000000000', pricePointId: 1, stale: false });
+    expect(await (await h.app.request('/api/quote?usdMicro=1000000')).json()).toMatchObject({ tokens: '100000000' });
+    expect((await h.app.request('/api/quote')).status).toBe(400);
+    expect((await h.app.request('/api/quote?tokens=1&usdMicro=1')).status).toBe(400);
+  });
+
+  it('without a price point quotes are 503 and the price DTO is zeroed', async () => {
+    const bare = await makeHarness({ INITIAL_PRICE_USD: '' }, {}, false);
+    try {
+      expect(await (await bare.app.request('/api/price')).json()).toMatchObject({ pricePointId: 0, priceE18: '0', stale: true });
+      expect((await bare.app.request('/api/quote?tokens=1')).status).toBe(503);
+      expect((await bare.app.request('/api/budgets/register', { method: 'POST', headers: { authorization: `Bearer ${bare.key(WS1)}`, 'content-type': 'application/json' }, body: JSON.stringify({ tokenAccount: ATA1 }) })).status).toBe(503);
+    } finally {
+      await bare.close();
+    }
   });
 });
 
@@ -278,21 +319,41 @@ describe('rate limiting', () => {
 
 describe('dashboard with session auth', () => {
   let h: Harness;
-  const account = privateKeyToAccount('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d');
-  const ws = account.address.toLowerCase();
+  const keypair = nacl.sign.keyPair.fromSeed(Uint8Array.from({ length: 32 }, (_, i) => 42 + i));
+  const ws = encodeBase58(keypair.publicKey);
+
+  function signedMessage(nonce: string): { message: string; signature: string } {
+    const now = Date.now();
+    const message = createSiwsMessage({
+      domain: 'localhost:8787',
+      address: ws,
+      statement: 'Sign in to Beagle.',
+      uri: 'http://localhost:8787/',
+      version: '1',
+      chainId: 'solana:localnet',
+      nonce,
+      issuedAt: siwsTimestamp(now),
+      expirationTime: siwsExpiration(now),
+    });
+    const signature = encodeBase58(nacl.sign.detached(new TextEncoder().encode(message), keypair.secretKey));
+    return { message, signature };
+  }
 
   beforeAll(async () => {
     h = await makeHarness();
   });
   afterAll(async () => h.close());
 
-  it('SIWE nonce → verify sets a cookie and returns a token; /api/me works with cookie and bearer', async () => {
+  it('SIWS nonce → verify sets a cookie and returns a token; /api/me works with cookie and bearer; replays and bad signatures fail', async () => {
     const nonceRes = await h.app.request('/api/auth/nonce');
     const { nonce } = (await nonceRes.json()) as { nonce: string };
     expect(nonce.length).toBeGreaterThanOrEqual(8);
-    const message = createSiweMessage({ address: account.address, chainId: 31337, domain: 'localhost:8787', nonce, uri: 'http://localhost:8787', version: '1', statement: 'Sign in to Beagle' });
-    const signature = await account.signMessage({ message });
-    const verify = await h.app.request(jsonRequest('POST', '/api/auth/verify', { message, signature }));
+    const { message, signature } = signedMessage(nonce);
+    const bad = await h.app.request(jsonRequest('POST', '/api/auth/verify', { message, signature, publicKey: testPubkey(1) }));
+    expect(bad.status).toBe(401);
+    expect(await bad.json()).toMatchObject({ error: { code: 'siws_address_mismatch' } });
+    expect((await h.app.request(jsonRequest('POST', '/api/auth/verify', { message, signature: 'xx', publicKey: ws }))).status).toBe(400);
+    const verify = await h.app.request(jsonRequest('POST', '/api/auth/verify', { message, signature, publicKey: ws }));
     expect(verify.status).toBe(200);
     const { token, workspace } = (await verify.json()) as { token: string; workspace: string };
     expect(workspace).toBe(ws);
@@ -304,9 +365,9 @@ describe('dashboard with session auth', () => {
     expect(await me1.json()).toMatchObject({ workspace: ws, plan: 'free', balanceMicro: '0' });
     const me2 = await h.app.request('/api/me', { headers: { authorization: `Bearer ${token}` } });
     expect(me2.status).toBe(200);
-    const replay = await h.app.request(jsonRequest('POST', '/api/auth/verify', { message, signature }));
+    const replay = await h.app.request(jsonRequest('POST', '/api/auth/verify', { message, signature, publicKey: ws }));
     expect(replay.status).toBe(401);
-    expect(await replay.json()).toMatchObject({ error: { code: 'siwe_bad_nonce' } });
+    expect(await replay.json()).toMatchObject({ error: { code: 'siws_nonce_unknown' } });
     const anon = await h.app.request('/api/me');
     expect(anon.status).toBe(401);
     expect(await anon.json()).toMatchObject({ error: { code: 'unauthorized' } });
@@ -353,7 +414,8 @@ describe('dashboard with session auth', () => {
     expect(summary).toMatchObject({ window: '7d', requests: 0, chargedMicro: '0' });
     expect((await h.app.request('/api/usage/summary?window=1y', { headers: auth })).status).toBe(400);
     expect(await (await h.app.request('/api/budgets', { headers: auth })).json()).toEqual([]);
-    expect((await h.app.request('/api/budgets/42', { headers: auth })).status).toBe(404);
+    expect((await h.app.request(`/api/budgets/${ATA2}`, { headers: auth })).status).toBe(404);
+    expect((await h.app.request('/api/budgets/not-base58', { headers: auth })).status).toBe(404);
     expect(await (await h.app.request('/api/upgrades/prices')).json()).toEqual({ pro: { priceMicro: '20000000', days: 30 }, warmHourPriceMicro: '2000000' });
   });
 
@@ -389,8 +451,8 @@ describe('dashboard with session auth', () => {
     expect(await short.json()).toMatchObject({ error: { code: 'insufficient_credit' } });
     // Budget headroom is not prepaid credit: an upgrade bought on it could never be drawn → 402.
     const nowMs = h.services.now();
-    h.services.repos.budgets.upsertOpened({ budgetId: 9, owner: ws, workspace: ws, cap: 10n ** 24n, deadline: Math.floor(nowMs / 1000) + 7200, openedBlock: 1, now: nowMs });
-    h.services.repos.budgets.setHeadroom(9, 10n ** 24n, 25_000_000n, null, nowMs);
+    h.services.repos.budgets.upsert({ tokenAccount: testPubkey(77), owner: ws, delegate: OPERATOR, cap: 10n ** 12n, balance: 10n ** 12n, now: nowMs });
+    h.services.repos.budgets.setHeadroom(testPubkey(77), 10n ** 12n, 25_000_000n, null, nowMs);
     expect(h.services.ledger.snapshot(ws).available).toBeGreaterThanOrEqual(25_000_000n);
     for (const kind of ['pro', 'warm'] as const) {
       const onHeadroom = await h.app.request(jsonRequest('POST', '/api/upgrades', { kind, quantity: 1 }, auth));
@@ -398,7 +460,7 @@ describe('dashboard with session auth', () => {
     }
     expect(h.services.ledger.balance(ws)).toBe(123n);
     expect(((await (await h.app.request('/api/me', { headers: auth })).json()) as { plan: string }).plan).toBe('free');
-    h.services.repos.budgets.setClosed(9, true, nowMs);
+    h.services.repos.budgets.setClosed(testPubkey(77), true, 'revoked', nowMs);
     h.credit(ws, 30_000_000n);
     const pro = await h.app.request(jsonRequest('POST', '/api/upgrades', { kind: 'pro', quantity: 1 }, auth));
     expect(pro.status).toBe(201);
@@ -415,7 +477,7 @@ describe('dashboard with session auth', () => {
     expect((await h.app.request(jsonRequest('POST', '/api/upgrades', { kind: 'warm', quantity: 999 }, auth))).status).toBe(400);
   });
 
-  it('admin routes need the token; credit adjusts the ledger', async () => {
+  it('admin routes need the token; credit adjusts the ledger; price publishes a manual point', async () => {
     expect((await h.app.request(jsonRequest('POST', '/api/admin/credit', { workspace: WS2, amountMicro: '5' }))).status).toBe(401);
     expect((await h.app.request(jsonRequest('POST', '/api/admin/credit', { workspace: WS2, amountMicro: '5' }, { 'x-admin-token': 'wrong' }))).status).toBe(401);
     const before = h.services.ledger.balance(WS2);
@@ -425,6 +487,12 @@ describe('dashboard with session auth', () => {
     const list = await h.app.request('/api/admin/workspaces', { headers: { 'x-admin-token': 'test-admin' } });
     expect(list.status).toBe(200);
     expect(((await list.json()) as { workspace: string }[]).some((w) => w.workspace === WS2)).toBe(true);
+    const priced = await h.app.request(jsonRequest('POST', '/api/admin/price', { priceE18: '20000000000000000' }, { 'x-admin-token': 'test-admin' }));
+    expect(priced.status).toBe(200);
+    expect(await priced.json()).toMatchObject({ ok: true, price: { pricePointId: 2, priceE18: '20000000000000000', source: 'manual', stale: false } });
+    expect(await (await h.app.request('/api/price')).json()).toMatchObject({ pricePointId: 2, usdPerToken: '0.02' });
+    expect((await (await h.app.request('/api/price/history')).json()) as unknown[]).toHaveLength(2);
+    expect((await h.app.request(jsonRequest('POST', '/api/admin/price', { priceE18: '0' }, { 'x-admin-token': 'test-admin' }))).status).toBe(400);
   });
 
   it('unknown routes return the right envelope', async () => {
@@ -434,5 +502,96 @@ describe('dashboard with session auth', () => {
     const v1 = await h.app.request('/v1/nope');
     expect(v1.status).toBe(404);
     expect(await v1.json()).toMatchObject({ error: { type: 'invalid_request_error' } });
+  });
+});
+
+describe('budgets and receipts over a fake chain', () => {
+  let h: Harness;
+  let rpc: FakeRpc;
+  let key2: string;
+
+  beforeAll(async () => {
+    rpc = new FakeRpc();
+    h = await makeHarness({ OPERATOR_SECRET_KEY: '', DRY_RUN: 'false' }, {}, false, { rpc });
+    key2 = h.key(WS2);
+  });
+  afterAll(async () => h.close());
+
+  it('POST /api/budgets/register validates the account and returns the BudgetDto; lists and detail routes follow', async () => {
+    const auth = { authorization: `Bearer ${key2}` };
+    expect((await h.app.request(jsonRequest('POST', '/api/budgets/register', { tokenAccount: 'nope' }, auth))).status).toBe(400);
+    const missing = await h.app.request(jsonRequest('POST', '/api/budgets/register', { tokenAccount: ATA2 }, auth));
+    expect(missing.status).toBe(400);
+    expect(await missing.json()).toMatchObject({ error: { code: 'invalid_token_account' } });
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 100_000_000_000n }));
+    const undelegated = await h.app.request(jsonRequest('POST', '/api/budgets/register', { tokenAccount: ATA2 }, auth));
+    expect(undelegated.status).toBe(400);
+    expect(await undelegated.json()).toMatchObject({ error: { code: 'not_delegated' } });
+    rpc.accounts.set(ATA2, makeTokenAccount({ owner: WS2, amount: 100_000_000_000n, delegate: OPERATOR, delegatedAmount: 500_000_000n }));
+    const created = await h.app.request(jsonRequest('POST', '/api/budgets/register', { tokenAccount: ATA2 }, auth));
+    expect(created.status).toBe(201);
+    const dto = (await created.json()) as Record<string, unknown>;
+    expect(dto).toMatchObject({ tokenAccount: ATA2, owner: WS2, workspace: WS2, delegate: OPERATOR, cap: '500000000', balance: '100000000000', headroomTokens: '500000000', headroomMicro: '5000000', closed: false, stalledReason: null, lastSeenSlot: null, draws: [] });
+    expect(typeof dto['registeredAt']).toBe('number');
+    const balance = (await (await h.app.request('/api/balance', { headers: auth })).json()) as { budgetHeadroomMicro: string; availableMicro: string };
+    expect(balance).toMatchObject({ budgetHeadroomMicro: '5000000', availableMicro: '5000000' });
+    const list = (await (await h.app.request('/api/budgets', { headers: auth })).json()) as { tokenAccount: string }[];
+    expect(list.map((b) => b.tokenAccount)).toEqual([ATA2]);
+    expect((await h.app.request(`/api/budgets/${ATA2}`, { headers: auth })).status).toBe(200);
+    expect(await (await h.app.request(`/api/budgets/${ATA2}/draws`, { headers: auth })).json()).toEqual([]);
+    // Another workspace cannot see it, and cannot redirect its headroom to itself.
+    const key1 = h.key(WS1);
+    expect((await h.app.request(`/api/budgets/${ATA2}`, { headers: { authorization: `Bearer ${key1}` } })).status).toBe(404);
+    const steal = await h.app.request(jsonRequest('POST', '/api/budgets/register', { tokenAccount: ATA2, workspace: WS1 }, { authorization: `Bearer ${key1}` }));
+    expect(steal.status).toBe(403);
+    expect(await steal.json()).toMatchObject({ error: { code: 'not_owner' } });
+    expect(h.services.repos.budgets.get(ATA2)?.workspace).toBe(WS2);
+    // The owner may fund another workspace; the owner still sees the budget under its own account.
+    const gift = await h.app.request(jsonRequest('POST', '/api/budgets/register', { tokenAccount: ATA2, workspace: WS1 }, auth));
+    expect(gift.status).toBe(201);
+    expect(((await gift.json()) as { workspace: string }).workspace).toBe(WS1);
+    expect(((await (await h.app.request('/api/balance', { headers: { authorization: `Bearer ${key1}` } })).json()) as { budgetHeadroomMicro: string }).budgetHeadroomMicro).toBe('5000000');
+    expect(((await (await h.app.request('/api/budgets', { headers: auth })).json()) as unknown[]).length).toBe(1);
+    expect((await h.app.request(`/api/budgets/${ATA2}`, { headers: { authorization: `Bearer ${key1}` } })).status).toBe(200);
+    // status reflects the fake chain and the operator key
+    const status = (await (await h.app.request('/api/status')).json()) as { operator: { enabled: boolean; dryRun: boolean; address: string } };
+    expect(status.operator).toEqual({ address: OPERATOR, enabled: true, dryRun: false });
+  });
+
+  it('GET /api/receipts lists indexed credit events with explorer links and cursor pagination', async () => {
+    const sig = rpc.addTransaction(makeBurnTx({ signature: testSignature(900), slot: 300, tokenAccount: ATA1, owner: WS1, amount: 1_000_000_000n, memo: `beagle:v1 ws=${WS2}` }));
+    rpc.addTransaction(makeBurnTx({ signature: testSignature(901), slot: 301, tokenAccount: ATA1, owner: WS1, amount: 2_000_000n }));
+    await h.services.indexer!.step();
+    const auth = { authorization: `Bearer ${key2}` };
+    const res = await h.app.request('/api/receipts?limit=1', { headers: auth });
+    expect(res.status).toBe(200);
+    const page = (await res.json()) as { rows: Record<string, unknown>[]; nextBefore: number | null };
+    expect(page.rows).toHaveLength(1);
+    expect(page.rows[0]).toMatchObject({
+      signature: sig,
+      ixIndex: 0,
+      slot: 300,
+      kind: 'purchase',
+      workspace: WS2,
+      payer: WS1,
+      tokenAccount: ATA1,
+      tokenAmount: '1000000000',
+      usdMicro: '10000000',
+      priceE18: '10000000000000000',
+      pricePointId: 1,
+      priceStale: false,
+      memo: `beagle:v1 ws=${WS2}`,
+      receiptHash: null,
+      explorerUrl: `https://explorer.solana.com/tx/${sig}?cluster=custom&customUrl=${encodeURIComponent('http://127.0.0.1:8899')}`,
+    });
+    expect(page.nextBefore).toBeTypeOf('number');
+    const next = (await (await h.app.request(`/api/receipts?limit=1&before=${page.nextBefore}`, { headers: auth })).json()) as { rows: unknown[]; nextBefore: null };
+    expect(next.rows).toEqual([]);
+    expect(((await (await h.app.request('/api/balance', { headers: auth })).json()) as { balanceMicro: string }).balanceMicro).toBe('10000000');
+    const ws1 = (await (await h.app.request('/api/receipts', { headers: { authorization: `Bearer ${h.key(WS1)}` } })).json()) as { rows: { usdMicro: string }[] };
+    expect(ws1.rows.map((r) => r.usdMicro)).toEqual(['20000']);
+    const status = (await (await h.app.request('/api/status')).json()) as { indexer: Record<string, unknown> };
+    expect(status.indexer).toMatchObject({ lastSignature: testSignature(901), lastSlot: 301, headSlot: 301, lagSlots: 0 });
+    expect(META.sigs.burnSig).toHaveLength(88);
   });
 });

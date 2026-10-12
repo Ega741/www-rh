@@ -10,7 +10,7 @@ import { buildReceipt } from '../src/metering/receipts.js';
 import { InsufficientCreditError, ReservationService } from '../src/metering/reserve.js';
 import { SettlementService } from '../src/metering/settle.js';
 import type { InternalRequestBase } from '../src/translate/internal.js';
-import { WS1 } from './helpers.js';
+import { ATA1, OPERATOR, WS1 } from './helpers.js';
 
 const house = DEFAULT_CATALOG.find((m) => m.id === 'house/gpt-oss-20b')!;
 const opus = DEFAULT_CATALOG.find((m) => m.id === 'anthropic/claude-opus-5-5')!;
@@ -77,8 +77,8 @@ describe('reserve', () => {
   it('budget headroom lets a workspace reserve below zero balance', () => {
     const { repos, reservations, now } = setup();
     repos.workspaces.ensure(WS1, now());
-    repos.budgets.upsertOpened({ budgetId: 1, owner: WS1, workspace: WS1, cap: 10n ** 21n, deadline: Math.floor(now() / 1000) + 100, openedBlock: 1, now: now() });
-    repos.budgets.setHeadroom(1, 10n ** 21n, 1_000_000n, null, now());
+    repos.budgets.upsert({ tokenAccount: ATA1, owner: WS1, delegate: OPERATOR, cap: 10n ** 9n, balance: 10n ** 9n, now: now() });
+    repos.budgets.setHeadroom(ATA1, 10n ** 9n, 1_000_000n, null, now());
     const r = reservations.reserve(WS1, 300_000n);
     expect(r.amountMicro).toBe(300_000n);
   });

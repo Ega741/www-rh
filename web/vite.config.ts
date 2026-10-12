@@ -2,7 +2,7 @@ import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
-/** Repository root: the single `.env` shared by the gateway, the web build and the contract scripts. */
+/** Repository root: the single `.env` shared by the gateway, the web build and the cluster setup script. */
 const envDir = new URL('..', import.meta.url).pathname;
 
 /** Gateway paths proxied in development (mirrors `docker/nginx.conf`). */

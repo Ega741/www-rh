@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   BPS_DENOMINATOR,
+  DEFAULT_DECIMALS,
   MAX_TOKEN_DECIMALS,
   MICRO_USD,
   PRICE_SCALE,
@@ -29,6 +30,7 @@ describe('constants', () => {
     expect(PRICE_SCALE).toBe(E18);
     expect(MAX_TOKEN_DECIMALS).toBe(36);
     expect(BPS_DENOMINATOR).toBe(10_000n);
+    expect(DEFAULT_DECIMALS).toBe(6);
   });
 });
 
@@ -48,8 +50,11 @@ describe('ceilDiv', () => {
 });
 
 describe('quoteUsdMicro', () => {
-  it('reproduces the SPEC example: 1000 BEAGLE at $0.0025 = $2.50', () => {
-    expect(quoteUsdMicro(1000n * E18, PRICE_0025)).toBe(2_500_000n);
+  it('reproduces the SPEC §1 example: 1000 BEAGLE (6 decimals) at $0.01 = $10', () => {
+    expect(quoteUsdMicro(1_000_000_000n, 10n ** 16n)).toBe(10_000_000n);
+    expect(quoteUsdMicro(1_000_000_000n, 10n ** 16n, 6)).toBe(10_000_000n);
+    // the default decimals are the mint's 6 (DEFAULT_DECIMALS)
+    expect(quoteUsdMicro(1000n * 10n ** 6n, PRICE_0025)).toBe(2_500_000n);
     expect(quoteUsdMicro(1000n * E18, PRICE_0025, 18)).toBe(2_500_000n);
   });
   it('handles other decimals', () => {
@@ -59,10 +64,11 @@ describe('quoteUsdMicro', () => {
     expect(quoteUsdMicro(10n ** 36n, 1n, 36)).toBe(0n); // 1 token at 1e-18 USD → 1e-12 USD → 0 µUSD
   });
   it('floors', () => {
-    // 1 wei at $0.0025: 2.5e-21 USD → 0
+    // 1 raw unit (1e-6 BEAGLE) at $0.0025: 2.5e-9 USD → 0 µUSD
     expect(quoteUsdMicro(1n, PRICE_0025)).toBe(0n);
     // 3 tokens at $1/3-ish: 333333333333333333 * 3 = 999999999999999999 → floor(0.999999999999 USD * 1e6) = 999_999
-    expect(quoteUsdMicro(3n * E18, 333_333_333_333_333_333n)).toBe(999_999n);
+    expect(quoteUsdMicro(3n * E18, 333_333_333_333_333_333n, 18)).toBe(999_999n);
+    expect(quoteUsdMicro(3_000_000n, 333_333_333_333_333_333n)).toBe(999_999n);
     expect(quoteUsdMicro(0n, PRICE_0025)).toBe(0n);
     expect(quoteUsdMicro(1000n * E18, 0n)).toBe(0n);
   });
@@ -77,11 +83,15 @@ describe('quoteUsdMicro', () => {
 
 describe('tokensForUsdMicro', () => {
   it('inverts the SPEC example', () => {
-    expect(tokensForUsdMicro(2_500_000n, PRICE_0025)).toBe(1000n * E18);
+    expect(tokensForUsdMicro(10_000_000n, 10n ** 16n)).toBe(1_000_000_000n);
+    expect(tokensForUsdMicro(2_500_000n, PRICE_0025)).toBe(1000n * 10n ** 6n);
+    expect(tokensForUsdMicro(2_500_000n, PRICE_0025, 18)).toBe(1000n * E18);
   });
   it('ceils', () => {
-    // 1 µUSD at $3 per token: 1e-6/3 tokens = 333333333333.33… wei → 333333333334
-    expect(tokensForUsdMicro(1n, 3n * E18)).toBe(333_333_333_334n);
+    // 1 µUSD at $3 per token: 1e-6/3 tokens = 333333333333.33… raw units (18 decimals) → 333333333334
+    expect(tokensForUsdMicro(1n, 3n * E18, 18)).toBe(333_333_333_334n);
+    // with 6 decimals: 0.333… raw units → 1
+    expect(tokensForUsdMicro(1n, 3n * E18)).toBe(1n);
     expect(tokensForUsdMicro(0n, 3n * E18)).toBe(0n);
     expect(tokensForUsdMicro(1_000_000n, E18, 6)).toBe(1_000_000n);
   });
@@ -105,7 +115,8 @@ describe('tokensForUsdMicro', () => {
     expect(() => tokensForUsdMicro(1n, 1n, 40)).toThrow(RangeError);
   });
   it('tokensPerUsd', () => {
-    expect(tokensPerUsd(10n ** 16n)).toBe(100n * E18); // $0.01 → 100 tokens per USD
+    expect(tokensPerUsd(10n ** 16n)).toBe(100n * 10n ** 6n); // $0.01 → 100 tokens per USD (6 decimals)
+    expect(tokensPerUsd(10n ** 16n, 18)).toBe(100n * E18);
     expect(tokensPerUsd(E18, 6)).toBe(1_000_000n);
   });
 });
@@ -290,13 +301,13 @@ describe('formatPriceE18', () => {
   });
 });
 
-describe('fixture parity with CreditMath (fixtures/quote.json)', () => {
+describe('fixture parity (fixtures/quote.json, static vectors)', () => {
   const url = new URL('../fixtures/quote.json', import.meta.url);
 
-  it('matches every case produced by contracts/script/GenerateFixtures.s.sol', () => {
+  it('matches every committed static vector (amount, priceE18, decimals → usdMicro, tokensBack)', () => {
     if (!existsSync(url)) {
       throw new Error(
-        'packages/shared/fixtures/quote.json is missing: run `cd contracts && forge script script/GenerateFixtures.s.sol` to generate it',
+        'packages/shared/fixtures/quote.json is missing: the static quote vectors are committed with the package',
       );
     }
     const raw: unknown = JSON.parse(readFileSync(url, 'utf8'));

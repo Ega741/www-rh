@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Deterministic OpenAI-compatible chat completions server for tests and the anvil e2e flow.
+// Deterministic OpenAI-compatible chat completions server for tests and the Solana e2e flow (scripts/solana-e2e.sh).
 // Env: MOCK_PORT (9999), MOCK_FAIL_RATE (0..1 → random 500s), MOCK_STATUS (force an HTTP status),
 //      MOCK_DELAY_MS (0), MOCK_MODELS (comma list; default openai/gpt-oss-20b,openai/gpt-oss-120b).
 import { createServer } from 'node:http';

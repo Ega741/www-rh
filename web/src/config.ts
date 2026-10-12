@@ -9,12 +9,10 @@ export type { AppConfig } from './lib/config.js';
 /** The resolved configuration of this build. */
 export const config: AppConfig = loadConfig(
   {
-    VITE_CHAIN_ID: import.meta.env.VITE_CHAIN_ID,
-    VITE_GATEWAY_URL: import.meta.env.VITE_GATEWAY_URL,
-    VITE_CREDIT_DESK_ADDRESS: import.meta.env.VITE_CREDIT_DESK_ADDRESS,
+    VITE_CLUSTER: import.meta.env.VITE_CLUSTER,
     VITE_RPC_URL: import.meta.env.VITE_RPC_URL,
-    VITE_WALLETCONNECT_PROJECT_ID: import.meta.env.VITE_WALLETCONNECT_PROJECT_ID,
-    VITE_MULTICALL: import.meta.env.VITE_MULTICALL,
+    VITE_GATEWAY_URL: import.meta.env.VITE_GATEWAY_URL,
+    VITE_MINT_ADDRESS: import.meta.env.VITE_MINT_ADDRESS,
   },
   { dev: import.meta.env.DEV },
 );
@@ -22,4 +20,9 @@ export const config: AppConfig = loadConfig(
 /** The gateway URL to show users in docs and snippets (configured URL or this page's origin). */
 export function publicGatewayUrl(): string {
   return publicGatewayUrlOf(config, typeof window === 'undefined' ? '' : window.location.origin);
+}
+
+/** `window.location.origin` (empty outside a browser). */
+export function pageOrigin(): string {
+  return typeof window === 'undefined' ? '' : window.location.origin;
 }

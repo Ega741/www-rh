@@ -1,10 +1,11 @@
-import { privateKeyToAccount } from 'viem/accounts';
-import { createSiweMessage } from 'viem/siwe';
+import { createSiwsMessage, siwsExpiration, siwsTimestamp, type SiwsFields } from '@beagle/shared/siws';
+import { encodeBase58 } from '@beagle/shared/solana';
+import nacl from 'tweetnacl';
 import { describe, expect, it } from 'vitest';
 import { API_KEY_PATTERN, ApiKeyService, apiKeyPrefix, extractApiKey, generateApiKey, hashApiKey } from '../src/auth/apiKeys.js';
 import { Keyring, KeyringError, safeEqual, sha256Hex } from '../src/auth/crypto.js';
 import { extractSessionToken, parseCookies, sessionCookie, SessionService } from '../src/auth/session.js';
-import { SiweService } from '../src/auth/siwe.js';
+import { decodeSignature, SiwsService, SIWS_NONCE_TTL_MS } from '../src/auth/siws.js';
 import { Repos } from '../src/db/repos.js';
 import { migrate } from '../src/db/schema.js';
 import { Db } from '../src/db/sqlite.js';
@@ -26,12 +27,13 @@ describe('API keys', () => {
     expect(apiKeyPrefix(key).startsWith('bgl_')).toBe(true);
   });
 
-  it('creates, authenticates, touches last_used_at once a minute and revokes', () => {
+  it('creates, authenticates, touches last_used_at once a minute and revokes; workspaces are base58 verbatim', () => {
     const r = repos();
     let now = 1_000_000;
     const svc = new ApiKeyService(r.apiKeys, r.workspaces, () => now);
-    const created = svc.create(WS1.toUpperCase(), 'ci');
+    const created = svc.create(` ${WS1} `, 'ci');
     expect(r.workspaces.get(WS1)).toBeDefined();
+    expect(r.workspaces.get(WS1.toLowerCase())).toBeUndefined(); // base58 is case-sensitive: no lowercasing
     const auth = svc.authenticate(created.key);
     expect(auth?.workspace).toBe(WS1);
     expect(r.apiKeys.byId(created.id)?.lastUsedAt).toBe(now);
@@ -84,54 +86,95 @@ describe('sessions', () => {
   });
 });
 
-describe('SIWE', () => {
-  const account = privateKeyToAccount('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d');
+describe('SIWS', () => {
+  const T0 = 1_791_808_200_000;
+  const keypair = nacl.sign.keyPair.fromSeed(Uint8Array.from({ length: 32 }, (_, i) => i + 1));
+  const other = nacl.sign.keyPair.fromSeed(Uint8Array.from({ length: 32 }, (_, i) => 100 + i));
+  const address = encodeBase58(keypair.publicKey);
+  const expected = { domain: 'localhost:8787', uri: 'http://localhost:8787', chainId: 'solana:localnet' } as const;
 
-  async function signed(svc: SiweService, overrides: Partial<Parameters<typeof createSiweMessage>[0]> = {}): Promise<{ message: string; signature: `0x${string}` }> {
-    const nonce = svc.issueNonce();
-    const message = createSiweMessage({ address: account.address, chainId: 31337, domain: 'localhost:8787', nonce, uri: 'http://localhost:8787', version: '1', ...overrides });
-    const signature = await account.signMessage({ message });
-    return { message, signature };
+  function service(now: () => number = () => T0): SiwsService {
+    return new SiwsService(repos().nonces, { ...expected, now });
   }
 
-  it('verifies an EOA signature offline and consumes the nonce', async () => {
-    const r = repos();
-    const svc = new SiweService(r.nonces, { domain: 'localhost:8787' });
-    const { message, signature } = await signed(svc);
-    const first = await svc.verify(message, signature);
-    expect(first).toEqual({ ok: true, address: account.address, chainId: 31337 });
-    const replay = await svc.verify(message, signature);
-    expect(replay.ok).toBe(false);
-    if (!replay.ok) expect(replay.code).toBe('bad_nonce');
+  function message(svc: SiwsService, overrides: Partial<SiwsFields> = {}, now = T0, omit: (keyof SiwsFields)[] = []): string {
+    const nonce = overrides.nonce ?? svc.issueNonce();
+    const fields: SiwsFields = {
+      domain: expected.domain,
+      address,
+      statement: 'Sign in to Beagle.',
+      uri: `${expected.uri}/`,
+      version: '1',
+      chainId: expected.chainId,
+      nonce,
+      issuedAt: siwsTimestamp(now),
+      expirationTime: siwsExpiration(now),
+      ...overrides,
+    };
+    for (const key of omit) delete fields[key];
+    return createSiwsMessage(fields);
+  }
+
+  function sign(text: string, key: nacl.SignKeyPair = keypair, encoding: 'base58' | 'base64' = 'base58'): string {
+    const sig = nacl.sign.detached(new TextEncoder().encode(text), key.secretKey);
+    return encoding === 'base58' ? encodeBase58(sig) : Buffer.from(sig).toString('base64');
+  }
+
+  it('verifies a base58 or base64 signature over the exact text and consumes the nonce', () => {
+    const svc = service();
+    const text = message(svc);
+    const ok = svc.verify(text, sign(text), address);
+    expect(ok).toMatchObject({ ok: true, address });
+    const replay = svc.verify(text, sign(text), address);
+    expect(replay).toMatchObject({ ok: false, code: 'nonce_unknown' });
+    const text64 = message(svc);
+    expect(svc.verify(text64, sign(text64, keypair, 'base64'), address)).toMatchObject({ ok: true });
+    expect(svc.issueNonce()).toMatch(/^[A-Za-z0-9_-]{22}$/);
   });
 
-  it('rejects wrong domain, unsupported chain, bad signature and unknown nonce', async () => {
-    const r = repos();
-    const svc = new SiweService(r.nonces, { domain: 'localhost:8787' });
-    const wrongDomain = await signed(svc, { domain: 'evil.example' });
-    expect((await svc.verify(wrongDomain.message, wrongDomain.signature)).ok).toBe(false);
-    const wrongChain = await signed(svc, { chainId: 1 });
-    expect((await svc.verify(wrongChain.message, wrongChain.signature)).ok).toBe(false);
-    const other = privateKeyToAccount('0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a');
-    const nonce = svc.issueNonce();
-    const message = createSiweMessage({ address: account.address, chainId: 31337, domain: 'localhost:8787', nonce, uri: 'http://localhost:8787', version: '1' });
-    const forged = await other.signMessage({ message });
-    const res = await svc.verify(message, forged);
-    expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.code).toBe('bad_signature');
-    const unknownNonce = createSiweMessage({ address: account.address, chainId: 31337, domain: 'localhost:8787', nonce: 'abcdefgh12345678', uri: 'http://localhost:8787', version: '1' });
-    const r2 = await svc.verify(unknownNonce, await account.signMessage({ message: unknownNonce }));
-    expect(r2.ok).toBe(false);
-    if (!r2.ok) expect(r2.code).toBe('bad_nonce');
-    expect((await svc.verify('not a siwe message', '0x00')).ok).toBe(false);
+  it('reports each validation failure with its code', () => {
+    const svc = service();
+    const check = (text: string, signature: string, publicKey: string, code: string): void => {
+      const res = svc.verify(text, signature, publicKey);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.code).toBe(code);
+    };
+    const wrongDomain = message(svc, { domain: 'evil.example' });
+    check(wrongDomain, sign(wrongDomain), address, 'domain_mismatch');
+    const wrongChain = message(svc, { chainId: 'solana:mainnet' });
+    check(wrongChain, sign(wrongChain), address, 'chain_mismatch');
+    const wrongUri = message(svc, { uri: 'http://evil.example/' });
+    check(wrongUri, sign(wrongUri), address, 'uri_mismatch');
+    const unknownNonce = message(svc, { nonce: 'abcdefgh12345678' });
+    check(unknownNonce, sign(unknownNonce), address, 'nonce_unknown');
+    const expired = message(svc, { expirationTime: siwsTimestamp(T0 - 1000) });
+    check(expired, sign(expired), address, 'expired');
+    const future = message(svc, { issuedAt: siwsTimestamp(T0 + 6 * 60_000) });
+    check(future, sign(future), address, 'issued_at_future');
+    const noNonce = message(svc, {}, T0, ['nonce']);
+    check(noNonce, sign(noNonce), address, 'nonce_missing');
+    const fine = message(svc);
+    check(fine, sign(fine), encodeBase58(other.publicKey), 'address_mismatch');
+    check(fine, sign(fine, other), address, 'bad_signature');
+    check(fine, encodeBase58(new Uint8Array(63).fill(7)), address, 'invalid_signature');
+    check(fine, 'not-a-signature', address, 'invalid_signature');
+    check(fine, sign(fine), 'not-a-key', 'invalid_public_key');
+    check('hello', sign('hello'), address, 'invalid_message');
+    // The nonce survives a failed signature check and is consumed by the successful one.
+    expect(svc.verify(fine, sign(fine), address)).toMatchObject({ ok: true });
   });
 
-  it('honours an injected verifier', async () => {
+  it('expires nonces after 10 minutes and purges them from housekeeping', () => {
+    let now = T0;
     const r = repos();
-    const svc = new SiweService(r.nonces, { domain: 'localhost:8787', verifier: async () => true });
-    const nonce = svc.issueNonce();
-    const message = createSiweMessage({ address: account.address, chainId: 4663, domain: 'localhost:8787', nonce, uri: 'http://localhost:8787', version: '1' });
-    expect((await svc.verify(message, '0x1234')).ok).toBe(true);
+    const svc = new SiwsService(r.nonces, { ...expected, now: () => now });
+    const text = message(svc);
+    const signature = sign(text);
+    now += SIWS_NONCE_TTL_MS + 1;
+    expect(svc.verify(text, signature, address)).toMatchObject({ ok: false, code: 'nonce_unknown' });
+    expect(svc.purgeExpired()).toBe(1);
+    expect(decodeSignature(signature)?.length).toBe(64);
+    expect(decodeSignature('x')).toBeUndefined();
   });
 });
 
@@ -154,20 +197,20 @@ describe('crypto', () => {
 });
 
 describe('logging redaction', () => {
-  it('never prints API keys, provider keys, bearer tokens or private keys', () => {
+  it('never prints API keys, provider keys, bearer tokens or secret keys', () => {
     const lines: string[] = [];
     const log = createLogger({ level: 'debug', write: (l) => lines.push(l) });
     const key = generateApiKey();
-    const txHash = '0x' + 'cd'.repeat(32);
-    log.info('auth ok', { key, apiKey: 'sk-ant-api03-abcdefghijklmnop', header: 'Bearer eyJhbGciOiJIUzI1NiJ9.abcdefghijklmnop', privateKey: '0x' + 'ab'.repeat(32), txHash, nested: { token: 'secret-value', sessionSecret: 'sess' } });
+    const signature = '5X31v1NFMMuZdh6dipB1DmvM2Ysn31ww62f3dauoqaPUi1JfdgdDH6hjdGER8HQeg46WzyxPoktbiD22a5r2Ee3j';
+    log.info('auth ok', { key, apiKey: 'sk-ant-api03-abcdefghijklmnop', header: 'Bearer eyJhbGciOiJIUzI1NiJ9.abcdefghijklmnop', secretKey: '[1,2,3,4]', signature, nested: { token: 'secret-value', sessionSecret: 'sess' } });
     const out = lines.join('\n');
     expect(out).not.toContain(key);
     expect(out).not.toContain('sk-ant-api03');
     expect(out).not.toContain('eyJhbGciOiJIUzI1NiJ9');
-    expect(out).not.toContain('ab'.repeat(32));
+    expect(out).not.toContain('[1,2,3,4]');
     expect(out).not.toContain('secret-value');
     expect(out).not.toContain('"sess"');
-    expect(out).toContain(txHash);
+    expect(out).toContain(signature);
     expect(out).toContain('[redacted]');
     expect(redactString(`key ${key} used`)).toBe('key [redacted] used');
     expect(JSON.parse(lines[0]!)).toMatchObject({ level: 'info', msg: 'auth ok' });

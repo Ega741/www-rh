@@ -1,27 +1,31 @@
 /**
- * Dashboard API (SPEC §5.9): auth (SIWE, sessions), keys, balance, usage, ledger, receipts, BYOK
- * providers, budgets, upgrades, models, price, quote, status, config. JSON with decimal-string money;
- * errors `{ error: { code, message } }`.
+ * Dashboard API (SPEC §5.9): auth (SIWS, sessions), keys, balance, usage, ledger, receipts, BYOK
+ * providers, budgets (SPL delegation), upgrades, models, price + history, quote, status, config.
+ * JSON with decimal-string money; errors `{ error: { code, message } }`.
  *
  * @module api/dashboard
  */
 import {
-  AdminCreditRequestSchema,
   CreateApiKeyRequestSchema,
   CursorQuerySchema,
+  PriceHistoryQuerySchema,
   PutProviderKeyRequestSchema,
   QuoteQuerySchema,
+  RegisterBudgetRequestSchema,
   UpgradeRequestSchema,
   UsageQuerySchema,
   UsageWindowSchema,
   VerifyRequestSchema,
+  type BudgetDtoWire,
 } from '@beagle/shared/api';
 import { BYOK_PROVIDERS, type ByokProvider } from '@beagle/shared/models';
+import { isBase58Pubkey } from '@beagle/shared/solana';
 import type { Context, Hono } from 'hono';
-import type { Hex } from 'viem';
 import { z } from 'zod';
 import { uuid } from '../auth/crypto.js';
 import { sessionCookie } from '../auth/session.js';
+import { BudgetRegisterError } from '../chain/budgets.js';
+import type { BudgetRow } from '../db/repos.js';
 import { buildReceipt } from '../metering/receipts.js';
 import { InsufficientCreditError } from '../metering/reserve.js';
 import { UpgradeInputError, UpgradeService } from '../upgrades/plans.js';
@@ -32,8 +36,6 @@ import { UnsafeBaseUrlError } from '../providers/registry.js';
 import { principalOf, requireSession, type AppEnv } from './auth.js';
 import { apiKeyDto, balanceDto, budgetDrawDto, budgetDto, configDto, creditEventDto, ledgerRowDto, meDto, modelsDto, providerKeyDto, statusDto, usageListDto, usageSummaryDto } from './dto.js';
 import { ApiError } from './errors.js';
-
-void AdminCreditRequestSchema;
 
 /** Active API keys a workspace may hold (`POST /api/keys` → 400 `too_many_keys` beyond it). */
 export const MAX_ACTIVE_KEYS = 50;
@@ -67,18 +69,53 @@ function byokProvider(raw: string): ByokProvider {
   return raw as ByokProvider;
 }
 
+/**
+ * `POST /api/budgets/register` (SPEC §3.4, §5.9), shared with the MCP in-process api: validates the
+ * account on chain (mint, delegate = operator → 400 `not_delegated`), lets only the token account
+ * owner choose another `workspace` to fund (403 `not_owner` otherwise) and returns the budget.
+ */
+export async function registerBudget(services: Services, principalWorkspace: string, tokenAccount: string, workspace?: string): Promise<BudgetDtoWire> {
+  const scanner = services.budgets;
+  if (scanner === undefined) throw new ApiError(503, 'chain_unavailable', 'This gateway has no chain access configured; budgets are disabled.');
+  let state;
+  try {
+    state = await scanner.inspect(tokenAccount);
+  } catch (e) {
+    if (e instanceof BudgetRegisterError) throw new ApiError(400, e.code === 'not_delegated' ? 'not_delegated' : 'invalid_token_account', e.message);
+    throw e;
+  }
+  if (workspace !== undefined && workspace !== state.owner && state.owner !== principalWorkspace) {
+    throw new ApiError(403, 'not_owner', 'only the token account owner may fund another workspace with it');
+  }
+  const row = scanner.applyState(state, undefined, { registeredAt: services.now(), ...(workspace === undefined ? {} : { workspace }) });
+  services.logger.info('budget registered', { tokenAccount, owner: row.owner, workspace: row.workspace, by: principalWorkspace });
+  return budgetDto(services, row);
+}
+
+/** `GET /api/budgets[/:tokenAccount]`: the budgets that fund `workspace` plus those its wallet delegated. */
+export function budgetsOf(services: Services, workspace: string): BudgetRow[] {
+  const seen = new Set<string>();
+  const out: BudgetRow[] = [];
+  for (const row of [...services.repos.budgets.list(workspace), ...services.repos.budgets.listByOwner(workspace)]) {
+    if (seen.has(row.tokenAccount)) continue;
+    seen.add(row.tokenAccount);
+    out.push(row);
+  }
+  return out;
+}
+
 /** Mounts the dashboard routes. */
 export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
   const secureCookie = services.config.server.publicUrl.startsWith('https:');
 
   // ---- auth ----------------------------------------------------------------------------------
-  app.get('/api/auth/nonce', (c) => c.json({ nonce: services.siwe.issueNonce() }));
+  app.get('/api/auth/nonce', (c) => c.json({ nonce: services.siws.issueNonce() }));
 
   app.post('/api/auth/verify', async (c) => {
     const body = parseOr400(VerifyRequestSchema, await readJson(c));
-    const result = await services.siwe.verify(body.message, body.signature as Hex);
-    if (!result.ok) throw new ApiError(401, `siwe_${result.code}`, result.message);
-    const workspace = result.address.toLowerCase();
+    const result = services.siws.verify(body.message, body.signature, body.publicKey);
+    if (!result.ok) throw new ApiError(401, `siws_${result.code}`, result.message);
+    const workspace = result.address;
     services.repos.workspaces.ensure(workspace, services.now());
     const { token } = services.sessions.create(workspace);
     c.header('set-cookie', sessionCookie(token, secureCookie));
@@ -97,7 +134,7 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
     return c.json(meDto(services, ws));
   });
 
-  app.get('/api/balance', requireSession(services, true), async (c) => c.json(await balanceDto(services, principalOf(c).workspace)));
+  app.get('/api/balance', requireSession(services, true), (c) => c.json(balanceDto(services, principalOf(c).workspace)));
 
   // ---- API keys ------------------------------------------------------------------------------
   app.get('/api/keys', requireSession(services), (c) => c.json(services.apiKeys.list(principalOf(c).workspace).map((k) => apiKeyDto(k))));
@@ -144,11 +181,11 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
     return c.json({ rows: rows.map(ledgerRowDto), nextBefore: rows.length === q.limit && last !== undefined ? last.createdAt : null });
   });
 
-  app.get('/api/receipts', requireSession(services), (c) => {
+  app.get('/api/receipts', requireSession(services, true), (c) => {
     const q = parseOr400(CursorQuerySchema, nonEmptyQuery(c.req.query()));
     const rows = services.repos.creditEvents.list(principalOf(c).workspace, q.limit, q.before);
     const last = rows[rows.length - 1];
-    return c.json({ rows: rows.map((r) => creditEventDto(services, r)), nextBefore: rows.length === q.limit && last !== undefined ? last.blockNumber : null });
+    return c.json({ rows: rows.map((r) => creditEventDto(services, r)), nextBefore: rows.length === q.limit && last !== undefined ? last.createdAt : null });
   });
 
   app.get('/api/receipts/:requestId', requireSession(services, true), (c) => {
@@ -215,17 +252,23 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
     }
   });
 
-  // ---- budgets -------------------------------------------------------------------------------
-  app.get('/api/budgets', requireSession(services, true), (c) => c.json(services.repos.budgets.list(principalOf(c).workspace).map((b) => budgetDto(services, b))));
+  // ---- budgets (SPL delegation) --------------------------------------------------------------
+  app.get('/api/budgets', requireSession(services, true), (c) => c.json(budgetsOf(services, principalOf(c).workspace).map((b) => budgetDto(services, b))));
 
-  const budgetOf = (c: Context<AppEnv>) => {
-    const id = Number(c.req.param('id'));
-    const row = Number.isInteger(id) ? services.repos.budgets.get(id) : undefined;
-    if (row === undefined || row.workspace !== principalOf(c).workspace) throw new ApiError(404, 'not_found', 'unknown budget');
+  app.post('/api/budgets/register', requireSession(services, true), async (c) => {
+    const body = parseOr400(RegisterBudgetRequestSchema, await readJson(c));
+    return c.json(await registerBudget(services, principalOf(c).workspace, body.tokenAccount, body.workspace), 201);
+  });
+
+  const budgetOf = (c: Context<AppEnv>): BudgetRow => {
+    const tokenAccount = c.req.param('tokenAccount');
+    const row = isBase58Pubkey(tokenAccount) ? services.repos.budgets.get(tokenAccount) : undefined;
+    const ws = principalOf(c).workspace;
+    if (row === undefined || (row.workspace !== ws && row.owner !== ws)) throw new ApiError(404, 'not_found', 'unknown budget');
     return row;
   };
-  app.get('/api/budgets/:id', requireSession(services, true), (c) => c.json(budgetDto(services, budgetOf(c))));
-  app.get('/api/budgets/:id/draws', requireSession(services, true), (c) => c.json(services.repos.budgetDraws.listByBudget(budgetOf(c).budgetId).map(budgetDrawDto)));
+  app.get('/api/budgets/:tokenAccount', requireSession(services, true), (c) => c.json(budgetDto(services, budgetOf(c))));
+  app.get('/api/budgets/:tokenAccount/draws', requireSession(services, true), (c) => c.json(services.repos.budgetDraws.listByTokenAccount(budgetOf(c).tokenAccount).map(budgetDrawDto)));
 
   // ---- upgrades ------------------------------------------------------------------------------
   app.get('/api/upgrades/prices', (c) => c.json(services.upgrades.prices()));
@@ -245,10 +288,14 @@ export function mountDashboard(app: Hono<AppEnv>, services: Services): void {
 
   // ---- public --------------------------------------------------------------------------------
   app.get('/api/models', (c) => c.json(modelsDto(services)));
-  app.get('/api/price', async (c) => c.json(await services.price.priceDto()));
-  app.get('/api/quote', async (c) => {
+  app.get('/api/price', (c) => c.json(services.price.priceDto()));
+  app.get('/api/price/history', (c) => {
+    const q = parseOr400(PriceHistoryQuerySchema, nonEmptyQuery(c.req.query()));
+    return c.json(services.price.historyDto(q.limit));
+  });
+  app.get('/api/quote', (c) => {
     const q = parseOr400(QuoteQuerySchema, c.req.query());
-    return c.json(await services.price.quote({ ...(q.tokens === undefined ? {} : { tokens: q.tokens }), ...(q.usdMicro === undefined ? {} : { usdMicro: q.usdMicro }) }));
+    return c.json(services.price.quote({ ...(q.tokens === undefined ? {} : { tokens: q.tokens }), ...(q.usdMicro === undefined ? {} : { usdMicro: q.usdMicro }) }));
   });
   app.get('/api/status', (c) => c.json(statusDto(services)));
   app.get('/api/config', (c) => c.json(configDto(services)));

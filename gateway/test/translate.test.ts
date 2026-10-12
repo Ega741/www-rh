@@ -8,7 +8,7 @@ import { OpenAiChunkEncoder, toChatCompletion } from '../src/translate/toOpenAI.
 import { buildAnthropicParams } from '../src/providers/anthropic.js';
 import { buildOpenAiBody } from '../src/providers/openaiCompat.js';
 
-const META = { requestId: 'req_1', workspace: '0x70997970c51812dc3a010c7d01b50e0d17dc79c8' };
+const META = { requestId: 'req_1', workspace: '46WBYp3PQAdDmjJ2MH3Duz3nm6WN7ZZMDhxZqcB9XF2k' };
 
 describe('fromOpenAI', () => {
   it('translates text, images, tools, tool results and options', () => {

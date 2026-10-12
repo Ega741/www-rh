@@ -1,31 +1,36 @@
 /**
- * The Beagle MCP server (SPEC §6.3): ten tools and two resources over a {@link BeagleApi}, with an
- * optional {@link WalletExecutor} for the two tools that spend tokens on chain.
+ * The Beagle MCP server (SPEC §6.3): eleven tools and two resources over a {@link BeagleApi}, with
+ * an optional {@link WalletExecutor} for the three tools that act on chain (burn, approve, revoke).
  *
  * Every tool returns its result both as pretty-printed JSON text and as `structuredContent`
  * (bigints serialized as decimal strings). Failures come back as `isError` results whose payload is
- * `{ error: { code, message, status? } }`, where `code` is the gateway error code when the gateway
- * produced the failure (`insufficient_credit`, `invalid_api_key`, …).
+ * `{ error: { code, message, status?, signature? } }`, where `code` is the gateway error code when
+ * the gateway produced the failure (`insufficient_credit`, `invalid_api_key`, …) or a wallet code.
+ *
+ * Without a wallet the on-chain tools return unsigned legacy transactions (`feePayer = workspace`,
+ * fresh blockhash, base64) for a wallet-capable agent to sign and send; that path needs an RPC
+ * (`connection` / `rpcUrl`, default: the gateway's `rpcUrl` from `GET /api/config`).
  *
  * @module server
  */
-import { explorerTxUrl, chainById } from '@beagle/shared/chains';
+import { explorerTxUrl, type ExplorerSite } from '@beagle/shared/clusters';
 import { formatPriceE18, formatTokenAmount, formatUsdMicro, parseTokenAmount, parseUsdToMicro } from '@beagle/shared/credit';
 import { ALIASES, ALIAS_DESCRIPTIONS, TIER_ORDER, type Tier } from '@beagle/shared/models';
-import type { BalanceDto, BudgetDto, ConfigDto, ModelDto, QuoteDto } from '@beagle/shared/api';
+import type { BalanceDto, BudgetDto, ConfigDto, CreditEventDto, ModelDto, PriceDto, QuoteDto } from '@beagle/shared/api';
 import type { ChatCompletionRequest } from '@beagle/shared/openai';
+import { isBase58Pubkey } from '@beagle/shared/solana';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
-import { getAddress, isAddress, type Address } from 'viem';
+import { Connection } from '@solana/web3.js';
 import { z } from 'zod';
 import { BeagleApiError, type BeagleApi } from './api.js';
-import { buildUnsignedSteps, creditFloor, DEFAULT_TOLERANCE_BPS, MAX_TOLERANCE_BPS, WalletError, type WalletExecutor } from './wallet.js';
+import { prepareUnsignedTransactions, WalletError, type SolanaRpc, type WalletDeployment, type WalletExecutor } from './wallet.js';
 
 /** Name and version reported in `initialize`. */
 export const MCP_SERVER_INFO = { name: 'beagle', version: '0.1.0' } as const;
 
-/** The ten tool names of SPEC §6.3, in table order. */
+/** The eleven tool names of SPEC §6.3, in table order. */
 export const BEAGLE_TOOL_NAMES = [
   'beagle_balance',
   'beagle_models',
@@ -34,6 +39,7 @@ export const BEAGLE_TOOL_NAMES = [
   'beagle_usage',
   'beagle_buy_compute',
   'beagle_open_budget',
+  'beagle_close_budget',
   'beagle_budgets',
   'beagle_upgrade',
   'beagle_status',
@@ -45,38 +51,39 @@ export type BeagleToolName = (typeof BEAGLE_TOOL_NAMES)[number];
 /** Resource URIs served by the server. */
 export const BEAGLE_RESOURCE_URIS = { models: 'beagle://models', quickstart: 'beagle://quickstart' } as const;
 
-/** Longest budget the desk accepts (`MAX_BUDGET_DURATION = 30 days`), in hours. */
-export const MAX_BUDGET_HOURS = 720;
-
 /** Options of {@link createBeagleMcpServer}. */
 export interface BeagleMcpServerOptions {
-  /** Signs `beagle_buy_compute` / `beagle_open_budget`; without it those tools return unsigned steps. */
+  /** Signs `beagle_buy_compute` / `beagle_open_budget` / `beagle_close_budget`; without it those tools return unsigned transactions. */
   wallet?: WalletExecutor;
-  /** After a burn, poll `balance()` until the credit shows up (default `true`). */
+  /** After a burn, poll `receipts()` / `balance()` until the credit shows up (default `true`). */
   waitForCredit?: boolean;
-  /** How long to wait for the credit after the burn is mined, ms (default 60 000, SPEC §6.1 "up to 60 s"). */
+  /** How long to wait for the credit after the burn is confirmed, ms (default 60 000, SPEC §6.1 "up to 60 s"). */
   creditWaitMs?: number;
-  /** Balance polling interval, ms (default 2 000). */
+  /** Credit polling interval, ms (default 2 000). */
   pollIntervalMs?: number;
   /**
    * Total time budget of one `beagle_buy_compute` call, ms, measured from its start (default 45 000).
    * The credit poll stops when this or `creditWaitMs` runs out, whichever is first, so the result
-   * (with `txHash`) reaches clients whose request timeout is the MCP SDK default of 60 s even when
-   * the receipt took a while; progress notifications are sent meanwhile for clients that reset their
-   * timeout on progress.
+   * (with the signature) reaches clients whose request timeout is the MCP SDK default of 60 s even
+   * when confirmation took a while; progress notifications are sent meanwhile for clients that reset
+   * their timeout on progress.
    */
   callBudgetMs?: number;
   /**
-   * Default `workspace` of the wallet tools when the call omits it. Falls back to
+   * Default `workspace` of the on-chain tools when the call omits it (base58). Falls back to
    * `wallet.address`; the gateway's `/mcp` mount passes the key's workspace here.
    */
-  workspace?: Address;
+  workspace?: string;
   /** Gateway URL shown in `beagle://quickstart` (default `http://localhost:8787`). */
   apiUrl?: string;
   /** How long `config()` is cached, ms (default 60 000). */
   configTtlMs?: number;
   /** Clock in unix ms (tests). */
   now?: () => number;
+  /** RPC for the unsigned path (token account lookup, blockhash); default: a `Connection` to `rpcUrl` or the gateway's `config.rpcUrl`. */
+  connection?: SolanaRpc;
+  /** JSON-RPC URL for the default connection (ignored when `connection` is given). */
+  rpcUrl?: string;
 }
 
 /** Raised for bad tool input that zod cannot express (e.g. `usd` and `tokens` together). */
@@ -112,13 +119,22 @@ export interface ToolErrorInfo {
   code: string;
   message: string;
   status?: number;
-  txHash?: string;
+  /** Transaction signature when the failure happened after a send. */
+  signature?: string;
+  logs?: string[];
 }
 
-/** Maps any thrown value to the `{ code, message, status? }` payload of an `isError` result. */
+/** Maps any thrown value to the `{ code, message, status?, signature? }` payload of an `isError` result. */
 export function toolErrorInfo(error: unknown): ToolErrorInfo {
   if (BeagleApiError.is(error)) return { code: error.code, message: error.message, status: error.status };
-  if (error instanceof WalletError) return { code: error.code, message: error.message, ...(error.txHash === undefined ? {} : { txHash: error.txHash }) };
+  if (error instanceof WalletError) {
+    return {
+      code: error.code,
+      message: error.message,
+      ...(error.signature === undefined ? {} : { signature: error.signature }),
+      ...(error.logs === undefined ? {} : { logs: error.logs }),
+    };
+  }
   if (error instanceof ToolInputError) return { code: error.code, message: error.message };
   if (error instanceof RangeError || error instanceof SyntaxError) return { code: 'invalid_request', message: error.message };
   if (error instanceof Error) return { code: 'internal_error', message: error.message };
@@ -181,7 +197,8 @@ export function numberToDecimalString(n: number): string {
 
 /**
  * Parses a whole-token amount (`1000`, `0.1`, `"1000.5"`) into raw units with `decimals` (> 0).
- * Numbers are taken at their shortest round-trip representation, so `0.1` is exactly `1e17` raw.
+ * Numbers are taken at their shortest round-trip representation, so `0.1` is exactly `100000` raw
+ * with 6 decimals.
  */
 export function tokenInputToRaw(input: number | string, decimals: number): bigint {
   let raw: bigint;
@@ -196,7 +213,7 @@ export function tokenInputToRaw(input: number | string, decimals: number): bigin
 }
 
 const AMOUNT_SCHEMA = z.union([z.number(), z.string()]);
-const ADDRESS_SCHEMA = z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'expected a 0x address');
+const ADDRESS_SCHEMA = z.string().refine(isBase58Pubkey, { message: 'expected a base58 Solana public key (32 bytes)' });
 
 interface ResolvedAmount {
   tokens: bigint;
@@ -204,11 +221,29 @@ interface ResolvedAmount {
   quote: QuoteDto;
 }
 
-/** Human-readable summary of a balance (`"$12.34 available; plan free; 1 BEAGLE = $0.0100"`). */
+/** Human-readable summary of a balance (`"$12.34 available; plan free; 1 BEAGLE = $0.0100"`, `(stale)` appended while the price is stale). */
 export function balanceSummary(balance: BalanceDto, symbol: string): string {
   const plan = balance.plan === 'pro' && balance.planUntil !== null ? `pro until ${new Date(balance.planUntil).toISOString()}` : balance.plan;
   const price = balance.price.priceE18 === 0n ? 'price unavailable' : `1 ${symbol} = ${formatPriceE18(balance.price.priceE18, { minFractionDigits: 4 })}${balance.price.stale ? ' (stale)' : ''}`;
   return `${formatUsdMicro(balance.availableMicro)} available; plan ${plan}; ${price}`;
+}
+
+/** `"3 min ago"` style age of a price point (`observedAt` is unix seconds). */
+export function priceAge(price: Pick<PriceDto, 'observedAt'>, nowMs: number): string {
+  const seconds = Math.max(0, Math.floor(nowMs / 1000) - price.observedAt);
+  if (seconds < 60) return `${seconds} s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3600)} h ago`;
+  return `${Math.floor(seconds / 86_400)} d ago`;
+}
+
+/** The warning the on-chain tools attach while the published price is stale (SPEC §3.3), else `undefined`. */
+export function staleWarning(price: PriceDto, nowMs: number): string | undefined {
+  if (!price.stale) return undefined;
+  return (
+    `The published price (point ${price.pricePointId}, ${formatPriceE18(price.priceE18, { minFractionDigits: 4 })} per token, observed ${priceAge(price, nowMs)}) is STALE: ` +
+    `older than ${price.maxAgeS} s. A burn observed now is credited at this last point and flagged priceStale; the quote may not reflect the market. Consider waiting for a fresh point.`
+  );
 }
 
 function priceHuman(perMillion: number): string {
@@ -227,20 +262,21 @@ function modelRow(model: ModelDto): Record<string, unknown> {
   };
 }
 
-/** Open, unexpired and not stalled: the gateway's predicate for headroom that counts as available credit. */
-function budgetCountsAsHeadroom(budget: BudgetDto, nowMs: number): boolean {
-  return !budget.closed && budget.stalledReason === null && budget.deadline * 1000 > nowMs;
+/** Open and not stalled: the gateway's predicate for headroom that counts as available credit. */
+function budgetCountsAsHeadroom(budget: BudgetDto): boolean {
+  return !budget.closed && budget.stalledReason === null;
 }
 
-function budgetRow(budget: BudgetDto, decimals: number, symbol: string, nowMs: number): Record<string, unknown> {
+function budgetRow(budget: BudgetDto, decimals: number, symbol: string): Record<string, unknown> {
   return {
     ...budget,
     capFormatted: `${formatTokenAmount(budget.cap, decimals)} ${symbol}`,
-    drawnFormatted: `${formatTokenAmount(budget.drawn, decimals)} ${symbol}`,
+    balanceFormatted: `${formatTokenAmount(budget.balance, decimals)} ${symbol}`,
     headroomFormatted: `${formatTokenAmount(budget.headroomTokens, decimals)} ${symbol} (${formatUsdMicro(budget.headroomMicro)})`,
-    deadlineIso: new Date(budget.deadline * 1000).toISOString(),
-    active: !budget.closed && budget.deadline * 1000 > nowMs,
-    countsAsHeadroom: budgetCountsAsHeadroom(budget, nowMs),
+    lifetime: budget.closed ? 'closed' : 'until revoked',
+    active: !budget.closed,
+    countsAsHeadroom: budgetCountsAsHeadroom(budget),
+    drawCount: budget.draws.length,
   };
 }
 
@@ -293,7 +329,7 @@ export function quickstartMarkdown(apiUrl: string): string {
   const base = apiUrl.replace(/\/+$/, '');
   return `# Beagle quick start
 
-Beagle is compute for agents on Robinhood Chain: one API key for every model, paid for by burning BEAGLE.
+Beagle is compute for agents on Solana: one API key for every model, paid for by burning BEAGLE (an SPL token).
 Credit is tracked in µUSD (1 USD = 1,000,000 µUSD); every response reports its cost and your remaining balance.
 
 ## 1. Check credit
@@ -303,13 +339,16 @@ unless the route is served through your own provider key (BYOK).
 
 ## 2. Get credit
 
-- \`beagle_buy_compute\` with \`usd\` or \`tokens\`: burns BEAGLE through the CreditDesk contract (approve + burnForCreditMin).
-  The contract emits the USD value at the on-chain price and the gateway credits exactly that amount once indexed.
-  The burn carries a credit floor of quote − \`tolerance_bps\` (default 100 = 1 %): if a price change lands first and the
-  burn would credit less, it reverts with SlippageExceeded and costs only gas; re-quote and retry.
-- \`beagle_open_budget\` with \`usd\`/\`tokens\` and \`hours\` (≤ 720): approve + openBudget. The operator draws from the
-  budget as usage accrues, never above the cap; the headroom counts as available credit right away.
-- Without an agent wallet both tools return unsigned transaction steps (\`to\`, \`data\`, \`value\`) to sign yourself.
+- \`beagle_buy_compute\` with \`usd\` or \`tokens\`: a plain SPL \`BurnChecked\` of BEAGLE from your token account
+  (plus a memo \`beagle:v1 ws=<workspace>\` when crediting another workspace). The gateway indexes the burn and credits
+  its USD value at the **published price point in force when it observes the burn** (\`beagle_quote\` shows the current
+  point; the tool warns while the price is stale). A burn is final and not refundable.
+- \`beagle_open_budget\` with \`usd\`/\`tokens\`: \`ApproveChecked\` that delegates up to the cap to the gateway operator
+  (no deadline, lives until revoked), then registers the token account. The operator burns from it as usage accrues,
+  never above the cap, with a receipt hash in each burn's memo; the headroom (min(cap, balance)) counts as credit
+  right away. A new approval replaces the previous cap. \`beagle_close_budget\` revokes it.
+- Without an agent wallet these tools return unsigned legacy transactions (base64, fee payer = your workspace, fresh
+  blockhash) to sign and send yourself.
 
 ## 3. Run inference
 
@@ -340,6 +379,25 @@ The gateway answers \`402 insufficient_credit\`; tools return \`isError\` with t
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Explorer link of a transaction per the gateway's cluster / RPC / explorer base. */
+export function explorerLink(config: Pick<ConfigDto, 'cluster' | 'rpcUrl' | 'explorer'>, signature: string): string {
+  const site: ExplorerSite = /solscan/i.test(config.explorer) ? 'solscan' : 'solana';
+  return explorerTxUrl(config.cluster, signature, { site, rpcUrl: config.rpcUrl });
+}
+
+/** The {@link WalletDeployment} a `ConfigDto` describes. */
+export function walletDeployment(config: ConfigDto): WalletDeployment {
+  return {
+    cluster: config.cluster,
+    mint: config.mint,
+    decimals: config.decimals,
+    tokenProgram: config.tokenProgram,
+    operator: config.operator,
+    memoProgram: config.memoProgram,
+    symbol: config.symbol,
+  };
+}
+
 // ---------------------------------------------------------------------------------------------
 // Server
 
@@ -359,8 +417,8 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
 
   const server = new McpServer(MCP_SERVER_INFO, {
     instructions:
-      'Beagle gives agents one API key for every model, paid for by burning BEAGLE on Robinhood Chain. ' +
-      'Check beagle_balance before spending; beagle_complete costs credit; beagle_buy_compute and beagle_open_budget spend tokens on chain. ' +
+      'Beagle gives agents one API key for every model, paid for by burning BEAGLE (an SPL token on Solana). ' +
+      'Check beagle_balance before spending; beagle_complete costs credit; beagle_buy_compute burns tokens (final), beagle_open_budget delegates tokens to the operator (revocable with beagle_close_budget). ' +
       'Read beagle://quickstart for the flow.',
   });
 
@@ -375,22 +433,21 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
   async function tokenInfo(): Promise<{ symbol: string; decimals: number }> {
     try {
       const config = await getConfig();
-      return { symbol: config.token?.symbol ?? 'BEAGLE', decimals: config.token?.decimals ?? 18 };
+      return { symbol: config.symbol, decimals: config.decimals };
     } catch {
-      return { symbol: 'BEAGLE', decimals: 18 };
+      return { symbol: 'BEAGLE', decimals: 6 };
     }
   }
 
-  function requireDeployment(config: ConfigDto): { creditDesk: Address; token: Address; symbol: string; decimals: number } {
-    if (config.creditDesk === null || config.token === null) {
-      throw new BeagleApiError(503, 'not_configured', 'the gateway has no CreditDesk deployment configured for this chain');
-    }
-    return {
-      creditDesk: config.creditDesk as Address,
-      token: config.token.address as Address,
-      symbol: config.token.symbol,
-      decimals: config.token.decimals,
-    };
+  let rpcCache: { url: string; rpc: SolanaRpc } | undefined;
+  /** The RPC of the unsigned path: the injected connection, else one `Connection` per RPC URL. */
+  function getRpc(config: ConfigDto): SolanaRpc {
+    if (opts.connection !== undefined) return opts.connection;
+    const url = opts.rpcUrl ?? config.rpcUrl;
+    if (rpcCache?.url === url) return rpcCache.rpc;
+    const rpc: SolanaRpc = new Connection(url, 'confirmed');
+    rpcCache = { url, rpc };
+    return rpc;
   }
 
   async function resolveAmount(input: { usd?: number | string | undefined; tokens?: number | string | undefined }, decimals: number): Promise<ResolvedAmount> {
@@ -408,34 +465,51 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
   }
 
   /**
-   * Where the wallet tools' `workspace` came from: the call (`input`), the server configuration
+   * Where the on-chain tools' `workspace` came from: the call (`input`), the server configuration
    * (`configured`: `BEAGLE_WORKSPACE` or the key's workspace on `/mcp`), or the agent wallet address
    * (`agent_wallet`), which is a guess: the API key may belong to a different workspace.
    */
   type WorkspaceSource = 'input' | 'configured' | 'agent_wallet';
 
-  function resolveWorkspace(input: string | undefined): { address: Address; source: WorkspaceSource } {
+  function resolveWorkspace(input: string | undefined): { address: string; source: WorkspaceSource } {
     const [ws, source]: [string | undefined, WorkspaceSource] =
       input !== undefined ? [input, 'input'] : opts.workspace !== undefined ? [opts.workspace, 'configured'] : [wallet?.address, 'agent_wallet'];
     if (ws === undefined) {
       throw new ToolInputError(
-        'workspace is required: pass the 0x address of the workspace to credit (your API key belongs to one). No agent wallet is configured, so it cannot be inferred.',
+        'workspace is required: pass the base58 public key of the workspace to credit (your API key belongs to one). No agent wallet is configured, so it cannot be inferred.',
       );
     }
-    if (!isAddress(ws, { strict: false })) throw new ToolInputError(`workspace is not an address: ${JSON.stringify(ws)}`);
-    return { address: getAddress(ws), source };
+    const trimmed = ws.trim();
+    if (!isBase58Pubkey(trimmed)) throw new ToolInputError(`workspace is not a base58 Solana public key: ${JSON.stringify(ws)}`);
+    return { address: trimmed, source };
   }
 
-  function workspaceWarning(source: WorkspaceSource, address: Address): string {
+  function workspaceWarning(source: WorkspaceSource, address: string): string {
     return source === 'agent_wallet'
       ? ` Warning: workspace defaulted to the agent wallet ${address}, which is not necessarily the workspace of this API key (set BEAGLE_WORKSPACE or pass workspace to be explicit); credit on another workspace is reachable only by signing in as it.`
       : '';
   }
 
-  function txUrl(config: ConfigDto, txHash: string): string | null {
-    if (config.explorer !== null && config.explorer !== '') return `${config.explorer.replace(/\/+$/, '')}/tx/${txHash}`;
-    const chain = chainById(config.chainId);
-    return chain === undefined ? null : (explorerTxUrl(chain, txHash) ?? null);
+  /** The signer of the unsigned path: `payer` from the call, else the resolved workspace (SPEC §6.1 `feePayer = workspace`). */
+  function resolvePayer(payer: string | undefined, workspace: string): string {
+    if (payer === undefined) return workspace;
+    const trimmed = payer.trim();
+    if (!isBase58Pubkey(trimmed)) throw new ToolInputError(`payer is not a base58 Solana public key: ${JSON.stringify(payer)}`);
+    return trimmed;
+  }
+
+  /** `GET /api/price` for the stale warning; a failure to read it is not fatal (the quote carries `stale` too). */
+  async function priceWarnings(quote: QuoteDto): Promise<{ price: PriceDto | null; warnings: string[] }> {
+    const warnings: string[] = [];
+    let price: PriceDto | null = null;
+    try {
+      price = await api.price();
+      const warning = staleWarning(price, now());
+      if (warning !== undefined) warnings.push(warning);
+    } catch {
+      if (quote.stale) warnings.push(`The published price point ${quote.pricePointId} used for this quote is STALE; a burn observed now is credited at it and flagged priceStale.`);
+    }
+    return { price, warnings };
   }
 
   // ---- read-only tools -----------------------------------------------------------------------
@@ -445,7 +519,7 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
     {
       title: 'Balance',
       description:
-        "Show the workspace's credit: available µUSD (balance − reserved + budget headroom), plan and the current BEAGLE price. " +
+        "Show the workspace's credit: available µUSD (balance − reserved + budget headroom), plan and the current published BEAGLE price (with its staleness). " +
         'Free. Call it before spending to know what you can afford.',
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -457,6 +531,7 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
           available: formatUsdMicro(balance.availableMicro),
           balance: formatUsdMicro(balance.balanceMicro),
           summary: balanceSummary(balance, token.symbol),
+          ...(balance.price.stale ? { warning: staleWarning(balance.price, now()) } : {}),
         };
       }),
   );
@@ -489,8 +564,8 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
     {
       title: 'Quote',
       description:
-        "Convert between BEAGLE tokens and USD at the CreditDesk's current on-chain price. Pass usd (e.g. 5 or \"2.50\") or tokens (whole tokens, e.g. 1000). " +
-        'Free. Use it before beagle_buy_compute or beagle_open_budget to size a purchase.',
+        "Convert between BEAGLE tokens and USD at the gateway's current published price point. Pass usd (e.g. 5 or \"2.50\") or tokens (whole tokens, e.g. 1000). " +
+        'Free. Use it before beagle_buy_compute or beagle_open_budget to size a purchase; stale: true means the point is older than the gateway allows.',
       inputSchema: {
         usd: AMOUNT_SCHEMA.optional().describe('USD amount to price in tokens (number or decimal string).'),
         tokens: AMOUNT_SCHEMA.optional().describe('Whole tokens to price in USD (number or decimal string).'),
@@ -506,7 +581,7 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
           tokensFormatted: `${formatTokenAmount(quote.tokens, token.decimals)} ${token.symbol}`,
           usd: formatUsdMicro(quote.usdMicro),
           usdPerToken: formatPriceE18(quote.priceE18, { minFractionDigits: 4 }),
-          updatedAtIso: new Date(quote.updatedAt * 1000).toISOString(),
+          ...(quote.stale ? { warning: `price point ${quote.pricePointId} is stale; the gateway credits burns at it until a fresh point is published` } : {}),
         };
       }),
   );
@@ -539,16 +614,15 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
     {
       title: 'Budgets',
       description:
-        "List the workspace's on-chain budgets: cap, drawn, remaining headroom in tokens and USD, deadline, stalled reason (price, allowance, draw_failed) and draws. Free.",
+        "List the workspace's delegation budgets (one per token account approved to the operator): cap = delegated amount, token balance, remaining headroom in tokens and USD, stalled reason (price, revoked, exhausted, draw_failed) and draws. Free.",
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     () =>
       run(async () => {
         const [budgets, token] = await Promise.all([api.budgets(), tokenInfo()]);
-        const nowMs = now();
-        const rows = budgets.map((b) => budgetRow(b, token.decimals, token.symbol, nowMs));
-        // Same predicate as the gateway ledger (open, unexpired, not stalled) so the total matches /api/balance.budgetHeadroomMicro.
-        const headroom = budgets.filter((b) => budgetCountsAsHeadroom(b, nowMs)).reduce((sum, b) => sum + b.headroomMicro, 0n);
+        const rows = budgets.map((b) => budgetRow(b, token.decimals, token.symbol));
+        // Same predicate as the gateway ledger (open, not stalled) so the total matches /api/balance.budgetHeadroomMicro.
+        const headroom = budgets.filter(budgetCountsAsHeadroom).reduce((sum, b) => sum + b.headroomMicro, 0n);
         return { budgets: rows, count: rows.length, headroomMicro: headroom, headroom: formatUsdMicro(headroom) };
       }),
   );
@@ -558,7 +632,7 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
     {
       title: 'Status',
       description:
-        'Gateway status: chain and CreditDesk, indexer height and lag, provider health, house model, operator mode and version, ' +
+        'Gateway status: cluster and mint, indexer cursor and lag, the published price point, provider health, house model, operator (budget delegate) and version, ' +
         'plus upgradePrices (pro period and warm hour, in µUSD and formatted) for beagle_upgrade. Free.',
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -575,7 +649,11 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
         } catch {
           // status still answers when config() is unavailable
         }
-        return { ...status, upgradePrices };
+        return {
+          ...status,
+          priceAge: priceAge(status.price, now()),
+          upgradePrices,
+        };
       }),
   );
 
@@ -671,47 +749,45 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
       }),
   );
 
+  const UNSIGNED_HINT =
+    'No agent wallet is configured here, so this returns unsigned legacy transactions (base64, fee payer = the workspace or payer, fresh blockhash) for your own wallet to sign and send; pass payer when the signing wallet is not the workspace.';
+
   server.registerTool(
     'beagle_buy_compute',
     {
       title: 'Buy compute',
       description:
-        'Buy credit by burning BEAGLE through the CreditDesk (approve + burnForCreditMin). Pass usd (credit wanted) or tokens (whole BEAGLE to burn); the on-chain price sets the rate. ' +
-        `The burn carries a credit floor of quote − tolerance_bps (default ${DEFAULT_TOLERANCE_BPS} = 1 %): if a price change lands before the transaction and the contract would credit less, it reverts with SlippageExceeded and costs only gas (nothing is burned; error code slippage_exceeded) — re-quote and retry, or raise tolerance_bps. ` +
+        'Buy credit by burning BEAGLE: a plain SPL BurnChecked from your token account of the mint (plus a memo naming the workspace when it is not the signer). Pass usd (credit wanted) or tokens (whole BEAGLE to burn). ' +
+        'Credit is computed from the published price point when the gateway observes the burn (not the quote shown here); the result warns when that price is stale, and burns quoting below the gateway minimum are refused because they would earn nothing. ' +
         (wallet === undefined
-          ? 'No agent wallet is configured here, so this returns unsigned transaction steps (to, data, value) for your own wallet to sign in order; pass workspace to name the account to credit.'
-          : `This signs and sends with the agent wallet (approving current allowance + amount so open budgets keep theirs), waits for the burn to be mined and polls the balance until the credit appears, returning within about ${Math.round(callBudgetMs / 1000)} s either way (credited: false means not visible yet, not failed). ` +
-            'If the call times out on your side the burn may still have gone through: check beagle_balance / beagle_usage (or the explorer) before retrying, never retry blindly.') +
+          ? UNSIGNED_HINT
+          : `This signs and sends with the agent wallet, waits for confirmation and polls the receipts / balance until the credit appears, returning within about ${Math.round(callBudgetMs / 1000)} s either way (credited: false means not visible yet, not failed). ` +
+            'If the call times out on your side the burn may still have gone through: check beagle_balance / beagle_usage (or the explorer link) before retrying, never retry blindly.') +
         ' Irreversible: burned tokens are gone and credit is not refundable.',
       inputSchema: {
         usd: AMOUNT_SCHEMA.optional().describe('Credit to buy, in USD (number or decimal string).'),
         tokens: AMOUNT_SCHEMA.optional().describe('Whole tokens to burn (number or decimal string).'),
-        workspace: ADDRESS_SCHEMA.optional().describe('Workspace (0x address) to credit; defaults to the configured workspace, else the agent wallet address (a guess: see workspaceSource in the result).'),
-        tolerance_bps: z
-          .number()
-          .int()
-          .min(0)
-          .max(MAX_TOLERANCE_BPS)
-          .optional()
-          .describe(
-            `Slippage tolerance of the credit floor in basis points, 0–${MAX_TOLERANCE_BPS} (default ${DEFAULT_TOLERANCE_BPS} = 1 %). The burn reverts, costing only gas, if the on-chain quote at inclusion would credit less than quote − tolerance; 0 demands exactly the quoted amount.`,
-          ),
+        workspace: ADDRESS_SCHEMA.optional().describe('Workspace (base58 public key) to credit; defaults to the configured workspace, else the agent wallet address (a guess: see workspaceSource in the result).'),
+        payer: ADDRESS_SCHEMA.optional().describe('Unsigned path only: the wallet that will sign and pay (token account owner); defaults to workspace.'),
+        tokenAccount: ADDRESS_SCHEMA.optional().describe('Unsigned path only: token account to burn from; default: the payer’s associated token account (or its largest account of the mint).'),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    ({ usd, tokens, workspace, tolerance_bps }, extra) =>
+    ({ usd, tokens, workspace, payer, tokenAccount }, extra) =>
       run(async () => {
         const started = now();
         const progress = progressReporter(extra);
         const config = await getConfig();
-        const dep = requireDeployment(config);
-        const amount = await resolveAmount({ usd, tokens }, dep.decimals);
+        const deployment = walletDeployment(config);
+        const amount = await resolveAmount({ usd, tokens }, config.decimals);
         const { address: ws, source: workspaceSource } = resolveWorkspace(workspace);
-        const tokensFormatted = `${formatTokenAmount(amount.tokens, dep.decimals)} ${dep.symbol}`;
-        // Credit floor (policy): quote − ceil(quote · tolerance / 10 000); the desk reverts rather than credit less.
-        const toleranceBps = tolerance_bps ?? DEFAULT_TOLERANCE_BPS;
-        const minUsdMicro = creditFloor(amount.usdMicro, toleranceBps);
-        const floorText = `${formatUsdMicro(minUsdMicro)} (quote − ${toleranceBps} bps)`;
+        const tokensFormatted = `${formatTokenAmount(amount.tokens, config.decimals)} ${config.symbol}`;
+        if (amount.usdMicro < config.minCreditMicro) {
+          throw new ToolInputError(
+            `${tokensFormatted} quotes ${formatUsdMicro(amount.usdMicro)}, below the gateway minimum credit of ${formatUsdMicro(config.minCreditMicro)}: the burn would be recorded with no credit. Burn more.`,
+          );
+        }
+        const { price, warnings } = await priceWarnings(amount.quote);
         const common = {
           workspace: ws,
           workspaceSource,
@@ -719,41 +795,43 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
           tokensFormatted,
           usdMicro: amount.usdMicro,
           usd: formatUsdMicro(amount.usdMicro),
-          minUsdMicro,
-          minUsd: formatUsdMicro(minUsdMicro),
-          toleranceBps,
           priceE18: amount.quote.priceE18,
-          chainId: config.chainId,
-          creditDesk: dep.creditDesk,
-          token: dep.token,
+          pricePointId: amount.quote.pricePointId,
+          priceStale: price?.stale ?? amount.quote.stale,
+          cluster: config.cluster,
+          mint: config.mint,
+          warnings,
         };
         if (wallet === undefined) {
-          const unsigned = buildUnsignedSteps({
+          const signer = resolvePayer(payer, ws);
+          const prepared = await prepareUnsignedTransactions(getRpc(config), {
             action: 'buyCompute',
-            chainId: config.chainId,
-            deployment: { creditDesk: dep.creditDesk, token: dep.token },
-            workspace: ws,
+            deployment,
+            payer: signer,
             tokens: amount.tokens,
-            minUsdMicro,
-            tokenSymbol: dep.symbol,
-            tokenDecimals: dep.decimals,
+            workspace: ws,
+            ...(tokenAccount === undefined ? {} : { tokenAccount }),
           });
+          const { tokenAccount: account, memo, ...unsigned } = prepared;
           return {
             ...unsigned,
+            tokenAccount: account.address,
+            tokenAccountBalance: account.amount,
+            memo,
             ...common,
             note:
-              `Sign and send the steps in order on chain ${config.chainId}. The gateway credits ${formatUsdMicro(amount.usdMicro)} (at the price the contract reads when mined) once the CreditPurchased event is indexed. ` +
-              `The burnForCreditMin step carries a credit floor of ${floorText}: if the price moves and the burn would credit less, it reverts with SlippageExceeded and costs only gas; re-quote and build new steps. ` +
-              'If this wallet has open budgets, approve your current allowance + the amount: the burn spends the allowance their headroom depends on.' +
+              `Sign with ${signer} and send on ${config.cluster} before block height ${prepared.lastValidBlockHeight} (otherwise call again for a fresh blockhash). ` +
+              `The gateway credits ${formatUsdMicro(amount.usdMicro)} at point ${amount.quote.pricePointId} if it observes the burn before the price changes (the price in force at observation applies). ` +
+              (memo === null ? 'No memo: the token account owner is the credited workspace.' : `The memo "${memo}" credits workspace ${ws}.`) +
               workspaceWarning(workspaceSource, ws),
           };
         }
         const before = await api.balance();
-        await progress(`burning ${tokensFormatted} for workspace ${ws}: approve + burnForCreditMin (credit floor ${floorText}), waiting for the receipt`);
-        const result = await wallet.buyCompute({ workspace: ws, tokens: amount.tokens, minUsdMicro });
-        // The event's usdMicro is the exact credit the gateway books (SPEC §9); the balance poll only tells whether it is visible yet.
-        let creditedMicro: bigint | null = result.usdMicro ?? null;
+        await progress(`burning ${tokensFormatted} for workspace ${ws}: BurnChecked${ws === wallet.address ? '' : ' + memo'}, waiting for confirmation`);
+        const result = await wallet.buyCompute({ workspace: ws, tokens: amount.tokens });
         let credited = false;
+        let creditedMicro: bigint | null = null;
+        let receipt: CreditEventDto | null = null;
         let balanceMicro = before.balanceMicro;
         let availableMicro = before.availableMicro;
         // Lowest balance seen so far: a concurrent debit must not mask the credit (compare against the floor, not `before`).
@@ -767,32 +845,42 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
             if (remaining <= 0) break;
             polls += 1;
             try {
-              // Bound the poll itself: a slow balance() must not push the call past the deadline.
-              const current = await Promise.race([api.balance(), sleep(remaining).then(() => undefined)]);
+              // Bound the poll itself: a slow gateway must not push the call past the deadline.
+              const poll = Promise.all([api.receipts({ limit: 25 }).catch(() => null), api.balance()]);
+              const current = await Promise.race([poll, sleep(remaining).then(() => undefined)]);
               if (current === undefined) break;
-              balanceMicro = current.balanceMicro;
-              availableMicro = current.availableMicro;
-              if (current.balanceMicro > floor) {
+              const [receipts, balance] = current;
+              balanceMicro = balance.balanceMicro;
+              availableMicro = balance.availableMicro;
+              const row = receipts?.rows.find((r) => r.signature === result.signature);
+              if (row !== undefined) {
+                receipt = row;
                 credited = true;
-                if (creditedMicro === null) creditedMicro = current.balanceMicro - floor;
+                creditedMicro = row.usdMicro;
                 break;
               }
-              if (current.balanceMicro < floor) floor = current.balanceMicro;
+              if (balance.balanceMicro > floor) {
+                credited = true;
+                creditedMicro = balance.balanceMicro - floor;
+                break;
+              }
+              if (balance.balanceMicro < floor) floor = balance.balanceMicro;
             } catch {
               // transient API error while polling; keep waiting
             }
-            await progress(`burn mined (tx ${result.txHash}); waiting for the gateway to index the credit (poll ${polls})`);
+            await progress(`burn confirmed (${result.signature}); waiting for the gateway to index the credit (poll ${polls})`);
           }
         }
-        const emitted = creditedMicro === null ? formatUsdMicro(amount.usdMicro) : formatUsdMicro(creditedMicro);
+        const expected = formatUsdMicro(amount.usdMicro);
         return {
           executed: true,
-          txHash: result.txHash,
-          ...(result.approveTxHash === undefined ? {} : { approveTxHash: result.approveTxHash }),
-          ...(result.receiptId === undefined ? {} : { receiptId: result.receiptId }),
+          signature: result.signature,
+          ...(result.slot === undefined ? {} : { slot: result.slot }),
+          tokenAccount: result.tokenAccount,
+          memo: result.memo,
+          explorerUrl: explorerLink(config, result.signature),
           ...common,
-          ...(result.priceE18 === undefined ? {} : { priceE18: result.priceE18 }),
-          explorerTxUrl: txUrl(config, result.txHash),
+          ...(receipt === null ? {} : { pricePointId: receipt.pricePointId ?? amount.quote.pricePointId, priceStale: receipt.priceStale, priceE18: receipt.priceE18, receipt }),
           credited,
           creditedMicro,
           balanceMicro,
@@ -801,10 +889,10 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
           elapsedMs: now() - started,
           note:
             (credited
-              ? `Credited ${emitted}.`
+              ? `Credited ${formatUsdMicro(creditedMicro ?? 0n)}${receipt === null ? '' : ` at price point ${receipt.pricePointId ?? '?'}${receipt.priceStale ? ' (stale price)' : ''}`}.`
               : waitForCredit
-                ? `The burn is mined (tx ${result.txHash}) and the contract emitted ${emitted} of credit, but it is not visible on this API key's workspace yet: indexer lag, or the credited workspace differs from the key's. Do not burn again; check beagle_balance shortly.`
-                : `The burn is mined (tx ${result.txHash}); the credit (${emitted}) appears once the indexer sees the event. Do not burn again.`) +
+                ? `The burn is confirmed (${result.signature}) but the credit (about ${expected}) is not visible on this API key's workspace yet: indexer lag, or the credited workspace differs from the key's. Do not burn again; check beagle_balance shortly.`
+                : `The burn is confirmed (${result.signature}); the credit (about ${expected}) appears once the indexer sees it. Do not burn again.`) +
             workspaceWarning(workspaceSource, ws),
         };
       }),
@@ -815,75 +903,146 @@ export function createBeagleMcpServer(api: BeagleApi, opts: BeagleMcpServerOptio
     {
       title: 'Open budget',
       description:
-        `Authorize a budget: approve BEAGLE and open an on-chain budget (cap in usd or tokens, hours 1–${MAX_BUDGET_HOURS}) that the operator draws from as usage accrues, never above the cap; ` +
-        'the headroom counts as available credit right away and nothing is burned until used. ' +
-        (wallet === undefined
-          ? 'No agent wallet is configured here, so this returns unsigned transaction steps for your own wallet; pass workspace to name the account the budget pays for.'
-          : 'This signs and sends with the agent wallet and returns the budget id.') +
-        ' Close it any time from the dashboard or with closeBudget.',
+        'Authorize a budget: SPL ApproveChecked that delegates up to the cap (in usd or tokens) of your BEAGLE token account to the gateway operator, then register the account with the gateway. ' +
+        'The operator burns from it as usage accrues, never above the cap, with a receipt hash in every burn memo; the headroom (min(cap, token balance) at the current price) counts as available credit right away and nothing is burned until used. ' +
+        'No deadline: the budget lives until revoked (beagle_close_budget) or exhausted. SPL allows one delegate per token account, so a new approval REPLACES the previous cap rather than adding to it. ' +
+        (wallet === undefined ? UNSIGNED_HINT + ' After sending, register the token account (POST /api/budgets/register) or wait for the gateway scanner.' : 'This signs and sends with the agent wallet and registers the budget.'),
       inputSchema: {
-        usd: AMOUNT_SCHEMA.optional().describe('Cap in USD (number or decimal string).'),
+        usd: AMOUNT_SCHEMA.optional().describe('Cap in USD (number or decimal string), converted at the current price.'),
         tokens: AMOUNT_SCHEMA.optional().describe('Cap in whole tokens (number or decimal string).'),
-        hours: z.number().int().min(1).max(MAX_BUDGET_HOURS).describe(`Budget lifetime in hours (max ${MAX_BUDGET_HOURS} = 30 days).`),
-        workspace: ADDRESS_SCHEMA.optional().describe('Workspace (0x address) the budget pays for; defaults to the configured workspace, else the agent wallet address (a guess: see workspaceSource in the result).'),
+        workspace: ADDRESS_SCHEMA.optional().describe('Workspace (base58 public key) the budget pays for; defaults to the configured workspace, else the agent wallet address (a guess: see workspaceSource in the result).'),
+        payer: ADDRESS_SCHEMA.optional().describe('Unsigned path only: the wallet that will sign (token account owner); defaults to workspace.'),
+        tokenAccount: ADDRESS_SCHEMA.optional().describe('Unsigned path only: token account to delegate; default: the payer’s associated token account of the mint.'),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    ({ usd, tokens, hours, workspace }) =>
+    ({ usd, tokens, workspace, payer, tokenAccount }) =>
       run(async () => {
         const config = await getConfig();
-        const dep = requireDeployment(config);
-        const amount = await resolveAmount({ usd, tokens }, dep.decimals);
+        if (config.operator === null) {
+          throw new BeagleApiError(503, 'not_configured', 'the gateway has no operator key, so budgets are disabled');
+        }
+        const deployment = walletDeployment(config);
+        const amount = await resolveAmount({ usd, tokens }, config.decimals);
         const { address: ws, source: workspaceSource } = resolveWorkspace(workspace);
-        // Leave a margin at the maximum so a slow inclusion never trips `deadline > now + 30 days`.
-        const margin = hours === MAX_BUDGET_HOURS ? 300 : 0;
-        const deadline = BigInt(Math.floor(now() / 1000) + hours * 3600 - margin);
+        const { warnings } = await priceWarnings(amount.quote);
+        const capFormatted = `${formatTokenAmount(amount.tokens, config.decimals)} ${config.symbol}`;
         const common = {
           workspace: ws,
           workspaceSource,
           cap: amount.tokens,
-          capFormatted: `${formatTokenAmount(amount.tokens, dep.decimals)} ${dep.symbol}`,
+          capFormatted,
           usdMicro: amount.usdMicro,
           usd: formatUsdMicro(amount.usdMicro),
           priceE18: amount.quote.priceE18,
-          hours,
-          deadline,
-          deadlineIso: new Date(Number(deadline) * 1000).toISOString(),
-          chainId: config.chainId,
-          creditDesk: dep.creditDesk,
-          token: dep.token,
+          pricePointId: amount.quote.pricePointId,
+          operator: config.operator,
+          cluster: config.cluster,
+          mint: config.mint,
+          warnings,
         };
         if (wallet === undefined) {
-          const unsigned = buildUnsignedSteps({
+          const signer = resolvePayer(payer, ws);
+          const prepared = await prepareUnsignedTransactions(getRpc(config), {
             action: 'openBudget',
-            chainId: config.chainId,
-            deployment: { creditDesk: dep.creditDesk, token: dep.token },
-            workspace: ws,
+            deployment,
+            payer: signer,
             cap: amount.tokens,
-            deadline,
-            tokenSymbol: dep.symbol,
-            tokenDecimals: dep.decimals,
+            ...(tokenAccount === undefined ? {} : { tokenAccount }),
           });
+          const { tokenAccount: account, memo: _memo, ...unsigned } = prepared;
           return {
             ...unsigned,
+            tokenAccount: account.address,
+            tokenAccountBalance: account.amount,
             ...common,
+            register: { tokenAccount: account.address, ...(ws === signer ? {} : { workspace: ws }) },
             note:
-              `Sign and send the steps in order on chain ${config.chainId}. Keep the allowance and token balance in the wallet: the headroom is min(cap − drawn, allowance, balance), ` +
-              'and the allowance is shared by every budget of this wallet, so approve your current allowance + the cap when other budgets are open.' +
+              `Sign with ${signer} and send on ${config.cluster} before block height ${prepared.lastValidBlockHeight}. ` +
+              `Then POST /api/budgets/register with the register object (or wait for the scanner). Headroom = min(cap ${capFormatted}, token balance ${formatTokenAmount(account.amount, config.decimals)} ${config.symbol}) at the current price; keep tokens in the account.` +
+              (account.delegatedAmount > 0n ? ` This replaces the existing delegation of ${formatTokenAmount(account.delegatedAmount, config.decimals)} ${config.symbol} to ${account.delegate ?? '?'}.` : '') +
               workspaceWarning(workspaceSource, ws),
           };
         }
-        const result = await wallet.openBudget({ workspace: ws, cap: amount.tokens, deadline });
+        const result = await wallet.openBudget({ cap: amount.tokens });
+        let registered = false;
+        let budget: BudgetDto | null = null;
+        let registerError: string | null = null;
+        try {
+          budget = await api.registerBudget({ tokenAccount: result.tokenAccount, ...(ws === wallet.address ? {} : { workspace: ws }) });
+          registered = true;
+        } catch (error) {
+          registerError = toolErrorInfo(error).message;
+        }
+        const balanceFormatted = `${formatTokenAmount(result.balance, config.decimals)} ${config.symbol}`;
         return {
           executed: true,
-          txHash: result.txHash,
-          ...(result.approveTxHash === undefined ? {} : { approveTxHash: result.approveTxHash }),
-          budgetId: result.budgetId,
+          signature: result.signature,
+          ...(result.slot === undefined ? {} : { slot: result.slot }),
+          tokenAccount: result.tokenAccount,
+          tokenAccountBalance: result.balance,
+          explorerUrl: explorerLink(config, result.signature),
           ...common,
-          explorerTxUrl: txUrl(config, result.txHash),
+          registered,
+          budget,
+          registerError,
           note:
-            `Budget ${result.budgetId.toString()} opened${result.approveTxHash === undefined ? '' : ' (allowance raised by the cap on top of what was there)'}. Keep the allowance and token balance in the wallet; the gateway shows the headroom in beagle_budgets after indexing.` +
+            `Delegated up to ${capFormatted} of token account ${result.tokenAccount} to the operator ${config.operator}` +
+            (registered ? ' and registered the budget.' : ` (registration failed: ${registerError ?? '?'}; the gateway scanner will pick it up).`) +
+            ` Headroom = min(cap, token balance ${balanceFormatted}) at the current price${result.balance < amount.tokens ? ' — the balance is below the cap, so the headroom is limited by it; top the account up to use the full cap' : ''}. Revoke any time with beagle_close_budget.` +
             workspaceWarning(workspaceSource, ws),
+        };
+      }),
+  );
+
+  server.registerTool(
+    'beagle_close_budget',
+    {
+      title: 'Close budget',
+      description:
+        'Close a budget: SPL Revoke clears the delegation of the token account, so the operator can no longer burn from it (the gateway marks the budget closed, reason revoked). ' +
+        'Usage already served but not yet drawn stays owed. ' +
+        (wallet === undefined ? UNSIGNED_HINT : 'This signs and sends with the agent wallet.'),
+      inputSchema: {
+        tokenAccount: ADDRESS_SCHEMA.optional().describe('Token account (= budget id from beagle_budgets) to revoke; default: the signer’s associated token account of the mint.'),
+        payer: ADDRESS_SCHEMA.optional().describe('Unsigned path only: the token account owner that will sign; defaults to the configured workspace.'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    ({ tokenAccount, payer }) =>
+      run(async () => {
+        const config = await getConfig();
+        const deployment = walletDeployment(config);
+        if (wallet === undefined) {
+          const { address: ws } = resolveWorkspace(undefined);
+          const signer = resolvePayer(payer, ws);
+          const prepared = await prepareUnsignedTransactions(getRpc(config), {
+            action: 'closeBudget',
+            deployment,
+            payer: signer,
+            ...(tokenAccount === undefined ? {} : { tokenAccount }),
+          });
+          const { tokenAccount: account, memo: _memo, ...unsigned } = prepared;
+          return {
+            ...unsigned,
+            tokenAccount: account.address,
+            delegate: account.delegate,
+            delegatedAmount: account.delegatedAmount,
+            cluster: config.cluster,
+            note:
+              `Sign with ${signer} and send on ${config.cluster} before block height ${prepared.lastValidBlockHeight}.` +
+              (account.delegate === null ? ' Note: the account currently has no delegate, so the Revoke changes nothing.' : ` Revokes the delegation of ${formatTokenAmount(account.delegatedAmount, config.decimals)} ${config.symbol} to ${account.delegate}.`),
+          };
+        }
+        const result = await wallet.closeBudget(tokenAccount === undefined ? {} : { tokenAccount });
+        return {
+          executed: true,
+          signature: result.signature,
+          ...(result.slot === undefined ? {} : { slot: result.slot }),
+          tokenAccount: result.tokenAccount,
+          explorerUrl: explorerLink(config, result.signature),
+          cluster: config.cluster,
+          note: `Revoked the delegation of token account ${result.tokenAccount}; the gateway shows the budget as closed (revoked) after its next scan.`,
         };
       }),
   );

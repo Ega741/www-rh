@@ -1,41 +1,56 @@
 import { describe, expect, it } from 'vitest';
-import { asAddress, envFlag, loadConfig, publicGatewayUrl, reconcileDesk, stripSlash } from './config.js';
+import { MEMO_PROGRAM_ID, TOKEN_PROGRAM_ID, deploymentFor, resolveDeployment } from '@beagle/shared/addresses';
+import { loadConfig, publicGatewayUrl, reconcileDeployment, stripSlash } from './config.js';
 
-const DESK = '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0';
-const OTHER_DESK = '0x000000000000000000000000000000000000dEaD';
+const LOCAL = deploymentFor('localnet');
+if (LOCAL === undefined) throw new Error('the committed localnet deployment is required by these tests');
+const OTHER_MINT = 'So11111111111111111111111111111111111111112';
+const OPERATOR = LOCAL.operator;
 
 describe('loadConfig', () => {
-  it('defaults to anvil with the committed deployment', () => {
+  it('defaults to localnet with the committed deployment', () => {
     const cfg = loadConfig({}, { dev: true });
-    expect(cfg.chainId).toBe(31337);
-    expect(cfg.chain.name).toBe('Anvil');
-    expect(cfg.deployment.creditDesk).toBe('0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0');
+    expect(cfg.cluster).toBe('localnet');
+    expect(cfg.clusterName).toBe('Localnet');
+    expect(cfg.deployment.mint).toBe(LOCAL.mint);
+    expect(cfg.rpcUrl).toBe('http://127.0.0.1:8899');
     expect(cfg.apiBase).toBe('');
     expect(cfg.errors).toEqual([]);
-    expect(cfg.multicall).toBe(false);
-    expect(cfg.chain.contracts?.multicall3).toBeUndefined();
   });
-  it('applies the desk override and multicall flag', () => {
-    const cfg = loadConfig(
-      { VITE_CHAIN_ID: '4663', VITE_CREDIT_DESK_ADDRESS: '0x000000000000000000000000000000000000dead', VITE_MULTICALL: '1' },
-      { dev: false },
-    );
-    expect(cfg.chainId).toBe(4663);
-    expect(cfg.deployment.creditDesk).toBe('0x000000000000000000000000000000000000dEaD');
-    expect(cfg.deployment.overridden).toEqual(['creditDesk']);
-    expect(cfg.chain.contracts?.multicall3?.address).toBe('0xcA11bde05977b3631167028862bE2a173976CA11');
+  it('applies the mint and RPC overrides', () => {
+    const cfg = loadConfig({ VITE_CLUSTER: 'devnet', VITE_MINT_ADDRESS: OTHER_MINT, VITE_RPC_URL: 'https://rpc.example/x' }, { dev: false });
+    expect(cfg.cluster).toBe('devnet');
+    expect(cfg.deployment.mint).toBe(OTHER_MINT);
+    expect(cfg.rpcUrl).toBe('https://rpc.example/x');
+    expect(cfg.deployment.overridden).toEqual(['mint', 'rpcUrl']);
     expect(cfg.errors).toEqual([]);
   });
-  it('reports an unknown chain and falls back to anvil', () => {
-    const cfg = loadConfig({ VITE_CHAIN_ID: '1' }, { dev: true });
-    expect(cfg.chainId).toBe(31337);
-    expect(cfg.errors[0]).toMatch(/not a supported chain/);
+  it('accepts the cluster aliases', () => {
+    expect(loadConfig({ VITE_CLUSTER: 'mainnet' }, { dev: true }).cluster).toBe('mainnet-beta');
+    expect(loadConfig({ VITE_CLUSTER: ' LOCAL ' }, { dev: true }).cluster).toBe('localnet');
   });
-  it('reports a missing deployment and a bad override without throwing', () => {
-    const cfg = loadConfig({ VITE_CHAIN_ID: '46630', VITE_CREDIT_DESK_ADDRESS: 'nope' }, { dev: true });
-    expect(cfg.errors.some((e) => /not an address/.test(e))).toBe(true);
-    expect(cfg.errors.some((e) => /No CreditDesk deployment/.test(e))).toBe(true);
-    expect(cfg.deployment.creditDesk).toBeUndefined();
+  it('reports an unknown cluster and falls back to localnet', () => {
+    const cfg = loadConfig({ VITE_CLUSTER: 'testnet' }, { dev: true });
+    expect(cfg.cluster).toBe('localnet');
+    expect(cfg.errors[0]).toMatch(/VITE_CLUSTER: unknown cluster/);
+  });
+  it('reports a bad mint override without throwing and keeps the valid RPC override', () => {
+    const cfg = loadConfig({ VITE_MINT_ADDRESS: 'nope', VITE_RPC_URL: 'http://localhost:9999' }, { dev: true });
+    expect(cfg.errors.some((e) => /not a base58 public key/.test(e))).toBe(true);
+    expect(cfg.deployment.mint).toBe(LOCAL.mint);
+    expect(cfg.rpcUrl).toBe('http://localhost:9999');
+  });
+  it('reports a bad RPC override and keeps the mint override', () => {
+    const cfg = loadConfig({ VITE_MINT_ADDRESS: OTHER_MINT, VITE_RPC_URL: 'ftp://nope' }, { dev: true });
+    expect(cfg.errors.some((e) => /rpcUrl/.test(e))).toBe(true);
+    expect(cfg.deployment.mint).toBe(OTHER_MINT);
+    expect(cfg.rpcUrl).toBe('http://127.0.0.1:8899');
+  });
+  it('a cluster without a committed deployment still boots (the gateway supplies the mint)', () => {
+    const cfg = loadConfig({ VITE_CLUSTER: 'devnet' }, { dev: true });
+    expect(cfg.errors).toEqual([]);
+    expect(cfg.deployment.tokenProgram).toBe(TOKEN_PROGRAM_ID);
+    expect(cfg.rpcUrl).toBe('https://api.devnet.solana.com');
   });
   it('uses the gateway URL as API base only in production', () => {
     expect(loadConfig({ VITE_GATEWAY_URL: 'https://api.example.com/' }, { dev: true }).apiBase).toBe('');
@@ -50,24 +65,43 @@ describe('helpers', () => {
     expect(publicGatewayUrl({ gatewayUrl: '' }, 'http://localhost:5173/')).toBe('http://localhost:5173');
     expect(publicGatewayUrl({ gatewayUrl: 'http://localhost:8787' }, 'http://localhost:5173')).toBe('http://localhost:8787');
   });
-  it('reconcileDesk disables the flows when the build and the gateway disagree on the desk', () => {
-    expect(reconcileDesk(DESK, DESK.toLowerCase())).toEqual({ desk: DESK, mismatch: undefined });
-    expect(reconcileDesk(DESK, null)).toEqual({ desk: DESK, mismatch: undefined });
-    expect(reconcileDesk(DESK, undefined)).toEqual({ desk: DESK, mismatch: undefined });
-    expect(reconcileDesk(undefined, OTHER_DESK.toLowerCase())).toEqual({ desk: OTHER_DESK, mismatch: undefined });
-    expect(reconcileDesk(undefined, null)).toEqual({ desk: undefined, mismatch: undefined });
-    const mismatch = reconcileDesk(DESK, OTHER_DESK);
-    expect(mismatch.desk).toBeUndefined();
-    expect(mismatch.mismatch).toContain(DESK);
-    expect(mismatch.mismatch).toContain(OTHER_DESK);
-    expect(asAddress('nope')).toBeUndefined();
-    expect(asAddress(DESK.toLowerCase())).toBe(DESK);
-  });
-  it('envFlag and stripSlash', () => {
-    expect(envFlag('1')).toBe(true);
-    expect(envFlag('TRUE')).toBe(true);
-    expect(envFlag('0')).toBe(false);
-    expect(envFlag(undefined)).toBe(false);
+  it('stripSlash', () => {
     expect(stripSlash('https://x.y///')).toBe('https://x.y');
+  });
+});
+
+describe('reconcileDeployment', () => {
+  const committed = resolveDeployment('localnet');
+  const gateway = { cluster: 'localnet', mint: LOCAL.mint, decimals: 6, symbol: 'BEAGLE', tokenProgram: TOKEN_PROGRAM_ID, memoProgram: MEMO_PROGRAM_ID, operator: OPERATOR };
+
+  it('takes the token facts from the gateway when it agrees', () => {
+    const v = reconcileDeployment(committed, { ...gateway, symbol: 'BGL', operator: null });
+    expect(v.mint).toBe(LOCAL.mint);
+    expect(v.symbol).toBe('BGL');
+    expect(v.operator).toBeUndefined();
+    expect(v.mismatch).toBeUndefined();
+  });
+  it('falls back to the committed deployment while the gateway is unknown', () => {
+    const v = reconcileDeployment(committed, undefined);
+    expect(v).toEqual({ mint: LOCAL.mint, decimals: 6, symbol: 'BEAGLE', tokenProgram: TOKEN_PROGRAM_ID, memoProgram: MEMO_PROGRAM_ID, operator: OPERATOR, mismatch: undefined });
+  });
+  it('uses the gateway mint when nothing is committed', () => {
+    const none = resolveDeployment('devnet');
+    const v = reconcileDeployment(none, { ...gateway, cluster: 'devnet', mint: OTHER_MINT });
+    expect(v.mint).toBe(OTHER_MINT);
+    expect(v.mismatch).toBeUndefined();
+    expect(reconcileDeployment(none, undefined).mint).toBeUndefined();
+    expect(reconcileDeployment(none, undefined).decimals).toBe(6);
+  });
+  it('disables the flows when the build and the gateway disagree on the mint', () => {
+    const v = reconcileDeployment(committed, { ...gateway, mint: OTHER_MINT });
+    expect(v.mint).toBeUndefined();
+    expect(v.mismatch).toContain(LOCAL.mint);
+    expect(v.mismatch).toContain(OTHER_MINT);
+  });
+  it('disables the flows when the gateway runs on another cluster', () => {
+    const v = reconcileDeployment(committed, { ...gateway, cluster: 'devnet' });
+    expect(v.mint).toBeUndefined();
+    expect(v.mismatch).toMatch(/targets localnet but the gateway runs on devnet/);
   });
 });

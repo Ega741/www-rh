@@ -1,6 +1,7 @@
 /**
  * Schema migrations (SPEC §5.2), applied in order and tracked with `PRAGMA user_version`.
- * Monetary columns are INTEGER µUSD; token amounts and `priceE18` are decimal TEXT.
+ * Monetary columns are INTEGER µUSD; token amounts and `priceE18` are decimal TEXT; workspaces,
+ * owners, token accounts and signatures are base58 TEXT stored verbatim (case-sensitive).
  *
  * @module db/schema
  */
@@ -33,11 +34,12 @@ export const MIGRATIONS: readonly string[] = [
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
   );
-  CREATE TABLE siwe_nonces (
+  CREATE TABLE siws_nonces (
     nonce TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
   );
+  CREATE INDEX siws_nonces_expires ON siws_nonces(expires_at);
   CREATE TABLE ledger (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     workspace TEXT NOT NULL REFERENCES workspaces(owner),
@@ -51,25 +53,34 @@ export const MIGRATIONS: readonly string[] = [
   CREATE INDEX ledger_workspace ON ledger(workspace);
   CREATE UNIQUE INDEX ledger_ref ON ledger(ref_type, ref_id) WHERE ref_type IS NOT NULL AND ref_id IS NOT NULL;
   CREATE TABLE credit_events (
-    tx_hash TEXT NOT NULL,
-    log_index INTEGER NOT NULL,
+    signature TEXT NOT NULL,
+    ix_index INTEGER NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('purchase','draw')),
-    receipt_id INTEGER NOT NULL,
     workspace TEXT NOT NULL,
     payer TEXT,
+    token_account TEXT NOT NULL,
+    authority TEXT,
     token_amount TEXT NOT NULL,
     usd_micro INTEGER NOT NULL,
     price_e18 TEXT NOT NULL,
-    budget_id INTEGER,
+    price_point_id INTEGER,
+    price_stale INTEGER NOT NULL DEFAULT 0,
+    memo TEXT,
     receipt_hash TEXT,
-    block_number INTEGER NOT NULL,
-    block_hash TEXT NOT NULL,
-    block_time INTEGER NOT NULL,
+    slot INTEGER NOT NULL,
+    block_time INTEGER,
     created_at INTEGER NOT NULL,
-    PRIMARY KEY (tx_hash, log_index)
+    PRIMARY KEY (signature, ix_index)
   );
-  CREATE INDEX credit_events_workspace ON credit_events(workspace, block_number);
-  CREATE INDEX credit_events_block ON credit_events(block_number);
+  CREATE INDEX credit_events_workspace ON credit_events(workspace, created_at);
+  CREATE INDEX credit_events_slot ON credit_events(slot);
+  CREATE TABLE price_points (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    price_e18 TEXT NOT NULL,
+    source TEXT NOT NULL,
+    observed_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
   CREATE TABLE reservations (
     id TEXT PRIMARY KEY,
     workspace TEXT NOT NULL,
@@ -94,6 +105,8 @@ export const MIGRATIONS: readonly string[] = [
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     upstream_cost_micro INTEGER NOT NULL DEFAULT 0,
     charged_micro INTEGER NOT NULL DEFAULT 0,
+    price_json TEXT,
+    markup_bps INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
     http_status INTEGER NOT NULL,
     error_code TEXT,
@@ -102,8 +115,6 @@ export const MIGRATIONS: readonly string[] = [
     stream INTEGER NOT NULL DEFAULT 0,
     difficulty REAL,
     draw_id INTEGER,
-    price_json TEXT,
-    markup_bps INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
   );
   CREATE INDEX usage_workspace_created ON usage(workspace, created_at);
@@ -122,37 +133,40 @@ export const MIGRATIONS: readonly string[] = [
     UNIQUE (workspace, provider)
   );
   CREATE TABLE budgets (
-    budget_id INTEGER PRIMARY KEY,
+    token_account TEXT PRIMARY KEY,
     owner TEXT NOT NULL,
     workspace TEXT NOT NULL,
-    cap TEXT NOT NULL,
-    drawn TEXT NOT NULL DEFAULT '0',
-    deadline INTEGER NOT NULL,
-    closed INTEGER NOT NULL DEFAULT 0,
+    delegate TEXT,
+    cap TEXT NOT NULL DEFAULT '0',
+    balance TEXT NOT NULL DEFAULT '0',
     headroom_tokens TEXT NOT NULL DEFAULT '0',
     headroom_micro INTEGER NOT NULL DEFAULT 0,
     headroom_checked_at INTEGER,
     stalled_reason TEXT,
-    opened_block INTEGER,
+    closed INTEGER NOT NULL DEFAULT 0,
+    registered_at INTEGER,
+    last_seen_slot INTEGER,
     updated_at INTEGER NOT NULL
   );
   CREATE INDEX budgets_workspace ON budgets(workspace);
+  CREATE INDEX budgets_owner ON budgets(owner);
   CREATE TABLE budget_draws (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    budget_id INTEGER NOT NULL,
+    token_account TEXT NOT NULL,
     workspace TEXT NOT NULL,
     token_amount TEXT NOT NULL,
     usd_micro INTEGER NOT NULL,
     receipt_hash TEXT NOT NULL UNIQUE,
     usage_ids TEXT NOT NULL,
     batch_json TEXT NOT NULL,
-    tx_hash TEXT,
+    signature TEXT,
+    last_valid_block_height INTEGER,
     status TEXT NOT NULL CHECK (status IN ('pending','sent','confirmed','failed')),
     error TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
-  CREATE INDEX budget_draws_budget ON budget_draws(budget_id);
+  CREATE INDEX budget_draws_token_account ON budget_draws(token_account);
   CREATE TABLE upgrades (
     id TEXT PRIMARY KEY,
     workspace TEXT NOT NULL,
@@ -176,26 +190,15 @@ export const MIGRATIONS: readonly string[] = [
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
-  CREATE TABLE price_posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    price_e18 TEXT NOT NULL,
-    source TEXT NOT NULL,
-    tx_hash TEXT,
-    status TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+  CREATE TABLE settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
   );
   CREATE TABLE rate_limits (
     key_id TEXT PRIMARY KEY,
     window_start INTEGER NOT NULL,
     count INTEGER NOT NULL
   );
-  CREATE TABLE settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-  );
-  `,
-  `
-  CREATE INDEX siwe_nonces_expires ON siwe_nonces(expires_at);
   `,
 ];
 

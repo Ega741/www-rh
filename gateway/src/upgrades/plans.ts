@@ -12,7 +12,7 @@
 import type { UpgradeDtoWire, UpgradePricesDtoWire } from '@beagle/shared/api';
 import { uuid } from '../auth/crypto.js';
 import type { Config } from '../config.js';
-import type { Repos, UpgradeRow } from '../db/repos.js';
+import { normalizeWorkspace, type Repos, type UpgradeRow } from '../db/repos.js';
 import { InsufficientCreditError } from '../metering/reserve.js';
 import type { WarmService } from './warm.js';
 
@@ -71,7 +71,7 @@ export class UpgradeService {
         startsAt = window.startsAt;
         endsAt = window.endsAt;
       }
-      const upgrade: UpgradeRow = { id, workspace: workspace.toLowerCase(), kind, quantity, amountMicro: amount, startsAt, endsAt, createdAt: now };
+      const upgrade: UpgradeRow = { id, workspace: normalizeWorkspace(workspace), kind, quantity, amountMicro: amount, startsAt, endsAt, createdAt: now };
       this.repos.upgrades.insert(upgrade);
       return upgrade;
     });

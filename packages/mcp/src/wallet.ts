@@ -1,326 +1,592 @@
 /**
- * Wallet side of the agent tools (SPEC §6.1, §3.4): the {@link WalletExecutor} interface, a viem
- * implementation that signs with an agent private key, and {@link buildUnsignedSteps} for agents
- * that hold their own wallet and only need calldata.
+ * Wallet side of the agent tools (SPEC §6.1, §3.2, §3.4): the {@link WalletExecutor} interface, a
+ * Keypair implementation over `@solana/web3.js`, and {@link buildUnsignedTransactions} for agents
+ * that hold their own wallet and only need something to sign.
  *
- * Both purchase paths are two-step: `token.approve(desk, …)` followed by `desk.burnForCreditMin(workspace,
- * amount, minUsdMicro)` (or plain `burnForCredit` when no quote is at hand) or `desk.openBudget(workspace, cap,
- * deadline)`. The executor approves **cumulatively** (`allowance + amount`): the same `allowance(owner, desk)`
- * backs every open budget of the wallet (headroom = min(cap − drawn, allowance, balance)) and a burn spends it,
- * so approving exactly `amount` would silently shrink or stall those budgets. Only an effectively unlimited
- * allowance is left alone.
+ * Three on-chain actions, no custom program:
+ * - **buyCompute** = `BurnChecked(tokenAccount, mint, owner, amount, decimals)` from the agent's token
+ *   account of the mint (the ATA, or the largest account when the ATA is empty) plus
+ *   `Memo("beagle:v1 ws=<workspace>")` when the credited workspace is not the owner. Final: the
+ *   gateway credits the burn at its published price when it observes the transaction.
+ * - **openBudget** = `ApproveChecked(tokenAccount, mint, delegate = operator, owner, cap, decimals)`:
+ *   SPL semantics, one delegate per account, a new approval replaces the previous cap.
+ * - **closeBudget** = `Revoke(tokenAccount, owner)`.
  *
- * **Credit floor.** A burn is final, and a price post can land between the quote shown to the caller and the
- * transaction. Every burn our own clients initiate therefore carries `minUsdMicro` ({@link creditFloor}:
- * `quote − ceil(quote · toleranceBps / 10 000)`, default 100 bps): the desk reverts `SlippageExceeded(usdMicro,
- * minUsdMicro)` instead of crediting less, and a reverted burn costs only gas. `0` disables the floor on chain.
+ * Every transaction is a legacy `Transaction` with `feePayer = owner` and a fresh blockhash; the
+ * executor signs, `sendRawTransaction`s and `confirmTransaction`s with the blockhash /
+ * `lastValidBlockHeight` strategy. Failures surface as {@link WalletError} codes
+ * (`insufficient_tokens`, `insufficient_sol`, `blockhash_expired`, `tx_failed`, `chain_mismatch`,
+ * `rpc_error`, …) and never contain the secret key.
  *
  * @module wallet
  */
-import { CREDIT_DESK_ABI, ERC20_ABI } from '@beagle/shared/abi';
-import { chainById } from '@beagle/shared/chains';
-import { BPS_DENOMINATOR, ceilDiv, formatTokenAmount, formatUsdMicro } from '@beagle/shared/credit';
+import { MEMO_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@beagle/shared/addresses';
+import { CLUSTERS, type Cluster } from '@beagle/shared/clusters';
+import { formatTokenAmount } from '@beagle/shared/credit';
+import { encodePurchaseMemo } from '@beagle/shared/memo';
+import { isBase58Pubkey } from '@beagle/shared/solana';
 import {
-  ChainMismatchError,
-  createPublicClient,
-  createWalletClient,
-  decodeErrorResult,
-  decodeEventLog,
-  defineChain,
-  encodeFunctionData,
-  getAddress,
-  http,
-  isAddress,
-  type Address,
-  type Chain,
-  type Hex,
-  type PublicClient,
-  type Transport,
-  type TransactionReceipt,
-  type WalletClient,
-  type WriteContractParameters,
-} from 'viem';
-import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
+  createApproveCheckedInstruction,
+  createBurnCheckedInstruction,
+  createRevokeInstruction,
+  getAssociatedTokenAddressSync,
+  unpackAccount,
+  type Account as TokenAccountState,
+} from '@solana/spl-token';
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  SendTransactionError,
+  Transaction,
+  TransactionExpiredBlockheightExceededError,
+  TransactionExpiredTimeoutError,
+  TransactionInstruction,
+  type AccountInfo,
+  type BlockhashWithExpiryBlockHeight,
+  type BlockheightBasedTransactionConfirmationStrategy,
+  type Commitment,
+  type RpcResponseAndContext,
+  type SendOptions,
+  type SignatureResult,
+  type TokenAccountsFilter,
+} from '@solana/web3.js';
+import bs58 from 'bs58';
+
+// ---------------------------------------------------------------------------------------------
+// Types
+
+/** The slice of `@solana/web3.js` `Connection` the wallet code uses; a `Connection` satisfies it, so do test fakes. */
+export interface SolanaRpc {
+  getLatestBlockhash(commitment?: Commitment): Promise<BlockhashWithExpiryBlockHeight>;
+  sendRawTransaction(rawTransaction: Buffer | Uint8Array | Array<number>, options?: SendOptions): Promise<string>;
+  confirmTransaction(strategy: BlockheightBasedTransactionConfirmationStrategy, commitment?: Commitment): Promise<RpcResponseAndContext<SignatureResult>>;
+  getAccountInfo(publicKey: PublicKey, commitment?: Commitment): Promise<AccountInfo<Buffer> | null>;
+  getTokenAccountsByOwner(
+    owner: PublicKey,
+    filter: TokenAccountsFilter,
+    commitment?: Commitment,
+  ): Promise<RpcResponseAndContext<ReadonlyArray<{ pubkey: PublicKey; account: AccountInfo<Buffer> }>>>;
+  getBalance(publicKey: PublicKey, commitment?: Commitment): Promise<number>;
+  getGenesisHash(): Promise<string>;
+}
+
+/** What the wallet flows need to know about the deployment (a subset of `ConfigDto`, SPEC §3.1). */
+export interface WalletDeployment {
+  cluster: Cluster;
+  /** The BEAGLE mint (base58). */
+  mint: string;
+  /** Decimals of the mint (`BurnChecked` / `ApproveChecked` verify them on chain). */
+  decimals: number;
+  /** Token program owning the mint (default: the classic Token program). */
+  tokenProgram?: string;
+  /** The gateway's operator: delegate of every budget. `null` while the gateway has no operator key. */
+  operator?: string | null;
+  /** Memo program the gateway indexes (default: Memo v2, `MemoSq4…`; `@solana/spl-memo` would emit the v1 id). */
+  memoProgram?: string;
+  /** Symbol for human-readable descriptions (default `BEAGLE`). */
+  symbol?: string;
+}
 
 /** Input of {@link WalletExecutor.buyCompute}. */
 export interface BuyComputeParams {
-  /** Workspace (wallet address) to credit. */
-  workspace: Address;
-  /** Raw token units to burn. */
+  /** Workspace (base58 public key) to credit; a memo is added when it differs from the signer. */
+  workspace: string;
+  /** Raw token units to burn (fits `u64`). */
   tokens: bigint;
-  /**
-   * Credit floor in µUSD (see {@link creditFloor}). When set the executor calls `burnForCreditMin`, which
-   * reverts `SlippageExceeded` (surfaced as `WalletError('slippage_exceeded')`, nothing burned) if the desk's
-   * quote at inclusion is below it; `0` keeps the call but disables the floor. Omitted → plain `burnForCredit`.
-   */
-  minUsdMicro?: bigint;
-}
-
-/** Default slippage tolerance of the credit floor, in basis points (1 %). */
-export const DEFAULT_TOLERANCE_BPS = 100;
-/** Largest tolerance a caller may pick (50 %): beyond that the floor stops meaning anything. */
-export const MAX_TOLERANCE_BPS = 5000;
-
-/**
- * The credit floor for a burn quoted at `quotedUsdMicro`:
- * `quotedUsdMicro − ceil(quotedUsdMicro · toleranceBps / 10 000)` (the tolerance is rounded *up*, so the
- * floor is never stricter than the stated percentage). `toleranceBps` is an integer in
- * `[0, MAX_TOLERANCE_BPS]`, default {@link DEFAULT_TOLERANCE_BPS}; `0` means "exactly the quote".
- */
-export function creditFloor(quotedUsdMicro: bigint, toleranceBps: number = DEFAULT_TOLERANCE_BPS): bigint {
-  if (typeof quotedUsdMicro !== 'bigint' || quotedUsdMicro < 0n) {
-    throw new WalletError('invalid_amount', `quotedUsdMicro must be a non-negative bigint (got ${String(quotedUsdMicro)})`);
-  }
-  if (!Number.isInteger(toleranceBps) || toleranceBps < 0 || toleranceBps > MAX_TOLERANCE_BPS) {
-    throw new WalletError('invalid_tolerance', `toleranceBps must be an integer in [0, ${MAX_TOLERANCE_BPS}] (got ${String(toleranceBps)})`);
-  }
-  return quotedUsdMicro - ceilDiv(quotedUsdMicro * BigInt(toleranceBps), BPS_DENOMINATOR);
 }
 
 /** Result of {@link WalletExecutor.buyCompute}. */
 export interface BuyComputeResult {
-  txHash: Hex;
-  /** `receiptId` of the `CreditPurchased` event when it could be decoded from the receipt. */
-  receiptId?: bigint;
-  /**
-   * `usdMicro` emitted by `CreditPurchased`: the exact credit the gateway will book (SPEC §0, §9).
-   * Present when the event could be decoded.
-   */
-  usdMicro?: bigint;
-  /** `priceE18` the contract read for this burn, from the same event. */
-  priceE18?: bigint;
-  /** Hash of the `approve` transaction when one was needed. */
-  approveTxHash?: Hex;
+  /** Transaction signature (base58). */
+  signature: string;
+  /** Slot the confirmation was observed at, when the RPC reported it. */
+  slot?: number;
+  /** The token account burned from. */
+  tokenAccount: string;
+  /** The memo attached, or `null` when the signer is the credited workspace. */
+  memo: string | null;
 }
 
 /** Input of {@link WalletExecutor.openBudget}. */
 export interface OpenBudgetParams {
-  /** Workspace the budget pays for. */
-  workspace: Address;
-  /** Cap in raw token units (`uint128`). */
+  /** Cap in raw token units (fits `u64`): the amount delegated to the operator. */
   cap: bigint;
-  /** Unix seconds; must be in the future and at most 30 days ahead (`MAX_BUDGET_DURATION`). */
-  deadline: bigint;
 }
 
 /** Result of {@link WalletExecutor.openBudget}. */
 export interface OpenBudgetResult {
-  txHash: Hex;
-  budgetId: bigint;
-  approveTxHash?: Hex;
+  signature: string;
+  slot?: number;
+  /** The delegated token account = the budget id (SPEC §3.4). */
+  tokenAccount: string;
+  /** Token balance of that account at the time of the approval (headroom = min(cap, balance)). */
+  balance: bigint;
+}
+
+/** Input of {@link WalletExecutor.closeBudget}. */
+export interface CloseBudgetParams {
+  /** Token account to revoke the delegation of; default: the signer's ATA of the mint. */
+  tokenAccount?: string;
+}
+
+/** Result of {@link WalletExecutor.closeBudget}. */
+export interface CloseBudgetResult {
+  signature: string;
+  slot?: number;
+  tokenAccount: string;
 }
 
 /**
- * Executes the two wallet flows with a signing key. `address` (when known) is the payer / budget
- * owner and the default workspace of the MCP tools.
+ * Executes the three wallet flows with a signing key. `address` (when known) is the token account
+ * owner / fee payer and the default workspace of the MCP tools.
  */
 export interface WalletExecutor {
-  /** The signing account, if the executor knows it. */
-  readonly address?: Address;
-  /** `approve` (if short) + `burnForCreditMin` (`burnForCredit` without `minUsdMicro`); resolves after the burn is mined. */
+  /** The signing public key (base58), if the executor knows it. */
+  readonly address?: string;
+  /** `BurnChecked` (+ `Memo` when `workspace ≠ address`); resolves once the transaction is confirmed. */
   buyCompute(params: BuyComputeParams): Promise<BuyComputeResult>;
-  /** `approve` (if short) + `openBudget`; resolves after the budget is mined. */
+  /** `ApproveChecked(tokenAccount, operator, cap)`; resolves once confirmed. Registration with the gateway is the caller's job. */
   openBudget(params: OpenBudgetParams): Promise<OpenBudgetResult>;
+  /** `Revoke(tokenAccount)`; resolves once confirmed. */
+  closeBudget(params: CloseBudgetParams): Promise<CloseBudgetResult>;
 }
 
-/** The two contract addresses the wallet flows need (a subset of `@beagle/shared` `Deployment`). */
-export interface WalletDeployment {
-  creditDesk: Address;
-  token: Address;
-}
-
-/** Thrown by the executor and the step builder for invalid input or failed transactions. */
+/** Thrown by the executor and the builders for invalid input, RPC trouble or failed transactions. */
 export class WalletError extends Error {
   override readonly name = 'WalletError';
   /**
-   * `invalid_address`, `invalid_amount`, `invalid_tolerance`, `chain_mismatch`, `rpc_error`,
-   * `simulation_failed`, `slippage_exceeded` (the desk's quote fell below the credit floor; nothing burned),
-   * `tx_failed`, `tx_reverted`, `event_missing`, `wallet_unavailable` (a lazy executor could not be set up).
+   * `invalid_address`, `invalid_amount`, `invalid_secret_key`, `not_configured`, `chain_mismatch`,
+   * `rpc_error`, `insufficient_tokens`, `insufficient_sol`, `blockhash_expired`, `tx_failed`,
+   * `wallet_unavailable` (a lazy executor could not be set up).
    */
   readonly code: string;
-  readonly txHash?: Hex;
+  /** The transaction signature when one was sent. */
+  readonly signature?: string;
+  /** Program logs of a failed send / simulation, when the RPC returned them. */
+  readonly logs?: string[];
 
-  constructor(code: string, message: string, options: { txHash?: Hex; cause?: unknown } = {}) {
+  constructor(code: string, message: string, options: { signature?: string; logs?: string[]; cause?: unknown } = {}) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.code = code;
-    if (options.txHash !== undefined) this.txHash = options.txHash;
+    if (options.signature !== undefined) this.signature = options.signature;
+    if (options.logs !== undefined) this.logs = options.logs;
   }
 }
 
-function checksum(label: string, value: string): Address {
-  if (!isAddress(value, { strict: false })) throw new WalletError('invalid_address', `${label} is not an address: ${JSON.stringify(value)}`);
-  return getAddress(value);
-}
+/** Largest amount an SPL instruction carries (`u64`). */
+export const U64_MAX = (1n << 64n) - 1n;
 
-function assertPositive(label: string, value: bigint): void {
-  if (typeof value !== 'bigint' || value <= 0n) throw new WalletError('invalid_amount', `${label} must be a positive bigint (got ${String(value)})`);
-}
+/** The fee payer needs at least this many lamports before the executor sends anything (one signature = 5 000). */
+export const MIN_FEE_LAMPORTS = 10_000;
 
-const UINT256_MAX = (1n << 256n) - 1n;
-const UINT128_MAX = (1n << 128n) - 1n;
-const UINT64_MAX = (1n << 64n) - 1n;
+/** Genesis hashes of the public clusters; a localnet validator has a fresh one per ledger. */
+export const GENESIS_HASHES: Readonly<Partial<Record<Cluster, string>>> = Object.freeze({
+  'mainnet-beta': '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d',
+  devnet: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG',
+});
 
 // ---------------------------------------------------------------------------------------------
-// Unsigned steps
+// Validation helpers
 
-/** One transaction an external wallet must sign and send, in order. */
-export interface UnsignedStep {
-  to: Address;
-  data: Hex;
-  /** Always `'0'`: neither flow sends native value. */
-  value: '0';
-  /** Human-readable purpose, e.g. `approve 1000 BEAGLE for the CreditDesk`. */
-  description: string;
+/** Parses a base58 public key; throws `WalletError('invalid_address')`. */
+export function pubkey(label: string, value: string): PublicKey {
+  if (typeof value !== 'string' || !isBase58Pubkey(value.trim())) {
+    throw new WalletError('invalid_address', `${label} is not a base58 Solana public key: ${JSON.stringify(value)}`);
+  }
+  return new PublicKey(value.trim());
 }
 
-/** The unsigned transaction request returned by the wallet tools when no signing key is configured. */
-export interface UnsignedTransactionRequest {
-  unsigned: true;
-  chainId: number;
-  steps: UnsignedStep[];
+/** Asserts a positive raw token amount that fits `u64`; throws `WalletError('invalid_amount')`. */
+export function assertTokenAmount(label: string, value: bigint): void {
+  if (typeof value !== 'bigint' || value <= 0n) throw new WalletError('invalid_amount', `${label} must be a positive bigint (got ${String(value)})`);
+  if (value > U64_MAX) throw new WalletError('invalid_amount', `${label} exceeds u64 (got ${value.toString()})`);
 }
 
-/** Common fields of {@link UnsignedStepsInput}. */
-interface UnsignedStepsBase {
-  chainId: number;
-  deployment: WalletDeployment;
-  workspace: Address;
-  /** Token symbol for the descriptions (default `BEAGLE`). */
-  tokenSymbol?: string;
-  /** Token decimals for the descriptions (default 18). */
-  tokenDecimals?: number;
-}
-
-/** Input of {@link buildUnsignedSteps}. */
-export type UnsignedStepsInput =
-  | (UnsignedStepsBase & {
-      action: 'buyCompute';
-      tokens: bigint;
-      /** Credit floor in µUSD (see {@link creditFloor}); with it the burn step is `burnForCreditMin`, without it plain `burnForCredit`. */
-      minUsdMicro?: bigint;
-    })
-  | (UnsignedStepsBase & { action: 'openBudget'; cap: bigint; deadline: bigint });
-
-function assertUint256(label: string, value: bigint): void {
-  if (typeof value !== 'bigint' || value < 0n || value > UINT256_MAX) throw new WalletError('invalid_amount', `${label} must be a bigint that fits uint256 (got ${String(value)})`);
+function assertDecimals(decimals: number): void {
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 255) {
+    throw new WalletError('invalid_amount', `decimals must be an integer in [0, 255] (got ${String(decimals)})`);
+  }
 }
 
 /**
- * Encodes `approve` + `burnForCreditMin` (or `burnForCredit` when no `minUsdMicro` is given, i.e. no
- * quote was available) or `approve` + `openBudget` as calldata for an external wallet. The approve step
- * is always included (the builder cannot read the allowance) and approves exactly `amount`; a wallet with
- * open budgets should approve `current allowance + amount` instead, because the budgets' headroom is
- * bounded by that same allowance and a burn spends it.
+ * Parses an agent secret key as the Solana tooling writes it: a JSON byte array (`solana-keygen`
+ * file contents, 64 bytes) or base58 text (Phantom-style export, 64 bytes). A 32-byte seed in either
+ * form is accepted too. The error message never echoes the input.
  */
-export function buildUnsignedSteps(input: UnsignedStepsInput): UnsignedTransactionRequest {
-  const desk = checksum('deployment.creditDesk', input.deployment.creditDesk);
-  const token = checksum('deployment.token', input.deployment.token);
-  const workspace = checksum('workspace', input.workspace);
-  const symbol = input.tokenSymbol ?? 'BEAGLE';
-  const decimals = input.tokenDecimals ?? 18;
-  const amount = input.action === 'buyCompute' ? input.tokens : input.cap;
-  assertPositive(input.action === 'buyCompute' ? 'tokens' : 'cap', amount);
-  const human = `${formatTokenAmount(amount, decimals)} ${symbol}`;
-
-  const approve: UnsignedStep = {
-    to: token,
-    data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [desk, amount] }),
-    value: '0',
-    description: `approve ${human} for the CreditDesk ${desk} (if this wallet has open budgets, approve your current allowance + ${human} instead: budgets draw from the same allowance and a burn spends it)`,
-  };
-
-  if (input.action === 'buyCompute') {
-    const credit = `burn ${human} and credit workspace ${workspace} with its USD value at the price the contract reads when mined`;
-    let burn: UnsignedStep;
-    if (input.minUsdMicro === undefined) {
-      burn = {
-        to: desk,
-        data: encodeFunctionData({ abi: CREDIT_DESK_ABI, functionName: 'burnForCredit', args: [workspace, amount] }),
-        value: '0',
-        description: `burnForCredit: ${credit} (no credit floor: the burn is final at whatever that price is)`,
-      };
-    } else {
-      assertUint256('minUsdMicro', input.minUsdMicro);
-      burn = {
-        to: desk,
-        data: encodeFunctionData({ abi: CREDIT_DESK_ABI, functionName: 'burnForCreditMin', args: [workspace, amount, input.minUsdMicro] }),
-        value: '0',
-        description:
-          `burnForCreditMin: ${credit}, with a credit floor of ${formatUsdMicro(input.minUsdMicro)} (${input.minUsdMicro.toString()} µUSD): ` +
-          'if a price change lands first and the burn would credit less, the transaction reverts with SlippageExceeded and costs only gas (nothing is burned); re-quote and send a new one',
-      };
+export function parseSecretKey(text: string): Uint8Array {
+  const trimmed = typeof text === 'string' ? text.trim() : '';
+  if (trimmed === '') throw new WalletError('invalid_secret_key', 'the secret key is empty');
+  let bytes: Uint8Array;
+  if (trimmed.startsWith('[')) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      throw new WalletError('invalid_secret_key', 'the secret key looks like a JSON array but does not parse');
     }
-    return { unsigned: true, chainId: input.chainId, steps: [approve, burn] };
+    if (!Array.isArray(parsed) || !parsed.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
+      throw new WalletError('invalid_secret_key', 'the secret key JSON must be an array of bytes (0–255)');
+    }
+    bytes = Uint8Array.from(parsed as number[]);
+  } else {
+    try {
+      bytes = bs58.decode(trimmed);
+    } catch {
+      throw new WalletError('invalid_secret_key', 'the secret key is neither a JSON byte array nor base58');
+    }
   }
-
-  if (amount > UINT128_MAX) throw new WalletError('invalid_amount', 'cap exceeds uint128');
-  if (input.deadline <= 0n || input.deadline > UINT64_MAX) throw new WalletError('invalid_amount', 'deadline must fit uint64 and be > 0');
-  const open: UnsignedStep = {
-    to: desk,
-    data: encodeFunctionData({ abi: CREDIT_DESK_ABI, functionName: 'openBudget', args: [workspace, amount, input.deadline] }),
-    value: '0',
-    description: `openBudget: let the operator draw up to ${human} for workspace ${workspace} until ${new Date(Number(input.deadline) * 1000).toISOString()}`,
-  };
-  return { unsigned: true, chainId: input.chainId, steps: [approve, open] };
+  if (bytes.length !== 64 && bytes.length !== 32) {
+    throw new WalletError('invalid_secret_key', `the secret key must be 64 bytes (or a 32-byte seed), got ${bytes.length}`);
+  }
+  return bytes;
 }
 
-// ---------------------------------------------------------------------------------------------
-// viem executor
-
-/** Options of {@link createViemWalletExecutor}. */
-export interface ViemWalletExecutorOptions {
-  /** `0x`-prefixed 32-byte private key of the agent wallet. */
-  privateKey: Hex;
-  /** JSON-RPC URL; defaults to the chain's first public RPC from `@beagle/shared/chains`. */
-  rpcUrl?: string;
-  chainId: number;
-  deployment: WalletDeployment;
-  /** Custom viem transport (tests); overrides `rpcUrl`. */
-  transport?: Transport;
-  /** Receipt wait timeout in ms (default 120 000). */
-  receiptTimeoutMs?: number;
-  /** Receipt polling interval in ms (default 1 000). */
-  pollingIntervalMs?: number;
+/** A `Keypair` from {@link parseSecretKey} text or raw bytes (64-byte secret key or 32-byte seed). */
+export function keypairFromSecret(secret: string | Uint8Array): Keypair {
+  const bytes = typeof secret === 'string' ? parseSecretKey(secret) : secret;
+  try {
+    return bytes.length === 32 ? Keypair.fromSeed(bytes) : Keypair.fromSecretKey(bytes);
+  } catch (error) {
+    throw new WalletError('invalid_secret_key', `the secret key is not a valid Ed25519 keypair (${errorMessage(error)})`);
+  }
 }
 
-function resolveChain(chainId: number, rpcUrl: string | undefined): Chain {
-  const known = chainById(chainId);
-  if (known !== undefined) {
-    if (rpcUrl === undefined) return known;
-    return { ...known, rpcUrls: { ...known.rpcUrls, default: { http: [rpcUrl] } } };
+/** The most specific message an error offers. */
+export function errorMessage(error: unknown): string {
+  if (typeof error === 'object' && error !== null) {
+    const e = error as { message?: unknown; transactionMessage?: unknown };
+    if (typeof e.transactionMessage === 'string') return e.transactionMessage;
+    if (typeof e.message === 'string') return e.message;
   }
-  if (rpcUrl === undefined) throw new WalletError('rpc_error', `chain ${chainId} is not in @beagle/shared/chains; pass rpcUrl`);
-  return defineChain({
-    id: chainId,
-    name: `chain-${chainId}`,
-    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-    rpcUrls: { default: { http: [rpcUrl] } },
+  return String(error);
+}
+
+function tokenProgramOf(deployment: WalletDeployment): PublicKey {
+  return pubkey('deployment.tokenProgram', deployment.tokenProgram ?? TOKEN_PROGRAM_ID);
+}
+
+/**
+ * An SPL Memo instruction (`text` as UTF-8) signed by `signer`, on the deployment's memo program
+ * (Memo v2 by default: `@solana/spl-memo`'s `createMemoInstruction` targets the v1 program id, which
+ * the gateway does not index).
+ */
+export function createMemoInstruction(text: string, signer: PublicKey, memoProgram: string = MEMO_PROGRAM_ID): TransactionInstruction {
+  return new TransactionInstruction({
+    keys: [{ pubkey: signer, isSigner: true, isWritable: false }],
+    programId: pubkey('deployment.memoProgram', memoProgram),
+    data: Buffer.from(text, 'utf8'),
   });
 }
 
-function decodeDeskEvent<N extends 'CreditPurchased' | 'BudgetOpened'>(
-  receipt: TransactionReceipt,
-  desk: Address,
-  eventName: N,
-): { args: Record<string, unknown> } | undefined {
-  for (const log of receipt.logs) {
-    if (log.address.toLowerCase() !== desk.toLowerCase()) continue;
-    try {
-      // `eventName` only narrows viem's types; the decoder picks the event by topic, so compare the name.
-      const decoded = decodeEventLog({ abi: CREDIT_DESK_ABI, data: log.data, topics: log.topics });
-      if (decoded.eventName !== eventName) continue;
-      return { args: decoded.args as Record<string, unknown> };
-    } catch {
-      // not a desk event we know; keep scanning
-    }
+// ---------------------------------------------------------------------------------------------
+// Token account resolution
+
+/** A token account of the mint owned by the wallet, as {@link resolveTokenAccount} finds it. */
+export interface ResolvedTokenAccount {
+  /** Token account address (base58). */
+  address: string;
+  /** Current token balance (raw units). */
+  amount: bigint;
+  /** `true` when it is the owner's associated token account. */
+  isAta: boolean;
+  /** Current delegate (base58) or `null`. */
+  delegate: string | null;
+  delegatedAmount: bigint;
+}
+
+/** Input of {@link resolveTokenAccount}. */
+export interface ResolveTokenAccountInput {
+  owner: string;
+  deployment: WalletDeployment;
+  /**
+   * Raw units the caller is about to burn / delegate. The ATA is used when it holds at least this
+   * much; otherwise the largest account of the mint is picked. With `0n` any existing account does.
+   */
+  need: bigint;
+  commitment?: Commitment;
+}
+
+function readTokenAccount(address: PublicKey, info: AccountInfo<Buffer> | null, programId: PublicKey, mint: PublicKey): TokenAccountState | undefined {
+  if (info === null) return undefined;
+  try {
+    const account = unpackAccount(address, info, programId);
+    return account.mint.equals(mint) ? account : undefined;
+  } catch {
+    return undefined;
   }
-  return undefined;
+}
+
+function describe(account: TokenAccountState, isAta: boolean): ResolvedTokenAccount {
+  return {
+    address: account.address.toBase58(),
+    amount: account.amount,
+    isAta,
+    delegate: account.delegate === null ? null : account.delegate.toBase58(),
+    delegatedAmount: account.delegatedAmount,
+  };
+}
+
+/**
+ * The token account of `deployment.mint` owned by `owner` to act on (SPEC §6.1): the associated
+ * token account when it exists and holds `need`, else the account with the largest balance. Throws
+ * `insufficient_tokens` when the owner has no account of the mint or none holds `need`
+ * (`need = 0n` only requires an account to exist), `rpc_error` when the node cannot be read.
+ */
+export async function resolveTokenAccount(rpc: SolanaRpc, input: ResolveTokenAccountInput): Promise<ResolvedTokenAccount> {
+  const owner = pubkey('owner', input.owner);
+  const mint = pubkey('deployment.mint', input.deployment.mint);
+  const programId = tokenProgramOf(input.deployment);
+  const commitment = input.commitment ?? 'confirmed';
+  const ata = getAssociatedTokenAddressSync(mint, owner, true, programId);
+  const symbol = input.deployment.symbol ?? 'BEAGLE';
+  const human = (raw: bigint): string => `${formatTokenAmount(raw, input.deployment.decimals, input.deployment.decimals)} ${symbol} (${raw.toString()} raw)`;
+
+  let ataState: TokenAccountState | undefined;
+  try {
+    ataState = readTokenAccount(ata, await rpc.getAccountInfo(ata, commitment), programId, mint);
+  } catch (error) {
+    throw new WalletError('rpc_error', `reading token account ${ata.toBase58()} failed: ${errorMessage(error)}`, { cause: error });
+  }
+  if (ataState !== undefined && ataState.amount >= input.need) return describe(ataState, true);
+
+  let accounts: ReadonlyArray<{ pubkey: PublicKey; account: AccountInfo<Buffer> }>;
+  try {
+    accounts = (await rpc.getTokenAccountsByOwner(owner, { mint }, commitment)).value;
+  } catch (error) {
+    throw new WalletError('rpc_error', `listing token accounts of ${owner.toBase58()} failed: ${errorMessage(error)}`, { cause: error });
+  }
+  let best: TokenAccountState | undefined = ataState;
+  for (const { pubkey: address, account } of accounts) {
+    const state = readTokenAccount(address, account, programId, mint);
+    if (state === undefined) continue;
+    if (best === undefined || state.amount > best.amount) best = state;
+  }
+  if (best === undefined) {
+    throw new WalletError('insufficient_tokens', `${owner.toBase58()} has no token account of mint ${mint.toBase58()} (${symbol}); fund its associated token account first`);
+  }
+  if (best.amount < input.need) {
+    throw new WalletError(
+      'insufficient_tokens',
+      `${owner.toBase58()} holds ${human(best.amount)} in its largest ${symbol} account (${best.address.toBase58()}), less than the ${human(input.need)} needed`,
+    );
+  }
+  return describe(best, best.address.equals(ata));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Instruction / transaction building
+
+/** Common fields of {@link UnsignedTransactionsInput}. */
+interface TransactionInputBase {
+  deployment: WalletDeployment;
+  /** Fee payer and token account owner (base58): the wallet that will sign. */
+  payer: string;
+  /** Token account to act on (base58); resolved with {@link resolveTokenAccount} by the callers. */
+  tokenAccount: string;
+}
+
+/** What {@link buildUnsignedTransactions} / {@link buildTransaction} encode. */
+export type UnsignedTransactionsInput =
+  | (TransactionInputBase & {
+      action: 'buyCompute';
+      tokens: bigint;
+      /** Workspace to credit; a memo is added when it differs from `payer`. */
+      workspace: string;
+    })
+  | (TransactionInputBase & { action: 'openBudget'; cap: bigint })
+  | (TransactionInputBase & { action: 'closeBudget' });
+
+/** One serialized transaction for an external wallet to sign and send. */
+export interface UnsignedTransaction {
+  /** Legacy `Transaction` wire format, base64, no signatures (`feePayer` must sign). */
+  base64: string;
+  /** Human-readable purpose, e.g. `burn 1000 BEAGLE from 7Gf…; memo beagle:v1 ws=…`. */
+  description: string;
+}
+
+/** The unsigned transaction request returned by the wallet tools when no signing key is configured (SPEC §6.1). */
+export interface UnsignedTransactionRequest {
+  unsigned: true;
+  cluster: Cluster;
+  transactions: UnsignedTransaction[];
+  /** Fee payer of every transaction (base58). */
+  feePayer: string;
+  /** The blockhash the transactions carry and the last block height it is valid at. */
+  blockhash: string;
+  lastValidBlockHeight: number;
+}
+
+/** The instructions and the description of one action (shared by the executor and the unsigned builder). */
+export function buildInstructions(input: UnsignedTransactionsInput): { instructions: TransactionInstruction[]; description: string; memo: string | null } {
+  const payer = pubkey('payer', input.payer);
+  const mint = pubkey('deployment.mint', input.deployment.mint);
+  const tokenAccount = pubkey('tokenAccount', input.tokenAccount);
+  const programId = tokenProgramOf(input.deployment);
+  const decimals = input.deployment.decimals;
+  assertDecimals(decimals);
+  const symbol = input.deployment.symbol ?? 'BEAGLE';
+  const human = (raw: bigint): string => `${formatTokenAmount(raw, decimals)} ${symbol}`;
+
+  switch (input.action) {
+    case 'buyCompute': {
+      assertTokenAmount('tokens', input.tokens);
+      const workspace = pubkey('workspace', input.workspace);
+      const instructions = [createBurnCheckedInstruction(tokenAccount, mint, payer, input.tokens, decimals, [], programId)];
+      let memo: string | null = null;
+      if (!workspace.equals(payer)) {
+        memo = encodePurchaseMemo({ workspace: workspace.toBase58() });
+        instructions.push(createMemoInstruction(memo, payer, input.deployment.memoProgram));
+      }
+      const credit = memo === null ? `credit workspace ${payer.toBase58()} (the owner)` : `credit workspace ${workspace.toBase58()} via memo "${memo}"`;
+      return {
+        instructions,
+        memo,
+        description: `BurnChecked ${human(input.tokens)} from token account ${tokenAccount.toBase58()} (owner ${payer.toBase58()}) and ${credit}; final, credited at the gateway's published price when observed`,
+      };
+    }
+    case 'openBudget': {
+      assertTokenAmount('cap', input.cap);
+      if (input.deployment.operator === undefined || input.deployment.operator === null) {
+        throw new WalletError('not_configured', 'the gateway has no operator key, so budgets cannot be delegated');
+      }
+      const operator = pubkey('deployment.operator', input.deployment.operator);
+      return {
+        instructions: [createApproveCheckedInstruction(tokenAccount, mint, operator, payer, input.cap, decimals, [], programId)],
+        memo: null,
+        description: `ApproveChecked: delegate up to ${human(input.cap)} of token account ${tokenAccount.toBase58()} to the operator ${operator.toBase58()} (replaces any previous delegation; revocable with Revoke)`,
+      };
+    }
+    case 'closeBudget':
+      return {
+        instructions: [createRevokeInstruction(tokenAccount, payer, [], programId)],
+        memo: null,
+        description: `Revoke the delegation of token account ${tokenAccount.toBase58()} (closes the budget)`,
+      };
+  }
+}
+
+/** A legacy `Transaction` with `feePayer = payer` and `blockhash`, ready to sign. */
+export function buildTransaction(input: UnsignedTransactionsInput, blockhash: BlockhashWithExpiryBlockHeight): { transaction: Transaction; description: string; memo: string | null } {
+  const { instructions, description, memo } = buildInstructions(input);
+  const transaction = new Transaction({ feePayer: pubkey('payer', input.payer), blockhash: blockhash.blockhash, lastValidBlockHeight: blockhash.lastValidBlockHeight });
+  transaction.add(...instructions);
+  return { transaction, description, memo };
+}
+
+function serializeUnsigned(input: UnsignedTransactionsInput, blockhash: BlockhashWithExpiryBlockHeight): UnsignedTransactionRequest & { memo: string | null } {
+  const { transaction, description, memo } = buildTransaction(input, blockhash);
+  const base64 = transaction.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64');
+  return {
+    unsigned: true,
+    cluster: input.deployment.cluster,
+    transactions: [{ base64, description }],
+    feePayer: transaction.feePayer!.toBase58(),
+    blockhash: blockhash.blockhash,
+    lastValidBlockHeight: blockhash.lastValidBlockHeight,
+    memo,
+  };
+}
+
+/**
+ * Encodes one action as an unsigned legacy transaction (`feePayer = payer`, the given blockhash,
+ * serialized with `requireAllSignatures: false`) for an external wallet to sign and send.
+ * The token account must already be resolved ({@link resolveTokenAccount}); see
+ * {@link prepareUnsignedTransactions} for the version that does it.
+ */
+export function buildUnsignedTransactions(input: UnsignedTransactionsInput, blockhash: BlockhashWithExpiryBlockHeight): UnsignedTransactionRequest {
+  const { memo: _memo, ...request } = serializeUnsigned(input, blockhash);
+  return request;
+}
+
+/** Common fields of {@link PrepareUnsignedInput}. */
+interface PrepareInputBase {
+  deployment: WalletDeployment;
+  /** Fee payer and token account owner (base58): the wallet that will sign. */
+  payer: string;
+  /** Token account to act on; resolved from `payer` when omitted. */
+  tokenAccount?: string;
+}
+
+/** Input of {@link prepareUnsignedTransactions}: like {@link UnsignedTransactionsInput} but the token account is optional. */
+export type PrepareUnsignedInput =
+  | (PrepareInputBase & { action: 'buyCompute'; tokens: bigint; workspace: string })
+  | (PrepareInputBase & { action: 'openBudget'; cap: bigint })
+  | (PrepareInputBase & { action: 'closeBudget' });
+
+/** Fetches a fresh blockhash; throws `rpc_error`. */
+export async function latestBlockhash(rpc: SolanaRpc, commitment: Commitment = 'confirmed'): Promise<BlockhashWithExpiryBlockHeight> {
+  try {
+    return await rpc.getLatestBlockhash(commitment);
+  } catch (error) {
+    throw new WalletError('rpc_error', `fetching a recent blockhash failed: ${errorMessage(error)}`, { cause: error });
+  }
+}
+
+/**
+ * Resolves the token account (unless given) and a fresh blockhash over `rpc`, then
+ * {@link buildUnsignedTransactions}. For `buyCompute` the account must hold the tokens; for
+ * `openBudget` / `closeBudget` any account of the mint does (the ATA when it exists).
+ */
+export async function prepareUnsignedTransactions(
+  rpc: SolanaRpc,
+  input: PrepareUnsignedInput,
+  options: { commitment?: Commitment } = {},
+): Promise<UnsignedTransactionRequest & { tokenAccount: ResolvedTokenAccount; memo: string | null }> {
+  const commitment = options.commitment ?? 'confirmed';
+  const need = input.action === 'buyCompute' ? input.tokens : 0n;
+  if (input.action === 'buyCompute') assertTokenAmount('tokens', input.tokens);
+  if (input.action === 'openBudget') assertTokenAmount('cap', input.cap);
+  const tokenAccount =
+    input.tokenAccount === undefined
+      ? await resolveTokenAccount(rpc, { owner: input.payer, deployment: input.deployment, need, commitment })
+      : await describeTokenAccount(rpc, input.tokenAccount, input.deployment, commitment);
+  const blockhash = await latestBlockhash(rpc, commitment);
+  const full: UnsignedTransactionsInput = { ...input, tokenAccount: tokenAccount.address };
+  return { ...serializeUnsigned(full, blockhash), tokenAccount };
+}
+
+/** Reads one token account of the mint; throws `invalid_address` when it is not one. */
+export async function describeTokenAccount(rpc: SolanaRpc, address: string, deployment: WalletDeployment, commitment: Commitment = 'confirmed'): Promise<ResolvedTokenAccount> {
+  const key = pubkey('tokenAccount', address);
+  const mint = pubkey('deployment.mint', deployment.mint);
+  const programId = tokenProgramOf(deployment);
+  let info: AccountInfo<Buffer> | null;
+  try {
+    info = await rpc.getAccountInfo(key, commitment);
+  } catch (error) {
+    throw new WalletError('rpc_error', `reading token account ${key.toBase58()} failed: ${errorMessage(error)}`, { cause: error });
+  }
+  const state = readTokenAccount(key, info, programId, mint);
+  if (state === undefined) {
+    throw new WalletError('invalid_address', `${key.toBase58()} is not a token account of mint ${mint.toBase58()}`);
+  }
+  const ata = getAssociatedTokenAddressSync(mint, state.owner, true, programId);
+  return describe(state, ata.equals(key));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Keypair executor
+
+/** Options of {@link createKeypairWalletExecutor}. */
+export interface KeypairWalletExecutorOptions {
+  /** The agent keypair: `Keypair`, raw secret bytes, or text as {@link parseSecretKey} reads it. */
+  secretKey: Keypair | Uint8Array | string;
+  deployment: WalletDeployment;
+  /** JSON-RPC URL (ignored when `connection` is given). */
+  rpcUrl?: string;
+  /** An existing connection or a test fake; overrides `rpcUrl`. */
+  connection?: SolanaRpc;
+  /** Commitment for reads, sends and confirmations (default `confirmed`). */
+  commitment?: Commitment;
+  /** Extra `sendRawTransaction` options (default: preflight at `commitment`, 3 retries). */
+  sendOptions?: SendOptions;
 }
 
 /** Options of {@link createLazyWalletExecutor}. */
 export interface LazyWalletExecutorOptions {
-  /** The signing address, known up front (e.g. from `privateKeyToAccount`) without any network call. */
-  address: Address;
+  /** The signing public key (base58), known up front without any network call. */
+  address: string;
   /**
    * Builds the real executor; called on the first wallet operation and again on every later
    * operation until one build succeeds. Its failures surface as `WalletError('wallet_unavailable')`.
@@ -334,7 +600,7 @@ export interface LazyWalletExecutorOptions {
  * gateway that is down at startup. `address` is available immediately for workspace defaulting.
  */
 export function createLazyWalletExecutor(options: LazyWalletExecutorOptions): WalletExecutor {
-  const address = checksum('address', options.address);
+  const address = pubkey('address', options.address).toBase58();
   let inner: WalletExecutor | undefined;
   async function resolve(): Promise<WalletExecutor> {
     if (inner !== undefined) return inner;
@@ -343,7 +609,7 @@ export function createLazyWalletExecutor(options: LazyWalletExecutorOptions): Wa
     } catch (error) {
       throw new WalletError(
         'wallet_unavailable',
-        `the agent wallet could not be set up (${errorMessage(error)}); the purchase was not attempted. Retry once the gateway is reachable, or sign the unsigned steps yourself.`,
+        `the agent wallet could not be set up (${errorMessage(error)}); nothing was sent. Retry once the gateway is reachable, or sign the unsigned transactions yourself.`,
         { cause: error },
       );
     }
@@ -353,236 +619,164 @@ export function createLazyWalletExecutor(options: LazyWalletExecutorOptions): Wa
     address,
     buyCompute: async (params) => (await resolve()).buyCompute(params),
     openBudget: async (params) => (await resolve()).openBudget(params),
+    closeBudget: async (params) => (await resolve()).closeBudget(params),
   };
 }
 
+/** Maps a send / simulation failure onto a {@link WalletError}; SPL "insufficient funds" (custom error 1) → `insufficient_tokens`. */
+function sendError(error: unknown, label: string): WalletError {
+  const message = errorMessage(error);
+  const logs = error instanceof SendTransactionError ? error.logs : undefined;
+  const withLogs = logs === undefined ? {} : { logs };
+  const text = `${message}${logs === undefined || logs.length === 0 ? '' : ` | logs: ${logs.join(' | ')}`}`;
+  if (/insufficient funds for (fee|rent)|found no record of a prior credit|insufficient lamports/i.test(text)) {
+    return new WalletError('insufficient_sol', `${label}: the fee payer has no SOL for the transaction fee (${message}); airdrop or transfer a little SOL to it`, { ...withLogs, cause: error });
+  }
+  if (/custom program error: 0x1\b|insufficient funds/i.test(text)) {
+    return new WalletError('insufficient_tokens', `${label}: the token account holds less than the amount (${message})`, { ...withLogs, cause: error });
+  }
+  if (/blockhash not found/i.test(text)) {
+    return new WalletError('blockhash_expired', `${label}: the blockhash expired before the transaction was accepted (${message}); nothing was sent, retry`, { ...withLogs, cause: error });
+  }
+  return new WalletError('tx_failed', `${label} failed: ${text}`, { ...withLogs, cause: error });
+}
+
 /**
- * A {@link WalletExecutor} signing with `privateKey` through viem. Each write is simulated first
- * (so contract errors such as `BurnTooSmall` surface as readable messages), sent, and awaited.
+ * A {@link WalletExecutor} signing with a `Keypair` over a `Connection`. Before the first
+ * transaction it checks that the RPC node is on the deployment's cluster (genesis hash for the
+ * public clusters) and that the mint exists there (`chain_mismatch` otherwise), then for every
+ * action: resolve the token account, check the fee payer's SOL, build, sign, `sendRawTransaction`
+ * (preflight on), `confirmTransaction` with the blockhash strategy.
  */
-export function createViemWalletExecutor(options: ViemWalletExecutorOptions): WalletExecutor {
-  const account: PrivateKeyAccount = privateKeyToAccount(options.privateKey);
-  const chain = resolveChain(options.chainId, options.rpcUrl);
-  const transport = options.transport ?? http(options.rpcUrl ?? chain.rpcUrls.default.http[0]);
-  const desk = checksum('deployment.creditDesk', options.deployment.creditDesk);
-  const token = checksum('deployment.token', options.deployment.token);
-  const pollingInterval = options.pollingIntervalMs ?? 1_000;
-  const publicClient: PublicClient = createPublicClient({ chain, transport, pollingInterval });
-  const walletClient: WalletClient<Transport, Chain, PrivateKeyAccount> = createWalletClient({ account, chain, transport });
-  const receiptTimeout = options.receiptTimeoutMs ?? 120_000;
+export function createKeypairWalletExecutor(options: KeypairWalletExecutorOptions): WalletExecutor {
+  const keypair = options.secretKey instanceof Keypair ? options.secretKey : keypairFromSecret(options.secretKey);
+  const deployment = options.deployment;
+  const mint = pubkey('deployment.mint', deployment.mint);
+  const tokenProgram = tokenProgramOf(deployment);
+  assertDecimals(deployment.decimals);
+  const commitment = options.commitment ?? 'confirmed';
+  const rpc: SolanaRpc = options.connection ?? new Connection(options.rpcUrl ?? CLUSTERS[deployment.cluster].rpcUrl, commitment);
+  const sendOptions: SendOptions = { skipPreflight: false, preflightCommitment: commitment, maxRetries: 3, ...(options.sendOptions ?? {}) };
+  const address = keypair.publicKey.toBase58();
 
-  /**
-   * viem signs with `chain.id` without asking the node, so a node on another chain (a wrong
-   * `BEAGLE_RPC_URL`) would only surface as an opaque rejection of the raw transaction. Check once,
-   * before the first transaction, and remember a match.
-   */
-  let chainVerified = false;
-  async function assertChain(): Promise<void> {
-    if (chainVerified) return;
-    let actual: number;
-    try {
-      actual = await publicClient.getChainId();
-    } catch (error) {
-      throw new WalletError('rpc_error', `reading the chain id failed: ${errorMessage(error)}`, { cause: error });
-    }
-    if (actual !== options.chainId) {
-      throw new WalletError('chain_mismatch', `the RPC node is on chain ${actual} but the gateway's CreditDesk is on chain ${options.chainId}; check BEAGLE_RPC_URL`);
-    }
-    chainVerified = true;
-  }
-
-  /**
-   * Waits for `hash` and returns the receipt. A reverted transaction throws `tx_reverted`, unless
-   * `diagnoseRevert` (which may replay the call at the receipt's block to learn the reason) returns a
-   * more specific error; its own failures are ignored.
-   */
-  async function waitMined(hash: Hex, label: string, diagnoseRevert?: (receipt: TransactionReceipt) => Promise<WalletError | undefined>): Promise<TransactionReceipt> {
-    let receipt: TransactionReceipt;
-    try {
-      receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: receiptTimeout, pollingInterval });
-    } catch (error) {
-      throw new WalletError('rpc_error', `${label}: waiting for receipt ${hash} failed: ${errorMessage(error)}`, { txHash: hash, cause: error });
-    }
-    if (receipt.status !== 'success') {
-      const diagnosed = diagnoseRevert === undefined ? undefined : await diagnoseRevert(receipt).catch(() => undefined);
-      throw diagnosed ?? new WalletError('tx_reverted', `${label} reverted (tx ${hash})`, { txHash: hash });
-    }
-    return receipt;
-  }
-
-  /**
-   * Approves `allowance + amount` so the pre-existing allowance (which every open budget of this
-   * wallet draws from) survives the burn / stays available next to the new budget's cap. Skipped
-   * only when the allowance is effectively unlimited (the sum would not fit `uint256`).
-   */
-  async function ensureAllowance(amount: bigint): Promise<Hex | undefined> {
-    let allowance: bigint;
-    try {
-      allowance = await publicClient.readContract({ address: token, abi: ERC20_ABI, functionName: 'allowance', args: [account.address, desk] });
-    } catch (error) {
-      throw new WalletError('rpc_error', `reading allowance failed: ${errorMessage(error)}`, { cause: error });
-    }
-    const target = allowance + amount;
-    if (target > UINT256_MAX) return undefined;
-    const hash = await send(() =>
-      walletClient.writeContract({ address: token, abi: ERC20_ABI, functionName: 'approve', args: [desk, target] }),
-      'approve',
-    );
-    await waitMined(hash, 'approve');
-    return hash;
-  }
-
-  async function send(write: () => Promise<Hex>, label: string): Promise<Hex> {
-    try {
-      return await write();
-    } catch (error) {
-      if (error instanceof ChainMismatchError || (error instanceof Error && error.name === 'ChainMismatchError')) {
-        throw new WalletError('chain_mismatch', `${label}: ${errorMessage(error)}`, { cause: error });
+  let clusterVerified = false;
+  /** One-time sanity check of the RPC endpoint against the deployment (a wrong `BEAGLE_RPC_URL` would otherwise fail obscurely at preflight). */
+  async function assertCluster(): Promise<void> {
+    if (clusterVerified) return;
+    const expectedGenesis = GENESIS_HASHES[deployment.cluster];
+    if (expectedGenesis !== undefined) {
+      let genesis: string;
+      try {
+        genesis = await rpc.getGenesisHash();
+      } catch (error) {
+        throw new WalletError('rpc_error', `reading the genesis hash failed: ${errorMessage(error)}`, { cause: error });
       }
-      throw new WalletError('tx_failed', `${label} failed: ${errorMessage(error)}`, { cause: error });
+      if (genesis !== expectedGenesis) {
+        throw new WalletError('chain_mismatch', `the RPC node's genesis hash ${genesis} is not ${deployment.cluster}'s (${expectedGenesis}); check BEAGLE_RPC_URL`);
+      }
     }
+    let info: AccountInfo<Buffer> | null;
+    try {
+      info = await rpc.getAccountInfo(mint, commitment);
+    } catch (error) {
+      throw new WalletError('rpc_error', `reading the mint account failed: ${errorMessage(error)}`, { cause: error });
+    }
+    if (info === null) {
+      throw new WalletError('chain_mismatch', `mint ${mint.toBase58()} does not exist on the RPC node (cluster ${deployment.cluster}); check BEAGLE_RPC_URL`);
+    }
+    if (!info.owner.equals(tokenProgram)) {
+      throw new WalletError('chain_mismatch', `mint ${mint.toBase58()} is owned by ${info.owner.toBase58()}, not the configured token program ${tokenProgram.toBase58()}`);
+    }
+    clusterVerified = true;
+  }
+
+  async function assertSol(): Promise<void> {
+    let lamports: number;
+    try {
+      lamports = await rpc.getBalance(keypair.publicKey, commitment);
+    } catch (error) {
+      throw new WalletError('rpc_error', `reading the SOL balance of ${address} failed: ${errorMessage(error)}`, { cause: error });
+    }
+    if (lamports < MIN_FEE_LAMPORTS) {
+      throw new WalletError('insufficient_sol', `${address} holds ${lamports} lamports, below the ${MIN_FEE_LAMPORTS} needed for a transaction fee; airdrop or transfer a little SOL to it`);
+    }
+  }
+
+  /** Sign, send and confirm; returns the signature and the confirmation slot. */
+  async function sendAndConfirm(transaction: Transaction, label: string): Promise<{ signature: string; slot?: number }> {
+    transaction.sign(keypair);
+    const raw = transaction.serialize();
+    let signature: string;
+    try {
+      signature = await rpc.sendRawTransaction(raw, sendOptions);
+    } catch (error) {
+      throw sendError(error, label);
+    }
+    const strategy: BlockheightBasedTransactionConfirmationStrategy = {
+      signature,
+      blockhash: transaction.recentBlockhash!,
+      lastValidBlockHeight: transaction.lastValidBlockHeight!,
+    };
+    let result: RpcResponseAndContext<SignatureResult>;
+    try {
+      result = await rpc.confirmTransaction(strategy, commitment);
+    } catch (error) {
+      if (error instanceof TransactionExpiredBlockheightExceededError || error instanceof TransactionExpiredTimeoutError) {
+        throw new WalletError(
+          'blockhash_expired',
+          `${label}: transaction ${signature} was not confirmed before its blockhash expired. It may still have landed: check the explorer before retrying, never resend blindly.`,
+          { signature, cause: error },
+        );
+      }
+      throw new WalletError('rpc_error', `${label}: waiting for confirmation of ${signature} failed: ${errorMessage(error)}`, { signature, cause: error });
+    }
+    if (result.value.err !== null) {
+      throw new WalletError('tx_failed', `${label}: transaction ${signature} failed on chain: ${JSON.stringify(result.value.err)}`, { signature });
+    }
+    const slot = result.context?.slot;
+    return { signature, ...(typeof slot === 'number' ? { slot } : {}) };
+  }
+
+  async function run(input: UnsignedTransactionsInput, label: string): Promise<{ signature: string; slot?: number; memo: string | null }> {
+    await assertCluster();
+    await assertSol();
+    const blockhash = await latestBlockhash(rpc, commitment);
+    const { transaction, memo } = buildTransaction(input, blockhash);
+    const sent = await sendAndConfirm(transaction, label);
+    return { ...sent, memo };
   }
 
   return {
-    address: account.address,
+    address,
 
-    async buyCompute({ workspace, tokens, minUsdMicro }) {
-      const ws = checksum('workspace', workspace);
-      assertPositive('tokens', tokens);
-      if (minUsdMicro !== undefined) assertUint256('minUsdMicro', minUsdMicro);
-      await assertChain();
-      const approveTxHash = await ensureAllowance(tokens);
-      // Plain `burnForCredit` only when the caller has no quote to protect; our own tools always pass a floor.
-      // (Two literal calls rather than one with a spread union: viem's overloads need the exact arg tuple.)
-      const label = minUsdMicro === undefined ? 'burnForCredit' : 'burnForCreditMin';
-      const simulateBurn = async (blockNumber?: bigint): Promise<{ request: WriteContractParameters }> => {
-        const at = blockNumber === undefined ? {} : { blockNumber };
-        if (minUsdMicro === undefined) {
-          const { request } = await publicClient.simulateContract({ account, address: desk, abi: CREDIT_DESK_ABI, functionName: 'burnForCredit', args: [ws, tokens], ...at });
-          return { request };
-        }
-        const { request } = await publicClient.simulateContract({ account, address: desk, abi: CREDIT_DESK_ABI, functionName: 'burnForCreditMin', args: [ws, tokens, minUsdMicro], ...at });
-        return { request };
-      };
-      const { request } = await simulate(() => simulateBurn(), label, { onSlippage: (s) => slippageError(s, label) });
-      const txHash = await send(() => walletClient.writeContract(request), label);
-      const receipt = await waitMined(txHash, label, async (reverted) => {
-        if (minUsdMicro === undefined) return undefined;
-        // The simulation passed, the mined transaction did not: replay it against the state of its block
-        // to tell a price move (SlippageExceeded) from anything else. Either way only gas was spent.
-        try {
-          await simulateBurn(reverted.blockNumber);
-        } catch (error) {
-          const slippage = decodeSlippage(error);
-          if (slippage !== undefined) return slippageError(slippage, label, txHash);
-        }
-        return new WalletError(
-          'tx_reverted',
-          `${label} reverted (tx ${txHash}); the simulation had passed, so most likely the desk's quote fell below the credit floor of ${minUsdMicro.toString()} µUSD between simulation and inclusion. Only gas was spent, nothing was burned: re-quote and retry, or allow a wider tolerance.`,
-          { txHash },
-        );
-      });
-      const event = decodeDeskEvent(receipt, desk, 'CreditPurchased');
-      const receiptId = event?.args['receiptId'];
-      const usdMicro = event?.args['usdMicro'];
-      const priceE18 = event?.args['priceE18'];
-      return {
-        txHash,
-        ...(typeof receiptId === 'bigint' ? { receiptId } : {}),
-        ...(typeof usdMicro === 'bigint' ? { usdMicro } : {}),
-        ...(typeof priceE18 === 'bigint' ? { priceE18 } : {}),
-        ...(approveTxHash === undefined ? {} : { approveTxHash }),
-      };
+    async buyCompute({ workspace, tokens }) {
+      const ws = pubkey('workspace', workspace).toBase58();
+      assertTokenAmount('tokens', tokens);
+      await assertCluster();
+      const account = await resolveTokenAccount(rpc, { owner: address, deployment, need: tokens, commitment });
+      const { signature, slot, memo } = await run({ action: 'buyCompute', deployment, payer: address, tokenAccount: account.address, tokens, workspace: ws }, 'burn');
+      return { signature, ...(slot === undefined ? {} : { slot }), tokenAccount: account.address, memo };
     },
 
-    async openBudget({ workspace, cap, deadline }) {
-      const ws = checksum('workspace', workspace);
-      assertPositive('cap', cap);
-      if (cap > UINT128_MAX) throw new WalletError('invalid_amount', 'cap exceeds uint128');
-      if (deadline <= 0n || deadline > UINT64_MAX) throw new WalletError('invalid_amount', 'deadline must fit uint64 and be > 0');
-      await assertChain();
-      const approveTxHash = await ensureAllowance(cap);
-      const { request } = await simulate(
-        () => publicClient.simulateContract({ account, address: desk, abi: CREDIT_DESK_ABI, functionName: 'openBudget', args: [ws, cap, deadline] }),
-        'openBudget',
-      );
-      const txHash = await send(() => walletClient.writeContract(request), 'openBudget');
-      const receipt = await waitMined(txHash, 'openBudget');
-      const event = decodeDeskEvent(receipt, desk, 'BudgetOpened');
-      const budgetId = event?.args['budgetId'];
-      if (typeof budgetId !== 'bigint') {
-        throw new WalletError('event_missing', `openBudget mined (tx ${txHash}) but no BudgetOpened event was found in the receipt`, { txHash });
+    async openBudget({ cap }) {
+      assertTokenAmount('cap', cap);
+      await assertCluster();
+      // Any account of the mint can be delegated (the ATA when it exists); the headroom is min(cap, balance).
+      const account = await resolveTokenAccount(rpc, { owner: address, deployment, need: 0n, commitment });
+      const { signature, slot } = await run({ action: 'openBudget', deployment, payer: address, tokenAccount: account.address, cap }, 'approve');
+      return { signature, ...(slot === undefined ? {} : { slot }), tokenAccount: account.address, balance: account.amount };
+    },
+
+    async closeBudget({ tokenAccount }) {
+      await assertCluster();
+      let account: ResolvedTokenAccount;
+      if (tokenAccount === undefined) {
+        account = await resolveTokenAccount(rpc, { owner: address, deployment, need: 0n, commitment });
+      } else {
+        account = await describeTokenAccount(rpc, tokenAccount, deployment, commitment);
       }
-      return { txHash, budgetId, ...(approveTxHash === undefined ? {} : { approveTxHash }) };
+      const { signature, slot } = await run({ action: 'closeBudget', deployment, payer: address, tokenAccount: account.address }, 'revoke');
+      return { signature, ...(slot === undefined ? {} : { slot }), tokenAccount: account.address };
     },
   };
-}
-
-async function simulate<T>(run: () => Promise<T>, label: string, hooks: { onSlippage?: (s: Slippage) => WalletError } = {}): Promise<T> {
-  try {
-    return await run();
-  } catch (error) {
-    if (hooks.onSlippage !== undefined) {
-      const slippage = decodeSlippage(error);
-      if (slippage !== undefined) throw hooks.onSlippage(slippage);
-    }
-    throw new WalletError('simulation_failed', `${label} would revert: ${errorMessage(error)}`, { cause: error });
-  }
-}
-
-/** The two numbers of the desk's `SlippageExceeded(uint256 usdMicro, uint256 minUsdMicro)`. */
-export interface Slippage {
-  /** What the desk would credit now. */
-  usdMicro: bigint;
-  /** The floor the caller asked for. */
-  minUsdMicro: bigint;
-}
-
-/**
- * Finds a `SlippageExceeded` revert in a viem error: either already decoded by viem
- * (`ContractFunctionRevertedError.data`) or as raw revert bytes (`data: 0x…`) anywhere down the `cause` chain.
- */
-export function decodeSlippage(error: unknown): Slippage | undefined {
-  let current: unknown = error;
-  for (let depth = 0; depth < 8 && typeof current === 'object' && current !== null; depth += 1) {
-    const data = (current as { data?: unknown }).data;
-    let decoded: { errorName?: unknown; args?: unknown } | undefined;
-    if (typeof data === 'object' && data !== null) decoded = data as { errorName?: unknown; args?: unknown };
-    else if (typeof data === 'string' && /^0x[0-9a-fA-F]{8,}$/.test(data)) {
-      try {
-        decoded = decodeErrorResult({ abi: CREDIT_DESK_ABI, data: data as Hex });
-      } catch {
-        // not a desk error
-      }
-    }
-    if (decoded?.errorName === 'SlippageExceeded' && Array.isArray(decoded.args)) {
-      const [usdMicro, minUsdMicro] = decoded.args as unknown[];
-      if (typeof usdMicro === 'bigint' && typeof minUsdMicro === 'bigint') return { usdMicro, minUsdMicro };
-    }
-    current = (current as { cause?: unknown }).cause;
-  }
-  return undefined;
-}
-
-function slippageError(slippage: Slippage, label: string, txHash?: Hex): WalletError {
-  const { usdMicro, minUsdMicro } = slippage;
-  const where = txHash === undefined ? `${label} would revert with SlippageExceeded` : `${label} reverted with SlippageExceeded (tx ${txHash}, only gas was spent)`;
-  return new WalletError(
-    'slippage_exceeded',
-    `${where}: the desk now quotes ${usdMicro.toString()} µUSD (${formatUsdMicro(usdMicro)}) for this burn, below the credit floor of ${minUsdMicro.toString()} µUSD (${formatUsdMicro(minUsdMicro)}); the price moved since the quote. Nothing was burned: re-quote and retry, or allow a wider tolerance.`,
-    txHash === undefined ? {} : { txHash },
-  );
-}
-
-/** The most specific message viem offers (`shortMessage` of a `BaseError`), else `message`. */
-export function errorMessage(error: unknown): string {
-  if (typeof error === 'object' && error !== null) {
-    const e = error as { shortMessage?: unknown; message?: unknown; metaMessages?: unknown };
-    const short = typeof e.shortMessage === 'string' ? e.shortMessage : undefined;
-    const meta = Array.isArray(e.metaMessages) ? e.metaMessages.filter((m): m is string => typeof m === 'string') : [];
-    const custom = meta.find((m) => /^Error: /.test(m));
-    if (short !== undefined) return custom === undefined ? short : `${short} (${custom.replace(/^Error: /, '')})`;
-    if (typeof e.message === 'string') return e.message;
-  }
-  return String(error);
 }

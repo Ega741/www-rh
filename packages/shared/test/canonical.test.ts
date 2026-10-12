@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canonicalJson, compareCodePoints, receiptHash, sha256Hex } from '../src/canonical.js';
+import { canonicalJson, compareCodePoints, receiptHash, sha256Hex, utf8Bytes } from '../src/canonical.js';
 
 describe('canonicalJson (SPEC §4.7)', () => {
   it('sorts keys and strips whitespace', () => {
@@ -87,6 +87,12 @@ describe('sha256Hex / receiptHash', () => {
     expect(receiptHash({ usage: { outputTokens: 2, inputTokens: 1 }, chargedMicro: '1234', requestId: 'req_1', v: 1 })).toBe(h);
     expect(receiptHash({ ...obj, chargedMicro: 1235n })).not.toBe(h);
     expect(receiptHash({ ...obj, extra: undefined })).toBe(h);
+  });
+
+  it('utf8Bytes encodes UTF-8', () => {
+    expect(Array.from(utf8Bytes('abc'))).toEqual([97, 98, 99]);
+    expect(Array.from(utf8Bytes('é'))).toEqual([0xc3, 0xa9]);
+    expect(utf8Bytes('')).toHaveLength(0);
   });
 
   it('matches a known digest', () => {

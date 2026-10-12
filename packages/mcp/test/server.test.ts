@@ -1,19 +1,23 @@
-import { CREDIT_DESK_ABI, ERC20_ABI } from '@beagle/shared/abi';
+import { TOKEN_PROGRAM_ID } from '@beagle/shared/addresses';
 import { tokensForUsdMicro } from '@beagle/shared/credit';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import { McpError, type CallToolResult, type Progress } from '@modelcontextprotocol/sdk/types.js';
-import { decodeFunctionData, getAddress, type Hex } from 'viem';
+import { decodeInstruction, isApproveCheckedInstruction, isBurnCheckedInstruction, isRevokeInstruction, TokenInstruction } from '@solana/spl-token';
+import { Transaction } from '@solana/web3.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { BeagleApiError, type BeagleApi } from '../src/api.js';
-import { BEAGLE_TOOL_NAMES, createBeagleMcpServer, numberToDecimalString, tokenInputToRaw, type BeagleMcpServerOptions } from '../src/server.js';
+import { BEAGLE_TOOL_NAMES, createBeagleMcpServer, explorerLink, numberToDecimalString, priceAge, tokenInputToRaw, type BeagleMcpServerOptions } from '../src/server.js';
 import { createLazyWalletExecutor, WalletError, type WalletExecutor } from '../src/wallet.js';
-import { createFakeApi, DESK, NOW_MS, PRICE_E18, sampleBudget, TOKEN, WORKSPACE, type FakeApi } from './fake-api.js';
+import { AGENT_ATA, createFakeApi, DECIMALS, NOW_MS, NOW_S, PRICE_E18, RPC_URL, sampleBudget, sampleReceipt, signatureOf, WORKSPACE, type FakeApi } from './fake-api.js';
+import { AGENT, BLOCKHASH, createFakeConnection, LAST_VALID_BLOCK_HEIGHT, MINT, OPERATOR, OTHER_WORKSPACE, PAYER, type FakeConnection } from './fake-connection.js';
+import { getAssociatedTokenAddressSync } from '@solana/spl-token';
+import { PublicKey } from '@solana/web3.js';
 
-const TX = `0x${'ab'.repeat(32)}` as Hex;
-const APPROVE_TX = `0x${'cd'.repeat(32)}` as Hex;
-const AGENT = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC';
+const SIG = signatureOf(0xab);
+const ONE = 10n ** BigInt(DECIMALS);
+const PAYER_ATA = getAssociatedTokenAddressSync(new PublicKey(MINT), new PublicKey(PAYER), true, new PublicKey(TOKEN_PROGRAM_ID)).toBase58();
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const closers: Array<() => Promise<void>> = [];
@@ -21,8 +25,18 @@ afterEach(async () => {
   while (closers.length > 0) await closers.pop()!();
 });
 
+/** A node where the agent and the payer each hold 1000 BEAGLE in their ATA. */
+function node(): FakeConnection {
+  return createFakeConnection({
+    tokenAccounts: [
+      { address: AGENT_ATA, mint: MINT, owner: AGENT, amount: 1_000n * ONE },
+      { address: PAYER_ATA, mint: MINT, owner: PAYER, amount: 1_000n * ONE, delegate: OPERATOR, delegatedAmount: 20n * ONE },
+    ],
+  });
+}
+
 async function connect(api: BeagleApi, opts: BeagleMcpServerOptions = {}) {
-  const server = createBeagleMcpServer(api, { now: () => NOW_MS, ...opts });
+  const server = createBeagleMcpServer(api, { now: () => NOW_MS, connection: node(), ...opts });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'beagle-mcp-test', version: '0.0.0' });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -38,7 +52,7 @@ async function call(client: Client, name: string, args: Record<string, unknown> 
 }
 
 function structured(result: CallToolResult): Record<string, unknown> {
-  expect(result.isError ?? false).toBe(false);
+  expect(result.isError ?? false, JSON.stringify(result.structuredContent)).toBe(false);
   expect(result.structuredContent).toBeDefined();
   const text = result.content.find((c) => c.type === 'text');
   expect(text?.type).toBe('text');
@@ -46,14 +60,21 @@ function structured(result: CallToolResult): Record<string, unknown> {
   return result.structuredContent as Record<string, unknown>;
 }
 
-function errorOf(result: CallToolResult): { code: string; message: string; status?: number } {
+function errorOf(result: CallToolResult): { code: string; message: string; status?: number; signature?: string } {
   expect(result.isError).toBe(true);
-  const sc = result.structuredContent as { error: { code: string; message: string; status?: number } };
+  const sc = result.structuredContent as { error: { code: string; message: string; status?: number; signature?: string } };
   expect(sc.error).toBeDefined();
   const text = result.content[0];
   expect(text?.type).toBe('text');
   expect(JSON.parse((text as { text: string }).text)).toEqual(sc);
   return sc.error;
+}
+
+function unsignedTx(data: Record<string, unknown>): Transaction {
+  const transactions = data['transactions'] as Array<{ base64: string; description: string }>;
+  expect(transactions.length).toBe(1);
+  expect(transactions[0]!.description).toBeTruthy();
+  return Transaction.from(Buffer.from(transactions[0]!.base64, 'base64'));
 }
 
 function fakeWallet(overrides: Partial<WalletExecutor> = {}): WalletExecutor & { calls: unknown[] } {
@@ -63,37 +84,50 @@ function fakeWallet(overrides: Partial<WalletExecutor> = {}): WalletExecutor & {
     address: AGENT,
     async buyCompute(params) {
       calls.push({ buyCompute: params });
-      // what a decoded CreditPurchased event carries: the exact credit and the price the contract read
-      return { txHash: TX, receiptId: 42n, usdMicro: 5_000_000n, priceE18: PRICE_E18, approveTxHash: APPROVE_TX };
+      return { signature: SIG, slot: 42, tokenAccount: AGENT_ATA, memo: params.workspace === AGENT ? null : `beagle:v1 ws=${params.workspace}` };
     },
     async openBudget(params) {
       calls.push({ openBudget: params });
-      return { txHash: TX, budgetId: 7n };
+      return { signature: SIG, slot: 42, tokenAccount: AGENT_ATA, balance: 1_000n * ONE };
+    },
+    async closeBudget(params) {
+      calls.push({ closeBudget: params });
+      return { signature: SIG, slot: 43, tokenAccount: params.tokenAccount ?? AGENT_ATA };
     },
     ...overrides,
   };
 }
 
 describe('tools/list', () => {
-  it('exposes exactly the ten tools of SPEC §6.3 with descriptions and object input schemas', async () => {
+  it('exposes exactly the eleven tools of SPEC §6.3 with descriptions and object input schemas', async () => {
     const client = await connect(createFakeApi());
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([...BEAGLE_TOOL_NAMES].sort());
+    expect(tools.length).toBe(11);
     for (const tool of tools) {
       expect(tool.description, tool.name).toBeTruthy();
       expect(tool.inputSchema.type).toBe('object');
     }
     const budget = tools.find((t) => t.name === 'beagle_open_budget')!;
-    const hours = (budget.inputSchema.properties as Record<string, { maximum?: number }>)['hours'];
-    expect(hours?.maximum).toBe(720);
+    const props = Object.keys(budget.inputSchema.properties ?? {}).sort();
+    expect(props).toEqual(['payer', 'tokenAccount', 'tokens', 'usd', 'workspace']); // cap only: no hours / deadline
+    expect(budget.description).toMatch(/REPLACES the previous cap/);
+    const buy = tools.find((t) => t.name === 'beagle_buy_compute')!;
+    expect(Object.keys(buy.inputSchema.properties ?? {})).not.toContain('tolerance_bps');
+    expect(buy.description).toMatch(/published price point when the gateway observes the burn/);
+    expect(buy.description).toMatch(/stale/);
+    expect(buy.description).not.toMatch(/CreditDesk|approve \+|slippage/i);
+    expect(tools.find((t) => t.name === 'beagle_close_budget')?.description).toMatch(/Revoke/);
     expect(tools.find((t) => t.name === 'beagle_balance')?.annotations?.readOnlyHint).toBe(true);
-    expect(tools.find((t) => t.name === 'beagle_buy_compute')?.annotations?.readOnlyHint).toBe(false);
+    expect(buy.annotations?.readOnlyHint).toBe(false);
+    expect(buy.annotations?.destructiveHint).toBe(true);
   });
 
   it('reports server info and instructions', async () => {
     const client = await connect(createFakeApi());
     expect(client.getServerVersion()?.name).toBe('beagle');
     expect(client.getInstructions()).toMatch(/beagle_balance/);
+    expect(client.getInstructions()).toMatch(/Solana/);
   });
 });
 
@@ -105,7 +139,17 @@ describe('read-only tools', () => {
     expect(data['balanceMicro']).toBe('12340000');
     expect(data['plan']).toBe('free');
     expect((data['price'] as Record<string, unknown>)['priceE18']).toBe(PRICE_E18.toString());
+    expect((data['price'] as Record<string, unknown>)['pricePointId']).toBe(7);
     expect(data['summary']).toBe('$12.34 available; plan free; 1 BEAGLE = $0.0100');
+    expect(data['warning']).toBeUndefined();
+  });
+
+  it('beagle_balance flags a stale price in the summary and a warning', async () => {
+    const client = await connect(createFakeApi({ priceStale: true }));
+    const data = structured(await call(client, 'beagle_balance'));
+    expect(data['summary']).toBe('$12.34 available; plan free; 1 BEAGLE = $0.0100 (stale)');
+    expect(data['warning']).toMatch(/STALE/);
+    expect(data['warning']).toMatch(/observed 2 h ago/);
   });
 
   it('beagle_models lists the catalog with aliases and filters by tier', async () => {
@@ -130,18 +174,20 @@ describe('read-only tools', () => {
     expect(result.isError).toBe(true);
   });
 
-  it('beagle_quote prices USD in tokens and tokens in USD', async () => {
+  it('beagle_quote prices USD in tokens and tokens in USD at 6 decimals', async () => {
     const api = createFakeApi();
     const client = await connect(api);
     const byUsd = structured(await call(client, 'beagle_quote', { usd: 5 }));
-    expect(byUsd['tokens']).toBe((500n * 10n ** 18n).toString());
+    expect(byUsd['tokens']).toBe((500n * ONE).toString());
     expect(byUsd['usdMicro']).toBe('5000000');
     expect(byUsd['tokensFormatted']).toBe('500 BEAGLE');
     expect(byUsd['usd']).toBe('$5.00');
     expect(byUsd['usdPerToken']).toBe('$0.0100');
+    expect(byUsd['pricePointId']).toBe(7);
+    expect(byUsd['stale']).toBe(false);
 
     const byTokens = structured(await call(client, 'beagle_quote', { tokens: '1000.5' }));
-    expect(byTokens['tokens']).toBe((10005n * 10n ** 17n).toString());
+    expect(byTokens['tokens']).toBe((10_005n * ONE / 10n).toString());
     expect(byTokens['usdMicro']).toBe('10005000');
 
     const byUsdString = structured(await call(client, 'beagle_quote', { usd: '$0.25' }));
@@ -149,29 +195,29 @@ describe('read-only tools', () => {
   });
 
   it('takes numeric token amounts at their shortest decimal form, without float noise', () => {
-    expect(tokenInputToRaw(0.1, 18)).toBe(10n ** 17n);
-    expect(tokenInputToRaw(0.3, 18)).toBe(3n * 10n ** 17n);
-    expect(tokenInputToRaw(1.005, 18)).toBe(1_005n * 10n ** 15n);
-    expect(tokenInputToRaw(123.456, 18)).toBe(123_456n * 10n ** 15n);
-    expect(tokenInputToRaw(1e21, 18)).toBe(10n ** 39n);
-    expect(tokenInputToRaw(1.5e-7, 18)).toBe(15n * 10n ** 10n);
-    expect(tokenInputToRaw('1000.5', 18)).toBe(10_005n * 10n ** 17n);
-    expect(() => tokenInputToRaw(Number.NaN, 18)).toThrow(/tokens/);
-    expect(() => tokenInputToRaw(1e-19, 18)).toThrow(/fraction digits/);
+    expect(tokenInputToRaw(0.1, 6)).toBe(100_000n);
+    expect(tokenInputToRaw(0.3, 6)).toBe(300_000n);
+    expect(tokenInputToRaw(1.005, 6)).toBe(1_005_000n);
+    expect(tokenInputToRaw(123.456, 6)).toBe(123_456_000n);
+    expect(tokenInputToRaw(1e9, 6)).toBe(10n ** 15n);
+    expect(tokenInputToRaw(1.5e-5, 6)).toBe(15n);
+    expect(tokenInputToRaw('1000.5', 6)).toBe(1_000_500_000n);
+    expect(() => tokenInputToRaw(Number.NaN, 6)).toThrow(/tokens/);
+    expect(() => tokenInputToRaw(1e-7, 6)).toThrow(/fraction digits/);
     expect(numberToDecimalString(2.5e22)).toBe('25000000000000000000000');
     expect(numberToDecimalString(-1.25e-3)).toBe('-0.00125');
     expect(numberToDecimalString(42)).toBe('42');
   });
 
-  it('beagle_quote prices a fractional numeric token amount exactly', async () => {
-    const client = await connect(createFakeApi());
-    const data = structured(await call(client, 'beagle_quote', { tokens: 0.3 }));
-    expect(data['tokens']).toBe((3n * 10n ** 17n).toString());
+  it('beagle_quote flags a stale point and needs exactly one of usd / tokens', async () => {
+    const stale = await connect(createFakeApi({ priceStale: true }));
+    const data = structured(await call(stale, 'beagle_quote', { tokens: 0.3 }));
+    expect(data['tokens']).toBe('300000');
     expect(data['tokensFormatted']).toBe('0.3 BEAGLE');
     expect(data['usdMicro']).toBe('3000');
-  });
+    expect(data['stale']).toBe(true);
+    expect(data['warning']).toMatch(/stale/);
 
-  it('beagle_quote needs exactly one of usd / tokens', async () => {
     const client = await connect(createFakeApi());
     expect(errorOf(await call(client, 'beagle_quote', {})).code).toBe('invalid_request');
     expect(errorOf(await call(client, 'beagle_quote', { usd: 1, tokens: 1 })).code).toBe('invalid_request');
@@ -191,57 +237,65 @@ describe('read-only tools', () => {
     expect(api.state.calls.find((c) => c.method === 'usage')?.args[0]).toEqual({ limit: 1, window: '7d' });
   });
 
-  it('beagle_budgets lists budgets with formatted amounts and total headroom', async () => {
+  it('beagle_budgets lists delegation budgets keyed by token account with formatted amounts and total headroom', async () => {
     const client = await connect(createFakeApi());
     const data = structured(await call(client, 'beagle_budgets'));
     const budgets = data['budgets'] as Array<Record<string, unknown>>;
     expect(budgets.length).toBe(1);
-    expect(budgets[0]!['budgetId']).toBe(3);
-    expect(budgets[0]!['cap']).toBe((500n * 10n ** 18n).toString());
-    expect(budgets[0]!['capFormatted']).toBe('500 BEAGLE');
+    expect(budgets[0]!['tokenAccount']).toBe(AGENT_ATA);
+    expect(budgets[0]!['delegate']).toBe(OPERATOR);
+    expect(budgets[0]!['cap']).toBe((400n * ONE).toString());
+    expect(budgets[0]!['capFormatted']).toBe('400 BEAGLE');
+    expect(budgets[0]!['balanceFormatted']).toBe('1000 BEAGLE');
     expect(budgets[0]!['headroomFormatted']).toBe('400 BEAGLE ($4.00)');
+    expect(budgets[0]!['lifetime']).toBe('until revoked');
     expect((budgets[0]!['draws'] as unknown[]).length).toBe(1);
+    expect(budgets[0]!['drawCount']).toBe(1);
     expect(data['headroomMicro']).toBe('4000000');
     expect(data['headroom']).toBe('$4.00');
     expect(budgets[0]!['active']).toBe(true);
     expect(budgets[0]!['countsAsHeadroom']).toBe(true);
   });
 
-  it('beagle_budgets excludes expired and stalled budgets from the total, like /api/balance does', async () => {
+  it('beagle_budgets excludes closed and stalled budgets from the total, like /api/balance does', async () => {
     const api = createFakeApi();
     api.state.budgets = [
       sampleBudget(),
-      // expired: the gateway refresher skips it, so its stale headroom_micro stays in the row
-      sampleBudget({ budgetId: 4, deadline: Math.floor(NOW_MS / 1000) - 60, headroomMicro: 4_000_000n }),
-      sampleBudget({ budgetId: 5, stalledReason: 'allowance', headroomMicro: 0n, headroomTokens: 0n }),
+      sampleBudget({ tokenAccount: PAYER_ATA, closed: true, delegate: null, stalledReason: 'revoked', headroomMicro: 4_000_000n }),
+      sampleBudget({ tokenAccount: OTHER_WORKSPACE, stalledReason: 'price', headroomMicro: 0n, headroomTokens: 0n }),
     ];
     const client = await connect(api);
     const data = structured(await call(client, 'beagle_budgets'));
     const rows = data['budgets'] as Array<Record<string, unknown>>;
     expect(rows.length).toBe(3);
     expect(rows[1]!['active']).toBe(false);
+    expect(rows[1]!['lifetime']).toBe('closed');
     expect(rows[1]!['countsAsHeadroom']).toBe(false);
     expect(rows[2]!['active']).toBe(true);
     expect(rows[2]!['countsAsHeadroom']).toBe(false);
     expect(data['headroomMicro']).toBe('4000000');
   });
 
-  it('beagle_status returns the status DTO plus the upgrade prices', async () => {
+  it('beagle_status returns the status DTO plus the price age and upgrade prices', async () => {
     const client = await connect(createFakeApi());
     const data = structured(await call(client, 'beagle_status'));
-    expect(data['chainId']).toBe(31337);
-    expect(data['creditDesk']).toBe(DESK);
+    expect(data['cluster']).toBe('localnet');
+    expect(data['mint']).toBe(MINT);
+    expect((data['operator'] as Record<string, unknown>)['address']).toBe(OPERATOR);
     expect((data['providers'] as Record<string, { state: string }>)['google']?.state).toBe('down');
+    expect(data['priceAge']).toBe('30 s ago');
     expect(data['upgradePrices']).toEqual({
       pro: { priceMicro: '20000000', price: '$20.00', days: 30 },
       warm: { hourPriceMicro: '2000000', hourPrice: '$2.00' },
     });
+    expect(priceAge({ observedAt: NOW_S - 90 }, NOW_MS)).toBe('1 min ago');
+    expect(priceAge({ observedAt: NOW_S - 2 * 86_400 }, NOW_MS)).toBe('2 d ago');
   });
 
   it('beagle_status still answers when config() fails', async () => {
     const client = await connect(createFakeApi({ failures: { config: new BeagleApiError(500, 'internal_error', 'nope') } }));
     const data = structured(await call(client, 'beagle_status'));
-    expect(data['chainId']).toBe(31337);
+    expect(data['cluster']).toBe('localnet');
     expect(data['upgradePrices']).toBeNull();
   });
 });
@@ -267,7 +321,6 @@ describe('beagle_complete', () => {
     expect(req.messages).toEqual([{ role: 'user', content: 'hi there' }]);
     expect(req.max_tokens).toBe(64);
     expect(completeCall.args[1]).toEqual({ difficulty: 0.9 });
-    // balance() was not needed: the metadata carried the balance
     expect(api.callsTo('balance')).toBe(0);
   });
 
@@ -358,100 +411,89 @@ describe('beagle_upgrade', () => {
 });
 
 describe('beagle_buy_compute without a wallet', () => {
-  it('returns unsigned approve + burnForCreditMin steps with decodable calldata and the default 1 % floor', async () => {
+  it('returns one unsigned BurnChecked + memo transaction with feePayer = workspace and a decodable burn', async () => {
     const api = createFakeApi();
-    const client = await connect(api);
-    const data = structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE }));
+    const rpc = node();
+    const client = await connect(api, { connection: rpc });
+    const data = structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: PAYER }));
     expect(data['unsigned']).toBe(true);
-    expect(data['chainId']).toBe(31337);
-    const expectedTokens = tokensForUsdMicro(5_000_000n, PRICE_E18);
+    expect(data['cluster']).toBe('localnet');
+    expect(data['feePayer']).toBe(PAYER);
+    expect(data['blockhash']).toBe(BLOCKHASH);
+    expect(data['lastValidBlockHeight']).toBe(LAST_VALID_BLOCK_HEIGHT);
+    const expectedTokens = tokensForUsdMicro(5_000_000n, PRICE_E18, DECIMALS);
     expect(data['tokens']).toBe(expectedTokens.toString());
+    expect(data['tokensFormatted']).toBe('500 BEAGLE');
     expect(data['usdMicro']).toBe('5000000');
-    // the floor: quote − ceil(quote · 100 / 10 000)
-    expect(data['minUsdMicro']).toBe('4950000');
-    expect(data['minUsd']).toBe('$4.95');
-    expect(data['toleranceBps']).toBe(100);
-    expect(data['workspace']).toBe(getAddress(WORKSPACE));
+    expect(data['pricePointId']).toBe(7);
+    expect(data['priceStale']).toBe(false);
+    expect(data['warnings']).toEqual([]);
+    expect(data['workspace']).toBe(PAYER);
     expect(data['workspaceSource']).toBe('input');
+    expect(data['tokenAccount']).toBe(PAYER_ATA);
+    expect(data['tokenAccountBalance']).toBe((1_000n * ONE).toString());
+    expect(data['memo']).toBeNull();
+    expect(data['mint']).toBe(MINT);
     expect(data['note']).not.toMatch(/Warning/);
-    expect(data['note']).toMatch(/current allowance \+ the amount/);
-    expect(data['note']).toMatch(/credit floor of \$4\.95 \(quote − 100 bps\)/);
-    expect(data['note']).toMatch(/costs only gas/);
-    const steps = data['steps'] as Array<{ to: string; data: Hex; value: string; description: string }>;
-    expect(steps.length).toBe(2);
-    expect(steps.every((s) => s.value === '0')).toBe(true);
-
-    expect(steps[0]!.to).toBe(TOKEN);
-    const approve = decodeFunctionData({ abi: ERC20_ABI, data: steps[0]!.data });
-    expect(approve.functionName).toBe('approve');
-    expect(approve.args).toEqual([DESK, expectedTokens]);
-    expect(steps[0]!.description).toMatch(/approve 500 BEAGLE/);
-
-    expect(steps[1]!.to).toBe(DESK);
-    const burn = decodeFunctionData({ abi: CREDIT_DESK_ABI, data: steps[1]!.data });
-    expect(burn.functionName).toBe('burnForCreditMin');
-    expect(burn.args).toEqual([getAddress(WORKSPACE), expectedTokens, 4_950_000n]);
-    expect(steps[1]!.description).toMatch(/credit floor of \$4\.95 \(4950000 µUSD\)/);
-    expect(steps[1]!.description).toMatch(/SlippageExceeded/);
+    expect(data['note']).toMatch(/No memo: the token account owner is the credited workspace/);
     expect(data['note']).toMatch(/\$5\.00/);
-    // the quote came from the api
+
+    const tx = unsignedTx(data);
+    expect(tx.feePayer?.toBase58()).toBe(PAYER);
+    expect(tx.recentBlockhash).toBe(BLOCKHASH);
+    expect(tx.signatures[0]!.signature).toBeNull();
+    expect(tx.instructions.length).toBe(1);
+    const burn = decodeInstruction(tx.instructions[0]!);
+    if (!isBurnCheckedInstruction(burn)) throw new Error('expected BurnChecked');
+    expect(burn.data).toEqual({ instruction: TokenInstruction.BurnChecked, amount: expectedTokens, decimals: DECIMALS });
+    expect(burn.keys.account.pubkey.toBase58()).toBe(PAYER_ATA);
+    expect(burn.keys.owner.pubkey.toBase58()).toBe(PAYER);
     expect(api.state.calls.find((c) => c.method === 'quote')?.args[0]).toEqual({ usdMicro: 5_000_000n });
+    expect(api.callsTo('price')).toBe(1);
+    expect(rpc.calls.map((c) => c.method)).toEqual(['getAccountInfo', 'getLatestBlockhash']);
   });
 
-  it('applies a caller-chosen tolerance_bps to the floor, including 0 (exactly the quote)', async () => {
+  it('adds the memo when a payer burns for another workspace', async () => {
     const client = await connect(createFakeApi());
-    const expectedTokens = tokensForUsdMicro(5_000_000n, PRICE_E18);
-
-    const loose = structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE, tolerance_bps: 250 }));
-    expect(loose['minUsdMicro']).toBe('4875000');
-    expect(loose['toleranceBps']).toBe(250);
-    const looseSteps = loose['steps'] as Array<{ data: Hex }>;
-    expect(decodeFunctionData({ abi: CREDIT_DESK_ABI, data: looseSteps[1]!.data })).toEqual({ functionName: 'burnForCreditMin', args: [getAddress(WORKSPACE), expectedTokens, 4_875_000n] });
-
-    const exact = structured(await call(client, 'beagle_buy_compute', { tokens: 250, workspace: WORKSPACE, tolerance_bps: 0 }));
-    expect(exact['usdMicro']).toBe('2500000');
-    expect(exact['minUsdMicro']).toBe('2500000');
-    expect(exact['toleranceBps']).toBe(0);
-    const exactSteps = exact['steps'] as Array<{ data: Hex }>;
-    expect(decodeFunctionData({ abi: CREDIT_DESK_ABI, data: exactSteps[1]!.data })).toEqual({ functionName: 'burnForCreditMin', args: [getAddress(WORKSPACE), 250n * 10n ** 18n, 2_500_000n] });
-
-    const max = structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE, tolerance_bps: 5000 }));
-    expect(max['minUsdMicro']).toBe('2500000');
+    const data = structured(await call(client, 'beagle_buy_compute', { tokens: 250, workspace: OTHER_WORKSPACE, payer: PAYER }));
+    expect(data['feePayer']).toBe(PAYER);
+    expect(data['workspace']).toBe(OTHER_WORKSPACE);
+    expect(data['memo']).toBe(`beagle:v1 ws=${OTHER_WORKSPACE}`);
+    expect(data['note']).toMatch(new RegExp(`The memo "beagle:v1 ws=${OTHER_WORKSPACE}" credits workspace ${OTHER_WORKSPACE}`));
+    const tx = unsignedTx(data);
+    expect(tx.instructions.length).toBe(2);
+    expect(Buffer.from(tx.instructions[1]!.data).toString('utf8')).toBe(`beagle:v1 ws=${OTHER_WORKSPACE}`);
   });
 
-  it('rejects tolerance_bps outside 0..5000, non-integers and non-numbers through the schema', async () => {
-    const client = await connect(createFakeApi());
-    for (const tolerance_bps of [5001, -1, 1.5, '100', null, 10_000]) {
-      const result = await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE, tolerance_bps });
-      expect(result.isError, `tolerance_bps ${JSON.stringify(tolerance_bps)}`).toBe(true);
-    }
-    // the boundaries are fine
-    structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE, tolerance_bps: 0 }));
-    structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE, tolerance_bps: 5000 }));
+  it('warns when the published price is stale and still builds the transaction', async () => {
+    const client = await connect(createFakeApi({ priceStale: true }));
+    const data = structured(await call(client, 'beagle_buy_compute', { usd: 5, workspace: PAYER }));
+    expect(data['priceStale']).toBe(true);
+    const warnings = data['warnings'] as string[];
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toMatch(/STALE/);
+    expect(warnings[0]).toMatch(/flagged priceStale/);
+    unsignedTx(data);
   });
 
-  it('describes the floor, its default and what a reverted burn costs in the tool description', async () => {
-    const client = await connect(createFakeApi());
-    const { tools } = await client.listTools();
-    const tool = tools.find((t) => t.name === 'beagle_buy_compute');
-    expect(tool?.description).toMatch(/burnForCreditMin/);
-    expect(tool?.description).toMatch(/credit floor of quote − tolerance_bps \(default 100 = 1 %\)/);
-    expect(tool?.description).toMatch(/SlippageExceeded/);
-    expect(tool?.description).toMatch(/costs only gas/);
-    const props = (tool?.inputSchema as { properties: Record<string, { type?: string; minimum?: number; maximum?: number; description?: string }> }).properties;
-    expect(props['tolerance_bps']?.type).toBe('integer');
-    expect(props['tolerance_bps']?.minimum).toBe(0);
-    expect(props['tolerance_bps']?.maximum).toBe(5000);
-    expect(props['tolerance_bps']?.description).toMatch(/default 100/);
-  });
-
-  it('accepts a token amount and uses the configured default workspace', async () => {
+  it('refuses burns that would quote below the gateway minimum credit', async () => {
     const api = createFakeApi();
-    const client = await connect(api, { workspace: WORKSPACE });
+    api.state.config = { ...api.state.config, minCreditMicro: 1_000_000n };
+    const client = await connect(api);
+    const error = errorOf(await call(client, 'beagle_buy_compute', { usd: 0.5, workspace: PAYER }));
+    expect(error.code).toBe('invalid_request');
+    expect(error.message).toMatch(/below the gateway minimum credit of \$1\.00/);
+    structured(await call(client, 'beagle_buy_compute', { usd: 1, workspace: PAYER }));
+  });
+
+  it('accepts a token amount and uses the configured default workspace as fee payer', async () => {
+    const api = createFakeApi();
+    const client = await connect(api, { workspace: PAYER });
     const data = structured(await call(client, 'beagle_buy_compute', { tokens: 250 }));
-    expect(data['tokens']).toBe((250n * 10n ** 18n).toString());
+    expect(data['tokens']).toBe((250n * ONE).toString());
     expect(data['usdMicro']).toBe('2500000');
-    expect(data['workspace']).toBe(getAddress(WORKSPACE));
+    expect(data['workspace']).toBe(PAYER);
+    expect(data['feePayer']).toBe(PAYER);
     expect(data['workspaceSource']).toBe('configured');
     expect(data['note']).not.toMatch(/Warning/);
   });
@@ -463,105 +505,120 @@ describe('beagle_buy_compute without a wallet', () => {
     expect(error.message).toMatch(/workspace is required/);
   });
 
-  it('fails cleanly when the gateway has no deployment configured', async () => {
-    const api = createFakeApi();
-    api.state.config = { ...api.state.config, creditDesk: null, token: null };
-    const client = await connect(api);
-    const error = errorOf(await call(client, 'beagle_buy_compute', { usd: 1, workspace: WORKSPACE }));
-    expect(error.code).toBe('not_configured');
-    expect(error.status).toBe(503);
+  it('reports insufficient_tokens from the node and rpc_error when the RPC is down', async () => {
+    const client = await connect(createFakeApi(), { connection: node() });
+    const short = errorOf(await call(client, 'beagle_buy_compute', { tokens: 5_000, workspace: PAYER }));
+    expect(short.code).toBe('insufficient_tokens');
+    expect(short.message).toMatch(/holds 1000 BEAGLE/);
+    const none = errorOf(await call(client, 'beagle_buy_compute', { tokens: 1, workspace: OTHER_WORKSPACE }));
+    expect(none.code).toBe('insufficient_tokens');
+    expect(none.message).toMatch(/no token account/);
+
+    const down = await connect(createFakeApi(), { connection: createFakeConnection({ fail: { getAccountInfo: new Error('ECONNREFUSED 127.0.0.1:8899') } }) });
+    const error = errorOf(await call(down, 'beagle_buy_compute', { usd: 1, workspace: PAYER }));
+    expect(error.code).toBe('rpc_error');
+    expect(error.message).toMatch(/ECONNREFUSED/);
   });
 
-  it('rejects a malformed workspace address through the schema', async () => {
+  it('rejects malformed workspace / payer / tokenAccount through the schema', async () => {
     const client = await connect(createFakeApi());
-    const result = await call(client, 'beagle_buy_compute', { usd: 1, workspace: 'not-an-address' });
-    expect(result.isError).toBe(true);
+    for (const args of [{ workspace: 'not-an-address' }, { workspace: PAYER, payer: '0x12' }, { workspace: PAYER, tokenAccount: 'x' }]) {
+      const result = await call(client, 'beagle_buy_compute', { usd: 1, ...args });
+      expect(result.isError, JSON.stringify(args)).toBe(true);
+    }
   });
+
+  it('uses the gateway rpcUrl for the default connection when none is injected (and surfaces the failure as rpc_error)', async () => {
+    const api = createFakeApi();
+    api.state.config = { ...api.state.config, rpcUrl: 'http://127.0.0.1:1' }; // nothing listens there
+    const server = createBeagleMcpServer(api, { now: () => NOW_MS });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'beagle-mcp-test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    closers.push(async () => {
+      await client.close();
+      await server.close();
+    });
+    const error = errorOf(await call(client, 'beagle_buy_compute', { usd: 1, workspace: PAYER }));
+    expect(error.code).toBe('rpc_error');
+  }, 20_000);
 });
 
 describe('beagle_buy_compute with a wallet', () => {
-  it('executes the purchase and polls the balance until the credit appears', async () => {
+  it('executes the burn and polls the receipts until the credit event appears, reporting its price point', async () => {
     const api = createFakeApi();
-    api.scheduleCredit(5_000_000n, 3); // visible on the third balance() call after the burn
+    api.scheduleReceipt(sampleReceipt({ signature: SIG, usdMicro: 5_000_000n, pricePointId: 7 }), 3); // visible on the third receipts() call
     const wallet = fakeWallet();
     const client = await connect(api, { wallet, pollIntervalMs: 1, creditWaitMs: 5_000, now: () => Date.now() });
     const data = structured(await call(client, 'beagle_buy_compute', { usd: 5 }));
     expect(data['executed']).toBe(true);
-    expect(data['txHash']).toBe(TX);
-    expect(data['approveTxHash']).toBe(APPROVE_TX);
-    expect(data['receiptId']).toBe('42');
+    expect(data['signature']).toBe(SIG);
+    expect(data['slot']).toBe(42);
+    expect(data['tokenAccount']).toBe(AGENT_ATA);
+    expect(data['memo']).toBeNull();
     expect(data['credited']).toBe(true);
     expect(data['creditedMicro']).toBe('5000000');
+    expect(data['pricePointId']).toBe(7);
+    expect(data['priceStale']).toBe(false);
     expect(data['priceE18']).toBe(PRICE_E18.toString());
+    expect((data['receipt'] as Record<string, unknown>)['signature']).toBe(SIG);
     expect(data['balanceMicro']).toBe((12_340_000n + 5_000_000n).toString());
     expect(data['workspace']).toBe(AGENT); // defaults to the agent wallet
     expect(data['workspaceSource']).toBe('agent_wallet');
-    expect(data['explorerTxUrl']).toBeNull();
-    // the executor gets the policy floor (quote − 1 %) and the result reports it
-    expect(wallet.calls).toEqual([{ buyCompute: { workspace: AGENT, tokens: 500n * 10n ** 18n, minUsdMicro: 4_950_000n } }]);
-    expect(data['minUsdMicro']).toBe('4950000');
-    expect(data['minUsd']).toBe('$4.95');
-    expect(data['toleranceBps']).toBe(100);
-    // one balance read before the burn, then polling until credited (visible on the third call overall)
-    expect(api.callsTo('balance')).toBe(3);
-    expect(data['note']).toMatch(/^Credited \$5\.00\./);
-    // the agent-wallet default is a guess about the key's workspace: say so
+    expect(data['explorerUrl']).toBe(`https://explorer.solana.com/tx/${SIG}?cluster=custom&customUrl=${encodeURIComponent(RPC_URL)}`);
+    expect(wallet.calls).toEqual([{ buyCompute: { workspace: AGENT, tokens: 500n * ONE } }]);
+    expect(api.callsTo('receipts')).toBe(3);
+    expect(data['note']).toMatch(/^Credited \$5\.00 at price point 7\./);
     expect(data['note']).toMatch(/Warning: workspace defaulted to the agent wallet/);
     expect(typeof data['elapsedMs']).toBe('number');
   });
 
-  it('passes a caller-chosen tolerance_bps to the executor as the floor', async () => {
-    const wallet = fakeWallet();
-    const client = await connect(createFakeApi(), { wallet, waitForCredit: false });
-    const data = structured(await call(client, 'beagle_buy_compute', { tokens: 10, workspace: WORKSPACE, tolerance_bps: 50 }));
-    // 10 BEAGLE @ $0.01 = 100_000 µUSD; 0.5 % = 500 → floor 99_500
-    expect(wallet.calls).toEqual([{ buyCompute: { workspace: getAddress(WORKSPACE), tokens: 10n * 10n ** 18n, minUsdMicro: 99_500n } }]);
-    expect(data['minUsdMicro']).toBe('99500');
-    expect(data['toleranceBps']).toBe(50);
+  it('falls back to the balance delta when the receipt is not listed (another workspace) but the balance moved', async () => {
+    const api = createFakeApi();
+    api.scheduleCredit(4_000_000n, 3);
+    const client = await connect(api, { wallet: fakeWallet(), pollIntervalMs: 1, creditWaitMs: 5_000, now: () => Date.now() });
+    const data = structured(await call(client, 'beagle_buy_compute', { usd: 4, workspace: OTHER_WORKSPACE }));
+    expect(data['credited']).toBe(true);
+    expect(data['creditedMicro']).toBe('4000000');
+    expect(data['receipt']).toBeUndefined();
+    expect(data['memo']).toBe(`beagle:v1 ws=${OTHER_WORKSPACE}`);
+    expect(data['pricePointId']).toBe(7); // from the quote
   });
 
-  it('maps a slippage_exceeded wallet failure to isError with that code, nothing burned', async () => {
-    const asked: unknown[] = [];
+  it('warns about a stale price on the executed path too', async () => {
+    const client = await connect(createFakeApi({ priceStale: true }), { wallet: fakeWallet(), waitForCredit: false });
+    const data = structured(await call(client, 'beagle_buy_compute', { usd: 1 }));
+    expect(data['executed']).toBe(true);
+    expect(data['priceStale']).toBe(true);
+    expect((data['warnings'] as string[])[0]).toMatch(/STALE/);
+  });
+
+  it('maps an insufficient_tokens wallet failure to isError with that code, nothing burned', async () => {
     const wallet = fakeWallet({
-      async buyCompute(params) {
-        asked.push(params);
-        throw new WalletError('slippage_exceeded', 'burnForCreditMin would revert with SlippageExceeded: the desk now quotes 4900000 µUSD ($4.90) for this burn, below the credit floor of 4950000 µUSD ($4.95); the price moved since the quote. Nothing was burned: re-quote and retry, or allow a wider tolerance.');
+      async buyCompute() {
+        throw new WalletError('insufficient_tokens', `${AGENT} holds 10 BEAGLE in its largest BEAGLE account, less than the 500 BEAGLE needed`);
       },
     });
     const api = createFakeApi();
     const client = await connect(api, { wallet });
     const error = errorOf(await call(client, 'beagle_buy_compute', { usd: 5, workspace: WORKSPACE }));
-    expect(error.code).toBe('slippage_exceeded');
-    expect(error.message).toMatch(/4900000 µUSD/);
-    expect(error.message).toMatch(/4950000 µUSD/);
-    expect((error as { txHash?: string }).txHash).toBeUndefined();
-    // the executor was asked for the floor the message talks about
-    expect(asked).toEqual([{ workspace: getAddress(WORKSPACE), tokens: 500n * 10n ** 18n, minUsdMicro: 4_950_000n }]);
-    // no credit poll after a failed burn
+    expect(error.code).toBe('insufficient_tokens');
+    expect(error.signature).toBeUndefined();
     expect(api.callsTo('balance')).toBe(1);
+    expect(api.callsTo('receipts')).toBe(0);
   });
 
-  it('reports a pending credit (with the emitted amount) when the indexer has not caught up in time', async () => {
+  it('reports a pending credit when the indexer has not caught up in time', async () => {
     const api = createFakeApi();
     const client = await connect(api, { wallet: fakeWallet(), pollIntervalMs: 1, creditWaitMs: 15, now: () => Date.now() });
     const data = structured(await call(client, 'beagle_buy_compute', { tokens: 10, workspace: WORKSPACE }));
     expect(data['executed']).toBe(true);
     expect(data['credited']).toBe(false);
-    expect(data['creditedMicro']).toBe('5000000'); // from the CreditPurchased event, not the balance delta
+    expect(data['creditedMicro']).toBeNull();
     expect(data['note']).toMatch(/not visible/);
+    expect(data['note']).toMatch(/about \$0\.10/);
     expect(data['note']).toMatch(/Do not burn again/);
     expect(api.callsTo('balance')).toBeGreaterThan(1);
-  });
-
-  it('falls back to the balance delta when the executor decoded no event', async () => {
-    const api = createFakeApi();
-    api.scheduleCredit(4_000_000n, 2);
-    const wallet = fakeWallet({ buyCompute: async () => ({ txHash: TX }) });
-    const client = await connect(api, { wallet, pollIntervalMs: 1, creditWaitMs: 5_000, now: () => Date.now() });
-    const data = structured(await call(client, 'beagle_buy_compute', { usd: 4, workspace: WORKSPACE }));
-    expect(data['credited']).toBe(true);
-    expect(data['creditedMicro']).toBe('4000000');
-    expect(data['receiptId']).toBeUndefined();
   });
 
   it('sees the credit even when a concurrent debit lands while polling', async () => {
@@ -573,8 +630,16 @@ describe('beagle_buy_compute with a wallet', () => {
     expect(data['credited']).toBe(true);
     expect(data['creditedMicro']).toBe('5000000');
     expect(data['balanceMicro']).toBe((12_340_000n - 6_000_000n + 5_000_000n).toString());
-    // before-read, the poll that saw the debit, the poll that saw the credit
     expect(api.callsTo('balance')).toBe(3);
+  });
+
+  it('keeps polling when receipts() fails transiently', async () => {
+    const api = createFakeApi({ failures: { receipts: new BeagleApiError(500, 'internal_error', 'db locked') } });
+    api.scheduleCredit(1_000_000n, 2);
+    const client = await connect(api, { wallet: fakeWallet(), pollIntervalMs: 1, creditWaitMs: 5_000, now: () => Date.now() });
+    const data = structured(await call(client, 'beagle_buy_compute', { usd: 1, workspace: WORKSPACE }));
+    expect(data['credited']).toBe(true);
+    expect(data['creditedMicro']).toBe('1000000');
   });
 
   it('skips polling when waitForCredit is false', async () => {
@@ -583,12 +648,13 @@ describe('beagle_buy_compute with a wallet', () => {
     const data = structured(await call(client, 'beagle_buy_compute', { usd: 1 }));
     expect(data['executed']).toBe(true);
     expect(data['credited']).toBe(false);
-    expect(data['creditedMicro']).toBe('5000000');
+    expect(data['creditedMicro']).toBeNull();
     expect(data['note']).toMatch(/Do not burn again/);
     expect(api.callsTo('balance')).toBe(1);
+    expect(api.callsTo('receipts')).toBe(0);
   });
 
-  it('returns within the call budget even when the credit never shows and balance() is slow', async () => {
+  it('returns within the call budget even when the credit never shows and the gateway is slow', async () => {
     const api = createFakeApi();
     let reads = 0;
     const slowApi: BeagleApi = {
@@ -602,9 +668,9 @@ describe('beagle_buy_compute with a wallet', () => {
     let burnedAt = 0;
     const wallet = fakeWallet({
       async buyCompute() {
-        await sleep(30); // receipt wait
+        await sleep(30); // confirmation wait
         burnedAt = Date.now();
-        return { txHash: TX, receiptId: 1n, usdMicro: 1_000_000n };
+        return { signature: SIG, tokenAccount: AGENT_ATA, memo: null };
       },
     });
     const client = await connect(slowApi, { wallet, pollIntervalMs: 5, creditWaitMs: 60_000, callBudgetMs: 120, now: () => Date.now() });
@@ -612,11 +678,10 @@ describe('beagle_buy_compute with a wallet', () => {
     const data = structured(await call(client, 'beagle_buy_compute', { usd: 1, workspace: WORKSPACE }));
     const elapsed = Date.now() - started;
     expect(data['executed']).toBe(true);
-    expect(data['txHash']).toBe(TX);
+    expect(data['signature']).toBe(SIG);
+    expect(data['slot']).toBeUndefined();
     expect(data['credited']).toBe(false);
-    expect(data['creditedMicro']).toBe('1000000');
     expect(burnedAt).toBeGreaterThan(0);
-    // ≈ 120 ms budget (+ scheduling slack), far below creditWaitMs and the slow balance()
     expect(elapsed).toBeLessThan(350);
     expect(data['elapsedMs'] as number).toBeLessThan(350);
   });
@@ -632,8 +697,8 @@ describe('beagle_buy_compute with a wallet', () => {
     expect(data['credited']).toBe(true);
     expect(progress.length).toBeGreaterThanOrEqual(10);
     expect(progress[0]!.message).toMatch(/burning 500 BEAGLE/);
-    expect(progress[0]!.message).toMatch(/burnForCreditMin \(credit floor \$4\.95 \(quote − 100 bps\)\)/);
-    expect(progress[1]!.message).toMatch(/burn mined \(tx 0xabab/);
+    expect(progress[0]!.message).toMatch(/BurnChecked, waiting for confirmation/);
+    expect(progress[1]!.message).toMatch(new RegExp(`burn confirmed \\(${SIG}\\)`));
     expect(progress.map((p) => p.progress)).toEqual(progress.map((_, i) => i + 1));
   });
 
@@ -687,80 +752,150 @@ describe('beagle_buy_compute with a wallet', () => {
     expect(inner.calls.length).toBe(1);
   });
 
-  it('builds an explorer link from the gateway config', async () => {
+  it('builds explorer links per cluster and explorer site', async () => {
+    expect(explorerLink({ cluster: 'devnet', rpcUrl: 'https://api.devnet.solana.com', explorer: 'https://explorer.solana.com' }, SIG)).toBe(`https://explorer.solana.com/tx/${SIG}?cluster=devnet`);
+    expect(explorerLink({ cluster: 'mainnet-beta', rpcUrl: 'https://api.mainnet-beta.solana.com', explorer: 'https://solscan.io' }, SIG)).toBe(`https://solscan.io/tx/${SIG}`);
     const api = createFakeApi();
-    api.state.config = { ...api.state.config, explorer: 'https://explorer.example/' };
+    api.state.config = { ...api.state.config, cluster: 'devnet', rpcUrl: 'https://api.devnet.solana.com' };
     const client = await connect(api, { wallet: fakeWallet(), waitForCredit: false });
     const data = structured(await call(client, 'beagle_buy_compute', { usd: 1 }));
-    expect(data['explorerTxUrl']).toBe(`https://explorer.example/tx/${TX}`);
+    expect(data['explorerUrl']).toBe(`https://explorer.solana.com/tx/${SIG}?cluster=devnet`);
   });
 
-  it('maps wallet failures to isError with the wallet code', async () => {
+  it('maps wallet failures to isError with the wallet code and signature', async () => {
     const wallet = fakeWallet({
       async buyCompute() {
-        throw new WalletError('tx_reverted', 'burnForCredit reverted (tx 0x01)', { txHash: TX });
+        throw new WalletError('blockhash_expired', `burn: transaction ${SIG} was not confirmed before its blockhash expired`, { signature: SIG });
       },
     });
     const client = await connect(createFakeApi(), { wallet });
     const error = errorOf(await call(client, 'beagle_buy_compute', { usd: 1 }));
-    expect(error.code).toBe('tx_reverted');
-    expect((error as { txHash?: string }).txHash).toBe(TX);
+    expect(error.code).toBe('blockhash_expired');
+    expect(error.signature).toBe(SIG);
   });
 });
 
 describe('beagle_open_budget', () => {
-  it('returns unsigned approve + openBudget steps with the deadline derived from hours', async () => {
+  it('returns one unsigned ApproveChecked transaction (cap only, no deadline) plus the register body', async () => {
     const client = await connect(createFakeApi());
-    const data = structured(await call(client, 'beagle_open_budget', { usd: '10', hours: 24, workspace: WORKSPACE }));
+    const data = structured(await call(client, 'beagle_open_budget', { usd: '10', workspace: PAYER }));
     expect(data['unsigned']).toBe(true);
-    const cap = 1000n * 10n ** 18n;
+    const cap = 1_000n * ONE;
     expect(data['cap']).toBe(cap.toString());
     expect(data['capFormatted']).toBe('1000 BEAGLE');
-    const deadline = BigInt(Math.floor(NOW_MS / 1000) + 24 * 3600);
-    expect(data['deadline']).toBe(deadline.toString());
-    const steps = data['steps'] as Array<{ to: string; data: Hex }>;
-    expect(steps.length).toBe(2);
-    const approve = decodeFunctionData({ abi: ERC20_ABI, data: steps[0]!.data });
-    expect(approve.args).toEqual([DESK, cap]);
-    const open = decodeFunctionData({ abi: CREDIT_DESK_ABI, data: steps[1]!.data });
-    expect(open.functionName).toBe('openBudget');
-    expect(open.args).toEqual([getAddress(WORKSPACE), cap, deadline]);
+    expect(data['usdMicro']).toBe('10000000');
+    expect(data['operator']).toBe(OPERATOR);
+    expect(data['feePayer']).toBe(PAYER);
+    expect(data['tokenAccount']).toBe(PAYER_ATA);
+    expect(data['register']).toEqual({ tokenAccount: PAYER_ATA });
     expect(data['workspaceSource']).toBe('input');
-    expect(data['note']).toMatch(/shared by every budget/);
+    expect(data['deadline']).toBeUndefined();
+    expect(data['note']).toMatch(/POST \/api\/budgets\/register/);
+    expect(data['note']).toMatch(/replaces the existing delegation of 20 BEAGLE/);
+    const tx = unsignedTx(data);
+    expect(tx.feePayer?.toBase58()).toBe(PAYER);
+    expect(tx.instructions.length).toBe(1);
+    const approve = decodeInstruction(tx.instructions[0]!);
+    if (!isApproveCheckedInstruction(approve)) throw new Error('expected ApproveChecked');
+    expect(approve.data).toEqual({ instruction: TokenInstruction.ApproveChecked, amount: cap, decimals: DECIMALS });
+    expect(approve.keys.delegate.pubkey.toBase58()).toBe(OPERATOR);
+    expect(approve.keys.owner.pubkey.toBase58()).toBe(PAYER);
+    expect(approve.keys.account.pubkey.toBase58()).toBe(PAYER_ATA);
   });
 
-  it('keeps a safety margin at the 720 h maximum and rejects longer budgets', async () => {
-    const client = await connect(createFakeApi());
-    const max = structured(await call(client, 'beagle_open_budget', { tokens: 1, hours: 720, workspace: WORKSPACE }));
-    expect(max['deadline']).toBe(String(Math.floor(NOW_MS / 1000) + 720 * 3600 - 300));
-    const tooLong = await call(client, 'beagle_open_budget', { tokens: 1, hours: 721, workspace: WORKSPACE });
-    expect(tooLong.isError).toBe(true);
+  it('names the funded workspace in the register body when it differs from the signer', async () => {
+    const client = await connect(createFakeApi(), { workspace: OTHER_WORKSPACE });
+    const data = structured(await call(client, 'beagle_open_budget', { tokens: 1, payer: PAYER }));
+    expect(data['workspace']).toBe(OTHER_WORKSPACE);
+    expect(data['workspaceSource']).toBe('configured');
+    expect(data['register']).toEqual({ tokenAccount: PAYER_ATA, workspace: OTHER_WORKSPACE });
   });
 
-  it('executes with a wallet and returns the budget id', async () => {
+  it('fails cleanly when the gateway has no operator', async () => {
+    const api = createFakeApi();
+    api.state.config = { ...api.state.config, operator: null };
+    const client = await connect(api);
+    const error = errorOf(await call(client, 'beagle_open_budget', { usd: 1, workspace: PAYER }));
+    expect(error.code).toBe('not_configured');
+    expect(error.status).toBe(503);
+  });
+
+  it('executes with a wallet, registers the token account and reports the budget', async () => {
     const wallet = fakeWallet();
-    const client = await connect(createFakeApi(), { wallet });
-    const data = structured(await call(client, 'beagle_open_budget', { usd: 2, hours: 1 }));
+    const api = createFakeApi();
+    const client = await connect(api, { wallet });
+    const data = structured(await call(client, 'beagle_open_budget', { usd: 2 }));
     expect(data['executed']).toBe(true);
-    expect(data['txHash']).toBe(TX);
-    expect(data['budgetId']).toBe('7');
+    expect(data['signature']).toBe(SIG);
+    expect(data['tokenAccount']).toBe(AGENT_ATA);
+    expect(data['tokenAccountBalance']).toBe((1_000n * ONE).toString());
+    expect(data['cap']).toBe((200n * ONE).toString());
+    expect(data['registered']).toBe(true);
+    expect((data['budget'] as Record<string, unknown>)['tokenAccount']).toBe(AGENT_ATA);
+    expect(data['registerError']).toBeNull();
     expect(data['workspace']).toBe(AGENT);
     expect(data['workspaceSource']).toBe('agent_wallet');
-    expect(data['note']).toMatch(/Budget 7 opened\./); // no approve was sent, so no "allowance raised" claim
+    expect(data['explorerUrl']).toMatch(/explorer\.solana\.com\/tx\//);
+    expect(data['note']).toMatch(/^Delegated up to 200 BEAGLE of token account/);
+    expect(data['note']).toMatch(/registered the budget/);
+    expect(data['note']).not.toMatch(/balance is below the cap/);
     expect(data['note']).toMatch(/Warning: workspace defaulted to the agent wallet/);
-    expect(wallet.calls).toEqual([
-      { openBudget: { workspace: AGENT, cap: 200n * 10n ** 18n, deadline: BigInt(Math.floor(NOW_MS / 1000) + 3600) } },
-    ]);
+    expect(wallet.calls).toEqual([{ openBudget: { cap: 200n * ONE } }]);
+    // the agent is the workspace: no workspace in the register body
+    expect(api.state.calls.find((c) => c.method === 'registerBudget')?.args[0]).toEqual({ tokenAccount: AGENT_ATA });
   });
 
-  it('mentions the raised allowance when an approve was part of the execution', async () => {
-    const wallet = fakeWallet({ openBudget: async () => ({ txHash: TX, budgetId: 8n, approveTxHash: APPROVE_TX }) });
-    const client = await connect(createFakeApi(), { wallet, workspace: WORKSPACE });
-    const data = structured(await call(client, 'beagle_open_budget', { usd: 2, hours: 1 }));
-    expect(data['approveTxHash']).toBe(APPROVE_TX);
+  it('passes the funded workspace to the registration and tolerates a registration failure', async () => {
+    const api = createFakeApi({ failures: { registerBudget: new BeagleApiError(400, 'not_delegated', 'token account is not delegated to the operator') } });
+    const client = await connect(api, { wallet: fakeWallet({ openBudget: async () => ({ signature: SIG, tokenAccount: AGENT_ATA, balance: 50n * ONE }) }), workspace: OTHER_WORKSPACE });
+    const data = structured(await call(client, 'beagle_open_budget', { tokens: 100 }));
+    expect(data['executed']).toBe(true);
+    expect(data['registered']).toBe(false);
+    expect(data['budget']).toBeNull();
+    expect(data['registerError']).toMatch(/not delegated/);
+    expect(data['note']).toMatch(/registration failed/);
+    expect(data['note']).toMatch(/scanner will pick it up/);
+    expect(data['note']).toMatch(/balance is below the cap/);
     expect(data['workspaceSource']).toBe('configured');
-    expect(data['note']).toMatch(/Budget 8 opened \(allowance raised by the cap on top of what was there\)\./);
-    expect(data['note']).not.toMatch(/Warning/);
+    expect(api.state.calls.find((c) => c.method === 'registerBudget')?.args[0]).toEqual({ tokenAccount: AGENT_ATA, workspace: OTHER_WORKSPACE });
+  });
+});
+
+describe('beagle_close_budget', () => {
+  it('returns one unsigned Revoke transaction for the configured workspace (default: its ATA)', async () => {
+    const client = await connect(createFakeApi(), { workspace: PAYER });
+    const data = structured(await call(client, 'beagle_close_budget'));
+    expect(data['unsigned']).toBe(true);
+    expect(data['feePayer']).toBe(PAYER);
+    expect(data['tokenAccount']).toBe(PAYER_ATA);
+    expect(data['delegate']).toBe(OPERATOR);
+    expect(data['delegatedAmount']).toBe((20n * ONE).toString());
+    expect(data['note']).toMatch(/Revokes the delegation of 20 BEAGLE/);
+    const tx = unsignedTx(data);
+    const revoke = decodeInstruction(tx.instructions[0]!);
+    if (!isRevokeInstruction(revoke)) throw new Error('expected Revoke');
+    expect(revoke.keys.account.pubkey.toBase58()).toBe(PAYER_ATA);
+    expect(revoke.keys.owner.pubkey.toBase58()).toBe(PAYER);
+
+    const explicit = structured(await call(client, 'beagle_close_budget', { tokenAccount: AGENT_ATA, payer: AGENT }));
+    expect(explicit['tokenAccount']).toBe(AGENT_ATA);
+    expect(explicit['note']).toMatch(/no delegate/);
+    const bad = errorOf(await call(client, 'beagle_close_budget', { tokenAccount: OTHER_WORKSPACE }));
+    expect(bad.code).toBe('invalid_address');
+  });
+
+  it('executes with a wallet', async () => {
+    const wallet = fakeWallet();
+    const client = await connect(createFakeApi(), { wallet });
+    const data = structured(await call(client, 'beagle_close_budget', { tokenAccount: AGENT_ATA }));
+    expect(data['executed']).toBe(true);
+    expect(data['signature']).toBe(SIG);
+    expect(data['slot']).toBe(43);
+    expect(data['tokenAccount']).toBe(AGENT_ATA);
+    expect(data['note']).toMatch(/closed \(revoked\)/);
+    expect(wallet.calls).toEqual([{ closeBudget: { tokenAccount: AGENT_ATA } }]);
+    structured(await call(client, 'beagle_close_budget'));
+    expect(wallet.calls[1]).toEqual({ closeBudget: {} });
   });
 });
 
@@ -781,7 +916,13 @@ describe('resources', () => {
     const qsText = (quickstart.contents[0] as { text: string }).text;
     expect(qsText).toMatch(/https:\/\/api\.beagle\.example\/v1\/chat\/completions/);
     expect(qsText).toMatch(/402 insufficient_credit/);
-    expect(qsText).toMatch(/approve \+ burnForCreditMin/);
-    expect(qsText).toMatch(/credit floor of quote − `tolerance_bps` \(default 100 = 1 %\)/);
+    expect(qsText).toMatch(/SPL `BurnChecked`/);
+    expect(qsText).toMatch(/published price point in force when it observes the burn/);
+    expect(qsText).toMatch(/`ApproveChecked`/);
+    expect(qsText).toMatch(/beagle_close_budget/);
+    expect(qsText).not.toMatch(/CreditDesk|Robinhood|tolerance/);
   });
 });
+
+/** Keeps the fake api type in scope for editors (the helpers above are typed against it). */
+export type _FakeApiRef = FakeApi;

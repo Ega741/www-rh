@@ -6,41 +6,40 @@ on:
   pull_request:
 
 env:
-  FOUNDRY_PROFILE: ci
-  FOUNDRY_DISABLE_NIGHTLY_WARNING: 1
+  AGAVE_VERSION: v3.0.9
 
 jobs:
-  contracts:
+  ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: stable
-      - name: forge fmt
-        run: forge fmt --check
-        working-directory: contracts
-      - name: forge build
-        run: forge build --sizes
-        working-directory: contracts
-      - name: forge test
-        run: forge test -vvv
-        working-directory: contracts
-      - name: fixtures are up to date
-        run: forge script script/GenerateFixtures.s.sol && git diff --exit-code ../packages/shared/fixtures/quote.json
-        working-directory: contracts
 
-  node:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      # Agave (Solana) CLI release: solana, solana-keygen, solana-test-validator, spl-token. The tarball is cached per
+      # version; the e2e starts a local validator with it (docs/SPEC.md §8).
+      - name: cache agave release
+        id: agave-cache
+        uses: actions/cache@v4
         with:
-          submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: stable
+          path: ~/.local/share/agave/${{ env.AGAVE_VERSION }}
+          key: agave-${{ runner.os }}-x86_64-${{ env.AGAVE_VERSION }}
+      - name: install agave release
+        if: steps.agave-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          dir="$HOME/.local/share/agave/$AGAVE_VERSION"
+          mkdir -p "$dir"
+          curl -sSfL "https://github.com/anza-xyz/agave/releases/download/$AGAVE_VERSION/solana-release-x86_64-unknown-linux-gnu.tar.bz2" \
+            | tar -xj -C "$dir" --strip-components=1
+      - name: add agave to PATH
+        run: echo "$HOME/.local/share/agave/$AGAVE_VERSION/bin" >> "$GITHUB_PATH"
+      - name: solana toolchain versions
+        run: |
+          solana --version
+          solana-keygen --version
+          solana-test-validator --version
+          spl-token --version
+
       # No `version:` input: the action reads `packageManager` (pnpm@10.28.0) from package.json; passing a
       # different `version` alongside it makes pnpm/action-setup@v4 fail with "Multiple versions of pnpm specified".
       - uses: pnpm/action-setup@v4
@@ -49,13 +48,13 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: forge build (ABI sync check)
-        run: forge build
-        working-directory: contracts
-      - run: node scripts/sync-abi.mjs --check
-      - run: node scripts/sync-deployments.mjs --check
+
+      - name: deployments.generated.ts is up to date
+        run: node scripts/sync-deployments.mjs --check
       - run: pnpm -r run build
       - run: pnpm -r run typecheck
       - run: pnpm -r run test
-      - name: anvil e2e
-        run: bash scripts/anvil-e2e.sh
+      - name: web lint
+        run: pnpm --filter @beagle/web run lint
+      - name: solana e2e
+        run: bash scripts/solana-e2e.sh

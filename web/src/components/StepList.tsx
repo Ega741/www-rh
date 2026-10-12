@@ -1,4 +1,4 @@
-/** Progress of a multi-transaction flow (approve → burn, approve → openBudget). */
+/** Progress of a transaction flow (burn + memo, approve → register, revoke). */
 import type { FlowState, StepState } from '../lib/steps.js';
 import { TxLink } from './Hash.jsx';
 import { Dot, Spinner } from './ui.jsx';
@@ -28,7 +28,7 @@ function statusText(s: StepState): string {
     case 'signing':
       return 'confirm in wallet…';
     case 'pending':
-      return 'pending on chain…';
+      return 'confirming on chain…';
     case 'confirmed':
       return 'confirmed';
     case 'failed':
@@ -53,13 +53,19 @@ export function StepList({ flow }: { flow: FlowState }) {
             </p>
             <p className={`text-xs ${s.status === 'failed' ? 'text-err' : 'text-muted'}`}>
               {statusText(s)}
-              {s.hash !== undefined ? (
+              {s.signature !== undefined ? (
                 <>
                   {' · '}
-                  <TxLink hash={s.hash} />
+                  <TxLink signature={s.signature} />
                 </>
               ) : null}
             </p>
+            {s.logs !== undefined && s.logs.length > 0 ? (
+              <details className="mt-1">
+                <summary className="cursor-pointer text-xs text-faint">program logs</summary>
+                <pre className="mt-1 max-h-40 overflow-auto rounded bg-bg p-2 text-[11px] leading-4 text-muted">{s.logs.join('\n')}</pre>
+              </details>
+            ) : null}
           </div>
         </li>
       ))}
