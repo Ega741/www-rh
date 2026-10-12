@@ -13,20 +13,10 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
-    "./chains": {
-      "types": "./dist/chains.d.ts",
-      "import": "./dist/chains.js",
-      "default": "./dist/chains.js"
-    },
     "./addresses": {
       "types": "./dist/addresses.d.ts",
       "import": "./dist/addresses.js",
       "default": "./dist/addresses.js"
-    },
-    "./abi": {
-      "types": "./dist/abi.d.ts",
-      "import": "./dist/abi.js",
-      "default": "./dist/abi.js"
     },
     "./credit": {
       "types": "./dist/credit.d.ts",
@@ -63,7 +53,27 @@
       "import": "./dist/openai.js",
       "default": "./dist/openai.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./clusters": {
+      "types": "./dist/clusters.d.ts",
+      "import": "./dist/clusters.js",
+      "default": "./dist/clusters.js"
+    },
+    "./memo": {
+      "types": "./dist/memo.d.ts",
+      "import": "./dist/memo.js",
+      "default": "./dist/memo.js"
+    },
+    "./siws": {
+      "types": "./dist/siws.d.ts",
+      "import": "./dist/siws.js",
+      "default": "./dist/siws.js"
+    },
+    "./solana": {
+      "types": "./dist/solana.d.ts",
+      "import": "./dist/solana.js",
+      "default": "./dist/solana.js"
+    }
   },
   "files": [
     "dist",
@@ -78,7 +88,8 @@
     "lint": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "viem": "^2.57.4",
+    "@noble/hashes": "^2.4.0",
+    "bs58": "^6.0.0",
     "zod": "^4.6.6"
   },
   "devDependencies": {

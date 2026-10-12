@@ -32,7 +32,10 @@
   "dependencies": {
     "@beagle/shared": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "viem": "^2.57.4",
+    "@solana/spl-memo": "^0.3.1",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.99.0",
+    "bs58": "^6.0.0",
     "zod": "^4.6.6"
   },
   "devDependencies": {

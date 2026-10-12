@@ -1,11 +1,12 @@
-# Beagle — compute for agents on Robinhood Chain · burn becomes compute
+# Beagle — compute for agents on Solana · burn becomes compute
 
 Normative specification. Implementation agents build from this document; where the document is silent,
 prefer the simplest behaviour that keeps the stated invariants. `docs/ANALYSIS.md` explains the original
-project (Darwin, @darwincompute) that this one replicates on Robinhood Chain.
+project (Darwin, @darwincompute) that this one replicates.
 
-Conventions: MUST / SHOULD / MAY as in RFC 2119. "Gateway" is the Node service in `gateway/`; "desk" is the
-`CreditDesk` contract; "workspace" is the billing account of one wallet address.
+Conventions: MUST / SHOULD / MAY as in RFC 2119. "Gateway" is the Node service in `gateway/`; "workspace" is
+the billing account of one wallet (a Solana public key); "operator" is the gateway's hot wallet keypair;
+"mint" is the SPL token (`BEAGLE`) whose burns buy credit.
 
 ## 0. Product summary
 
@@ -13,18 +14,20 @@ Conventions: MUST / SHOULD / MAY as in RFC 2119. "Gateway" is the Node service i
   OpenAI-compatible `/v1/chat/completions` (+ `/v1/models`) and an Anthropic-compatible `/v1/messages`,
   routing to Anthropic (official SDK), OpenAI, Google Gemini (OpenAI-compatible endpoint) and the
   project's own **house** model served by vLLM (`gpt-oss-20b`, Pro: `gpt-oss-120b`).
-- **Burn becomes compute.** Access is paid by burning the project token (`BEAGLE`) through the
-  `CreditDesk` contract on Robinhood Chain. The contract quotes the burn in USD from an on-chain price
-  source and emits the USD amount; the gateway indexes the event and credits the workspace **exactly** the
-  emitted amount. No e-mail, no card: sign-in is Sign-In-With-Ethereum (SIWE), workspace = wallet.
+- **Burn becomes compute.** Access is paid by burning the project token (`BEAGLE`, an SPL mint on Solana —
+  on mainnet the pump.fun-launched token) **from the user's own wallet with a plain SPL `Burn`**; an optional
+  SPL Memo names another workspace to credit. There is no custom on-chain program: the gateway indexes burns
+  of the mint, prices them with its **published price point** at observation time and credits the workspace.
+  No e-mail, no card: sign-in is Sign-In-With-Solana (a signed message), workspace = wallet.
 - **Model router.** `beagle/auto` keeps the best model for hard requests, moves easy requests to cheaper
   models, downgrades as credit or provider limits run down, and falls back to the house model when
   everything else is unavailable. Explicit model ids are honoured with configurable fallback.
 - **BYOK.** A workspace may store its own provider keys (encrypted at rest). Requests served through
   them consume no credit.
 - **Agents.** An MCP server (stdio binary and `/mcp` HTTP transport) gives agents balance, models,
-  quotes, inference, usage, compute purchase and **budgets**: an agent approves tokens and opens an
-  on-chain budget; the operator draws from it as usage accrues, never above the cap.
+  quotes, inference, usage, compute purchase and **budgets**: an agent **delegates** a token allowance to the
+  operator with SPL `Approve` (cap = delegated amount); the operator burns from it as usage accrues, never
+  above the cap, with a receipt hash in the burn's memo; the agent revokes at any time.
 - **Upgrades.** `pro` (30 days: large house model, 128K house context, higher rate limit) and `warm`
   hours (keep the house GPU warm) are bought with credit.
 
@@ -32,18 +35,21 @@ Conventions: MUST / SHOULD / MAY as in RFC 2119. "Gateway" is the Node service i
 
 | Term | Definition |
 |---|---|
-| µUSD | integer micro-dollars; `1 USD = 1_000_000 µUSD`. Solidity `uint256`, TS `bigint`, SQLite `INTEGER`. |
+| µUSD | integer micro-dollars; `1 USD = 1_000_000 µUSD`. TS `bigint`, SQLite `INTEGER`. |
 | `priceE18` | USD per **one whole token**, scaled by `1e18`. `$0.0025` → `2_500_000_000_000_000`. |
-| token amount | raw token units (`decimals` of the token; `BeagleToken` has 18). Stored off-chain as decimal strings. |
-| quote | `usdMicro = floor(amount · priceE18 / 10^(decimals + 12))`. For 18 decimals: `amount · priceE18 / 1e30`. Example: `1000e18 · 2.5e15 / 1e30 = 2_500_000 µUSD = $2.50`. |
+| token amount | raw units of the mint (`decimals` from the mint account; pump.fun-style mints and the local mint use **6**). Stored off-chain as decimal strings. |
+| quote | `usdMicro = floor(amount · priceE18 / 10^(decimals + 12))`. For 6 decimals: `amount · priceE18 / 1e18`. Example: `1000 BEAGLE = 1_000_000_000 raw`, `priceE18 = 1e16` ($0.01) → `10_000_000 µUSD = $10`. |
 | inverse quote | `tokens = ceil(usdMicro · 10^(decimals+12) / priceE18)`. |
-| workspace id | the owner wallet address. On-chain `address`; off-chain lowercase `0x…` hex (40 nibbles). UI shows EIP-55. |
+| workspace id | the wallet public key, **base58** (case-sensitive, 32–44 chars). On-chain: the owner of the burned token account; off-chain: stored verbatim. UI shows `Abcd…wxyz`. |
+| cluster | `mainnet-beta`, `devnet`, `localnet` (`solana-test-validator`, `http://127.0.0.1:8899`). |
+| tx reference | transaction `signature` (base58, 87–88 chars), `slot`, `blockTime` (unix seconds). Credit event id = `<signature>:<ixIndex>`. |
+| price point | a row `{ id, priceE18, source, observedAt }` of the gateway's published price history; every credit event references the point it was priced with. |
 | request id | `req_` + UUIDv4. |
 | API key | `bgl_` + 43 chars base64url of 32 random bytes. Stored as `sha256(key)` hex; `prefix` = first 12 characters (`bgl_xxxxxxxx`) for display. |
 | session | random 32-byte id, 7 days. Cookie `beagle_session` (HttpOnly, SameSite=Lax, Secure when `PUBLIC_URL` is https) or `Authorization: Bearer <session>`. |
 | model id | catalog id `provider/model` (e.g. `anthropic/claude-opus-5-5`). Aliases `beagle/auto`, `beagle/best`, `beagle/cheap`, `beagle/house`. Bare upstream ids (e.g. `claude-opus-5-5`) resolve when unique. |
-| DEAD | `0x000000000000000000000000000000000000dEaD` |
-| chain ids | Robinhood Chain `4663`, testnet `46630`, anvil `31337` (`docs/ROBINHOOD_CHAIN.md`). |
+| program ids | Token `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`, Token-2022 `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`, Associated Token `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`, Memo `MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr`. |
+| memo | `beagle:v1 ws=<base58>` (credit another workspace) · `beagle:draw v1 ws=<base58> h=<0x…sha256>` (operator budget draw). UTF-8, ≤ 256 bytes. |
 
 Money math is integer-only everywhere. Per-component model cost = `ceilDiv(tokens · pricePerMillion, 1_000_000)`;
 markup = `cost + ceilDiv(cost · bps, 10_000)`.
@@ -51,239 +57,167 @@ markup = `cost + ceilDiv(cost · bps, 10_000)`.
 ## 2. Repository layout
 
 ```
-contracts/        Foundry: BeagleToken, CreditDesk, CreditMath, IPriceSource, ManualPriceSource,
-                  ChainlinkPriceSource, mocks, tests, script/Deploy.s.sol, PostPrice.s.sol, GenerateFixtures.s.sol
-packages/shared/  @beagle/shared: chains, addresses (+ deployments.generated.ts), abi (generated), credit math,
-                  model catalog, routing policy, difficulty heuristic, canonical JSON + receipt hash, API/OpenAI DTOs (zod)
-packages/mcp/     @beagle/mcp: MCP tools (library), REST client, stdio binary `beagle-mcp`
-gateway/          @beagle/gateway: Hono API, SQLite (node:sqlite), indexer, router, metering, providers, MCP HTTP, CLI
-web/              @beagle/web: Vite + React 19 + wagmi 3 + viem + TanStack Query + react-router 7 + Tailwind 4
-scripts/          sync-abi.mjs, sync-deployments.mjs, mock-provider.mjs, anvil-e2e.sh
+solana/           scripts/setup-cluster.sh (airdrop, create the mint, mint supply, write deployments/<cluster>.json),
+                  scripts/keypair.sh helpers, deployments/<cluster>.json (committed: localnet reference, devnet, mainnet-beta)
+packages/shared/  @beagle/shared: clusters, addresses (program ids + deployments.generated.ts), memo, siws, solana (layouts/schemas),
+                  credit math, model catalog, routing policy, difficulty heuristic, canonical JSON + receipt hash, API/OpenAI DTOs (zod)
+packages/mcp/     @beagle/mcp: MCP tools (library), REST client, Keypair wallet executor, stdio binary `beagle-mcp`
+gateway/          @beagle/gateway: Hono API, SQLite (node:sqlite), Solana indexer / budget scanner / drawer / price service,
+                  router, metering, providers, MCP HTTP, CLI
+web/              @beagle/web: Vite + React 19 + Solana wallet-adapter + TanStack Query + react-router 7 + Tailwind 4
+scripts/          sync-deployments.mjs, mock-provider.mjs, solana-e2e.sh
 docker/           Dockerfiles + nginx.conf; docker-compose.yml at the root (gateway, web, optional vLLM house)
-docs/             ANALYSIS, SPEC, DEPLOY, ROBINHOOD_CHAIN
+docs/             ANALYSIS, SPEC, DEPLOY, SOLANA
 ```
 
 Tooling: Node ≥ 22.13 (`node:sqlite`), pnpm 10, TypeScript 5.9 (strict, `exactOptionalPropertyTypes`),
-vitest 5, Foundry stable (solc 0.8.28), OpenZeppelin Contracts v5.x and forge-std as git submodules in
-`contracts/lib/`. ESM everywhere (`"type": "module"`), `.js` import specifiers in TS sources.
+vitest 5, Agave/Solana CLI 3.x (`solana`, `solana-test-validator`, `solana-keygen`, `spl-token` 5.x) for local
+clusters and the e2e. On-chain code: **none** (SPL Token + Memo programs only). Node libraries:
+`@solana/web3.js` 1.x, `@solana/spl-token` 0.4.x, `@solana/spl-memo`, `tweetnacl`, `bs58`; web:
+`@solana/wallet-adapter-react`, `@solana/wallet-adapter-react-ui`, `@solana/wallet-adapter-base`
+(wallet-standard discovery covers Phantom, Solflare, Backpack and others). ESM everywhere (`"type": "module"`),
+`.js` import specifiers in TS sources.
 
-## 3. Contracts (`contracts/`)
+## 3. On-chain layer (Solana, no custom program)
 
-All contracts `pragma solidity 0.8.28;`, MIT. Use OpenZeppelin: `ERC20`, `ERC20Burnable`, `ERC20Permit`,
-`Ownable2Step`, `Pausable`, `ReentrancyGuard`, `SafeERC20`, `Math.mulDiv`. Custom errors, no revert strings.
-`forge fmt` clean. Natspec on every external function.
+### 3.1 Token
 
-### 3.1 `CreditMath` (library)
-
-```solidity
-library CreditMath {
-    /// usdMicro = floor(amount * priceE18 / 10**(decimals + 12))
-    function usdMicro(uint256 amount, uint256 priceE18, uint8 decimals) internal pure returns (uint256);
-    /// tokens = ceil(usdMicro * 10**(decimals + 12) / priceE18); reverts on priceE18 == 0
-    function tokensForUsdMicro(uint256 usdMicro, uint256 priceE18, uint8 decimals) internal pure returns (uint256);
-}
-```
-Uses `Math.mulDiv` (no intermediate overflow). `decimals` MUST be ≤ 36 (checked by callers at construction).
-
-### 3.2 `BeagleToken`
-
-`contract BeagleToken is ERC20, ERC20Burnable, ERC20Permit`. Name `Beagle`, symbol `BEAGLE`, 18 decimals,
-`TOTAL_SUPPLY = 1_000_000_000e18` minted to `recipient` in the constructor. No owner, no mint afterwards.
-Used on anvil/testnet; on mainnet the token is whatever ERC-20 the project launched (e.g. on Pons).
-
-### 3.3 Price sources
-
-```solidity
-interface IPriceSource {
-    /// @return priceE18 USD per 1 whole token (18 decimals); 0 = unavailable
-    /// @return updatedAt unix time of the observation
-    function latestPrice() external view returns (uint256 priceE18, uint256 updatedAt);
-}
-```
-
-**`ManualPriceSource is Ownable2Step, IPriceSource`** — operator-posted price with guard rails.
-
-- Storage: `address poster; uint256 priceE18; uint256 updatedAt; uint16 maxStepBps (default 2500); uint32 minInterval (default 60)`.
-- `post(uint256 newPriceE18)` — `onlyPoster`. Requires `newPriceE18 > 0`. If a price is already set:
-  `|new − old| · 10_000 ≤ old · maxStepBps` else `PriceStepTooLarge(old, new)`, and
-  `block.timestamp ≥ updatedAt + minInterval` else `PostTooSoon(nextAllowedAt)`. Sets price and
-  `updatedAt = block.timestamp`. Emits `PricePosted(uint256 priceE18, uint256 updatedAt, address poster)`.
-- `forcePrice(uint256 priceE18)` — `onlyOwner`, bypasses bounds (bootstrap / emergency). Emits `PriceForced(priceE18, updatedAt)`.
-- `setPoster(address)`, `setBounds(uint16 maxStepBps, uint32 minInterval)` — `onlyOwner`; `0 < maxStepBps ≤ 10_000`.
-  Events `PosterSet(address)`, `BoundsSet(uint16, uint32)`.
-- `latestPrice()` returns the stored pair (zeros before the first post).
-- Errors: `NotPoster()`, `ZeroPrice()`, `PriceStepTooLarge(uint256 oldPrice, uint256 newPrice)`, `PostTooSoon(uint256 nextAllowedAt)`, `BadBounds()`.
-
-**`ChainlinkPriceSource is IPriceSource`** — adapter for an `AggregatorV3Interface` feed quoting the token in
-USD. Immutable `feed`, `feedDecimals`. `latestPrice()` reads `latestRoundData()`; if `answer ≤ 0` returns
-`(0, updatedAt)`; otherwise rescales `answer` to 18 decimals. Define the minimal `AggregatorV3Interface`
-locally (`decimals()`, `latestRoundData()`).
-
-### 3.4 `CreditDesk`
-
-`contract CreditDesk is Ownable2Step, Pausable, ReentrancyGuard`.
-
-Immutables: `IERC20 public immutable token; uint8 public immutable tokenDecimals; bool public immutable nativeBurn;`
-Constants: `address public constant DEAD = 0x000000000000000000000000000000000000dEaD; uint64 public constant MAX_BUDGET_DURATION = 30 days;`
-Storage:
-```solidity
-IPriceSource public priceSource;
-uint32  public maxPriceAge;      // seconds; default 3600
-uint256 public minBurn;          // raw token units; default 0
-address public operator;         // gateway hot wallet: draws budgets
-uint256 public nextReceiptId;    // starts at 1
-uint256 public nextBudgetId;     // starts at 1
-uint256 public totalBurned;      // raw token units
-uint256 public totalUsdMicro;    // credited µUSD
-struct Budget { address owner; address workspace; uint128 cap; uint128 drawn; uint64 deadline; bool closed; }
-mapping(uint256 => Budget) public budgets;
-```
-Constructor `(IERC20 token_, bool nativeBurn_, IPriceSource priceSource_, address owner_, address operator_)`:
-reads `IERC20Metadata(token_).decimals()` (revert `BadDecimals()` if > 36), sets `maxPriceAge = 3600`,
-`nextReceiptId = nextBudgetId = 1`, `Ownable(owner_)`. Zero `token_`/`owner_` → `ZeroAddress()`;
-`priceSource_`/`operator_` may be zero (set later).
-
-Pricing:
-```solidity
-function quote(uint256 amount) public view returns (uint256 usdMicro, uint256 priceE18, uint256 updatedAt);
-```
-`_price()` reads `priceSource.latestPrice()`; reverts `PriceUnavailable()` if `priceSource == 0` or `priceE18 == 0`;
-reverts `PriceStale(updatedAt, maxPriceAge)` unless `|block.timestamp − updatedAt| ≤ maxPriceAge` (symmetric: a
-future-dated observation is not fresh forever; no underflow).
-`usdMicro = CreditMath.usdMicro(amount, priceE18, tokenDecimals)`.
-
-Credit purchase:
-```solidity
-function burnForCredit(address workspace, uint256 amount) external whenNotPaused nonReentrant returns (uint256 receiptId);
-function burnForCreditWithPermit(address workspace, uint256 amount, uint256 deadline, uint8 v, bytes32 r, bytes32 s)
-    external whenNotPaused nonReentrant returns (uint256 receiptId);
-/// Same as above with a credit floor: reverts SlippageExceeded(usdMicro, minUsdMicro) when the quote at inclusion
-/// time is below `minUsdMicro` (a price post can land between the client's quote and the transaction).
-function burnForCreditMin(address workspace, uint256 amount, uint256 minUsdMicro) external returns (uint256 receiptId);
-function burnForCreditWithPermitMin(address workspace, uint256 amount, uint256 minUsdMicro, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external returns (uint256 receiptId);
-```
-Clients operated by this project (web Credits page, MCP `beagle_buy_compute`) always use the `…Min` variants with
-`minUsdMicro = quoted − ceil(quoted · toleranceBps / 10 000)` (default 100 bps); the plain variants stay for third parties.
-- `workspace == 0` → `ZeroAddress()`. `amount == 0 || amount < minBurn` → `BurnTooSmall(amount, minBurn)`.
-- `(usdMicro, priceE18, ) = quote(amount)`; `usdMicro == 0` → `QuoteTooSmall()`.
-- `token.safeTransferFrom(msg.sender, address(this), amount)`; `_burn(amount)`.
-- `receiptId = nextReceiptId++`; `totalBurned += amount; totalUsdMicro += usdMicro`.
-- `emit CreditPurchased(receiptId, workspace, msg.sender, amount, usdMicro, priceE18)`.
-- Permit variant first does `try IERC20Permit(address(token)).permit(msg.sender, address(this), amount, deadline, v, r, s) {} catch {}`
-  (front-running-safe), then the same path.
-
-Budgets ("authorize a budget from the wallet"):
-```solidity
-function openBudget(address workspace, uint128 cap, uint64 deadline) external whenNotPaused returns (uint256 budgetId);
-function draw(uint256 budgetId, uint256 amount, bytes32 receiptHash) external whenNotPaused nonReentrant returns (uint256 receiptId);
-function closeBudget(uint256 budgetId) external;
-function budgetRemaining(uint256 budgetId) external view returns (uint256); // 0 when closed/expired; min(cap-drawn, allowance, balance)
-```
-- `openBudget`: `workspace != 0`; `cap > 0`; `block.timestamp < deadline ≤ block.timestamp + MAX_BUDGET_DURATION` else `BadBudgetParams()`.
-  Stores `{owner: msg.sender, workspace, cap, drawn: 0, deadline, closed: false}`. Emits
-  `BudgetOpened(budgetId, msg.sender, workspace, cap, deadline)`. The owner separately `approve`s the desk.
-- `draw`: `msg.sender == operator` else `NotOperator()`; budget exists (`owner != 0`) else `UnknownBudget()`;
-  `!closed` else `BudgetIsClosed()`; `block.timestamp ≤ deadline` else `BudgetExpired()`; `amount > 0`;
-  `drawn + amount ≤ cap` else `BudgetExceeded(cap − drawn)`. Quote, `safeTransferFrom(owner, this, amount)`,
-  `_burn`, `drawn += amount`, receipt id, totals, `emit BudgetDrawn(budgetId, receiptId, workspace, amount, usdMicro, priceE18, receiptHash)`.
-- `closeBudget`: allowed for the budget owner, the operator, or anyone after `deadline`; otherwise `NotBudgetOwner()`.
-  Idempotent on an already closed budget is **not** allowed (`BudgetIsClosed()`). Works while paused. Emits `BudgetClosed(budgetId, drawn)`.
-
-Burning: `_burn(amount)`: `nativeBurn ? ERC20Burnable(address(token)).burn(amount) : token.safeTransfer(DEAD, amount)`.
-
-`draw` also reverts `QuoteTooSmall()` when the quoted credit is 0 (never burn tokens for no credit). `renounceOwnership()`
-is overridden to revert `RenounceDisabled()` on both the desk and `ManualPriceSource` (an owner-less desk could not be
-paused or re-parameterised). The emergency stop for a compromised poster is `setPoster(0)` + `pause()`.
-
-Admin (`onlyOwner`): `setPriceSource(IPriceSource)`, `setMaxPriceAge(uint32 > 0, else BadMaxPriceAge())`, `setMinBurn(uint256)`,
-`setOperator(address)`, `pause()`, `unpause()`, `recoverToken(IERC20 t, address to, uint256 amount)` (any token,
-including stray credit tokens; the desk never holds tokens between calls). Events: `PriceSourceSet(address)`,
-`MaxPriceAgeSet(uint32)`, `MinBurnSet(uint256)`, `OperatorSet(address)`.
-
-Events (exact signatures):
-```solidity
-event CreditPurchased(uint256 indexed receiptId, address indexed workspace, address indexed payer, uint256 tokenAmount, uint256 usdMicro, uint256 priceE18);
-event BudgetOpened(uint256 indexed budgetId, address indexed owner, address indexed workspace, uint128 cap, uint64 deadline);
-event BudgetDrawn(uint256 indexed budgetId, uint256 indexed receiptId, address indexed workspace, uint256 tokenAmount, uint256 usdMicro, uint256 priceE18, bytes32 receiptHash);
-event BudgetClosed(uint256 indexed budgetId, uint128 drawn);
-```
-Errors: `ZeroAddress()`, `BadDecimals()`, `BurnTooSmall(uint256 amount, uint256 minBurn)`, `QuoteTooSmall()`,
-`PriceUnavailable()`, `PriceStale(uint256 updatedAt, uint32 maxAge)`, `NotOperator()`, `BadBudgetParams()`,
-`UnknownBudget()`, `BudgetIsClosed()`, `BudgetExpired()`, `BudgetExceeded(uint256 remaining)`, `NotBudgetOwner()`,
-`SlippageExceeded(uint256 usdMicro, uint256 minUsdMicro)`, `RenounceDisabled()`, `BadMaxPriceAge()`.
-
-Invariants (write as Foundry invariant tests):
-1. `totalBurned == Σ tokenAmount` over all `CreditPurchased` + `BudgetDrawn`; `totalUsdMicro == Σ usdMicro`.
-2. `token.balanceOf(desk) == 0` after every call. Native mode: `totalSupply` decreased by `totalBurned`; dead mode: `balanceOf(DEAD) == totalBurned`.
-3. For every budget `drawn ≤ cap`; a closed or expired budget never increases `drawn`.
-4. Receipt ids are strictly increasing and unique across both purchase paths.
-
-Tests also cover: staleness and unavailable price, pause semantics (burn/open/draw blocked, close allowed),
-permit path (valid permit; replayed/invalid permit still succeeds when allowance pre-exists), dead-address
-mode with a `MockERC20` lacking `burn`, operator/owner access control, fuzz of `CreditMath` (monotonic in
-amount and price, no overflow for `amount ≤ 1e36`, `price ≤ 1e30`, `decimals ≤ 36`; `tokensForUsdMicro`
-round-trips within one unit), and `ManualPriceSource` bounds.
-
-### 3.5 Scripts and deployments
-
-`script/Deploy.s.sol` (env):
-
-| Var | Meaning |
-|---|---|
-| `DEPLOYER_PRIVATE_KEY` | broadcaster |
-| `TOKEN` | existing ERC-20; empty → deploy `BeagleToken` to `TOKEN_RECIPIENT` (default deployer) |
-| `NATIVE_BURN` | `true/false`; default `true` when the script deploys the token, else required |
-| `OWNER`, `OPERATOR`, `POSTER` | default deployer |
-| `INITIAL_PRICE_E18` | if > 0, `forcePrice` right after deploy (bootstrap) |
-| `MAX_PRICE_AGE` (3600), `MIN_BURN` (0) | desk params |
-| `NATIVE_BURN_UNCHECKED` | `true` skips the simulated `burn(0)` probe that otherwise rejects a non-burnable `TOKEN` with `NATIVE_BURN=true` (`TokenNotBurnable()`) |
-| `WRITE_DEPLOYMENT` | `true` writes the deployment JSON even outside a broadcast; by default a dry run never overwrites `deployments/<chainId>.json` |
-
-Deploys `ManualPriceSource(owner, poster)` then `CreditDesk(token, nativeBurn, priceSource, owner, operator)`.
-When `OWNER != deployer`, ownership is transferred with `transferOwnership` (Ownable2Step; the owner accepts
-later) — the script logs this. Writes `contracts/deployments/<chainId>.json` via `vm.writeJson`
-(`fs_permissions = [{ access = "read-write", path = "./deployments" }, { access = "write", path = "../packages/shared/fixtures" }]`):
+An SPL mint under the Token program (Token-2022 supported through `tokenProgram` in the deployment record;
+the indexer and the clients read it from `ConfigDto`). Mainnet: the pump.fun-launched `BEAGLE` (6 decimals,
+mint authority revoked by the launchpad). Devnet / localnet: `solana/scripts/setup-cluster.sh <cluster>`
+creates a 6-decimal mint with the deployer keypair as mint authority, mints `1_000_000_000` whole tokens to the
+deployer, disables further minting (`spl-token authorize <mint> mint --disable`) and writes
+`solana/deployments/<cluster>.json`:
 
 ```json
-{ "chainId": 31337, "token": "0x…", "tokenSymbol": "BEAGLE", "tokenDecimals": 18, "nativeBurn": true,
-  "creditDesk": "0x…", "priceSource": "0x…", "priceSourceKind": "manual",
-  "deployBlock": 12, "owner": "0x…", "pendingOwner": "0x…", "operator": "0x…", "poster": "0x…" }
+{ "cluster": "localnet", "mint": "<base58>", "decimals": 6, "symbol": "BEAGLE", "tokenProgram": "<base58>",
+  "operator": "<base58>", "memoProgram": "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", "createdSlot": 123 }
 ```
-`owner` is the on-chain owner at the time of writing (the deployer until the configured `OWNER` accepts), `pendingOwner`
-the Ownable2Step pending owner (zero when none). `scripts/sync-deployments.mjs` ignores keys it does not know.
 
-`script/PostPrice.s.sol`: env `PRICE_SOURCE`, `PRICE_E18`, `POSTER_PRIVATE_KEY`; calls `post`.
-`script/GenerateFixtures.s.sol`: writes `packages/shared/fixtures/quote.json` — an array of
-`{ "amount": "<dec>", "priceE18": "<dec>", "decimals": n, "usdMicro": "<dec>", "tokensBack": "<dec>" }` for ≥ 24
-cases (edge: 0, 1 wei, 1e36; decimals 6, 8, 18; prices 1e9 … 1e24) computed by `CreditMath`. CI regenerates
-and diffs the file.
+`scripts/sync-deployments.mjs` collects these files into `packages/shared/src/deployments.generated.ts`
+(`--check` mode for CI). Unknown keys are ignored.
 
-`foundry.toml`: `solc = "0.8.28"`, `optimizer = true`, `optimizer_runs = 2000`, `via_ir = false`,
-`[profile.ci] fuzz.runs = 2000, invariant.runs = 200, invariant.depth = 40`; `remappings` for
-`@openzeppelin/contracts/` and `forge-std/`.
+### 3.2 Credit purchase = burn
+
+A purchase is any **successful** transaction that contains an SPL `Burn` or `BurnChecked` instruction on the
+mint (top-level or inner), executed by a token account **owner** (authority = owner; a delegate burn by the
+operator is a draw, §3.4; a delegate burn by anyone else still credits the token account owner).
+
+- Workspace credited = the token account owner, unless the transaction carries an SPL Memo instruction
+  `beagle:v1 ws=<base58>` (then that key). One memo per transaction is honoured (the first `beagle:` memo);
+  malformed memos are ignored (credit goes to the owner).
+- Credit = `quoteUsdMicro(amount, priceE18)` with the gateway's **current price point at observation**
+  (§3.3); the event stores `price_point_id` and `price_e18`. Multiple burns in one transaction are separate
+  events (`<signature>:<ixIndex>`).
+- A burn is final: the token supply decreases and nothing is refundable. Clients show the current price and
+  the sentence "credit is computed from the published price when the gateway observes the burn".
+- Minimum: burns quoting below `MIN_CREDIT_USD` (default $0.001) are recorded with `usd_micro = 0` and no
+  ledger credit (dust guard); the UI enforces a minimum amount.
+
+Purchases MUST be discoverable by `getSignaturesForAddress(mint)`: the mint is a writable account of every
+`Burn`, so every burn transaction mentions it. The gateway never relies on clients notifying it.
+
+### 3.3 Price (off-chain, published)
+
+The token price is **not** on-chain (as in the original: "rates follow the $DARWIN price"). The gateway's
+`PriceService` keeps a price history (`price_points`) and exposes it publicly:
+
+- Sources (`PRICE_SOURCE`): `manual` (admin API / CLI set the price; `INITIAL_PRICE_USD` bootstraps it),
+  `feed` (HTTP JSON `{ "priceUsd": number }` at `PRICE_FEED_URL`), `jupiter` (Jupiter Price API
+  `GET {JUPITER_PRICE_URL}?ids=<mint>` → `data[mint].usdPrice`, mainnet only). Refresh every `PRICE_REFRESH_MS`.
+- A new point is appended only when the price changes by ≥ `PRICE_MIN_CHANGE_BPS` (default 50) **or** the
+  last point is older than `PRICE_MAX_AGE_S / 2` (keep-alive); a jump above `PRICE_MAX_STEP_BPS` (default
+  2500) relative to the last point is rejected and logged (`price_rejected`), the previous point stays.
+- Staleness: `stale = now − lastPoint.observedAt > PRICE_MAX_AGE_S` (default 3600). Burns observed while
+  stale are still credited at the last point when `CREDIT_WHEN_STALE=true` (default) and flagged
+  (`credit_events.price_stale = 1`); the web disables the burn button and the MCP tool warns while stale.
+- `GET /api/price` → current point + `stale`; `GET /api/price/history?limit` → points; every credit event and
+  `/api/receipts` row shows the point used. Anyone can recompute credits from the burn amount and the history.
+
+### 3.4 Budgets = SPL delegation
+
+"Authorize a budget from the wallet": the agent runs `ApproveChecked(tokenAccount, delegate = operator,
+amount = cap)` on its token account of the mint (SPL semantics: one delegate per account; a new approve
+replaces the previous cap; `Revoke` clears it; every delegate burn decrements `delegatedAmount`).
+
+- Budget id = the token account address (the owner's ATA in the normal case). `owner` = account owner,
+  `workspace` = owner (a registration may name another workspace to fund, §5.9).
+- Headroom (tokens) = `min(delegatedAmount, amount)` while `delegate == operator`; in µUSD at the current
+  price. No deadline on-chain: the budget lives until revoked or exhausted (the UI shows "until revoked").
+- Draw = operator transaction `[ComputeBudget(priority fee, optional), BurnChecked(tokenAccount, mint,
+  authority = operator, amount, decimals), Memo("beagle:draw v1 ws=<workspace> h=<receiptHash>")]`. The
+  indexer confirms the draw by the memo hash (§5.4). The operator cannot move tokens anywhere else: `Burn` is
+  the only instruction it signs, bounded by `delegatedAmount`.
+- Discovery: (a) `POST /api/budgets/register { tokenAccount }` right after approving (web and MCP do this),
+  (b) a periodic scan `getProgramAccounts(tokenProgram, { filters: [{ dataSize: 165 }, { memcmp: { offset: 0,
+  bytes: mint } }, { memcmp: { offset: 76, bytes: operator } }] })` every `BUDGET_SCAN_INTERVAL_MS` (classic
+  Token program accounts are 165 bytes: mint 0–32, owner 32–64, amount 64–72, delegate option 72–76 +
+  pubkey 76–108, …, delegatedAmount 121–129). Token-2022 accounts vary in size: for them only (a) and
+  per-workspace `getTokenAccountsByOwner` refreshes apply.
+- Close = `Revoke` by the owner (or approve 0); the scanner marks the budget `closed` (`stalledReason: 'revoked'`).
+
+### 3.5 Trust summary
+
+No program to audit. The user's only on-chain actions are `Burn` (final) and `Approve`/`Revoke` (bounded,
+revocable). The operator's only action is a delegate `Burn` up to the cap. The price is off-chain but
+published point by point and pinned on every credit event; the ledger is a cache of chain events plus
+debits and can be rebuilt by replaying the mint's signatures.
 
 ## 4. Shared package (`packages/shared`, `@beagle/shared`)
 
-Pure, browser-safe TypeScript (no `node:` imports; viem is the only runtime dependency besides zod).
-Subpath exports: `.`, `./chains`, `./addresses`, `./abi`, `./credit`, `./models`, `./routing`, `./difficulty`,
-`./canonical`, `./api`, `./openai`. 100 % of the public functions have vitest coverage.
+Pure, browser-safe TypeScript (no `node:` imports; runtime dependencies: zod, `bs58`, `@noble/hashes` for sha256 — no
+`@solana/web3.js` here so the web bundle stays small).
+Subpath exports: `.`, `./clusters`, `./addresses`, `./memo`, `./siws`, `./solana`, `./credit`, `./models`, `./routing`,
+`./difficulty`, `./canonical`, `./api`, `./openai`. 100 % of the public functions have vitest coverage.
 
-### 4.1 `chains.ts`, `addresses.ts`
+### 4.1 `clusters.ts`, `addresses.ts`, `memo.ts`, `siws.ts`, `solana.ts`
 
-As in `docs/ROBINHOOD_CHAIN.md`: `robinhoodChain` (4663), `robinhoodChainTestnet` (46630), `anvilChain` (31337),
-`SUPPORTED_CHAINS`, `chainById`, `toAddEthereumChainParameter` (EIP-3085), explorer URL helpers,
-`MULTICALL3_ADDRESS` + `withMulticall3`. `addresses.ts`: Robinhood protocol addresses (WETH9, Uniswap v2/v3/v4,
-Permit2, Universal Router), Pons V2 addresses, and `deploymentFor(chainId)` reading `deployments.generated.ts`
-(`Record<number, Deployment>` generated by `scripts/sync-deployments.mjs` from `contracts/deployments/*.json`;
-committed; anvil entry allowed). `resolveDeployment(chainId, overrides)` applies env overrides where the zero
-address counts as unset.
+`clusters.ts`: `Cluster = 'mainnet-beta' | 'devnet' | 'localnet'`, `CLUSTERS` (`rpcUrl`, `wsUrl`, `explorer`:
+`https://explorer.solana.com` with `?cluster=devnet` / `?cluster=custom&customUrl=<rpc>` for localnet, `solscan`
+`https://solscan.io` with `?cluster=devnet`), `isCluster(s)`, `explorerTxUrl(cluster, signature)`,
+`explorerAddressUrl(cluster, address)`, `explorerTokenUrl(cluster, mint)`, `clusterCaip(cluster)` →
+`solana:mainnet | solana:devnet | solana:localnet` (SIWS `chainId`).
 
-### 4.2 `abi.ts`
+`addresses.ts`: `TOKEN_PROGRAM_ID`, `TOKEN_2022_PROGRAM_ID`, `ASSOCIATED_TOKEN_PROGRAM_ID`, `MEMO_PROGRAM_ID`
+(base58 strings), `Deployment` (the §3.1 JSON shape), `DEPLOYMENTS` (from `deployments.generated.ts`),
+`deploymentFor(cluster)`, `resolveDeployment(cluster, overrides?: { mint?, operator?, rpcUrl? })` (empty string
+counts as unset; invalid base58 throws), `isUnsetAddress`.
 
-`CREDIT_DESK_ABI`, `BEAGLE_TOKEN_ABI` (ERC-20 + permit + burn subset), `MANUAL_PRICE_SOURCE_ABI`,
-`ERC20_ABI` — `as const` arrays generated by `scripts/sync-abi.mjs` from `contracts/out/*.json` into
-`packages/shared/src/abi.generated.ts` (committed). The script exits non-zero in `--check` mode when the
-committed file differs. A test asserts the event signatures of §3.4 are present.
+`memo.ts`: `encodePurchaseMemo({ workspace })` → `beagle:v1 ws=<base58>`; `encodeDrawMemo({ workspace,
+receiptHash })` → `beagle:draw v1 ws=<base58> h=0x<64 hex>`; `parseMemo(text)` →
+`{ kind: 'purchase', workspace } | { kind: 'draw', workspace, receiptHash } | undefined` (strict grammar,
+whitespace-tolerant, ≤ 256 bytes, unknown versions → undefined); `MEMO_MAX_BYTES`.
+
+`siws.ts`: Sign-In-With-Solana message text (the wallet-standard `signIn` layout):
+```
+<domain> wants you to sign in with your Solana account:
+<address>
+
+<statement>
+
+URI: <uri>
+Version: 1
+Chain ID: <solana:mainnet|solana:devnet|solana:localnet>
+Nonce: <nonce>
+Issued At: <ISO8601>
+Expiration Time: <ISO8601>
+```
+`createSiwsMessage(fields)`, `parseSiwsMessage(text)` (returns fields or throws `SiwsParseError`),
+`validateSiwsFields(fields, { domain, uri, chainId, now, nonceOk })` → list of problems (empty = ok). No
+signature verification here (browser-safe); the gateway verifies with tweetnacl.
+
+`solana.ts`: `Base58PubkeySchema` (zod; 32-byte decode check), `SignatureSchema`, `isBase58Pubkey`,
+`TOKEN_ACCOUNT_SIZE = 165`, `TOKEN_ACCOUNT_DELEGATE_OFFSET = 76`, `TOKEN_ACCOUNT_MINT_OFFSET = 0`,
+`BURN_INSTRUCTION_TYPES = ['burn', 'burnChecked']`, `DEFAULT_DECIMALS = 6`, `shortAddress(s)`.
+
+### 4.2 Deployments
+
+`deployments.generated.ts` (generated by `scripts/sync-deployments.mjs` from `solana/deployments/*.json`,
+committed; header comment `// Generated by scripts/sync-deployments.mjs … — do not edit by hand.`):
+`export const DEPLOYMENTS: Readonly<Record<Cluster, Deployment>>` (partial: only clusters with a file). The
+localnet entry is the reference produced by `setup-cluster.sh` with the e2e deployer keypair
+(`solana/keys/deployer.json`, committed — **test key only**, never fund it on mainnet) so the mint address is
+deterministic across runs (`spl-token create-token` with a fixed mint keypair `solana/keys/mint-localnet.json`).
 
 ### 4.3 `credit.ts`
 
@@ -396,7 +330,7 @@ Deterministic: same input → same output; no randomness, no clock.
 
 `canonicalJson(value)`: RFC 8785-style — object keys sorted (code point order), no whitespace, `bigint` →
 decimal string, `undefined` members omitted, numbers must be finite integers (throw otherwise; monetary
-values are bigint). `sha256Hex(string)` via viem `sha256(stringToBytes())`. `receiptHash(obj) = '0x' + sha256Hex(canonicalJson(obj))`.
+values are bigint). `sha256Hex(string)` via `@noble/hashes` (`sha256` over UTF-8 bytes). `receiptHash(obj) = '0x' + sha256Hex(canonicalJson(obj))`.
 Receipt objects: see §5.7 (`UsageReceipt`) and §5.4 (`DrawBatch`).
 
 ### 4.8 `api.ts`, `openai.ts` (zod v4)
@@ -412,17 +346,17 @@ parts (text, image_url), tools / tool_choice, `response_format`, `stream`, `stre
 
 ## 5. Gateway (`gateway/`, `@beagle/gateway`)
 
-Node 22 ESM, Hono 4 + `@hono/node-server`, `node:sqlite` (`DatabaseSync`, WAL, foreign keys on), viem 2,
-`@anthropic-ai/sdk` (official; the only Anthropic client), `@modelcontextprotocol/sdk` (HTTP transport),
-zod 4, no other heavy runtime deps. Structure:
+Node 22 ESM, Hono 4 + `@hono/node-server`, `node:sqlite` (`DatabaseSync`, WAL, foreign keys on),
+`@solana/web3.js` 1.x + `@solana/spl-token` (chain), `tweetnacl` + `bs58` (SIWS), `@anthropic-ai/sdk` (official; the
+only Anthropic client), `@modelcontextprotocol/sdk` (HTTP transport), zod 4, no other heavy runtime deps. Structure:
 
 ```
 src/main.ts            boot: config → db.migrate → services → indexer/poster/drawer/warm loops → http
 src/cli.ts             create-key | credit | post-price | status | migrate
 src/config.ts          zod-validated env (§5.1)
 src/db/{sqlite,schema,repos}.ts
-src/auth/{siwe,session,apiKeys,crypto}.ts
-src/chain/{clients,indexer,drawer,poster,budgets}.ts
+src/auth/{siws,session,apiKeys,crypto}.ts
+src/chain/{rpc,indexer,budgets,drawer,price}.ts
 src/providers/{types,anthropic,openaiCompat,registry}.ts
 src/translate/{internal,fromOpenAI,toOpenAI,fromAnthropic,toAnthropic}.ts
 src/router/{health,execute}.ts
@@ -442,13 +376,13 @@ the `VITE_*` keys from the repo-root file itself.
 | Group | Keys (default) |
 |---|---|
 | runtime | `NODE_ENV` (development; `production` → `SESSION_SECRET` required and CLI `credit` needs `--force`; set by the Docker image) |
-| chain | `CHAIN_ID` (31337), `RPC_URL`, `CREDIT_DESK_ADDRESS` (override; zero = unset), `START_BLOCK` (deployment block from `deployments` when unset), `CONFIRMATIONS` (0), `POLL_INTERVAL_MS` (2000), `LOG_CHUNK_BLOCKS` (2000) |
-| operator | `OPERATOR_PRIVATE_KEY` (`0x`/empty → draws and posts disabled), `DRY_RUN` (true) |
-| price poster | `PRICE_POSTER_ENABLED` (false), `PRICE_SOURCE_ADDRESS` (from deployments), `PRICE_FEED_URL` (http JSON `{ "priceUsd": number }`), `PRICE_POST_INTERVAL_MS` (300000) |
-| budgets | `DRAW_THRESHOLD_USD` (1), `DRAW_INTERVAL_MS` (30000), `BUDGET_HEADROOM_REFRESH_MS` (15000) |
-| server | `PORT` (8787), `HOST` (0.0.0.0), `PUBLIC_URL` (http://localhost:8787; SIWE domain/uri), `PUBLIC_WEB_ORIGIN` (http://localhost:5173; CORS, comma list), `DB_PATH` (./data/gateway.sqlite), `MAX_BODY_BYTES` (2000000), `TRUST_PROXY` (false; reserved, not honoured yet), `LOG_LEVEL` (info), `LOG_PROMPTS` (false) |
+| cluster | `CLUSTER` (localnet), `RPC_URL` (cluster default), `RPC_WS_URL` (optional), `MINT_ADDRESS` (override of the deployment mint), `TOKEN_PROGRAM` (override), `COMMITMENT` (confirmed \| finalized), `INDEX_FROM_SIGNATURE` (optional start cursor: index only burns after it; default = everything the RPC returns, newest 1000 signatures per page), `INDEX_PAGE_LIMIT` (1000), `POLL_INTERVAL_MS` (2000), `TX_FETCH_CONCURRENCY` (4) |
+| operator | `OPERATOR_SECRET_KEY` (base58 or JSON byte array; empty → draws disabled), `DRY_RUN` (true), `PRIORITY_FEE_MICROLAMPORTS` (0) |
+| price | `PRICE_SOURCE` (manual \| feed \| jupiter), `INITIAL_PRICE_USD` (manual bootstrap, e.g. 0.01), `PRICE_FEED_URL`, `JUPITER_PRICE_URL` (https://lite-api.jup.ag/price/v3), `PRICE_REFRESH_MS` (60000), `PRICE_MIN_CHANGE_BPS` (50), `PRICE_MAX_STEP_BPS` (2500), `PRICE_MAX_AGE_S` (3600), `CREDIT_WHEN_STALE` (true), `MIN_CREDIT_USD` (0.001) |
+| budgets | `BUDGET_SCAN_INTERVAL_MS` (30000), `BUDGET_HEADROOM_REFRESH_MS` (15000), `DRAW_THRESHOLD_USD` (1), `DRAW_INTERVAL_MS` (30000), `DRAW_CONFIRM_TIMEOUT_MS` (90000) |
+| server | `PORT` (8787), `HOST` (0.0.0.0), `PUBLIC_URL` (http://localhost:8787; SIWS domain/uri), `PUBLIC_WEB_ORIGIN` (http://localhost:5173; CORS, comma list), `DB_PATH` (./data/gateway.sqlite), `MAX_BODY_BYTES` (2000000), `TRUST_PROXY` (false), `LOG_LEVEL` (info), `LOG_PROMPTS` (false) |
 | secrets | `SESSION_SECRET` (required in prod; dev default with a warning), `KEYRING_MASTER_KEY` (32-byte hex; required when BYOK enabled), `ADMIN_TOKEN` (empty = admin routes disabled) |
-| providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` (https://api.openai.com/v1), `GOOGLE_API_KEY`, `GOOGLE_BASE_URL` (https://generativelanguage.googleapis.com/v1beta/openai), `HOUSE_BASE_URL` (empty = house disabled; the single endpoint both house models are requested from), `HOUSE_API_KEY`, `HOUSE_MODEL_SMALL` (openai/gpt-oss-20b), `HOUSE_MODEL_LARGE` (openai/gpt-oss-120b), `PROVIDER_TIMEOUT_MS` (120000), `MODEL_CATALOG_FILE` |
+| providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` (https://api.openai.com/v1), `GOOGLE_API_KEY`, `GOOGLE_BASE_URL` (https://generativelanguage.googleapis.com/v1beta/openai), `HOUSE_BASE_URL` (empty = house disabled), `HOUSE_API_KEY`, `HOUSE_MODEL_SMALL` (openai/gpt-oss-20b), `HOUSE_MODEL_LARGE` (openai/gpt-oss-120b), `PROVIDER_TIMEOUT_MS` (120000; whole call for JSON, first byte + idle for streams), `MODEL_CATALOG_FILE` |
 | economics | `MARKUP_BPS` (1000), `BYOK_FEE_BPS` (0), `LOW_CREDIT_USD` (1), `VERY_LOW_CREDIT_USD` (0.1), `MIN_RESERVE_USD` (0.01), `MAX_RESERVE_USD` (5), `RESERVATION_TTL_MS` (600000), `PRO_PRICE_USD` (20), `PRO_DAYS` (30), `WARM_HOUR_PRICE_USD` (2), `RATE_LIMIT_RPM` (60), `RATE_LIMIT_RPM_PRO` (300), `WARM_DRIVER` (log \| ollama \| http), `WARM_WEBHOOK_URL`, `WARM_PING_INTERVAL_MS` (240000) |
 
 Platform keys absent → that provider is `down` for credit-paid routing (BYOK still works). `HOUSE_BASE_URL`
@@ -457,53 +391,59 @@ empty → house tier absent (router may return `no_capable_model`).
 ### 5.2 Database (SQLite, migrations in `schema.ts`, versioned `PRAGMA user_version`)
 
 ```
-workspaces(owner TEXT PK, created_at INTEGER, plan TEXT NOT NULL DEFAULT 'free', plan_until INTEGER, display_name TEXT)
+workspaces(owner TEXT PK /* base58 */, created_at INTEGER, plan TEXT NOT NULL DEFAULT 'free', plan_until INTEGER, display_name TEXT)
 api_keys(id TEXT PK, workspace TEXT REFERENCES workspaces, name TEXT, prefix TEXT, hash TEXT UNIQUE, created_at, revoked_at, last_used_at)
 sessions(id TEXT PK, workspace TEXT, created_at, expires_at)
-siwe_nonces(nonce TEXT PK, created_at, expires_at)
+siws_nonces(nonce TEXT PK, created_at, expires_at)
 ledger(id INTEGER PK AUTOINCREMENT, workspace TEXT, kind TEXT CHECK(kind IN ('credit','debit','adjustment','upgrade')),
-       amount_micro INTEGER NOT NULL, ref_type TEXT, ref_id TEXT, memo TEXT, created_at)      -- balance = SUM(amount_micro); credit > 0, debit < 0
-credit_events(tx_hash TEXT, log_index INTEGER, kind TEXT CHECK(kind IN ('purchase','draw')), receipt_id INTEGER, workspace TEXT, payer TEXT,
-       token_amount TEXT, usd_micro INTEGER, price_e18 TEXT, budget_id INTEGER, receipt_hash TEXT, block_number INTEGER, block_hash TEXT,
-       block_time INTEGER, created_at, PRIMARY KEY (tx_hash, log_index))
+       amount_micro INTEGER NOT NULL, ref_type TEXT, ref_id TEXT, memo TEXT, created_at)      -- balance = SUM(amount_micro); UNIQUE(ref_type, ref_id) partial index
+credit_events(signature TEXT, ix_index INTEGER, kind TEXT CHECK(kind IN ('purchase','draw')), workspace TEXT, payer TEXT /* token account owner */,
+       token_account TEXT, authority TEXT, token_amount TEXT, usd_micro INTEGER, price_e18 TEXT, price_point_id INTEGER, price_stale INTEGER DEFAULT 0,
+       memo TEXT, receipt_hash TEXT, slot INTEGER, block_time INTEGER, created_at, PRIMARY KEY (signature, ix_index))
+price_points(id INTEGER PK AUTOINCREMENT, price_e18 TEXT NOT NULL, source TEXT, observed_at INTEGER, created_at)
 reservations(id TEXT PK, workspace TEXT, amount_micro INTEGER, created_at, expires_at)
 usage(id TEXT PK, workspace TEXT, api_key_id TEXT, endpoint TEXT, requested_model TEXT, served_model TEXT, provider TEXT, tier TEXT,
        paid_by TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-       upstream_cost_micro INTEGER, charged_micro INTEGER, status TEXT, http_status INTEGER, error_code TEXT, latency_ms INTEGER,
-       route_reasons TEXT, stream INTEGER, difficulty REAL, draw_id INTEGER, created_at)
-provider_keys(id TEXT PK, workspace TEXT, provider TEXT, ciphertext BLOB, iv BLOB, tag BLOB, last4 TEXT, base_url TEXT, created_at, UNIQUE(workspace, provider))
-budgets(budget_id INTEGER PK, owner TEXT, workspace TEXT, cap TEXT, drawn TEXT, deadline INTEGER, closed INTEGER DEFAULT 0,
-       headroom_tokens TEXT, headroom_micro INTEGER, headroom_checked_at INTEGER, stalled_reason TEXT, opened_block INTEGER, updated_at)
-budget_draws(id INTEGER PK AUTOINCREMENT, budget_id INTEGER, workspace TEXT, token_amount TEXT, usd_micro INTEGER, receipt_hash TEXT UNIQUE,
-       usage_ids TEXT, tx_hash TEXT, status TEXT CHECK(status IN ('pending','sent','confirmed','failed')), error TEXT, created_at, updated_at)
+       upstream_cost_micro INTEGER, charged_micro INTEGER, price_json TEXT, markup_bps INTEGER, status TEXT, http_status INTEGER, error_code TEXT,
+       latency_ms INTEGER, route_reasons TEXT, stream INTEGER, difficulty REAL, draw_id INTEGER, created_at)
+provider_keys(id TEXT PK, workspace TEXT, provider TEXT, ciphertext BLOB, iv BLOB, tag BLOB, last4 TEXT, base_url TEXT, last_error TEXT, created_at, UNIQUE(workspace, provider))
+budgets(token_account TEXT PK, owner TEXT, workspace TEXT, delegate TEXT, cap TEXT /* delegatedAmount */, balance TEXT /* account amount */,
+       headroom_tokens TEXT, headroom_micro INTEGER, headroom_checked_at INTEGER, stalled_reason TEXT, closed INTEGER DEFAULT 0,
+       registered_at INTEGER, last_seen_slot INTEGER, updated_at)
+budget_draws(id INTEGER PK AUTOINCREMENT, token_account TEXT, workspace TEXT, token_amount TEXT, usd_micro INTEGER, receipt_hash TEXT UNIQUE,
+       usage_ids TEXT, batch_json TEXT, signature TEXT, last_valid_block_height INTEGER, status TEXT CHECK(status IN ('pending','sent','confirmed','failed')),
+       error TEXT, created_at, updated_at)
 upgrades(id TEXT PK, workspace TEXT, kind TEXT CHECK(kind IN ('pro','warm')), quantity INTEGER, amount_micro INTEGER, starts_at, ends_at, created_at)
 provider_health(provider TEXT PK, state TEXT, failures INTEGER, opened_at INTEGER, open_for_ms INTEGER, updated_at)
-indexer_state(key TEXT PK, value TEXT)                       -- last_block, last_block_hash
-price_posts(id INTEGER PK AUTOINCREMENT, price_e18 TEXT, source TEXT, tx_hash TEXT, status TEXT, created_at)
+indexer_state(key TEXT PK, value TEXT)                       -- last_signature, last_slot, head_slot, last_event_at
+settings(key TEXT PK, value TEXT)                            -- warm window, manual price, …
 rate_limits(key_id TEXT PK, window_start INTEGER, count INTEGER)
 ```
-Indices on `ledger(workspace)`, `usage(workspace, created_at)`, `credit_events(workspace)`, `reservations(workspace)`,
-`budgets(workspace)`. All repos use prepared statements; monetary columns are 64-bit integers (µUSD) — amounts
-above `2^53` are handled as `bigint` via `readBigInts`-safe access (`stmt.setReadBigInts(true)`).
+Indices on `ledger(workspace)`, `usage(workspace, created_at)`, `credit_events(workspace)`, `credit_events(slot)`,
+`reservations(workspace)`, `budgets(workspace)`, `budgets(owner)`. All repos use prepared statements; monetary
+columns are 64-bit integers (µUSD) read as `bigint` (`setReadBigInts(true)`); token amounts are decimal strings.
 
 **Balance definitions** (used by every route and by routing):
 `balance = Σ ledger.amount_micro`; `reserved = Σ reservations.amount_micro (not expired)`;
-`budgetHeadroom = Σ budgets.headroom_micro` over open, unexpired, non-stalled budgets of the workspace, where one
-owner's backing `min(allowance, balance)` is allocated once across all of that owner's open budgets (in `budget_id`
-order, each capped by `cap − drawn`) so shared allowance is never counted twice;
+`budgetHeadroom = Σ budgets.headroom_micro` over open, non-stalled budgets of the workspace (one SPL token
+account has exactly one delegate and one delegated amount, so headroom is never double-counted; a workspace
+funded by several token accounts simply sums them);
 `available = balance − reserved + budgetHeadroom`.
 
 ### 5.3 Authentication
 
-- **SIWE** (`viem/siwe`): `GET /api/auth/nonce` → `{ nonce }` (stored, 10 min). The web signs `domain = host(VITE_GATEWAY_URL || page origin)`,
-  `uri = that origin + '/'`, `chainId = VITE_CHAIN_ID`, so `PUBLIC_URL` of the gateway MUST equal the origin the browser talks to
-  (dev: `http://localhost:8787` = `VITE_GATEWAY_URL`; prod behind nginx: the site URL). `POST /api/auth/verify { message, signature }`:
-  `parseSiweMessage`, check `domain == host(PUBLIC_URL)`, `nonce` known & unused, `chainId ∈ SUPPORTED_CHAINS`,
-  `verifySiweMessage` with a public client for the message's chain (EOA; contract wallets via ERC-1271 are supported
-  by viem's verify when RPC is available). Creates the workspace if missing, creates a session, sets the cookie,
-  returns `{ token, workspace }`. `POST /api/auth/logout`. `GET /api/me`.
-- **API keys**: `POST /api/keys { name }` → `{ id, key, prefix, name, createdAt }` (full key returned once).
-  `GET /api/keys` → masked list. `DELETE /api/keys/:id` → revoke. Inference and MCP accept
+- **SIWS** (Sign-In-With-Solana): `GET /api/auth/nonce` → `{ nonce }` (stored, 10 min). The web builds the
+  message with `createSiwsMessage` from `@beagle/shared/siws` using `domain = host(VITE_GATEWAY_URL || page
+  origin)`, `uri = that origin + '/'`, `chainId = clusterCaip(VITE_CLUSTER)`, `expirationTime = issuedAt + 10 min`,
+  and signs it with the wallet's `signMessage` (UTF-8 bytes; wallets that expose the wallet-standard `signIn`
+  feature may be used too, the server accepts the same text). `POST /api/auth/verify { message, signature, publicKey }`
+  (signature base58 or base64; publicKey base58): `parseSiwsMessage`, `validateSiwsFields` (domain == host(`PUBLIC_URL`),
+  uri origin == `PUBLIC_URL` origin, chainId == `clusterCaip(CLUSTER)`, nonce known and unused, `issuedAt ≤ now + 5 min`,
+  not expired), `address == publicKey`, then `nacl.sign.detached.verify(utf8(message), signature, pubkey)`.
+  Creates the workspace if missing, creates a session, sets the cookie, returns `{ token, workspace }`.
+  `POST /api/auth/logout`. `GET /api/me`.
+- **API keys**: `POST /api/keys { name }` → `{ id, key, prefix, name, createdAt }` (full key returned once; ≤ 50
+  active keys). `GET /api/keys` → masked list. `DELETE /api/keys/:id` → revoke. Inference and MCP accept
   `Authorization: Bearer bgl_…` or `x-api-key: bgl_…`. Keys are looked up by `sha256`; `last_used_at` updated
   at most once a minute. Revoked → 401 `invalid_api_key`.
 - **Session vs key**: `/api/*` dashboard routes accept sessions; routes marked "key OK" (§5.9) also accept API keys.
@@ -511,56 +451,67 @@ order, each capped by `cap − drawn`) so shared allowance is never counted twic
   Decrypt only in the request path; never log. `last4` shown in UI.
 - **Admin**: `x-admin-token` header equal to `ADMIN_TOKEN` (constant-time compare). Disabled when unset.
 
-### 5.4 Chain workers
+### 5.4 Chain workers (Solana)
 
-**Indexer** (`chain/indexer.ts`): one `PublicClient` (viem `http(RPC_URL)`, `batch: { multicall: false }`).
-Loop every `POLL_INTERVAL_MS`: `head = getBlockNumber() − CONFIRMATIONS`; from `last_block + 1` to `head`
-in chunks of `LOG_CHUNK_BLOCKS`: `getLogs({ address: desk, events: [CreditPurchased, BudgetOpened, BudgetDrawn, BudgetClosed] })`.
-Apply inside one transaction per chunk, idempotent on `(tx_hash, log_index)`:
-- `CreditPurchased` → `credit_events(kind='purchase')`; ensure workspace; `ledger(kind='credit', amount=usd_micro, ref_type='credit_event', ref_id='<tx>:<idx>')`.
-- `BudgetOpened` → upsert `budgets` (drawn 0, closed 0); ensure workspace.
-- `BudgetDrawn` → `credit_events(kind='draw')`; ledger credit; `budgets.drawn += amount`; `budget_draws` with the same
-  `receipt_hash` → `status='confirmed', tx_hash`.
-- `BudgetClosed` → `budgets.closed = 1`.
-Store `last_block` and `last_block_hash`. **Reorg guard**: before applying, fetch the block at `last_block`; an RPC
-error or missing block is logged and skipped (never treated as a reorg); if its hash ≠ `last_block_hash`, rewind `R = CONFIRMATIONS + 10` blocks: delete `credit_events` with `block_number > last_block − R`
-and their ledger rows (`ref_type='credit_event'`), reset `budgets` affected by deleted draws (recompute `drawn` from
-remaining events), set `last_block −= R`. `GET /api/status` reports `{ lastBlock, head, lagBlocks, lastEventAt }`.
-First run: `last_block = START_BLOCK − 1`.
+All RPC access goes through a `ChainReader` / `ChainWriter` pair (`chain/rpc.ts`, `@solana/web3.js`
+`Connection` with `commitment = COMMITMENT`; both injectable so tests use a fake). Transactions are legacy
+`Transaction`s with a fresh blockhash, `feePayer = operator`, signed with the operator keypair; sending uses
+`sendRawTransaction({ skipPreflight: false, maxRetries: 3 })` and `confirmTransaction({ signature, blockhash,
+lastValidBlockHeight })`.
 
-**Budget headroom refresher** (`chain/budgets.ts`, every `BUDGET_HEADROOM_REFRESH_MS`): for each open, unexpired
-budget: `remainingCap = cap − drawn`, `allowance = token.allowance(owner, desk)`, `balance = token.balanceOf(owner)`
-(one `multicall` when available, else three reads); `headroom_tokens = min(remainingCap, allowance, balance)`;
-(allocated per owner across its budgets as defined in §5.2) `headroom_micro = quoteUsdMicro(headroom_tokens, price)` using the desk's current `quote(1e18)`-derived price
-(call `quote(10**decimals)` for `priceE18`); on `PriceStale`/`PriceUnavailable` → `headroom_micro = 0`,
-`stalled_reason = 'price'`. `headroom_tokens == 0` with `remainingCap > 0` → `stalled_reason = 'allowance'`.
+**Indexer** (`chain/indexer.ts`): every `POLL_INTERVAL_MS`: `getSignaturesForAddress(mint, { until:
+last_signature, limit: INDEX_PAGE_LIMIT, commitment })`, paging backwards with `before` until the page is
+exhausted or `until` is reached; the collected signatures are processed **oldest first** (skip entries with
+`err`), `TX_FETCH_CONCURRENCY` at a time: `getTransaction(signature, { commitment, maxSupportedTransactionVersion: 0,
+encoding: 'jsonParsed' })`. For each parsed instruction (top-level and `meta.innerInstructions`) with
+`program ∈ { 'spl-token', 'spl-token-2022' }` and `parsed.type ∈ { 'burn', 'burnChecked' }` and
+`parsed.info.mint == mint`:
+- `amount` = `info.amount` (burn) or `info.tokenAmount.amount` (burnChecked); `tokenAccount = info.account`;
+  `authority = info.authority ?? info.multisigAuthority`; `owner` = the `meta.preTokenBalances` entry whose
+  `accountIndex` resolves to `tokenAccount` (fallback `getAccountInfo` jsonParsed); `memo` = the first
+  `spl-memo` instruction's parsed string in the transaction (if any).
+- Classification: `parseMemo(memo)?.kind === 'draw'` **and** `authority == operator` → `kind='draw'`
+  (match `budget_draws.receipt_hash`; unknown hash → recorded as a draw with no batch, logged `orphan_draw`);
+  otherwise `kind='purchase'`, `workspace = parseMemo(memo)?.workspace ?? owner`.
+- Pricing: `price = priceService.current()`; `usd_micro = quoteUsdMicro(amount, price.priceE18, decimals)`;
+  `price_stale = price.stale`; below `MIN_CREDIT_USD` → `usd_micro = 0`.
+- Apply in one transaction per signature, idempotent on `(signature, ix_index)`: insert `credit_events`,
+  ensure the workspace, ledger credit (`ref_type='credit_event'`, `ref_id='<sig>:<ix>'`); draws also set
+  `budget_draws.status='confirmed'`, `signature`, and `usage.claimDrawId` for the batch rows.
+- Cursor: after a full page set is applied, `last_signature` = the newest processed signature, `last_slot`;
+  `head_slot = getSlot()`; `lagSlots = head_slot − last_slot`. The first run with no cursor processes the
+  newest `INDEX_PAGE_LIMIT` signatures only unless `INDEX_FROM_SIGNATURE` is set (then everything after it).
+  Commitment `confirmed` may in rare cases drop a transaction later; an event whose signature is no longer
+  found at `finalized` after 2 minutes is reverted (`credit_events` row deleted, ledger row deleted) — a
+  finality sweep over the last 300 slots runs every minute.
 
-**Budget drawer** (`chain/drawer.ts`, every `DRAW_INTERVAL_MS`, requires operator key, skipped in `DRY_RUN`):
-for each workspace with `balance − reserved < 0` and ≥ 1 open non-stalled budget: `deficit = −(balance − reserved)`;
-if `deficit ≥ DRAW_THRESHOLD_USD` **or** the budget expires within 1 h: pick the budget with the largest headroom;
-`usageIds` = unsettled usage rows (`draw_id IS NULL`, `paid_by='credit'`, `charged_micro > 0`) oldest first until
-their sum ≥ deficit (cap at 500 rows); `amountMicro = Σ charged_micro of those rows` (≤ `headroom_micro`, else
-truncate the list); `tokens = tokensForUsdMicro(amountMicro, priceE18)`; `batch: DrawBatch = { v: 1, chainId, desk,
-budgetId, workspace, usageIds, amountMicro, priceE18 }`; `receiptHash = receiptHash(batch)`; insert
-`budget_draws(status='pending')`, mark the usage rows `draw_id`; send `desk.draw(budgetId, tokens, receiptHash)`;
-on send → `status='sent', tx_hash`; wait for the receipt (`waitForTransactionReceipt`, 120 s); reverted →
-`status='failed', error`, un-mark its usage rows, `budgets.stalled_reason = 'draw_failed'` (cleared on the next
-successful headroom refresh showing allowance/balance); a receipt **timeout or RPC error keeps the row `sent`**
-(the transaction may still land; the indexer's `BudgetDrawn` confirms it and re-marks the usage rows). Every tick
-starts with a reconciliation of in-flight rows: `pending` without a tx older than 10 min → `failed`; `sent` →
-`getTransactionReceipt`: reverted → `failed`, mined → left for the indexer, unknown for > 60 min → `failed`.
-`usageIds` selection skips rows that do not fit the headroom instead of stopping at them, so one oversized request
-never blocks settlement of the rest. Confirmation and the ledger credit come from the indexer
-(`BudgetDrawn` with the same `receipt_hash`), never from the drawer, so the ledger has exactly one source of truth.
+**Budget scanner** (`chain/budgets.ts`): every `BUDGET_SCAN_INTERVAL_MS` the gPA scan of §3.4 (classic
+Token program) upserts budgets for every token account of the mint delegated to the operator; every
+`BUDGET_HEADROOM_REFRESH_MS` all open budgets are refreshed with `getMultipleAccountsInfo` (jsonParsed):
+`delegate`, `delegatedAmount`, `amount`, `owner`; `headroom_tokens = delegate == operator ? min(delegatedAmount,
+amount) : 0`; `headroom_micro = quoteUsdMicro(headroom_tokens, currentPrice)` (stale price → `headroom_micro = 0`,
+`stalled_reason='price'`); `delegate != operator` → `closed = 1`, `stalled_reason = 'revoked'`;
+`headroom_tokens == 0` with a delegate → `stalled_reason = 'exhausted'`. `POST /api/budgets/register` inserts
+the row immediately (validating that the account belongs to the mint and is delegated to the operator).
 
-**Price poster** (`chain/poster.ts`, optional): fetch `PRICE_FEED_URL` → `priceUsd` → `priceE18`; read
-`ManualPriceSource` bounds; clamp the step to `maxStepBps`; skip if within `minInterval` or if the change is
-< 0.5 % — **unless** the current observation is about to go stale (`age ≥ desk.maxPriceAge() − 2·PRICE_POST_INTERVAL`),
-in which case the same price is re-posted as a keep-alive; `post()` with the operator key; record in `price_posts`.
-`DRY_RUN` → log only.
+**Budget drawer** (`chain/drawer.ts`, every `DRAW_INTERVAL_MS`, requires the operator key, skipped in `DRY_RUN`):
+reconcile first (`pending` without signature older than 10 min → `failed`; `sent` → `getSignatureStatuses`:
+confirmed/finalized → leave for the indexer, error → `failed`, unknown and `getBlockHeight() > last_valid_block_height`
+→ `failed` (the transaction can no longer land — Solana's blockhash expiry makes this deterministic), else keep).
+Then for each workspace with `balance − reserved < 0` and an open non-stalled budget: `deficit = −(balance − reserved)`;
+if `deficit ≥ DRAW_THRESHOLD_USD`: pick the budget with the largest headroom; `usageIds` = unsettled usage rows
+(`draw_id IS NULL`, `paid_by='credit'`, `charged_micro > 0`) oldest first, skipping rows that do not fit, until
+their sum ≥ deficit (≤ 500 rows); `amountMicro = Σ charged_micro`; `tokens = tokensForUsdMicro(amountMicro,
+priceE18, decimals)` capped at `headroom_tokens`; `batch: DrawBatch = { v: 1, cluster, mint, tokenAccount,
+workspace, usageIds, amountMicro, priceE18, pricePointId }`; `receiptHash = receiptHash(batch)`; insert
+`budget_draws(status='pending')`, mark rows; build and send the draw transaction of §3.4; on send →
+`status='sent', signature, last_valid_block_height`. Confirmation and the ledger credit come **only** from
+the indexer (memo hash match). A `failed` draw un-marks its usage rows (`usage.clearDrawId`) and sets
+`stalled_reason='draw_failed'` on the budget until the next successful refresh.
 
-Transactions are sent with a small in-process queue (one at a time, nonce from `getTransactionCount('pending')`,
-`maxFeePerGas` from `estimateFeesPerGas`), retrying `nonce too low` once.
+**Price service** (`chain/price.ts`): §3.3. `current()` returns `{ id, priceE18, observedAt, stale, source }`
+from an in-memory cache of the last `price_points` row; refresh loop per source; `set(priceE18, source='manual')`
+for the admin API / CLI (bypasses the step bound, logged).
 
 ### 5.5 Providers and translation
 
@@ -702,17 +653,17 @@ sent as the final SSE comment line `: beagle cost=<micro> balance=<micro>` and i
 | `GET /api/usage?limit=50&before=<createdAt>&model=&status=` (key OK) | newest first, cursor pagination |
 | `GET /api/usage/summary?window=24h\|7d\|30d` (key OK) | `{ window, requests, chargedMicro, upstreamCostMicro, inputTokens, outputTokens, byModel: [{ model, requests, chargedMicro }], byDay: [{ day, requests, chargedMicro }] }` |
 | `GET /api/ledger?limit&before` | ledger rows |
-| `GET /api/receipts?limit&before` | `credit_events` of the workspace with explorer links |
+| `GET /api/receipts?limit&before` (key OK) | `credit_events` of the workspace: `CreditEventDto { signature, ixIndex, slot, blockTime, kind, workspace, payer, tokenAccount, tokenAmount, usdMicro, priceE18, pricePointId, priceStale, memo, receiptHash, explorerUrl }` |
 | `GET /api/receipts/:requestId` (key OK) | `ReceiptDto = { receipt: UsageReceipt, hash }` (`hash = receiptHash(receipt)`) |
 | `GET /api/providers`, `PUT /api/providers/:provider { apiKey, baseUrl? }`, `DELETE /api/providers/:provider`, `POST /api/providers/:provider/test` | BYOK; `provider ∈ anthropic\|openai\|google`; `baseUrl` must be `https:` and not resolve to a private/loopback range (SSRF guard; hostnames checked at save time and again at use time) ; test = minimal completion through the key |
-| `GET /api/budgets`, `GET /api/budgets/:id`, `GET /api/budgets/:id/draws` (key OK) | `BudgetDto { budgetId, owner, workspace, cap, drawn, remainingCap, headroomTokens, headroomMicro, deadline, closed, stalledReason, draws }` |
+| `GET /api/budgets`, `GET /api/budgets/:tokenAccount`, `GET /api/budgets/:tokenAccount/draws`, `POST /api/budgets/register { tokenAccount, workspace? }` (all key OK) | `BudgetDto { tokenAccount, owner, workspace, delegate, cap, balance, headroomTokens, headroomMicro, closed, stalledReason, registeredAt, lastSeenSlot, draws }`; register validates the account (mint, delegate = operator) and returns the dto (201) or 400 `not_delegated` |
 | `GET /api/upgrades`, `GET /api/upgrades/prices`, `POST /api/upgrades { kind, quantity }` (key OK) | §5.11; 402 when `available` is short |
 | `GET /api/models` (public) | `ModelDto[]` + aliases, availability per provider health and plan |
-| `GET /api/price` (public) | `{ priceE18, updatedAt, stale, usdPerToken, tokensPerUsd, source: 'manual'\|'chainlink'\|'unknown', maxPriceAge }` |
-| `GET /api/quote?tokens=<raw>` or `?usdMicro=<n>` (public) | `{ tokens, usdMicro, priceE18, updatedAt }` from `desk.quote` / inverse |
-| `GET /api/status` (public) | `{ chainId, creditDesk, token: { address, symbol, decimals, nativeBurn }, indexer: {…}, providers: Record<Provider, { state, configured }>, house: { enabled, warmUntil, largeModel }, operator: { enabled, dryRun }, version }` |
-| `GET /api/config` (public) | `{ chainId, creditDesk, token, priceSource, explorer, aliases, markupBps, byokFeeBps, pro: { priceMicro, days }, warmHourPriceMicro }` |
-| `POST /api/admin/credit { workspace, amountMicro, memo }`, `POST /api/admin/price { priceE18 }`, `GET /api/admin/workspaces` | `ADMIN_TOKEN` |
+| `GET /api/price` (public), `GET /api/price/history?limit=100` (public) | `PriceDto { pricePointId, priceE18, observedAt, stale, source: 'manual'\|'feed'\|'jupiter', maxAgeS, usdPerToken, tokensPerUsd }`; history = `PriceDto[]` newest first |
+| `GET /api/quote?tokens=<raw>` or `?usdMicro=<n>` (public) | `{ tokens, usdMicro, priceE18, pricePointId, stale }` from the current price point |
+| `GET /api/status` (public) | `{ cluster, mint, token: { mint, symbol, decimals, tokenProgram }, indexer: { lastSignature, lastSlot, headSlot, lagSlots, lastEventAt }, price: PriceDto, providers: Record<Provider, { state, configured }>, house: { enabled, warmUntil, largeModel }, operator: { address, enabled, dryRun, solBalance? }, version }` |
+| `GET /api/config` (public) | `ConfigDto { cluster, rpcUrl, mint, decimals, symbol, tokenProgram, memoProgram, operator, explorer, aliases, markupBps, byokFeeBps, minCreditMicro, pro: { priceMicro, days }, warmHourPriceMicro }` |
+| `POST /api/admin/credit { workspace, amountMicro, memo }`, `POST /api/admin/price { priceE18 }` (manual price point), `GET /api/admin/workspaces` | `ADMIN_TOKEN` |
 | `GET /healthz` | `{ ok: true }` |
 
 All monetary values are decimal strings. List routes without pagination (`/api/keys`, `/api/providers`, `/api/budgets`,
@@ -741,8 +692,10 @@ here (no agent key on the server).
 
 ### 5.12 CLI (`gateway/src/cli.ts`, `pnpm --filter @beagle/gateway cli -- <cmd>`)
 
-`migrate`, `create-key --workspace 0x… [--name]` (prints the key), `credit --workspace 0x… --usd 10 [--memo]`
-(admin adjustment; refuses when `NODE_ENV=production` unless `--force`), `post-price --usd 0.01`, `status`.
+`migrate`, `create-key --workspace <base58> [--name]` (prints the key on stdout), `credit --workspace <base58>
+--usd 10 [--memo]` (admin adjustment; refuses when `NODE_ENV=production` unless `--force`), `set-price --usd 0.01`
+(manual price point), `register-budget --token-account <base58> [--workspace <base58>]`, `status`
+(indexer cursor, head slot, price, operator balance in SOL).
 
 ### 5.13 Logging
 
@@ -753,15 +706,25 @@ logged unless `LOG_PROMPTS=true`. Provider keys, API keys, session ids never app
 
 ### 6.1 Transports
 
-- `bin/beagle-mcp` (stdio): env `BEAGLE_API_URL` (default `http://localhost:8787` → document), `BEAGLE_API_KEY`
-  (required), optional `BEAGLE_AGENT_PRIVATE_KEY` (hex) + `BEAGLE_RPC_URL`. With an agent key the wallet tools
-  **execute** transactions (approve → burn/openBudget, wait for receipt, then poll `/api/balance` up to 60 s until
-  the credit appears); without it they return one object
-  `{ unsigned: true, chainId, steps: [{ to, data, value: '0', description }] }` (approve first, then
-  `burnForCredit` / `openBudget`) so a wallet-capable agent can sign each step. The package is not published to
-  npm: docs reference the local build (`node packages/mcp/dist/bin.js`) or the gateway's HTTP transport.
-- Library: `createBeagleMcpServer(api: BeagleApi, opts: { wallet?: WalletExecutor }) → McpServer` (used by the gateway
-  with the HTTP transport).
+- `bin/beagle-mcp` (stdio): env `BEAGLE_API_URL` (default `http://localhost:8787`), `BEAGLE_API_KEY`
+  (required), optional `BEAGLE_AGENT_SECRET_KEY` (base58 or JSON byte array of a Solana keypair) +
+  `BEAGLE_RPC_URL` (defaults to the cluster RPC from `GET /api/config`), optional `BEAGLE_WORKSPACE`. With
+  an agent key the wallet tools **execute** transactions (burn + memo, approve, revoke; wait for confirmation,
+  then poll `/api/balance` / `/api/receipts` up to 60 s until the credit appears when `waitForCredit`); without
+  it they return `{ unsigned: true, cluster, transactions: [{ base64, description }] }` — unsigned legacy
+  transactions with `feePayer = workspace` and a fresh blockhash — so a wallet-capable agent can sign and send
+  each one. The package is not published to npm: docs reference the local build
+  (`node packages/mcp/dist/bin.js`) or the gateway's HTTP transport.
+- Library: `createBeagleMcpServer(api: BeagleApi, opts: { wallet?: WalletExecutor; workspace?; waitForCredit?; … }) → McpServer`
+  (used by the gateway with the HTTP transport).
+
+`WalletExecutor` (`src/wallet.ts`): `address`, `buyCompute({ workspace, tokens }) → { signature, slot? }`
+(`BurnChecked` from the agent's token account of the mint — the ATA, or the largest account when the ATA is
+empty — plus `Memo(beagle:v1 ws=…)` when `workspace ≠ agent`), `openBudget({ cap }) → { signature, tokenAccount }`
+(`ApproveChecked(ata, operator, cap)` then `POST /api/budgets/register`), `closeBudget({ tokenAccount }) → { signature }`
+(`Revoke`); `createKeypairWalletExecutor({ secretKey, rpcUrl, deployment })`; `buildUnsignedTransactions(...)` for
+the same three actions. Errors surface as `WalletError` codes (`insufficient_tokens`, `insufficient_sol`,
+`blockhash_expired`, `tx_failed`, `chain_mismatch`), never the secret key.
 
 ### 6.2 `BeagleApi` interface and REST client
 
@@ -784,8 +747,9 @@ implementation calls its services directly.
 | `beagle_quote` | `{ usd? \| tokens? }` | `QuoteDto` |
 | `beagle_complete` | `{ prompt? , messages?, system?, model? ('beagle/auto'), max_tokens?, difficulty? }` | `{ text, model, provider, paidBy, costMicro, balanceMicro, finishReason }` |
 | `beagle_usage` | `{ limit?, window? }` | rows + summary |
-| `beagle_buy_compute` | `{ usd? \| tokens?, workspace?, tolerance_bps? (0..5000, default 100) }` | burns through `burnForCreditMin` with `minUsdMicro` from the quote; executed: `{ txHash, receiptId?, creditedMicro, balanceMicro, minUsdMicro, toleranceBps }`; else unsigned steps |
-| `beagle_open_budget` | `{ usd? \| tokens?, hours (≤ 720), workspace? }` | executed: `{ txHash, budgetId }`; else unsigned steps |
+| `beagle_buy_compute` | `{ usd? \| tokens?, workspace? }` | burn + memo; executed: `{ signature, creditedMicro, balanceMicro, pricePointId, priceStale }`; else unsigned transactions. The description says credit is computed from the published price when the burn is observed and warns when the price is stale |
+| `beagle_open_budget` | `{ usd? \| tokens?, workspace? }` | `ApproveChecked` of the cap to the operator + register; executed: `{ signature, tokenAccount, cap }`; else unsigned transactions. Notes that a new approval replaces the previous cap |
+| `beagle_close_budget` | `{ tokenAccount? }` | `Revoke`; executed: `{ signature }`; else unsigned |
 | `beagle_budgets` | — | `BudgetDto[]` |
 | `beagle_upgrade` | `{ kind: 'pro'\|'warm', quantity? }` | `UpgradeDto` |
 | `beagle_status` | — | `StatusDto` |
@@ -796,93 +760,118 @@ SDK's in-memory transport pair.
 
 ## 7. Web app (`web/`, `@beagle/web`)
 
-Vite 8, React 19, react-router 7 (data router), wagmi 3 + viem (connectors: injected, WalletConnect when
-`VITE_WALLETCONNECT_PROJECT_ID` set), TanStack Query 5, Tailwind 4. Dark theme, monospace accents, English UI.
-No chart libraries (CSS bars). Vitest for `lib/` and hooks logic.
+Vite 8, React 19, react-router 7 (data router), `@solana/wallet-adapter-react` + `-react-ui` (modal) with
+wallet-standard auto-discovery (Phantom, Solflare, Backpack, …; no hard-coded adapters required),
+`@solana/web3.js` + `@solana/spl-token` for transactions, TanStack Query 5, Tailwind 4. Dark theme,
+monospace accents, English UI. No chart libraries (CSS bars). Vitest for `lib/` and hooks logic.
 
-Env: `VITE_CHAIN_ID` (31337), `VITE_GATEWAY_URL` (dev proxy target for `/api`, `/v1`, `/mcp`; prod: same origin
-when empty), `VITE_CREDIT_DESK_ADDRESS` (override), `VITE_RPC_URL`, `VITE_WALLETCONNECT_PROJECT_ID`, `VITE_MULTICALL`.
-Deployment addresses come from `@beagle/shared` `resolveDeployment(chainId, { creditDesk: VITE_CREDIT_DESK_ADDRESS })`
-and the token address from `GET /api/config`.
+Env: `VITE_CLUSTER` (localnet), `VITE_RPC_URL` (override), `VITE_GATEWAY_URL` (dev proxy target for `/api`,
+`/v1`, `/mcp` and the SIWS domain; prod: same origin when empty), `VITE_MINT_ADDRESS` (override). The mint,
+decimals, symbol, token program and operator come from `GET /api/config` (reconciled with the committed
+deployment: a disagreement disables burning and shows why).
 
 Routes:
 - `/` **Landing**: hero ("Compute for agents. Burn becomes compute."), three cards (one key for every model /
-  router keeps your best model for hard work / paid by burning BEAGLE, no e-mail, no card), live strip from
-  `/api/status` + `/api/price` (token price, indexer height, provider health), code sample (curl), CTA → `/app`.
+  router keeps your best model for hard work / paid by burning BEAGLE from your Solana wallet, no e-mail, no card),
+  live strip from `/api/status` + `/api/price` (token price + source + freshness, indexer head slot and lag,
+  provider health), code sample (curl), CTA → `/app`.
 - `/models` **Models & pricing**: table from `/api/models` (tier, context, price in/out per 1M, availability, Pro).
 - `/docs` **Docs**: quick start with the gateway base URL (curl, OpenAI SDK python/node `base_url`, Anthropic SDK
-  `baseURL`, MCP config JSON for Claude Desktop / Claude Code with `beagle-mcp`), headers reference, aliases, 402 semantics.
+  `baseURL`, MCP config JSON for Claude Desktop / Claude Code with the local `beagle-mcp` build), headers
+  reference, aliases, 402 semantics, "how credit is computed" (burn amount × published price at observation),
+  budgets as SPL delegation, receipt verification snippet.
 - `/app` **Overview** (signed in): balance card (available / reserved / budget headroom), plan, 24 h usage, latest
   requests, token price, "Buy credit" CTA.
-- `/app/credits` **Credits**: amount input (USD or BEAGLE, toggles), live quote via `readContract(desk.quote)`,
-  wallet token balance + allowance, steps **Approve → Burn** (cumulative `approve(desk, allowance + amount)` when
-  the allowance is short — open budgets of the same wallet share it — then `burnForCreditMin(workspace, amount,
-  minUsdMicro)` with a user-selectable price tolerance, default 1 %; workspace defaults to the signed-in workspace,
-  editable "credit another workspace"), tx progress with explorer links, then poll `/api/balance` until the ledger shows the credit
-  (indexer lag notice). Shows `minBurn`, price staleness warnings (disable when `stale`).
+- `/app/credits` **Credits**: amount input (USD or BEAGLE, toggles), live conversion at the published price
+  (`/api/price`; refreshed every 15 s; disabled when `stale` with an explanation), wallet token balance
+  (`getTokenAccountBalance` of the ATA; "no token account" state), **one wallet confirmation**: a transaction
+  `[BurnChecked(ata, mint, owner, amount, decimals), Memo(beagle:v1 ws=<workspace>) when crediting another
+  workspace]` sent with `sendTransaction` from the wallet adapter and confirmed with the blockhash/height
+  pair; then poll `/api/receipts` until the purchase row with that signature appears (indexer lag notice,
+  ~2–10 s), then `/api/balance`. The target workspace defaults to the signed-in workspace; "credit another
+  workspace" validates base58. Shows the price point that will apply ("computed when observed") and the
+  minimum amount (`MIN_CREDIT_USD`).
 - `/app/keys`: create (shows the key once with copy), list, revoke.
 - `/app/usage`: summary tiles (window selector), by-model bars, by-day bars, table with request id → `/app/receipts/:id`.
 - `/app/receipts/:id`: `UsageReceipt` fields, canonical JSON, hash, "verify locally" snippet.
 - `/app/providers`: BYOK add/replace/remove per provider, test button, encrypted-at-rest notice.
 - `/app/upgrades`: Pro (price, days, current `planUntil`, buy), Warm hours (hours input, price, buy, current warm window).
-- `/app/budgets`: open a budget (cap in USD/BEAGLE, hours; Approve cap → `openBudget`), list with cap/drawn/headroom/
-  deadline/stalled reason, draws with tx links, close.
-- Global: wallet button, chain guard (switch/add Robinhood Chain via EIP-3085), SIWE sign-in flow
-  (`nonce → createSiweMessage → signMessage → verify`), session restore via `GET /api/me`, toasts, error boundary, 404.
+- `/app/budgets`: open a budget (cap in USD/BEAGLE; `ApproveChecked(ata, operator, cap)` in one wallet
+  confirmation, then `POST /api/budgets/register`), list with cap/balance/headroom/stalled reason, draws with
+  explorer links, close (`Revoke`). Explains that a new approval replaces the previous cap and that the
+  operator can only burn, never transfer.
+- Global: wallet modal button, cluster badge (mismatch warning when the wallet is on another cluster is not
+  detectable from the page — the page states the cluster it talks to), SIWS sign-in flow
+  (`nonce → createSiwsMessage → signMessage → verify`), session restore via `GET /api/me`, toasts, error boundary, 404.
 
-`web/src/lib/` holds pure helpers (formatting, step state machines, SIWE message building) with tests; hooks wrap
-wagmi/query; components are presentational.
+`web/src/lib/` holds pure helpers (formatting, transaction builders returning `TransactionInstruction[]`, SIWS
+message building, step state machines, explorer links) with tests; hooks wrap wallet-adapter/query; components
+are presentational.
 
 ## 8. Dev, e2e, CI, Docker
 
-- Root scripts: `build`, `typecheck`, `test`, `lint`, `dev:gateway`, `dev:web`, `contracts:build`, `contracts:test`,
-  `abi:sync`, `deployments:sync`, `anvil:e2e`.
+- Root scripts: `build`, `typecheck`, `test`, `lint`, `dev:gateway`, `dev:web`, `deployments:sync`,
+  `cluster:setup` (`bash solana/scripts/setup-cluster.sh localnet`), `solana:e2e`.
 - `scripts/mock-provider.mjs`: OpenAI-compatible server (`/v1/models`, `/v1/chat/completions` JSON + SSE) returning
   deterministic text (`echo:` + last user message, capped) with usage; env `MOCK_FAIL_RATE`, `MOCK_STATUS` for tests.
-- `scripts/anvil-e2e.sh`: anvil (`--block-time 1`) → `Deploy.s.sol` (deployer/operator/poster = anvil #0,
-  `INITIAL_PRICE_E18 = 1e16` i.e. $0.01, token to #0; #0 transfers 100 000 BEAGLE to #1 and #2) →
-  `sync-deployments` → build → mock provider on 9999 → gateway (`HOUSE_BASE_URL=http://127.0.0.1:9999/v1`,
-  no platform keys, `DRY_RUN=false`, operator = #0, temp DB, `DRAW_THRESHOLD_USD=0.000001`, `DRAW_INTERVAL_MS=2000`) →
-  `create-key` for #1 and #2 → `cast send` #1 `approve` + `burnForCredit(#1, 1000e18)` ($10) → wait for
-  `/api/balance ≥ 9_990_000` → `POST /v1/chat/completions {model:'beagle/auto'}` → assert 200,
-  `x-beagle-model == house/gpt-oss-20b`, cost > 0, balance decreased, `/api/usage` has the row, `/api/receipts/:id`
-  hash recomputes → streaming request asserts SSE frames and `[DONE]` → `/v1/messages` request asserts Anthropic
-  shape → #2 (no credit) gets 402 → #2 `approve(cap)` + `openBudget(#2, 500e18, +1h)` → wait for headroom → #2
-  request succeeds (balance negative) → drawer draws → indexer credits → `/api/balance` of #2 shows `balance ≥ 0`
-  and `/api/budgets` shows `drawn > 0` with a confirmed draw whose `receiptHash` recomputes → MCP HTTP:
-  `tools/list` and `beagle_balance` via `curl` JSON-RPC → exit 0. Timeouts fail loudly; cleanup via `trap`.
-- CI (`.github/workflows/ci.yml`): job `contracts` (foundry-toolchain stable: `forge fmt --check`, `forge build --sizes`,
-  `forge test -vvv`, fixtures diff); job `node` (pnpm 10 taken from `packageManager` in the root package.json —
-  `pnpm/action-setup@v4` gets no `version` input, Node 22: install, `forge build`, `abi:sync --check`,
-  build, typecheck, test, `anvil:e2e`).
+- `solana/scripts/setup-cluster.sh <cluster>`: for `localnet` uses the committed test keypairs
+  (`solana/keys/deployer.json`, `solana/keys/mint-localnet.json`, `solana/keys/operator.json`), airdrops SOL,
+  creates the mint (6 decimals, fixed mint keypair → deterministic address), mints 1e9 tokens to the deployer,
+  disables minting, writes `solana/deployments/localnet.json`; for `devnet`/`mainnet-beta` takes
+  `DEPLOYER_KEYPAIR`, `OPERATOR_PUBKEY`, optional `MINT_KEYPAIR`/`EXISTING_MINT` from env.
+- `scripts/solana-e2e.sh`: `solana-test-validator --reset --quiet --ledger <tmp>` (port 8899) → setup-cluster
+  localnet → `sync-deployments` → build → mock provider on 9999 → gateway (`CLUSTER=localnet`,
+  `OPERATOR_SECRET_KEY` = operator keypair, `DRY_RUN=false`, `PRICE_SOURCE=manual`, `INITIAL_PRICE_USD=0.01`,
+  `MIN_CREDIT_USD=0.000001`, `DRAW_THRESHOLD_USD=0.000001`, `DRAW_INTERVAL_MS=2000`, `BUDGET_SCAN_INTERVAL_MS=2000`,
+  `BUDGET_HEADROOM_REFRESH_MS=2000`, temp DB) → two agent keypairs (generated into the temp dir), airdrop, ATAs
+  funded with 100 000 BEAGLE each (`spl-token transfer --fund-recipient --allow-unfunded-recipient`) → `create-key`
+  for both → agent 1 burns 1000 BEAGLE (`node scripts/e2e/burn.mjs` using `@solana/spl-token` `createBurnCheckedInstruction`
+  + memo; or `spl-token burn` when it supports a memo) → wait for `/api/balance ≥ 9_990_000` and assert exactly
+  `10_000_000` → `POST /v1/chat/completions {model:'beagle/auto'}` → 200, `x-beagle-model == house/gpt-oss-20b`,
+  cost > 0, balance decreased, `/api/usage` row, `/api/receipts/:id` hash recomputes → streaming request asserts
+  SSE frames and `[DONE]` → `/v1/messages` Anthropic shape → agent 2 (no credit) gets 402 → agent 2 approves the
+  operator for 500 BEAGLE (`spl-token approve <ata> 500 <operator>`) and registers (`POST /api/budgets/register`)
+  → headroom appears → agent 2 request succeeds (balance negative) → drawer burns as delegate → indexer confirms
+  → `/api/balance ≥ 0`, `/api/budgets` shows the draw confirmed with a recomputable receipt hash and
+  `cap` decreased by the drawn amount → agent 2 revokes → budget `closed` → MCP HTTP `initialize`, `tools/list`,
+  `beagle_balance` → `/api/status.cluster == 'localnet'` → ALL GOOD. Timeouts fail loudly; cleanup via `trap`
+  (validator killed, ledger dir removed, committed `localnet.json`/generated file untouched because the mint
+  keypair is fixed).
+- CI (`.github/workflows/ci.yml`): one job: install the Agave release tarball (cached), pnpm 10 from
+  `packageManager`, Node 22, `pnpm install --frozen-lockfile`, `sync-deployments --check`, build, typecheck,
+  test, web lint, `solana:e2e`.
 - Docker: `docker/gateway.Dockerfile` (node:22-alpine, pnpm, workspace build, `NODE_ENV=production`,
   `node gateway/dist/main.js`), `docker/web.Dockerfile` (build → nginx; `docker/nginx.conf` proxies `/api`,
-  `/v1`, `/mcp`, `/healthz` to `gateway:8787` with SSE-friendly `proxy_buffering off`), a root `.dockerignore`
-  (host `node_modules`, `dist`, `.env*` except `.env.example`, `gateway/data`, `*.sqlite*`, foundry outputs never
-  enter the build context), `docker-compose.yml`: `gateway` (`env_file: .env`, `DEPLOYER_PRIVATE_KEY` blanked),
-  `web`, profile `gpu`: `house` (`vllm/vllm-openai`, `--model openai/gpt-oss-20b --served-model-name
-  openai/gpt-oss-20b`, NVIDIA device reservation), profile `gpu-large`: `house-large` (`gpt-oss-120b`).
-  `HOUSE_BASE_URL=http://house:8000/v1` in the compose env; the gateway has a single house endpoint, so serving
-  both house models needs an OpenAI-compatible router in front of the two services (DEPLOY §3).
+  `/v1`, `/mcp`, `/healthz` to `gateway:8787` with SSE-friendly `proxy_buffering off`), root `.dockerignore`,
+  `docker-compose.yml`: `gateway` (`env_file: .env`), `web`, profile `gpu`: `house` (`vllm/vllm-openai`), profile
+  `gpu-large`: `house-large`. `HOUSE_BASE_URL=http://house:8000/v1` in the compose env; the gateway has a single
+  house endpoint, so serving both house models needs an OpenAI-compatible router in front (DEPLOY §3).
 
 ## 9. Security and trust model
 
-- **Burn is final and verifiable.** Credit equals the `usdMicro` in the on-chain event; the price used is the one
-  the contract read. Anyone can recompute credits from events; the gateway's ledger is a cache of them plus debits.
-- **Operator** (gateway hot wallet) can only (a) post prices within `maxStepBps`/`minInterval` on
-  `ManualPriceSource` and (b) `draw` from budgets up to each cap before its deadline, with a receipt hash of the
-  usage it settles. It cannot move user tokens otherwise. Owner (multisig on mainnet) controls params and pause.
-- **Keys**: API keys hashed; BYOK encrypted (AES-256-GCM) with a server master key; sessions random; SIWE nonces
-  single-use; CORS restricted to `PUBLIC_WEB_ORIGIN`; `baseUrl` SSRF guard; body size limits; per-key rate limits.
+- **Burn is final.** Credit is derived from the burn amount and the **published** price point in force when the
+  gateway observed the burn; both are recorded on the credit event and can be recomputed by anyone from the mint's
+  transaction history plus `/api/price/history`. The gateway's ledger is a cache of chain events plus debits.
+- **No custom program.** Users only sign SPL `Burn` (final), `Approve` and `Revoke` (bounded, revocable). The
+  operator keypair only signs delegate `Burn`s up to each delegated amount; it cannot transfer user tokens.
+  Keep it funded with a little SOL for fees; rotate by changing `operator` in the deployment and asking agents to
+  re-approve.
+- **Price risk.** The price is set off-chain (manual / feed / Jupiter) with a step bound and a staleness flag;
+  changes are published before they apply (new point appended, visible in `/api/price/history`). A malicious or
+  broken feed can only over- or under-credit future burns within `PRICE_MAX_STEP_BPS` per refresh; the operator
+  should alert on `price_rejected` logs.
+- **Keys**: API keys hashed; BYOK encrypted (AES-256-GCM) with a server master key; sessions random; SIWS nonces
+  single-use with expiry; CORS restricted to `PUBLIC_WEB_ORIGIN`; `baseUrl` SSRF guard (no redirects); body size
+  limits; per-key rate limits.
 - **Prompts** are not persisted (only token counts and costs) unless `LOG_PROMPTS=true`.
 - **Fallback never silently upgrades price class** beyond the request: `cheaper` is the default; `any` is opt-in.
 - **Known gaps**: provider price snapshots must be maintained by the operator; the house model is only as
-  available as the GPU behind `HOUSE_BASE_URL`, and that single endpoint must serve both `HOUSE_MODEL_SMALL`
-  and `HOUSE_MODEL_LARGE` (no per-model base URL yet); the Manual price source trusts the poster within bounds —
-  use `ChainlinkPriceSource` when a feed exists.
+  available as the GPU behind `HOUSE_BASE_URL`; `confirmed` commitment can in rare cases be rolled back
+  (finality sweep reverts such credits); budgets are approvals, not escrow — the owner can revoke before a draw,
+  so the gateway settles often (`DRAW_THRESHOLD_USD`) and caps the post-paid gap by the reserve rules.
 
 ## 10. Addresses
 
-See `docs/ROBINHOOD_CHAIN.md` for chain parameters, Uniswap/Pons/WETH9 addresses, explorers and faucets.
-Deployed `CreditDesk`/token/price-source addresses live in `contracts/deployments/<chainId>.json` and
-`packages/shared/src/deployments.generated.ts`.
+Program ids are in `@beagle/shared/addresses` (§1). Deployed mints and the operator key per cluster live in
+`solana/deployments/<cluster>.json` and `packages/shared/src/deployments.generated.ts`; `docs/SOLANA.md` lists
+RPC endpoints, explorers, faucets and the pump.fun launch notes for mainnet.

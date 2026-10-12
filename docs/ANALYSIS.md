@@ -1,4 +1,4 @@
-# Анализ проекта Darwin (@darwincompute) и план порта на Robinhood Chain
+# Анализ проекта Darwin (@darwincompute) и план порта (Solana)
 
 ## 1. Что такое Darwin Compute
 
@@ -51,61 +51,59 @@ for agents*, зарегистрирован в октябре 2026), сайт `d
 | Агенты | MCP-сервер даёт агенту баланс, модели, запуск запросов и покупку compute; агент может **авторизовать бюджет** из своего кошелька под задачу. |
 | Тарифы | Цены в токенах пересчитываются по курсу `$DARWIN`; изменения публикуются заранее. |
 
-## 3. Что переносим и что меняем для Robinhood Chain
+## 3. Что переносим и что меняем для Solana
 
-Robinhood Chain — EVM L2 на стеке Arbitrum Orbit (Nitro), газ в ETH, блоки ~100 мс, mainnet chain id
-**4663**, testnet **46630**. Роль pump.fun играет лаунчпад **Pons V2** (ponsfamily.com): токен проекта на
-mainnet запускается на Pons, а наш контракт принимает любой ERC-20 (`docs/ROBINHOOD_CHAIN.md`).
+Оригинал живёт на Solana, и порт остаётся на Solana: токен — SPL-mint (на mainnet — запущенный через
+pump.fun, 6 знаков), оплата — обычный SPL-`Burn` из кошелька пользователя, никакой собственной программы.
+Это ровно то, что делает Darwin («burning $DARWIN from your wallet»): сервис смотрит на сжигания своего
+mint'а и начисляет кредит по опубликованному курсу.
 
-| Компонент | Darwin / Solana | Beagle / Robinhood Chain (наша реализация) |
+| Компонент | Darwin | Beagle (наша реализация) |
 |---|---|---|
-| Токен | SPL `$DARWIN` (pump.fun) | ERC-20 `BEAGLE` (1 млрд, фикс. эмиссия) — на testnet/anvil наш `BeagleToken`; на mainnet токен с Pons |
-| Сжигание → кредит | Транзакция burn, сервис начисляет по своему курсу | Контракт **`CreditDesk.burnForCredit(workspace, amount)`**: сжигает токены (burn или перевод на `0x…dEaD`) и **пишет в событие USD-номинал по ончейн-цене** `IPriceSource`. Кредит начисляется ровно по событию — любой может пересчитать |
-| Курс токена | Внутренний | `ManualPriceSource` (оператор публикует цену с ограничением шага/частоты) или `ChainlinkPriceSource`; квота отклоняется при устаревшей цене |
-| Бюджет агента | «authorize a budget from the wallet» | **`openBudget(workspace, cap, deadline)`** + `approve`: оператор списывает (`draw`) токены по мере потребления, не выше `cap`, с хэшем квитанции об использовании; агент в любой момент закрывает бюджет |
-| Вход | Кошелёк Solana | **SIWE** (EIP-4361) кошельком EVM; workspace = адрес |
+| Токен | SPL `$DARWIN` (pump.fun) | SPL `BEAGLE`; на localnet/devnet создаётся скриптом `solana/scripts/setup-cluster.sh` (6 знаков, эмиссия 1 млрд, mint authority отключён) |
+| Сжигание → кредит | Burn из кошелька, сервис начисляет по своему курсу | **SPL `BurnChecked`** из кошелька (+ опциональный Memo `beagle:v1 ws=<pubkey>`, чтобы зачислить другому workspace). Индексатор находит сжигания через `getSignaturesForAddress(mint)` и начисляет `amount · price` по **опубликованной точке цены** на момент наблюдения; точка цены записывается в событие |
+| Курс токена | Внутренний, «rates follow the $darwin price» | `PriceService`: manual / HTTP-feed / Jupiter Price API; история точек публична (`/api/price/history`), шаг ограничен, устаревание помечается |
+| Бюджет агента | «authorize a budget from the Solana wallet» | **SPL-делегирование**: агент делает `ApproveChecked(ata, delegate = оператор, cap)`; оператор сжигает из счёта агента как делегат по мере потребления (memo с хэшем квитанции), SPL сам уменьшает `delegatedAmount`; `Revoke` закрывает бюджет в любой момент |
+| Вход | Кошелёк Solana | **Sign-In-With-Solana** (подпись сообщения, проверка ed25519); workspace = публичный ключ |
 | API | OpenAI-совместимый | OpenAI-совместимый `/v1/chat/completions` (+ stream) и Anthropic-совместимый `/v1/messages`; один ключ `bgl_…` |
-| Роутер | «auto», спуск по лимитам | Детерминированная политика в `@beagle/shared`: сложность → уровень (frontier/efficient/budget/house), понижение при малом остатке кредита и при деградации провайдера (circuit breaker по 429/5xx), последняя ступень — house-модель |
+| Роутер | «auto», спуск по лимитам | Детерминированная политика в `@beagle/shared`: сложность → уровень (frontier/efficient/budget/house), понижение при малом остатке кредита и деградации провайдера (circuit breaker), последняя ступень — house-модель |
 | BYOK | Зашифрованные ключи | AES-256-GCM с мастер-ключом сервера; запросы через BYOK кредит не тратят |
-| Своя модель | gpt-oss / Qwen на GPU | `house/gpt-oss-20b` (по умолчанию) и `house/gpt-oss-120b` (Pro) через vLLM (OpenAI-совместимый endpoint); в разработке — мок |
-| Апгрейды | Pro, warm hours | `pro` (30 дней) и `warm` (часы) покупаются кредитом; драйвер «тёплого» GPU — подключаемый |
-| MCP | MCP-сервер для агентов | `@beagle/mcp`: stdio-бинарь и HTTP-транспорт `/mcp` в шлюзе; инструменты баланс/модели/квота/запрос/покупка compute/бюджет/апгрейд |
-| Тарифы | По курсу токена | Кредит в µUSD; каталог цен моделей + наценка (`MARKUP_BPS`); стоимость в токенах следует за ончейн-ценой автоматически |
+| Своя модель | gpt-oss / Qwen на GPU | `house/gpt-oss-20b` и `house/gpt-oss-120b` (Pro) через vLLM; в разработке — мок |
+| Апгрейды | Pro, warm hours | `pro` (30 дней) и `warm` (часы) покупаются кредитом |
+| MCP | MCP-сервер для агентов | `@beagle/mcp`: stdio-бинарь и HTTP-транспорт `/mcp`; инструменты баланс/модели/квота/запрос/покупка compute/бюджет (approve, revoke)/апгрейд; с ключом агента транзакции исполняются сами, без — возвращаются неподписанными |
+| Тарифы | По курсу токена | Кредит в µUSD; каталог цен моделей + наценка; стоимость в токенах следует за опубликованной ценой |
 
-Что добавляем сверх оригинала (дёшево и усиливает доверие): квитанции по каждому запросу с канонической
-JSON-записью и хэшем; хэш пакета использования в `draw` бюджета; публичный `/api/status` с лагом
+Что добавляем сверх оригинала: квитанция по каждому запросу (канонический JSON + хэш), хэш пакета
+использования в memo каждого списания из бюджета, публичная история цены, `/api/status` с лагом
 индексатора и здоровьем провайдеров.
 
-Чего не делаем: собственный лаунчпад (на mainnet — Pons), фьючерсы по токену, свой GPU-парк (в репозитории —
-compose-профиль с vLLM).
+Чего не делаем: собственная on-chain программа (не нужна — SPL Token даёт и сжигание, и делегирование),
+лаунчпад (на mainnet — pump.fun), свой GPU-парк (в репозитории — compose-профиль с vLLM).
 
 ## 4. Архитектура порта (кратко)
 
 ```
-  пользователь / агент                        оператор (горячий кошелёк шлюза)
-     │ approve + burnForCredit()                  │ draw(budgetId, amount, receiptHash)
-     │ approve + openBudget()                     │ post(price) → ManualPriceSource
-     ▼                                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│ CreditDesk (Robinhood Chain)                                 │
-│  • quote(amount) по IPriceSource (свежесть ≤ maxPriceAge)    │
-│  • burnForCredit → CreditPurchased(receiptId, workspace, …) │
-│  • openBudget / draw / closeBudget → Budget* события         │
-└───────────────────────────┬──────────────────────────────────┘
-                            │ события (viem getLogs)
+  пользователь / агент (кошелёк Solana)             оператор (keypair шлюза, делегат)
+     │ BurnChecked(ata, mint, amount) [+ Memo ws=…]     │ BurnChecked(ata агента, authority = делегат)
+     │ ApproveChecked(ata, delegate = оператор, cap)    │   + Memo "beagle:draw v1 ws=… h=<хэш квитанции>"
+     ▼                                                  ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ Solana: SPL Token program + Memo program (своей программы нет)   │
+└───────────────────────────┬──────────────────────────────────────┘
+                            │ getSignaturesForAddress(mint) → getTransaction (jsonParsed)
                             ▼
 ┌──────────────────────────────┐   REST /api/*   ┌──────────────────┐
 │ gateway (Node 22, Hono)      │ ◀─────────────▶ │ web (Vite/React) │
-│  индексатор → SQLite-леджер  │                 │  лендинг         │
-│  SIWE, API-ключи, BYOK       │                 │  Credits (burn)  │
-│  роутер + метеринг           │                 │  ключи, usage    │
-│  /v1/chat/completions        │ ◀── агенты ──▶  │  бюджеты, Pro    │
-│  /v1/messages, /mcp          │  MCP stdio/HTTP │                  │
+│  индексатор → SQLite-леджер  │                 │  wallet-adapter  │
+│  точки цены (публичные)      │                 │  Credits (burn)  │
+│  SIWS, API-ключи, BYOK       │                 │  Budgets (approve│
+│  роутер + метеринг           │ ◀── агенты ──▶  │   / revoke)      │
+│  /v1/chat/completions, /mcp  │  MCP stdio/HTTP │  ключи, usage    │
 └──────────┬───────────────────┘                 └──────────────────┘
            │ Anthropic SDK · OpenAI-совместимые (OpenAI, Gemini, vLLM house)
            ▼
      провайдеры моделей
 ```
 
-Нормативное описание — `docs/SPEC.md`. Сеть и адреса — `docs/ROBINHOOD_CHAIN.md`. Развёртывание —
+Нормативное описание — `docs/SPEC.md`. Сеть, RPC, эксплореры, фаучеты — `docs/SOLANA.md`. Развёртывание —
 `docs/DEPLOY.md`.
