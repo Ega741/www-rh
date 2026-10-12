@@ -1,128 +1,96 @@
-# Deploying Beagle
+# Deploying Beagle (Solana)
 
-Three moving parts: the contracts (`CreditDesk`, a price source, optionally `BeagleToken`), the gateway
-(API + indexer + operator) and the web app. Everything is configured from one `.env` (see `.env.example`).
-Network parameters and addresses: `docs/ROBINHOOD_CHAIN.md`.
+Three moving parts: the token (an SPL mint — nothing to deploy on-chain beyond it), the gateway (API + indexer +
+operator keypair + price service) and the web app. Everything is configured from one `.env` (see
+`.env.example`). Clusters, RPC endpoints, explorers and faucets: `docs/SOLANA.md`.
 
 ## 0. Prerequisites
 
-- Node ≥ 22.13, pnpm 10, Foundry (stable), Docker (optional), `git submodule update --init --recursive`.
-- Wallets: **deployer** (pays gas), **owner** (multisig with a timelock on mainnet; may equal deployer on
-  testnet), **operator** (gateway hot wallet: posts prices and draws budgets), **poster** (usually the operator).
-- ETH on Robinhood Chain for gas (testnet faucets in `docs/ROBINHOOD_CHAIN.md`).
+- Node ≥ 22.13, pnpm 10, Solana CLI 3.x (`solana`, `solana-keygen`, `spl-token`, `solana-test-validator` for local
+  work), Docker (optional).
+- Keypairs: **deployer** (creates the mint on devnet; pays fees), **operator** (the gateway's hot wallet: it signs
+  delegate burns for agent budgets and needs a little SOL), the web and agents bring their own wallets.
+- SOL for fees (devnet faucet in `docs/SOLANA.md`).
 
 ## 1. Token
 
-- **Testnet / anvil**: let `Deploy.s.sol` deploy `BeagleToken` (1 000 000 000 BEAGLE to `TOKEN_RECIPIENT`).
-- **Mainnet**: launch the token the way the original launched `$DARWIN` on pump.fun — on **Pons**
-  (ponsfamily.com, Robinhood Chain's launchpad) — then set `TOKEN=<address>` and `NATIVE_BURN=false`
-  (Pons tokens have no `burn()`; the desk burns by transfer to `0x…dEaD`). Any ERC-20 works.
+- **Localnet / devnet**: `bash solana/scripts/setup-cluster.sh <cluster>` creates a 6-decimal mint, mints the supply
+  to the deployer, disables further minting and writes `solana/deployments/<cluster>.json`. Localnet uses the
+  committed test keypairs in `solana/keys/` (never fund them anywhere else).
+- **Mainnet**: launch the token the way the original launched `$DARWIN` — on **pump.fun** — then write
+  `solana/deployments/mainnet-beta.json` by hand (`mint`, `decimals: 6`, `symbol`, `tokenProgram`, `operator`).
+  The gateway only needs the mint address; nothing is deployed.
 
-## 2. Contracts
+Then `node scripts/sync-deployments.mjs && pnpm -r build` and commit the deployment JSON plus
+`packages/shared/src/deployments.generated.ts`.
 
-```bash
-cd contracts
-export DEPLOYER_PRIVATE_KEY=0x…  OWNER=0x…  OPERATOR=0x…  POSTER=0x…
-export TOKEN=                     # empty → deploy BeagleToken
-export INITIAL_PRICE_E18=10000000000000000   # bootstrap price: $0.01 per token (0 = leave unset)
-export MAX_PRICE_AGE=3600 MIN_BURN=0
-forge script script/Deploy.s.sol --rpc-url "$ROBINHOOD_TESTNET_RPC_URL" --broadcast --private-key "$DEPLOYER_PRIVATE_KEY" \
-  --verify --verifier blockscout --verifier-url https://explorer.testnet.chain.robinhood.com/api
-```
-
-The script writes `contracts/deployments/<chainId>.json`. Then:
+## 2. Gateway
 
 ```bash
-cd .. && node scripts/sync-deployments.mjs && node scripts/sync-abi.mjs && pnpm -r build
-```
-
-Commit the deployment JSON and the regenerated `packages/shared/src/*.generated.ts`.
-
-Post-deploy checklist:
-- If `OWNER ≠ deployer`, the owner must call `acceptOwnership()` on **both** `CreditDesk` and
-  `ManualPriceSource` (Ownable2Step).
-- `CreditDesk.operator()` must equal the gateway's `OPERATOR_PRIVATE_KEY` address; `ManualPriceSource.poster()` too.
-- Set a real price: `PRICE_SOURCE=0x… PRICE_E18=… POSTER_PRIVATE_KEY=0x… forge script script/PostPrice.s.sol --rpc-url … --broadcast`
-  or enable the gateway price poster (`PRICE_POSTER_ENABLED=true`, `PRICE_FEED_URL=…`).
-- Verify on Blockscout: `forge verify-contract --verifier blockscout --verifier-url <api> <address> <Contract>`.
-
-## 3. Gateway
-
-The gateway reads **`process.env` only** — it never opens `.env` itself (docker compose injects the file through
-`env_file`; Vite reads it for the web build). On bare metal hand the file to Node with `--env-file`, export it
-in the shell (`set -a; source .env; set +a`) or use `EnvironmentFile=/srv/beagle/.env` in the systemd unit.
-Set `NODE_ENV=production` on every real deployment (the Docker image does): it makes `SESSION_SECRET` mandatory
-and makes `beagle-gateway credit` refuse without `--force`; without it an empty secret only logs a warning.
-
-```bash
-cp .env.example .env         # CHAIN_ID, RPC_URL, OPERATOR_PRIVATE_KEY, DRY_RUN=false, SESSION_SECRET, KEYRING_MASTER_KEY,
-                             # ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY, HOUSE_BASE_URL, PUBLIC_URL, PUBLIC_WEB_ORIGIN,
-                             # NODE_ENV=production
+cp .env.example .env     # CLUSTER, RPC_URL, OPERATOR_SECRET_KEY, DRY_RUN=false, PRICE_SOURCE, SESSION_SECRET, KEYRING_MASTER_KEY,
+                         # ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY, HOUSE_BASE_URL, PUBLIC_URL, PUBLIC_WEB_ORIGIN
 pnpm install && pnpm -r build
-NODE_ENV=production node --env-file=.env gateway/dist/cli.js migrate
-NODE_ENV=production node --env-file=.env gateway/dist/main.js    # http://0.0.0.0:8787
+node --env-file=.env gateway/dist/cli.js migrate
+node --env-file=.env gateway/dist/cli.js set-price --usd 0.01      # PRICE_SOURCE=manual: first price point
+NODE_ENV=production node --env-file=.env gateway/dist/main.js      # http://0.0.0.0:8787
 ```
 
-(`NODE_ENV=production` on the command line is redundant once it is in `.env`; a variable already in the
-environment wins over the file.) If the startup log says `RPC_URL is unset` or `SESSION_SECRET is unset: using
-the development default`, the file was not loaded.
+The gateway reads `process.env` only: pass the file with `--env-file`, export it in the shell, or use `env_file`
+in compose. Secrets: `SESSION_SECRET` (≥ 32 random bytes), `KEYRING_MASTER_KEY` (`openssl rand -hex 32`),
+`ADMIN_TOKEN` (optional), `OPERATOR_SECRET_KEY` (base58 or the JSON byte array of `solana-keygen`; keep it funded
+with ~0.1 SOL; it can only burn what agents delegated to it).
 
-Secrets: `SESSION_SECRET` (≥ 32 random bytes), `KEYRING_MASTER_KEY` (`openssl rand -hex 32`), `ADMIN_TOKEN`
-(optional). Keep `OPERATOR_PRIVATE_KEY` funded with a little ETH for draws and price posts; it can only draw
-within budget caps and post prices within `maxStepBps`. `DEPLOYER_PRIVATE_KEY` and the other keys of the
-"contracts deploy" section are for `forge script` only (§2): keep them out of the `.env` the gateway is started
-with — compose blanks `DEPLOYER_PRIVATE_KEY` in the gateway container, `--env-file` would not.
+Price: `PRICE_SOURCE=jupiter` on mainnet (Jupiter Price API by mint), `feed` for your own endpoint
+(`{ "priceUsd": … }`), `manual` for devnet/local (`set-price`, `POST /api/admin/price`). Changes are published as
+price points (`/api/price/history`) and every credit event pins the point it used.
 
-House model: run vLLM with an OpenAI-compatible API and set `HOUSE_BASE_URL` (e.g. `http://house:8000/v1`).
-The gateway has **one** house endpoint: both catalog models (`HOUSE_MODEL_SMALL` = `openai/gpt-oss-20b` and
-`HOUSE_MODEL_LARGE` = `openai/gpt-oss-120b`, Pro plan) are requested from `HOUSE_BASE_URL`, while a vLLM
-process serves a single model, so the two compose services are alternatives, not a pair:
+Indexing: the first start indexes the newest `INDEX_PAGE_LIMIT` burns of the mint; set `INDEX_FROM_SIGNATURE` to
+start from a known transaction instead. Rebuilding from scratch = delete the DB rows of `credit_events`/`ledger`
+credits and restart with the cursor cleared (or point at a fresh `DB_PATH`); debits cannot be rebuilt — back up
+the SQLite file.
+
+House model: run vLLM with an OpenAI-compatible API and set `HOUSE_BASE_URL` (e.g. `http://house:8000/v1`):
 
 ```bash
 docker compose --profile gpu up -d house                 # openai/gpt-oss-20b (one 24 GB+ GPU)
-docker compose --profile gpu-large up -d house-large     # openai/gpt-oss-120b (one 80 GB GPU)
+docker compose --profile gpu-large up -d house-large     # openai/gpt-oss-120b (one 80 GB GPU, Pro plan)
 ```
 
-- One GPU (`house`, `HOUSE_BASE_URL=http://house:8000/v1`): remove the model it does not serve from the catalog so
-  Pro workspaces are not offered a `house/gpt-oss-120b` that 404s — `MODEL_CATALOG_FILE=/app/data/catalog.json`
-  with `[{ "id": "house/gpt-oss-120b", "remove": true }]` (the reverse for `house-large`, which then leaves only a
-  Pro-gated house model, so free workspaces lose the house fallback).
-- Both models: put an OpenAI-compatible router (LiteLLM, a vLLM router, …) in front of `house` and `house-large`
-  and point `HOUSE_BASE_URL` at it; a second base URL for the large model is not supported yet.
+The gateway has a single house endpoint: to serve both models put an OpenAI-compatible router in front of the
+two services, or drop the other model from the catalog (`MODEL_CATALOG_FILE`). Without a GPU leave
+`HOUSE_BASE_URL` empty or point it at Ollama (`http://127.0.0.1:11434/v1`, `HOUSE_MODEL_SMALL=gpt-oss:20b`).
 
-Without a GPU, leave `HOUSE_BASE_URL` empty (the house tier disappears from routing) or point it at Ollama
-(`http://127.0.0.1:11434/v1`, `HOUSE_MODEL_SMALL=gpt-oss:20b`).
-
-## 4. Web
+## 3. Web
 
 ```bash
-VITE_CHAIN_ID=4663 VITE_GATEWAY_URL= pnpm --filter @beagle/web build   # same-origin API behind nginx
+VITE_CLUSTER=mainnet-beta VITE_GATEWAY_URL= pnpm --filter @beagle/web build   # same-origin API behind nginx
 ```
 
-`docker compose up -d gateway web` builds both images; nginx serves the SPA on `:8080` and proxies
-`/api`, `/v1`, `/mcp`, `/healthz` to the gateway with buffering disabled (SSE). The root `.dockerignore` keeps
-host `node_modules`, builds, `.env` and `gateway/data` (the dev SQLite) out of the build context — build from a
-checkout that has no other secrets lying around anyway.
+`docker compose up -d gateway web` builds both images; nginx serves the SPA on `:8080` and proxies `/api`, `/v1`,
+`/mcp`, `/healthz` to the gateway with buffering disabled (SSE). `PUBLIC_URL` of the gateway must equal the
+origin the browser talks to (SIWS domain): dev `http://localhost:8787` = `VITE_GATEWAY_URL`; prod the site URL.
 
-## 5. Smoke test
+## 4. Smoke test
 
 ```bash
 curl -s https://<host>/api/status | jq
 curl -s https://<host>/api/price | jq
-# burn on /app/credits, then:
+# burn on /app/credits (or spl-token burn <ata> 1000 from the CLI), then:
 curl https://<host>/v1/chat/completions -H "authorization: Bearer bgl_…" -H 'content-type: application/json' \
   -d '{"model":"beagle/auto","messages":[{"role":"user","content":"hello"}]}' -i
 ```
 
-Local full flow without a network: `pnpm anvil:e2e` (`scripts/anvil-e2e.sh`).
+Local full flow without a network: `pnpm solana:e2e` (`scripts/solana-e2e.sh`, needs `solana-test-validator`).
 
-## 6. Operations
+## 5. Operations
 
-- **Indexer lag**: `/api/status.indexer.lagBlocks`. Credits appear after `CONFIRMATIONS` blocks.
-- **Price**: `/api/price.stale` turns true after `maxPriceAge`; burns then revert with `PriceStale` and the
-  Credits page disables the button. Post a price.
-- **Budgets**: a stalled budget (`stalledReason = allowance | price | draw_failed`) contributes no headroom;
-  the agent must top up allowance/balance.
+- **Indexer lag**: `/api/status.indexer.lagSlots`. Credits appear once the burn is `confirmed` (seconds); the
+  finality sweep reverts a credit whose transaction disappears before `finalized` (rare).
+- **Price**: `/api/price.stale` turns true after `PRICE_MAX_AGE_S`; burns are still credited at the last point
+  (`CREDIT_WHEN_STALE`), the Credits page disables burning. Fix the source or `set-price`.
+- **Budgets**: a budget stalls when the agent revoked the delegation, emptied the token account, or a draw
+  failed; agents re-approve (`ApproveChecked`) — a new approval replaces the cap.
+- **Operator SOL**: `/api/status.operator.solBalance`; top up before it runs dry (draws stop otherwise).
 - **Catalog prices** are snapshots: override with `MODEL_CATALOG_FILE` when providers change prices.
-- **Backups**: the SQLite file (`DB_PATH`) is a cache of on-chain credits plus the debit ledger — back it up;
-  credits can be rebuilt from events (`indexer_state.last_block = deployBlock − 1` and restart), debits cannot.
+- **Backups**: the SQLite file (`DB_PATH`) holds the ledger (credits rebuildable from the chain + price history,
+  debits not) — back it up.
