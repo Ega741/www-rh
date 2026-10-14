@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { addressLink, sameAddress, shortAddress, shortHash, shortSignature, tokenLink, txLink } from './explorer.js';
+import { addressLink, sameAddress, shortAddress, shortHash, shortRequestId, shortSignature, tokenLink, txLink } from './explorer.js';
 
 const ADDR = 'BEJQY85xuHoT2NyAT5eXF9ftMv6RnSM7LQSujxm8BAbZ';
 const SIG = '5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW';
 const HASH = '0x' + 'ab'.repeat(32);
 
 describe('explorer helpers', () => {
+  it('shortens request ids for tables', () => {
+    expect(shortRequestId('req_c13ba5d4-4ff6-4e26-a752-779a72476fa6')).toBe('req_c13ba5d4…');
+    expect(shortRequestId('req_short')).toBe('req_short');
+  });
+
   it('shortens addresses, signatures and hashes', () => {
     expect(shortAddress(ADDR)).toBe('BEJQ…BAbZ');
     expect(shortAddress(ADDR, 6)).toBe('BEJQY8…m8BAbZ');

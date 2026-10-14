@@ -96,7 +96,11 @@ export function Credits() {
   const events = useCreditEvents(10, watching ? WATCH_POLL_MS : undefined);
 
   const settle = (next: WatchState, w: WatchState) => {
-    if (next !== w) setWatch(next);
+    if (next === w) return;
+    // Both polling effects can settle in the same commit; update the ref now so the second one sees the
+    // transition and does not announce it again.
+    watchRef.current = next;
+    setWatch(next);
     if (next.status === 'landed') {
       toast.push({ kind: 'success', title: 'Credit landed', message: balance.data === undefined ? 'The ledger shows the purchase.' : `Balance is now ${fmtUsd(balance.data.balanceMicro)}` });
       void invalidateBalances(client);

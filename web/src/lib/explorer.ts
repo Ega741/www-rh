@@ -22,6 +22,11 @@ export function shortHash(hash: string, head = 8, tail = 4): string {
   return `${hash.slice(0, 2 + head)}…${hash.slice(-tail)}`;
 }
 
+/** `req_c13ba5d4…` for request ids (`req_` + UUID) in tables; the full id goes in the link target and title. */
+export function shortRequestId(id: string, head = 12): string {
+  return id.length <= head + 1 ? id : `${id.slice(0, head)}…`;
+}
+
 /** Explorer URL of a transaction; `rpcUrl` points a localnet link at the right validator. */
 export function txLink(cluster: Cluster, signature: string, rpcUrl?: string): string {
   return explorerTxUrl(cluster, signature, rpcUrl === undefined ? {} : { rpcUrl });

@@ -482,7 +482,9 @@ encoding: 'jsonParsed' })`. For each parsed instruction (top-level and `meta.inn
   ensure the workspace, ledger credit (`ref_type='credit_event'`, `ref_id='<sig>:<ix>'`); draws also set
   `budget_draws.status='confirmed'`, `signature`, and `usage.claimDrawId` for the batch rows.
 - Cursor: after a full page set is applied, `last_signature` = the newest processed signature, `last_slot`;
-  `head_slot = getSlot()`; `lagSlots = head_slot − last_slot`. The first run with no cursor processes the
+  `head_slot = getSlot()` at the start of each poll; a poll that reaches the cursor (nothing left to fetch or apply)
+  stores `synced_slot = head_slot`; `lagSlots = head_slot − synced_slot` (a quiet mint is not lagging; before the first
+  complete poll the newest event slot is the reference). The first run with no cursor processes the
   newest `INDEX_PAGE_LIMIT` signatures only unless `INDEX_FROM_SIGNATURE` is set (then everything after it).
   Commitment `confirmed` may in rare cases drop a transaction later; an event whose signature is no longer
   found at `finalized` after 2 minutes is reverted (`credit_events` row deleted, ledger row deleted) — a

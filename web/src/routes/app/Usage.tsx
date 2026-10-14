@@ -9,6 +9,7 @@ import { formatDateTime } from '../../lib/time.js';
 import { averageCharge, dayBars, modelBars } from '../../lib/usage.js';
 import { USAGE_WINDOWS, isUsageWindow, windowLabel, type UsageWindow } from '../../lib/windows.js';
 import { useUsageList, useUsageSummary } from '../../queries.js';
+import { shortRequestId } from '../../lib/explorer.js';
 
 const WINDOW_OPTIONS = USAGE_WINDOWS.map((w) => ({ value: w, label: w }));
 
@@ -115,8 +116,8 @@ export function Usage() {
                       <tr key={r.id}>
                         <td className="text-muted">{formatDateTime(r.createdAt)}</td>
                         <td>
-                          <Link className="link font-mono text-xs" to={`/app/receipts/${encodeURIComponent(r.id)}`}>
-                            {r.id}
+                          <Link className="link font-mono text-xs" title={r.id} to={`/app/receipts/${encodeURIComponent(r.id)}`}>
+                            {shortRequestId(r.id)}
                           </Link>
                         </td>
                         <td className="font-mono text-xs">

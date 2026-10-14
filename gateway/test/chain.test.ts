@@ -231,7 +231,8 @@ describe('indexer', () => {
     expect(r.creditEvents.get(META.sigs.twoSig, 2)).toMatchObject({ usdMicro: 30_000n, workspace: WS1 });
     expect(r.creditEvents.get(META.sigs.twoSig, 1)).toBeUndefined();
     expect(r.ledger.hasRef('credit_event', `${META.sigs.twoSig}:2`)).toBe(true);
-    expect(ix.status()).toEqual({ lastSignature: META.sigs.twoSig, lastSlot: 128, headSlot: 130, lagSlots: 2, lastEventAt: T0 });
+    // The poll reached the cursor, so the indexer is in sync with head 130 although the newest burn is at slot 128.
+    expect(ix.status()).toEqual({ lastSignature: META.sigs.twoSig, lastSlot: 128, headSlot: 130, lagSlots: 0, lastEventAt: T0 });
     expect(r.creditEvents.list(WS1, 10).map((e) => [e.signature, e.ixIndex])).toEqual([
       [META.sigs.twoSig, 2],
       [META.sigs.twoSig, 0],
@@ -248,6 +249,15 @@ describe('indexer', () => {
     // Re-applying a transaction is a no-op.
     expect(await ix.applyParsedTransaction(META.sigs.burnSig, txs.get(META.sigs.burnSig)!)).toBe(0);
     expect(r.ledger.balance(WS1)).toBe(60_000n);
+    // A quiet mint is not lagging: the head moves on, polls find nothing new, the lag stays 0.
+    rpc.slot = 5_000;
+    expect(await ix.step()).toBeUndefined();
+    expect(ix.status()).toMatchObject({ lastSlot: 128, headSlot: 5_000, lagSlots: 0 });
+    // A poll that cannot finish (transaction not yet available) leaves the synced slot behind: the lag grows.
+    rpc.signatures = [{ signature: 'pendingSig1111111111111111111111111111111111111111111111111111111111111111111111111', slot: 5_001, err: null, blockTime: null, memo: null, confirmationStatus: 'confirmed' } as RpcSignatureInfo, ...rpc.signatures];
+    rpc.slot = 5_050;
+    await ix.step();
+    expect(ix.status()).toMatchObject({ headSlot: 5_050, lagSlots: 50 });
   });
 
   it('first run takes only the newest page; INDEX_FROM_SIGNATURE pages everything after it; failed txs advance the cursor', async () => {

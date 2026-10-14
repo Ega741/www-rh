@@ -60,6 +60,8 @@ export interface IndexerOptions {
 const KEY_LAST_SIGNATURE = 'last_signature';
 const KEY_LAST_SLOT = 'last_slot';
 const KEY_HEAD_SLOT = 'head_slot';
+/** Head slot observed at the start of the last poll that caught up with the chain (`lagSlots` is measured from it). */
+const KEY_SYNCED_SLOT = 'synced_slot';
 const KEY_LAST_EVENT_AT = 'last_event_at';
 /** JSON list of {@link BackfillGap}s still to drain (newest gap first). */
 const KEY_BACKFILL = 'backfill';
@@ -199,9 +201,15 @@ export class Indexer {
     return v === undefined ? null : Number(v);
   }
 
-  /** `{ lastSignature, lastSlot, headSlot, lagSlots, lastEventAt }`. */
+  /**
+   * `{ lastSignature, lastSlot, headSlot, lagSlots, lastEventAt }`. `lastSlot` is the slot of the newest indexed
+   * signature; `lagSlots` is how far the head has moved since the last poll that caught up (not since the last
+   * burn: a quiet mint is not lagging), falling back to `lastSlot` before the first complete poll.
+   */
   status(): IndexerStatusDto {
     const lastSlot = this.lastSlot();
+    const synced = this.repos.indexerState.get(KEY_SYNCED_SLOT);
+    const reference = synced === undefined ? lastSlot : Number(synced);
     const lastEventAt = this.repos.indexerState.get(KEY_LAST_EVENT_AT);
     const storedHead = this.repos.indexerState.get(KEY_HEAD_SLOT);
     const headSlot = Math.max(this.head, storedHead === undefined ? 0 : Number(storedHead));
@@ -209,7 +217,7 @@ export class Indexer {
       lastSignature: this.lastSignature() ?? null,
       lastSlot,
       headSlot,
-      lagSlots: lastSlot === null ? 0 : Math.max(0, headSlot - lastSlot),
+      lagSlots: reference === null ? 0 : Math.max(0, headSlot - reference),
       lastEventAt: lastEventAt === undefined ? null : Number(lastEventAt),
     };
   }
@@ -309,11 +317,13 @@ export class Indexer {
     const cursorSlot = this.lastSlot() ?? this.indexFrom?.slot ?? null;
     const walk = await this.walk({ until, untilSlot: cursorSlot });
     const signatures = walk.pages.flat().reverse();
+    let caughtUp = walk.reachedUntil;
     if (signatures.length > 0) {
       didSomething = true;
       const r = await this.apply(signatures, true);
       processed += r.processed;
       events += r.events;
+      if (!r.complete) caughtUp = false;
       if (!walk.reachedUntil && r.processed > 0 && walk.oldest !== undefined) {
         // The cursor is now at or past the oldest fetched signature: everything between it and the old
         // cursor is still unindexed and unreachable from the head — remember it and drain it on later polls.
@@ -322,6 +332,7 @@ export class Indexer {
         this.logger.error('indexer: page cap reached; older signatures queued for backfill', { ...newGap, maxPages: this.options.maxPages ?? DEFAULT_MAX_PAGES, pageLimit: this.options.pageLimit });
       }
     }
+    if (caughtUp) this.repos.indexerState.set(KEY_SYNCED_SLOT, String(this.head));
     if (!didSomething) return undefined;
     if (events > 0) this.logger.info('indexed burns', { events, processed, head: this.head });
     return { processed, events };

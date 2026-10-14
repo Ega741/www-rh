@@ -6,6 +6,7 @@ import { useSession } from '../../hooks/useSession.jsx';
 import { fmtCompact, fmtCount, fmtPrice, fmtUsd } from '../../lib/amounts.js';
 import { formatDateTime, relativeTime } from '../../lib/time.js';
 import { useBalance, useUsageList, useUsageSummary } from '../../queries.js';
+import { shortRequestId } from '../../lib/explorer.js';
 
 /** Overview page. */
 export function Overview() {
@@ -104,8 +105,8 @@ export function Overview() {
                         {relativeTime(r.createdAt, now)}
                       </td>
                       <td>
-                        <Link className="link font-mono text-xs" to={`/app/receipts/${encodeURIComponent(r.id)}`}>
-                          {r.id}
+                        <Link className="link font-mono text-xs" title={r.id} to={`/app/receipts/${encodeURIComponent(r.id)}`}>
+                          {shortRequestId(r.id)}
                         </Link>
                       </td>
                       <td className="font-mono text-xs">
